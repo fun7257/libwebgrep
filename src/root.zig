@@ -17,10 +17,17 @@ pub const FindOptions = matcher.FindOptions;
 
 pub const Span = sink_mod.Span;
 pub const Line = sink_mod.Line;
+pub const AnySink = sink_mod.AnySink;
+pub const anyVtable = sink_mod.anyVtable;
+pub const SliceIter = sink_mod.SliceIter;
+pub const Result = sink_mod.Result;
+pub const Outcome = sink_mod.Outcome;
 
 pub const BinaryPolicy = searcher.BinaryPolicy;
 pub const SearchConfig = searcher.SearchConfig;
-pub const Outcome = searcher.Outcome;
+pub const searchSlice = searcher.searchSlice;
+pub const searchReader = searcher.searchReader;
+pub const searchFile = searcher.searchFile;
 
 test "默认搜索配置" {
     const cfg: SearchConfig = .{};

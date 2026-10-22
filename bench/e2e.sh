@@ -108,12 +108,23 @@ run_pair "1 单个大文件，热缓存" \
   "${common_rg[*]} ZXZQNEEDLE $big >/dev/null" \
   "${common_zrg[*]} ZXZQNEEDLE $big >/dev/null"
 
-echo
-echo "## 2 真实源码树，单线程"
-echo "跳过：目录遍历在 P1。"
-echo
-echo "## 3 真实源码树，多线程"
-echo "跳过：目录遍历和并行调度在 P1。"
+# 默认是本机的 Zig 标准库树。别的机器可以设 ZRG_TREE。
+tree=${ZRG_TREE:-/Users/fun/zig-source/zig-aarch64-macos-0.17.0/lib}
+if [[ ! -d $tree ]]; then
+  echo
+  echo "## 2 真实源码树，单线程"
+  echo "跳过：找不到 $tree。设置 ZRG_TREE 后再跑。"
+  echo
+  echo "## 3 真实源码树，多线程"
+  echo "跳过：找不到 $tree。"
+else
+  run_pair "2 真实源码树，单线程" \
+    "${common_rg[*]} -j 1 OutOfMemory $tree >/dev/null" \
+    "${common_zrg[*]} -j 1 OutOfMemory $tree >/dev/null"
+  run_pair "3 真实源码树，多线程" \
+    "${common_rg[*]} OutOfMemory $tree >/dev/null" \
+    "${common_zrg[*]} OutOfMemory $tree >/dev/null"
+fi
 echo
 echo "## 4 冷缓存"
 if sudo -n true >/dev/null 2>&1; then

@@ -5,6 +5,21 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const sanitize_thread = b.option(bool, "sanitize-thread", "启用 ThreadSanitizer") orelse false;
     const fuzz_filter = b.option([]const u8, "fuzz-filter", "只运行名称包含该子串的测试");
+    // 系统和 CPU 专属优化都走构建选项，默认关闭。通用路径不依赖它们。
+    const want_linux_getdents = b.option(
+        bool,
+        "linux-getdents",
+        "Linux 上用裸 getdents64 枚举目录。默认关闭，走 std.Io.Dir.Reader",
+    ) orelse false;
+    const mmap_windows = b.option(
+        bool,
+        "mmap-windows",
+        "大文件按 8 MiB 窗口映射后再搜索。默认关闭，走 readPositional",
+    ) orelse false;
+    const linux_getdents = want_linux_getdents and target.result.os.tag == .linux;
+    const options = b.addOptions();
+    options.addOption(bool, "linux_getdents", linux_getdents);
+    options.addOption(bool, "mmap_windows", mmap_windows);
     const test_filters: []const []const u8 = if (fuzz_filter) |filter| &.{filter} else &.{};
 
     const mod = b.addModule("zrg", .{
@@ -13,6 +28,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .sanitize_thread = sanitize_thread,
     });
+    mod.addOptions("build_options", options);
 
     const exe = b.addExecutable(.{
         .name = "zrg",
@@ -58,6 +74,12 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&lib_tests.step);
     check_step.dependOn(&exe_tests.step);
     check_step.dependOn(&exe.step);
+    if (want_linux_getdents and target.result.os.tag != .linux) {
+        const fail = b.addFail("-Dlinux-getdents 只适用于 os 为 linux 的目标");
+        test_step.dependOn(&fail.step);
+        check_step.dependOn(&fail.step);
+        b.getInstallStep().dependOn(&fail.step);
+    }
 
     const bench_step = b.step("bench", "ReleaseFast 基准（内核微基准，随后是端到端脚本）");
     if (optimize != .fast) {

@@ -7,6 +7,7 @@
 //! `buffer_size` 倍增到 `max_line_len`，超过则返回 `error.LineTooLong`。
 
 const std = @import("std");
+const build_options = @import("build_options");
 const matcher_mod = @import("matcher.zig");
 const memchr = @import("finder/memchr.zig");
 const sink_mod = @import("sink.zig");
@@ -39,6 +40,10 @@ pub const SearchConfig = struct {
     buffer_size: usize = default_buffer_size,
     max_line_len: usize = default_max_line_len,
     match_mode: matcher_mod.MatchMode = .earliest,
+    /// 非 null 时复用这块缓冲。扩容后把新切片写回去。null 时这次调用自己分配、自己释放。
+    scratch: ?*[]u8 = null,
+    /// 非 null 且为真时，下一块开始前停止。遍历用它做提前结束。
+    stop: ?*const std.atomic.Value(bool) = null,
 };
 
 pub const Outcome = sink_mod.Outcome;
@@ -145,8 +150,9 @@ pub fn searchReader(
     }.read, reader);
 }
 
-/// 从已打开的文件搜索。用 `readPositional` 分块读进调用方缓冲。
+/// 从已打开的文件搜索。默认用 `readPositional` 分块读进调用方缓冲。
 /// 整文件映射在这台机器的 1 GiB 热缓存上比分块读更慢，还把驻留撑到文件大小，所以不用。
+/// `-Dmmap-windows` 才改走 8 MiB 窗口映射，默认关闭。
 pub fn searchFile(
     comptime S: type,
     allocator: std.mem.Allocator,
@@ -158,6 +164,14 @@ pub fn searchFile(
     config: SearchConfig,
 ) ReadError!Result {
     resetStats(matcher);
+    if (comptime build_options.mmap_windows) {
+        const mmap_window = @import("io/mmap_window.zig");
+        if (try mmap_window.open(io, file, bufferWindow(config))) |opened| {
+            var ctx = opened;
+            defer ctx.close();
+            return drive(S, allocator, sink, matcher, config, name, mmap_window.readBytes, &ctx);
+        }
+    }
     const Ctx = struct { io: std.Io, file: std.Io.File, offset: u64 = 0 };
     var ctx = Ctx{ .io = io, .file = file };
     return drive(S, allocator, sink, matcher, config, name, struct {
@@ -190,13 +204,31 @@ fn drive(
 
     const initial = bufferWindow(config);
     const cap0 = @max(initial, 1);
-    var buf = try allocator.alloc(u8, cap0);
-    defer allocator.free(buf);
+    const borrowed = config.scratch != null;
+    var buf: []u8 = undefined;
+    if (config.scratch) |slot| {
+        if (slot.len < cap0) {
+            if (slot.len == 0) {
+                slot.* = try allocator.alloc(u8, cap0);
+            } else {
+                slot.* = try allocator.realloc(slot.*, cap0);
+            }
+        }
+        buf = slot.*;
+    } else {
+        buf = try allocator.alloc(u8, cap0);
+    }
+    defer if (!borrowed) allocator.free(buf);
     var filled: usize = 0;
 
     while (!state.stopped) {
+        if (flagIsSet(config)) {
+            state.stopped = true;
+            break;
+        }
         if (filled == buf.len) {
             buf = try grow(allocator, buf, config);
+            if (config.scratch) |slot| slot.* = buf;
         }
         const n = try readFn(read_ctx, buf[filled..]);
         const eof = n == 0;
@@ -278,6 +310,11 @@ fn drive(
     }
 
     return finishSink(S, sink, &state, config);
+}
+
+fn flagIsSet(config: SearchConfig) bool {
+    const flag = config.stop orelse return false;
+    return flag.load(.acquire);
 }
 
 fn grow(allocator: std.mem.Allocator, buf: []u8, config: SearchConfig) error{ LineTooLong, OutOfMemory }![]u8 {
@@ -1055,4 +1092,41 @@ test "拉式迭代器" {
     try testing.expectEqualStrings("ab", second.bytes);
     try testing.expectEqual(@as(?u64, 2), second.number);
     try testing.expect(it.next() == null);
+}
+
+test "外部停止标志让流式搜索不再读下一块" {
+    var reader = std.Io.Reader.fixed("MATCH\nMATCH\n");
+    var finder = try Finder.init("MATCH", .{});
+    var flag = std.atomic.Value(bool).init(true);
+    const Sink = struct {
+        pub fn matched(_: *@This(), _: Line) bool {
+            return true;
+        }
+    };
+    var sink = Sink{};
+    const result = try searchReader(Sink, testing.allocator, &sink, &reader, "", &finder, .{
+        .stop = &flag,
+    });
+    try testing.expectEqual(Outcome.stopped, result.outcome);
+    try testing.expectEqual(@as(u64, 0), result.matched_lines);
+}
+
+test "scratch 在两次搜索之间复用" {
+    var scratch: []u8 = &.{};
+    defer testing.allocator.free(scratch);
+    const Sink = struct {
+        pub fn matched(_: *@This(), _: Line) bool {
+            return true;
+        }
+    };
+    var sink = Sink{};
+    var finder = try Finder.init("MATCH", .{});
+    const cfg = SearchConfig{ .scratch = &scratch, .buffer_size = 32, .max_line_len = 64 };
+    var first = std.Io.Reader.fixed("MATCH\n");
+    _ = try searchReader(Sink, testing.allocator, &sink, &first, "", &finder, cfg);
+    try testing.expect(scratch.len >= 32);
+    const ptr = scratch.ptr;
+    var second = std.Io.Reader.fixed("MATCH\n");
+    _ = try searchReader(Sink, testing.allocator, &sink, &second, "", &finder, cfg);
+    try testing.expectEqual(ptr, scratch.ptr);
 }

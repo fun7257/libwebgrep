@@ -62,3 +62,29 @@ test {
 }
 
 pub const two_way = @import("finder/two_way.zig");
+
+pub const source = @import("source.zig");
+pub const walk_glob = @import("walk/glob.zig");
+pub const walk_ignore = @import("walk/ignore.zig");
+pub const walk_deque = @import("walk/deque.zig");
+pub const walk_file_id = @import("walk/file_id.zig");
+pub const walk_types = @import("walk/types.zig");
+pub const walk_list = @import("walk/list_dir.zig");
+pub const walker = @import("walk/walker.zig");
+pub const parallel = @import("parallel.zig");
+pub const json_printer = @import("printer/json.zig");
+pub const files_printer = @import("printer/files.zig");
+
+test {
+    _ = @import("source.zig");
+    _ = @import("walk/glob.zig");
+    _ = @import("walk/ignore.zig");
+    _ = @import("walk/deque.zig");
+    _ = @import("walk/file_id.zig");
+    _ = @import("walk/types.zig");
+    _ = @import("walk/list_dir.zig");
+    _ = @import("walk/walker.zig");
+    _ = @import("parallel.zig");
+    _ = @import("printer/json.zig");
+    _ = @import("printer/files.zig");
+}

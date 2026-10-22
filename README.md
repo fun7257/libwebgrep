@@ -2,7 +2,7 @@
 
 可嵌入的字面量行搜索库。用 Zig 0.17.0 和标准库写成，没有第三方依赖，也不链接 C 库。
 
-当前是 P0：在一段内存、一个 `std.Io.Reader` 或一个已打开的文件里做单模式字面量搜索，带行号、上下文、反选、计数和二进制 NUL 检测。目录遍历、忽略规则、并行和多模式还没做。
+当前做到 P1：在一段内存、一个 `std.Io.Reader` 或一个已打开的文件里做单模式字面量搜索，也能够遍历目录、应用 gitignore 和 glob、用多个工人并行，并写出 JSON Lines 或文件名列表。多模式还没做。
 
 示例程序 `zrg` 只用来对照 ripgrep 和跑基准，不追求兼容 `rg` 的全部参数。
 
@@ -34,6 +34,15 @@ zig build check -Dtarget=x86_64-linux-musl
 zig build check -Dtarget=x86_64-windows
 zig build check -Dtarget=aarch64-linux-musl
 ```
+
+系统和 CPU 专属的优化用构建选项打开，默认都关闭。P1 没有 CPU 分派。
+
+```sh
+zig build test -Dmmap-windows
+zig build check -Dtarget=x86_64-linux-musl -Dlinux-getdents
+```
+
+`-Dlinux-getdents` 只适用于 Linux 目标。在其它系统上，`test`、`check` 和 `install` 会失败。`-Dmmap-windows` 让大于搜索缓冲的文件按 8 MiB 窗口映射。细节在 `DESIGN.md` 的「构建特性」。
 
 在自己的 `build.zig` 里引用：
 
@@ -137,16 +146,20 @@ pub fn searchPath(
 
 `searchReader` 的形状相同，只是把文件换成 `*std.Io.Reader`。默认缓冲 1 MiB，单行上限 2 MiB。超长行返回 `error.LineTooLong`，缓冲不会一直涨。
 
-内置打印器有两种：
+内置打印器：
 
 - `TextPrinter`：`路径:行号:列号:文本`，上下文用 `-`，组之间用 `--`。
 - `CountPrinter`：单输入写 `N`，多输入写 `路径:N`。
+- `Json`：对齐 `rg --json` 的 JSON Lines。没有命中的文件不写事件。
+- `Files`：命中一次就写路径，对应 `-l`。
 
 二进制策略：
 
-- `.quit`：读到 NUL 就停。遍历发现的文件以后用这个。
+- `.quit`：读到 NUL 就停。遍历发现的文件用这个，除非 `-a`。
 - `.report`：显式文件的默认。确认有匹配后只报告二进制说明。
 - `.none`：不检测，对应示例 CLI 的 `-a`。
+
+目录搜索在 `zrg.parallel.run`。每个工人有自己的查找器、搜索缓冲和 Chase-Lev 队列。忽略规则在发布之后只读。热路径上的逐块查找仍然不分配、不加锁；锁只包住一个文件的输出。
 
 ## 示例命令
 
@@ -154,10 +167,12 @@ pub fn searchPath(
 zig build run -Doptimize=ReleaseFast -- -n -C 1 needle path/to/file
 ```
 
-没有路径时读标准输入。退出码和 `rg` 一样：0 有匹配，1 没有，2 是用法或 I/O 错误。目录会报错并退出 2，因为遍历还没做。
+没有路径时读标准输入。`--files` 没有路径时列当前目录。退出码和 `rg` 一样：0 有匹配，1 没有，2 是用法或 I/O 错误。
+
+目录参数会遍历。显式文件保持参数顺序。目录里的输出顺序不稳定。默认跳过隐藏文件，并且始终不进入名为 `.git` 的条目。`-g`、`-t`、`--max-depth`、`--max-filesize`、`-j`、`--hidden`、`--no-ignore`、`--follow`、`-l`、`--json` 见 `zrg --help`。
 
 ## 范围
 
-做了：单模式字面量、ASCII 大小写和 smart case、行语义、文本和计数输出。
+做了：单模式字面量、ASCII 大小写和 smart case、行语义、文本、计数、JSON Lines、文件名列表、gitignore、glob、类型过滤、目录并行。
 
-没做：正则、多行匹配、目录遍历、gitignore、并行、多模式、mmap 窗口、JSON 和文件名打印器、C ABI、Unicode 大小写。见 `DESIGN.md`。
+没做：正则、多行匹配、多模式、C ABI、Unicode 大小写、压缩包读取。窗口映射和裸 `getdents64` 有源文件，默认不编进去。见 `DESIGN.md`。

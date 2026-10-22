@@ -1,6 +1,8 @@
 //! 示例 CLI。只用于测试和基准，不追求兼容 rg 的全部参数。
 //!
 //! 模式始终按字面量处理。没有路径时读标准输入，单独的 `-` 也表示标准输入。
+//! `--files` 没有模式，位置参数都是路径；没有路径时从当前目录列起。
+//! 显式文件按参数顺序逐个搜索。目录交给并行遍历，输出顺序不固定。
 //! 退出码：0 有匹配，1 没有，2 是用法或 I/O 错误。
 
 const std = @import("std");
@@ -53,21 +55,29 @@ pub fn execute(
         return 2;
     };
     defer parsed.paths.deinit(allocator);
+    defer parsed.globs.deinit(allocator);
+    defer parsed.types.deinit(allocator);
 
     if (parsed.help) {
         stdout.writeAll(usage) catch return 2;
         stdout.flush() catch return 2;
         return 0;
     }
+    if (parsed.files_only and parsed.paths.items.len == 0) {
+        parsed.paths.append(allocator, ".") catch return 2;
+    }
 
-    var finder = zrg.Finder.init(parsed.pattern, .{ .case = parsed.case_mode }) catch {
-        stderr.writeAll("zrg: 模式不能包含换行\n") catch {};
-        stderr.flush() catch {};
-        return 2;
-    };
+    var finder: zrg.Finder = undefined;
+    if (!parsed.files_only) {
+        finder = zrg.Finder.init(parsed.pattern, .{ .case = parsed.case_mode }) catch {
+            stderr.writeAll("zrg: 模式不能包含换行\n") catch {};
+            stderr.flush() catch {};
+            return 2;
+        };
+    }
 
     const config = zrg.SearchConfig{
-        .line_numbers = parsed.line_numbers or parsed.column,
+        .line_numbers = parsed.line_numbers or parsed.column or parsed.json,
         .invert = parsed.invert,
         .before = parsed.before,
         .after = parsed.after,
@@ -76,11 +86,12 @@ pub fn execute(
     };
     const input_count: usize = if (parsed.paths.items.len == 0) 1 else parsed.paths.items.len;
     const spec = SinkSpec{
-        .kind = if (parsed.quiet) .quiet else if (parsed.count) .count else .text,
+        .kind = sinkKind(parsed),
         .show_path = parsed.force_path or input_count > 1,
         .column = parsed.column,
-        .use_separator = !parsed.quiet and !parsed.count and (parsed.before > 0 or parsed.after > 0),
+        .use_separator = !parsed.quiet and !parsed.count and !parsed.json and !parsed.files_with_matches and (parsed.before > 0 or parsed.after > 0),
     };
+    const started = std.Io.Timestamp.now(io, .awake);
 
     var scratch: std.Io.Writer.Allocating = .init(allocator);
     defer scratch.deinit();
@@ -91,9 +102,17 @@ pub fn execute(
     var saw_output = false;
     var any_match = false;
     var any_error = false;
+    var totals = zrg.json_printer.Totals{
+        .searches = 0,
+        .searches_with_match = 0,
+        .bytes_searched = 0,
+        .bytes_printed = 0,
+        .matched_lines = 0,
+        .matches = 0,
+    };
 
-    if (parsed.paths.items.len == 0) {
-        const matched = driveOne(
+    if (!parsed.files_only and parsed.paths.items.len == 0) {
+        const one = driveOne(
             allocator,
             io,
             .{ .reader = &stdin_reader.interface },
@@ -107,11 +126,13 @@ pub fn execute(
         ) catch |err| {
             return failInput(stderr, "<stdin>", err);
         };
-        any_match = matched;
+        any_match = one.matched;
+        addOne(&totals, one);
     } else {
         for (parsed.paths.items) |path| {
-            if (std.mem.eql(u8, path, "-")) {
-                const matched = driveOne(
+            if (parsed.quiet and any_match) break;
+            if (!parsed.files_only and std.mem.eql(u8, path, "-")) {
+                const one = driveOne(
                     allocator,
                     io,
                     .{ .reader = &stdin_reader.interface },
@@ -125,7 +146,57 @@ pub fn execute(
                 ) catch |err| {
                     return failInput(stderr, "<stdin>", err);
                 };
-                any_match = any_match or matched;
+                any_match = any_match or one.matched;
+                addOne(&totals, one);
+                continue;
+            }
+
+            const stat = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = true }) catch |err| {
+                stderr.print("zrg: 打不开 {s}：{t}\n", .{ path, err }) catch {};
+                any_error = true;
+                continue;
+            };
+            if (stat.kind == .directory) {
+                const summary = zrg.parallel.run(allocator, io, .{
+                    .pattern = parsed.pattern,
+                    .find = .{ .case = parsed.case_mode },
+                    .roots = &.{path},
+                    .search = config,
+                    .walk = .{
+                        .hidden = parsed.hidden,
+                        .follow_symlinks = parsed.follow,
+                        .read_ignore = !parsed.no_ignore,
+                        .max_depth = parsed.max_depth,
+                        .max_filesize = parsed.max_filesize,
+                        .globs = parsed.globs.items,
+                        .types = parsed.types.items,
+                        .threads = parsed.threads,
+                    },
+                    .emit = toEmit(spec.kind),
+                    .stdout = stdout,
+                    .stderr = stderr,
+                    .column = parsed.column,
+                    .use_separator = spec.use_separator,
+                    .saw_output = &saw_output,
+                }) catch |err| {
+                    stderr.print("zrg: {s}: {t}\n", .{ path, err }) catch {};
+                    any_error = true;
+                    continue;
+                };
+                any_match = any_match or summary.matched;
+                if (summary.errors != 0) any_error = true;
+                totals.searches += summary.searches;
+                totals.searches_with_match += summary.searches_with_match;
+                totals.bytes_searched += summary.bytes_searched;
+                totals.bytes_printed += summary.bytes_printed;
+                totals.matched_lines += summary.matched_lines;
+                totals.matches += summary.matches;
+                continue;
+            }
+
+            if (parsed.files_only) {
+                stdout.print("{s}\n", .{path}) catch return 2;
+                any_match = true;
                 continue;
             }
 
@@ -135,19 +206,7 @@ pub fn execute(
                 continue;
             };
             defer file.close(io);
-
-            const stat = file.stat(io) catch |err| {
-                stderr.print("zrg: 无法读取 {s} 的信息：{t}\n", .{ path, err }) catch {};
-                any_error = true;
-                continue;
-            };
-            if (stat.kind == .directory) {
-                stderr.print("zrg: {s}: 目录遍历还没做\n", .{path}) catch {};
-                any_error = true;
-                continue;
-            }
-
-            const matched = driveOne(
+            const one = driveOne(
                 allocator,
                 io,
                 .{ .file = file },
@@ -161,10 +220,15 @@ pub fn execute(
             ) catch |err| {
                 return failInput(stderr, path, err);
             };
-            any_match = any_match or matched;
+            any_match = any_match or one.matched;
+            addOne(&totals, one);
         }
     }
 
+    if (parsed.json) {
+        const elapsed = elapsedNanos(started.durationTo(std.Io.Timestamp.now(io, .awake)));
+        zrg.json_printer.writeSummary(stdout, elapsed, totals) catch return 2;
+    }
     stdout.flush() catch return 2;
     stderr.flush() catch {};
     if (any_error) return 2;
@@ -194,7 +258,18 @@ const usage =
     \\  -m, --max-count NUM      每个输入最多多少条匹配
     \\  -a, --text               不检测 NUL
     \\  -q, --quiet              不写匹配，只用退出码
-    \\      --no-config, --color, -j, --threads, --binary
+    \\  -l, --files-with-matches 只打印有匹配的路径
+    \\      --files              只列文件，不需要模式
+    \\      --json               按 rg 的 JSON Lines 写出
+    \\  -g, --glob GLOB          文件名过滤，可重复。正模式是白名单
+    \\  -t, --type TYPE          按内置类型过滤，可重复
+    \\      --max-depth NUM      起始目录深度为 1，0 什么也不列
+    \\      --max-filesize SIZE  跳过更大的文件。K/M/G 按 1024 计
+    \\  -j, --threads NUM        工人数，0 表示 CPU 数
+    \\      --hidden             不跳过隐藏文件
+    \\      --no-ignore          不读 .gitignore、.ignore 和 exclude
+    \\      --follow             跟随符号链接，并用设备号加 inode 防环
+    \\      --no-config, --color, --binary
     \\                           接受并忽略，方便和 rg 的命令对齐
     \\
 ;
@@ -207,7 +282,49 @@ const Quiet = struct {
     }
 };
 
-const SinkKind = enum { text, count, quiet };
+const SinkKind = enum { text, count, quiet, json, files_with_matches, files_only };
+
+fn sinkKind(parsed: Parsed) SinkKind {
+    if (parsed.files_only) return .files_only;
+    if (parsed.quiet) return .quiet;
+    if (parsed.json) return .json;
+    if (parsed.files_with_matches) return .files_with_matches;
+    if (parsed.count) return .count;
+    return .text;
+}
+
+fn toEmit(kind: SinkKind) zrg.parallel.Emit {
+    return switch (kind) {
+        .text => .text,
+        .count => .count,
+        .quiet => .quiet,
+        .json => .json,
+        .files_with_matches => .files_with_matches,
+        .files_only => .files_only,
+    };
+}
+
+const One = struct {
+    matched: bool,
+    matched_lines: u64 = 0,
+    matches: u64 = 0,
+    bytes_printed: u64 = 0,
+};
+
+fn addOne(totals: *zrg.json_printer.Totals, one: One) void {
+    totals.searches += 1;
+    if (one.matched) totals.searches_with_match += 1;
+    totals.matched_lines += one.matched_lines;
+    totals.matches += one.matches;
+    totals.bytes_printed += one.bytes_printed;
+}
+
+fn elapsedNanos(duration: std.Io.Duration) u64 {
+    if (duration.nanoseconds <= 0) return 0;
+    const wide: u128 = @intCast(duration.nanoseconds);
+    if (wide > std.math.maxInt(u64)) return std.math.maxInt(u64);
+    return @intCast(wide);
+}
 
 const SinkSpec = struct {
     kind: SinkKind,
@@ -236,7 +353,7 @@ fn openInput(io: std.Io, path: []const u8) std.Io.File.OpenError!std.Io.File {
     return std.Io.Dir.cwd().openFile(io, path, .{});
 }
 
-/// 搜索一个输入。返回值表示这个输入有没有匹配行。
+/// 搜索一个显式输入。目录不走这里。
 fn driveOne(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -248,15 +365,16 @@ fn driveOne(
     stdout: *std.Io.Writer,
     scratch: *std.Io.Writer.Allocating,
     saw_output: *bool,
-) !bool {
+) !One {
     switch (spec.kind) {
+        .files_only => unreachable,
         .quiet => {
             var sink = Quiet{};
             const result = switch (input) {
                 .file => |file| try zrg.searchFile(Quiet, allocator, io, &sink, file, name, finder, config),
                 .reader => |reader| try zrg.searchReader(Quiet, allocator, &sink, reader, name, finder, config),
             };
-            return result.matched_lines > 0;
+            return .{ .matched = result.matched_lines > 0, .matched_lines = result.matched_lines, .matches = result.matched_lines };
         },
         .count => {
             var sink = zrg.CountPrinter{ .writer = stdout, .show_path = spec.show_path };
@@ -265,7 +383,36 @@ fn driveOne(
                 .reader => |reader| try zrg.searchReader(zrg.CountPrinter, allocator, &sink, reader, name, finder, config),
             };
             if (sink.write_error) |err| return err;
-            return result.matched_lines > 0;
+            return .{ .matched = result.matched_lines > 0, .matched_lines = result.matched_lines, .matches = result.matched_lines };
+        },
+        .files_with_matches => {
+            var sink = zrg.files_printer.Files{ .writer = stdout };
+            const result = switch (input) {
+                .file => |file| try zrg.searchFile(zrg.files_printer.Files, allocator, io, &sink, file, name, finder, config),
+                .reader => |reader| try zrg.searchReader(zrg.files_printer.Files, allocator, &sink, reader, name, finder, config),
+            };
+            if (sink.write_error) |err| return err;
+            return .{ .matched = result.matched_lines > 0, .matched_lines = result.matched_lines, .matches = result.matched_lines };
+        },
+        .json => {
+            scratch.clearRetainingCapacity();
+            var sink = zrg.json_printer.Json{ .writer = &scratch.writer, .finder = finder };
+            const result = switch (input) {
+                .file => |file| try zrg.searchFile(zrg.json_printer.Json, allocator, io, &sink, file, name, finder, config),
+                .reader => |reader| try zrg.searchReader(zrg.json_printer.Json, allocator, &sink, reader, name, finder, config),
+            };
+            if (sink.write_error) |err| return err;
+            if (sink.started and !sink.writeEnd(0)) {
+                if (sink.write_error) |err| return err;
+            }
+            const bytes = scratch.written();
+            if (sink.started) try stdout.writeAll(bytes);
+            return .{
+                .matched = result.matched_lines > 0,
+                .matched_lines = result.matched_lines,
+                .matches = sink.matches,
+                .bytes_printed = bytes.len,
+            };
         },
         .text => {
             if (spec.use_separator) {
@@ -286,7 +433,7 @@ fn driveOne(
                     try stdout.writeAll(bytes);
                     saw_output.* = true;
                 }
-                return result.matched_lines > 0;
+                return .{ .matched = result.matched_lines > 0, .matched_lines = result.matched_lines, .matches = result.matched_lines, .bytes_printed = bytes.len };
             }
 
             var sink = zrg.TextPrinter{
@@ -299,7 +446,7 @@ fn driveOne(
                 .reader => |reader| try zrg.searchReader(zrg.TextPrinter, allocator, &sink, reader, name, finder, config),
             };
             if (sink.write_error) |err| return err;
-            return result.matched_lines > 0;
+            return .{ .matched = result.matched_lines > 0, .matched_lines = result.matched_lines, .matches = result.matched_lines };
         },
     }
 }
@@ -313,6 +460,17 @@ const Parsed = struct {
     invert: bool = false,
     count: bool = false,
     quiet: bool = false,
+    files_with_matches: bool = false,
+    files_only: bool = false,
+    json: bool = false,
+    hidden: bool = false,
+    no_ignore: bool = false,
+    follow: bool = false,
+    threads: u32 = 0,
+    max_depth: ?u32 = null,
+    max_filesize: ?u64 = null,
+    globs: std.ArrayList([]const u8) = .empty,
+    types: std.ArrayList([]const u8) = .empty,
     case_mode: zrg.CaseMode = .sensitive,
     before: u32 = 0,
     after: u32 = 0,
@@ -334,6 +492,12 @@ const ParseError = error{
 fn parse(allocator: std.mem.Allocator, argv: []const []const u8, stderr: *std.Io.Writer) ParseError!Parsed {
     var parsed = Parsed{};
     errdefer parsed.paths.deinit(allocator);
+    errdefer parsed.globs.deinit(allocator);
+    errdefer parsed.types.deinit(allocator);
+    for (argv) |arg| {
+        if (std.mem.eql(u8, arg, "--")) break;
+        if (std.mem.eql(u8, arg, "--files")) parsed.files_only = true;
+    }
 
     var pattern: ?[]const u8 = null;
     var end_flags = false;
@@ -348,13 +512,13 @@ fn parse(allocator: std.mem.Allocator, argv: []const []const u8, stderr: *std.Io
         }
         if (!end_flags and arg.len > 1 and arg[0] == '-') {
             if (arg[1] == '-') {
-                index = try parseLong(&parsed, argv, index, stderr);
+                index = try parseLong(allocator, &parsed, argv, index, stderr);
             } else {
-                index = try parseShort(&parsed, &pattern, argv, index, stderr);
+                index = try parseShort(allocator, &parsed, &pattern, argv, index, stderr);
             }
             continue;
         }
-        if (pattern == null) {
+        if (!parsed.files_only and pattern == null) {
             pattern = arg;
         } else {
             try parsed.paths.append(allocator, arg);
@@ -362,7 +526,10 @@ fn parse(allocator: std.mem.Allocator, argv: []const []const u8, stderr: *std.Io
         index += 1;
     }
 
-    if (parsed.help) return parsed;
+    if (parsed.help or parsed.files_only) {
+        if (pattern) |text| parsed.pattern = text;
+        return parsed;
+    }
     if (pattern == null) {
         stderr.writeAll("zrg: 需要一个模式\n") catch {};
         return error.NoPattern;
@@ -372,6 +539,7 @@ fn parse(allocator: std.mem.Allocator, argv: []const []const u8, stderr: *std.Io
 }
 
 fn parseShort(
+    allocator: std.mem.Allocator,
     parsed: *Parsed,
     pattern: *?[]const u8,
     argv: []const []const u8,
@@ -395,7 +563,8 @@ fn parseShort(
             'H' => parsed.force_path = true,
             'a' => parsed.binary = .none,
             'F' => {},
-            'A', 'B', 'C', 'm', 'e', 'j' => {
+            'l' => parsed.files_with_matches = true,
+            'A', 'B', 'C', 'm', 'e', 'j', 'g', 't' => {
                 const flag = arg[k];
                 const rest = arg[k + 1 ..];
                 const value = if (rest.len != 0) rest else blk: {
@@ -406,7 +575,7 @@ fn parseShort(
                     break :blk argv[index + 1];
                 };
                 const took_next = rest.len == 0;
-                try applyShortValue(parsed, pattern, flag, value, stderr);
+                try applyShortValue(allocator, parsed, pattern, flag, value, stderr);
                 return index + 1 + @intFromBool(took_next);
             },
             else => {
@@ -419,6 +588,7 @@ fn parseShort(
 }
 
 fn applyShortValue(
+    allocator: std.mem.Allocator,
     parsed: *Parsed,
     pattern: *?[]const u8,
     flag: u8,
@@ -441,14 +611,17 @@ fn applyShortValue(
             }
             pattern.* = value;
         },
-        'j' => {},
+        'j' => parsed.threads = try parseU32(value, stderr),
+        'g' => try parsed.globs.append(allocator, value),
+        't' => try appendType(parsed, allocator, value, stderr),
         else => return error.UnknownFlag,
     }
 }
 
-const LongValue = enum { after, before, context, max_count, color, threads };
+const LongValue = enum { after, before, context, max_count, color, threads, glob, type_name, max_depth, max_filesize };
 
 fn parseLong(
+    allocator: std.mem.Allocator,
     parsed: *Parsed,
     argv: []const []const u8,
     index: usize,
@@ -489,7 +662,12 @@ fn parseLong(
                 parsed.after = n;
             },
             .max_count => parsed.max_count = try parseU64(value, stderr),
-            .color, .threads => {},
+            .color => {},
+            .threads => parsed.threads = try parseU32(value, stderr),
+            .glob => try parsed.globs.append(allocator, value),
+            .type_name => try appendType(parsed, allocator, value, stderr),
+            .max_depth => parsed.max_depth = try parseU32(value, stderr),
+            .max_filesize => parsed.max_filesize = try parseSize(value, stderr),
         }
         return index + 1 + @intFromBool(took_next);
     }
@@ -509,6 +687,10 @@ fn longValueKind(name: []const u8) ?LongValue {
     if (std.mem.eql(u8, name, "max-count")) return .max_count;
     if (std.mem.eql(u8, name, "color")) return .color;
     if (std.mem.eql(u8, name, "threads")) return .threads;
+    if (std.mem.eql(u8, name, "glob")) return .glob;
+    if (std.mem.eql(u8, name, "type")) return .type_name;
+    if (std.mem.eql(u8, name, "max-depth")) return .max_depth;
+    if (std.mem.eql(u8, name, "max-filesize")) return .max_filesize;
     return null;
 }
 
@@ -531,11 +713,23 @@ fn applyLongFlag(parsed: *Parsed, name: []const u8, stderr: *std.Io.Writer) Pars
         parsed.case_mode = .smart;
     } else if (std.mem.eql(u8, name, "text")) {
         parsed.binary = .none;
+    } else if (std.mem.eql(u8, name, "files-with-matches")) {
+        parsed.files_with_matches = true;
+    } else if (std.mem.eql(u8, name, "files")) {
+        parsed.files_only = true;
+    } else if (std.mem.eql(u8, name, "json")) {
+        parsed.json = true;
+    } else if (std.mem.eql(u8, name, "hidden")) {
+        parsed.hidden = true;
+    } else if (std.mem.eql(u8, name, "no-ignore")) {
+        parsed.no_ignore = true;
+    } else if (std.mem.eql(u8, name, "follow")) {
+        parsed.follow = true;
     } else if (std.mem.eql(u8, name, "fixed-strings") or
         std.mem.eql(u8, name, "no-config") or
         std.mem.eql(u8, name, "binary"))
     {
-        // --binary 在显式文件上和默认的 report 一样。目录遍历的 quit 留到下一阶段。
+        // 显式文件保持 report。目录搜索在 parallel 里改成 quit，除非用户传了 -a。
     } else {
         stderr.print("zrg: 无法识别的选项：--{s}\n", .{name}) catch {};
         return error.UnknownFlag;
@@ -545,6 +739,46 @@ fn applyLongFlag(parsed: *Parsed, name: []const u8, stderr: *std.Io.Writer) Pars
 fn parseU32(text: []const u8, stderr: *std.Io.Writer) ParseError!u32 {
     return std.fmt.parseInt(u32, text, 10) catch {
         stderr.print("zrg: 需要无符号整数：{s}\n", .{text}) catch {};
+        return error.BadNumber;
+    };
+}
+
+fn appendType(parsed: *Parsed, allocator: std.mem.Allocator, value: []const u8, stderr: *std.Io.Writer) ParseError!void {
+    if (zrg.walk_types.find(value) == null) {
+        stderr.print("zrg: 未知的类型：{s}\n", .{value}) catch {};
+        return error.UnknownFlag;
+    }
+    try parsed.types.append(allocator, value);
+}
+
+fn parseSize(text: []const u8, stderr: *std.Io.Writer) ParseError!u64 {
+    if (text.len == 0) {
+        stderr.writeAll("zrg: 需要大小\n") catch {};
+        return error.BadNumber;
+    }
+    var body = text;
+    var mul: u64 = 1;
+    switch (text[text.len - 1]) {
+        'K', 'k' => {
+            mul = 1024;
+            body = text[0 .. text.len - 1];
+        },
+        'M', 'm' => {
+            mul = 1024 * 1024;
+            body = text[0 .. text.len - 1];
+        },
+        'G', 'g' => {
+            mul = 1024 * 1024 * 1024;
+            body = text[0 .. text.len - 1];
+        },
+        else => {},
+    }
+    const n = std.fmt.parseInt(u64, body, 10) catch {
+        stderr.print("zrg: 需要大小：{s}\n", .{text}) catch {};
+        return error.BadNumber;
+    };
+    return std.math.mul(u64, n, mul) catch {
+        stderr.print("zrg: 大小溢出：{s}\n", .{text}) catch {};
         return error.BadNumber;
     };
 }
@@ -602,7 +836,7 @@ test "标准输入的路径名是 <stdin>" {
         &scratch,
         &saw,
     );
-    try testing.expect(matched);
+    try testing.expect(matched.matched);
     try testing.expectEqualStrings("<stdin>:2:MATCH\n", out.written());
 }
 
@@ -723,4 +957,166 @@ test "样例语料和 rg 逐字节一致" {
     try expectRg(&.{ "-a", "-n" }, "MATCH", &.{bin});
     try expectRg(&.{ "-n", "--column", "-C", "1" }, "MATCH", &.{ok});
     try expectRg(&.{"-n"}, "", &.{ok});
+}
+
+fn sortedLines(text: []const u8) ![]u8 {
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer lines.deinit(testing.allocator);
+    var rest = text;
+    while (rest.len > 0) {
+        if (std.mem.indexOfScalar(u8, rest, '\n')) |nl| {
+            if (nl > 0) try lines.append(testing.allocator, rest[0..nl]);
+            rest = rest[nl + 1 ..];
+        } else {
+            try lines.append(testing.allocator, rest);
+            break;
+        }
+    }
+    std.mem.sort([]const u8, lines.items, {}, struct {
+        fn less(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.less);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(testing.allocator);
+    for (lines.items) |line| {
+        try out.appendSlice(testing.allocator, line);
+        try out.append(testing.allocator, '\n');
+    }
+    return out.toOwnedSlice(testing.allocator);
+}
+
+fn expectSorted(z_args: []const []const u8, rg_args: []const []const u8) !void {
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var err_w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer err_w.deinit();
+    const code = execute(testing.allocator, testing.io, z_args, &out.writer, &err_w.writer);
+    const rg = try std.process.run(testing.allocator, testing.io, .{ .argv = rg_args });
+    defer testing.allocator.free(rg.stdout);
+    defer testing.allocator.free(rg.stderr);
+    const rg_code: u8 = switch (rg.term) {
+        .exited => |exited| exited,
+        else => return error.TestUnexpectedResult,
+    };
+    const z_sorted = try sortedLines(out.written());
+    defer testing.allocator.free(z_sorted);
+    const r_sorted = try sortedLines(rg.stdout);
+    defer testing.allocator.free(r_sorted);
+    if (rg.stderr.len != 0) std.debug.print("rg stderr: {s}\n", .{rg.stderr});
+    if (err_w.written().len != 0) std.debug.print("zrg stderr: {s}\n", .{err_w.written()});
+    try testing.expectEqualStrings("", rg.stderr);
+    try testing.expectEqualStrings("", err_w.written());
+    try testing.expectEqualStrings(r_sorted, z_sorted);
+    try testing.expectEqual(rg_code, code);
+}
+
+fn dirRoot(dir: std.Io.Dir) ![]u8 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try dir.realPath(testing.io, &buf);
+    return testing.allocator.dupe(u8, buf[0..n]);
+}
+
+test "目录列表和搜索排序后与 rg 一致" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    try tmp.dir.createDir(io, "sub", .default_dir);
+    try tmp.dir.createDir(io, "nested", .default_dir);
+    try tmp.dir.createDir(io, "dir", .default_dir);
+    try tmp.dir.createDir(io, ".git", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "keep.txt", .data = "needle\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "skip.log", .data = "needle\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "keep.log", .data = "needle\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "sub/nope.txt", .data = "nope\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "sub/keep.txt", .data = "needle\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "nested/a.zig", .data = "needle\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "nested/b.txt", .data = "nope\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "dir/keep.txt", .data = "needle\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".git/config", .data = "needle\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".gitignore", .data = "dir/\n*.log\n!keep.log\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tiny.txt", .data = "x" });
+
+    const root = try dirRoot(tmp.dir);
+    defer testing.allocator.free(root);
+
+    try expectSorted(&.{ "--files", root }, &.{ "rg", "--no-config", "--files", root });
+    try expectSorted(&.{ "-F", "-j", "1", "needle", root }, &.{ "rg", "--no-config", "--color=never", "-F", "-j", "1", "needle", root });
+    try expectSorted(&.{ "-F", "-j", "2", "needle", root }, &.{ "rg", "--no-config", "--color=never", "-F", "-j", "1", "needle", root });
+    try expectSorted(&.{ "-F", "-g", "*.zig", "needle", root }, &.{ "rg", "--no-config", "--color=never", "-F", "-g", "*.zig", "needle", root });
+    try expectSorted(&.{ "-F", "--max-depth", "1", "needle", root }, &.{ "rg", "--no-config", "--color=never", "-F", "--max-depth", "1", "needle", root });
+    try expectSorted(&.{ "--files", "--max-filesize", "2", root }, &.{ "rg", "--no-config", "--files", "--max-filesize", "2", root });
+    try expectSorted(&.{ "--files", "-t", "zig", root }, &.{ "rg", "--no-config", "--files", "-t", "zig", root });
+    try expectSorted(&.{ "--files", "--no-ignore", root }, &.{ "rg", "--no-config", "--files", "--no-ignore", root });
+    try expectSorted(&.{ "-F", "-l", "needle", root }, &.{ "rg", "--no-config", "--color=never", "-F", "-l", "needle", root });
+    try expectSorted(&.{ "-c", "-F", "needle", root }, &.{ "rg", "--no-config", "--color=never", "-c", "-F", "needle", root });
+
+    var hidden_out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer hidden_out.deinit();
+    var hidden_err: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer hidden_err.deinit();
+    const hidden_code = execute(testing.allocator, io, &.{ "--files", "--hidden", root }, &hidden_out.writer, &hidden_err.writer);
+    try testing.expectEqual(@as(u8, 0), hidden_code);
+    try testing.expect(std.mem.indexOf(u8, hidden_out.written(), ".gitignore") != null);
+    try testing.expect(std.mem.indexOf(u8, hidden_out.written(), ".git/config") == null);
+
+    var json_out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer json_out.deinit();
+    var json_err: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer json_err.deinit();
+    const json_code = execute(testing.allocator, io, &.{ "--json", "-F", "-j", "1", "needle", root }, &json_out.writer, &json_err.writer);
+    try testing.expectEqual(@as(u8, 0), json_code);
+    const json_text = json_out.written();
+    try testing.expect(std.mem.indexOf(u8, json_text, "\"type\":\"summary\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json_text, "keep.txt") != null);
+    try testing.expect(std.mem.indexOf(u8, json_text, "nope.txt") == null);
+    try testing.expect(std.mem.indexOf(u8, json_text, "skip.log") == null);
+}
+
+test "父目录被忽略时 git check-ignore 也拒绝再包含" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const root = try dirRoot(tmp.dir);
+    defer testing.allocator.free(root);
+    const init_git = try std.process.run(testing.allocator, io, .{
+        .argv = &.{ "git", "init", "-q" },
+        .cwd = .{ .path = root },
+    });
+    defer testing.allocator.free(init_git.stdout);
+    defer testing.allocator.free(init_git.stderr);
+    try tmp.dir.createDir(io, "dir", .default_dir);
+    try tmp.dir.createDir(io, "sub", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = ".gitignore", .data = "dir/\n*.log\n!keep.log\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "dir/keep.txt", .data = "a\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "keep.log", .data = "a\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "other.log", .data = "a\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "keep.txt", .data = "a\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "sub/keep.log", .data = "a\n" });
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var err_w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer err_w.deinit();
+    const code = execute(testing.allocator, io, &.{ "--files", root }, &out.writer, &err_w.writer);
+    try testing.expectEqual(@as(u8, 0), code);
+    const listed = out.written();
+
+    const paths = [_][]const u8{ "dir/keep.txt", "keep.log", "other.log", "keep.txt", "sub/keep.log" };
+    for (paths) |rel| {
+        const checked = try std.process.run(testing.allocator, io, .{
+            .argv = &.{ "git", "check-ignore", "-q", "--", rel },
+            .cwd = .{ .path = root },
+        });
+        defer testing.allocator.free(checked.stdout);
+        defer testing.allocator.free(checked.stderr);
+        const ignored = switch (checked.term) {
+            .exited => |exited| exited == 0,
+            else => return error.TestUnexpectedResult,
+        };
+        const full = try std.fmt.allocPrint(testing.allocator, "{s}/{s}\n", .{ root, rel });
+        defer testing.allocator.free(full);
+        const shown = std.mem.indexOf(u8, listed, full) != null;
+        try testing.expectEqual(!ignored, shown);
+    }
 }

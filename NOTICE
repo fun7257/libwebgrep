@@ -13,3 +13,9 @@ Two-Way 按 Crochemore 与 Perrin 发表的算法实现：
 实现是照论文描述写的，没有复制 memchr crate 或 ripgrep 的源码。
 
 二进制文件那两句说明与 ripgrep 15 的用户可见文案相同，用来让示例 CLI 的输出能逐字节对照。没有复制 ripgrep 的实现。ripgrep 的许可证是 Unlicense 或 MIT。
+
+工作窃取队列按 Chase 与 Lev 的双端队列实现：
+
+> David Chase and Yossi Lev, “Dynamic Circular Work-Stealing Deque”, SPAA ’05, pages 21–28, 2005. https://doi.org/10.1145/1073970.1073974
+
+实现是照论文描述另写的。Zig 0.14 起没有独立的内存栅栏，弹出和窃取用 seq_cst 的加载和存储代替。没有复制论文里的示例代码，也没有复制别的项目里的 Chase-Lev 实现。

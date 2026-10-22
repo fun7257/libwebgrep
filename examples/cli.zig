@@ -559,7 +559,7 @@ fn parseU64(text: []const u8, stderr: *std.Io.Writer) ParseError!u64 {
 const testing = std.testing;
 
 test "示例链接到库" {
-    try testing.expectEqual(@as(usize, 256 * 1024), zrg.SearchConfig.default_buffer_size);
+    try testing.expectEqual(@as(usize, 1024 * 1024), zrg.SearchConfig.default_buffer_size);
 }
 
 test "没有模式时退出码是 2" {

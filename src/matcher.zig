@@ -38,7 +38,9 @@ pub const FindOptions = struct {
     case: CaseMode = .sensitive,
     /// null 用内置表。
     frequency: ?[256]u8 = null,
-    /// 预过滤假阳性率超过该值后，这个 Finder 之后的查找改走 Two-Way。
+    /// 长于 32 字节的模式，在两个稀有字节的平均间距小于 8、并且确认失败时，
+    /// 剩下的查找改走 Two-Way。设为 1 或更大则一直留在 packed pair。
+    /// 不超过 32 字节的模式不使用这个阈值。
     prefilter_fp_threshold: f32 = 0.80,
 };
 

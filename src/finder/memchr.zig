@@ -99,6 +99,90 @@ fn checkWidth(comptime width: comptime_int) void {
     if (width != 16 and width != 32) @compileError("memchr 宽度只支持 16 和 32");
 }
 
+pub const AnyHit = struct { index: usize, byte: u8 };
+
+/// 查找 `a`、`b`、`c` 中最先出现的字节。三者可以相同。
+/// 没命中的循环只做向量比较和归约，落到命中再算下标。
+pub fn findAny(comptime width: comptime_int, haystack: []const u8, start: usize, a: u8, b: u8, c: u8) ?AnyHit {
+    comptime checkWidth(width);
+    if (start >= haystack.len) return null;
+    var uniq: [3]u8 = .{ a, a, a };
+    var n: usize = 1;
+    if (b != a) {
+        uniq[n] = b;
+        n += 1;
+    }
+    if (c != a and c != b) {
+        uniq[n] = c;
+        n += 1;
+    }
+    const kind: u2 = if (n == 3) 3 else if (n == 2) 2 else 1;
+    return switch (kind) {
+        1 => findAnyN(width, haystack, start, 1, uniq),
+        2 => findAnyN(width, haystack, start, 2, uniq),
+        3 => findAnyN(width, haystack, start, 3, uniq),
+        0 => null,
+    };
+}
+
+fn findAnyN(
+    comptime width: comptime_int,
+    haystack: []const u8,
+    start: usize,
+    comptime n: u2,
+    bytes: [3]u8,
+) ?AnyHit {
+    var i: usize = start;
+    const len = haystack.len;
+    if (len - i >= width) {
+        const stride = width * 4;
+        while (len - i >= stride) {
+            inline for (0..4) |k| {
+                const at = i + k * width;
+                const block: @Vector(width, u8) = haystack[at..][0..width].*;
+                if (anyMask(width, block, n, bytes)) {
+                    @branchHint(.unlikely);
+                    const rel = @call(.never_inline, firstAny, .{ width, block, n, bytes });
+                    return .{ .index = at + rel, .byte = haystack[at + rel] };
+                }
+            }
+            i += stride;
+        }
+        while (len - i >= width) {
+            const block: @Vector(width, u8) = haystack[i..][0..width].*;
+            if (anyMask(width, block, n, bytes)) {
+                @branchHint(.unlikely);
+                const rel = @call(.never_inline, firstAny, .{ width, block, n, bytes });
+                return .{ .index = i + rel, .byte = haystack[i + rel] };
+            }
+            i += width;
+        }
+    }
+    while (i < len) : (i += 1) {
+        const byte = haystack[i];
+        inline for (0..n) |k| {
+            if (byte == bytes[k]) return .{ .index = i, .byte = byte };
+        }
+    }
+    return null;
+}
+
+inline fn anyMask(comptime width: comptime_int, block: @Vector(width, u8), comptime n: u2, bytes: [3]u8) bool {
+    var hits = block == @as(@Vector(width, u8), @splat(bytes[0]));
+    inline for (1..n) |k| {
+        hits = hits | (block == @as(@Vector(width, u8), @splat(bytes[k])));
+    }
+    return @reduce(.Or, hits);
+}
+
+fn firstAny(comptime width: comptime_int, block: @Vector(width, u8), comptime n: u2, bytes: [3]u8) usize {
+    var hits = block == @as(@Vector(width, u8), @splat(bytes[0]));
+    inline for (1..n) |k| {
+        hits = hits | (block == @as(@Vector(width, u8), @splat(bytes[k])));
+    }
+    return std.simd.firstTrue(hits).?;
+}
+
 fn scalarEither(haystack: []const u8, start: usize, end: usize, a: u8, b: u8) ?usize {
     var i = start;
     while (i < end) : (i += 1) {
@@ -221,6 +305,22 @@ test "同一向量里的多次命中" {
         try std.testing.expectEqual(@as(?usize, 15), findLast(w, &buf, 0, 16, 1));
         try std.testing.expectEqual(hits.len, count(w, &buf, 0, buf.len, 1));
         try std.testing.expectEqual(@as(usize, 5), count(w, &buf, 0, 16, 1));
+    }
+}
+
+test "三个候选字节，先出现的那个胜出" {
+    var buf: [80]u8 = undefined;
+    @memset(&buf, 'a');
+    buf[5] = 0;
+    buf[40] = 'Z';
+    inline for (.{ 16, 32 }) |w| {
+        const nul = findAny(w, &buf, 0, 'Z', 0, 0).?;
+        try std.testing.expectEqual(@as(usize, 5), nul.index);
+        try std.testing.expectEqual(@as(u8, 0), nul.byte);
+        const later = findAny(w, &buf, 6, 'Z', 0, 'Q').?;
+        try std.testing.expectEqual(@as(usize, 40), later.index);
+        try std.testing.expectEqual(@as(u8, 'Z'), later.byte);
+        try std.testing.expect(findAny(w, &buf, 41, 'Z', 0, 'Q') == null);
     }
 }
 

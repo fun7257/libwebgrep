@@ -29,10 +29,30 @@ if [[ ! -f $big ]] || [[ $(file_size "$big") -lt $target ]]; then
   python3 - "$big" "$target" <<'PY'
 import sys
 path, target = sys.argv[1], int(sys.argv[2])
-# 填充里不放 Z/X/Q，模式的稀有字节不会每行命中。
-# 否则 packed pair 会在几十次假阳性后切到 Two-Way，测到的就不是快路径。
+# 填充里不放 Z/X/Q，两个锚点字节不会命中，测的是向量快路径。
 line = b"the quick brown fox jumps over a dog 0123456789\n"
 needle = b"ZXZQNEEDLE\n"
+with open(path, "wb") as f:
+    left = target - len(needle)
+    while left > 0:
+        chunk = line * min(left // len(line), 8192)
+        if not chunk:
+            chunk = b"a" * left
+        f.write(chunk)
+        left -= len(chunk)
+    f.write(needle)
+PY
+fi
+
+# 每个字母都出现，旧预过滤会在假阳性后掉进标量 Two-Way。
+adv=corpus/large/adv.txt
+if [[ ! -f $adv ]] || [[ $(file_size "$adv") -lt $target ]]; then
+  echo "生成 $adv"
+  python3 - "$adv" "$target" <<'PY'
+import sys
+path, target = sys.argv[1], int(sys.argv[2])
+line = b"abcdefghijklmnopqrstuvwxyz\n"
+needle = b"zrgneedle\n"
 with open(path, "wb") as f:
     left = target - len(needle)
     while left > 0:
@@ -101,6 +121,10 @@ if sudo -n true >/dev/null 2>&1; then
 else
   echo "跳过：没有免密 sudo，不能 drop caches / purge。"
 fi
+
+run_pair "1b 字母表填充，热缓存" \
+  "${common_rg[*]} zrgneedle $adv >/dev/null" \
+  "${common_zrg[*]} zrgneedle $adv >/dev/null"
 
 run_pair "5 密集匹配" \
   "${common_rg[*]} match $dense >/dev/null" \

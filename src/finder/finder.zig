@@ -1,5 +1,6 @@
 //! 单模式字面量查找器。
-//! 一个字节走 memchr，更长的走 packed pair，假阳性率过高时换成 Two-Way。
+//! 一个字节走 memchr。长度不超过 32 的模式走向量 packed pair，自己完成确认。
+//! 更长的模式仍用 packed pair，但两个稀有字节挤在一起、确认又总是失败时改走 Two-Way。
 //! 不分配内存。模式字节由调用方持有，并且不能含有换行。
 
 const std = @import("std");
@@ -55,6 +56,7 @@ pub const Finder = struct {
     }
 
     /// 单个字面量下 `earliest` 和 `leftmost_first` 是同一次匹配。
+    /// 这条路径单独写，不经过 NUL 监视。密集命中时它会被内联进搜索循环。
     pub fn find(self: *Finder, haystack: []const u8, start: usize, mode: matcher.MatchMode) ?matcher.Match {
         _ = mode;
         switch (self.kind) {
@@ -71,6 +73,33 @@ pub const Finder = struct {
                 return .{ .start = i, .end = i + 1 };
             },
             .pair => return self.findPair(haystack, start),
+        }
+    }
+
+    /// 和 `find` 一样，另外把扫描过的区间里第一个 NUL 写到 `nul`。
+    /// 返回匹配时，只保证这个匹配起点之前没有 NUL。
+    pub fn findWatched(self: *Finder, haystack: []const u8, start: usize, nul: *?usize) ?matcher.Match {
+        switch (self.kind) {
+            .empty => {
+                if (start < haystack.len) {
+                    if (memchr.find(memchr.native_width, haystack, start, 0)) |at| nul.* = at;
+                }
+                if (start <= haystack.len) return .{ .start = start, .end = start };
+                return null;
+            },
+            .byte => |needle| {
+                const hit = if (self.ignore_case) blk: {
+                    const forms = ascii.caseVariants(needle);
+                    break :blk memchr.findAny(memchr.native_width, haystack, start, forms[0], forms[1], 0);
+                } else memchr.findAny(memchr.native_width, haystack, start, needle, 0, 0);
+                const found = hit orelse return null;
+                if (found.byte == 0) {
+                    nul.* = found.index;
+                    return null;
+                }
+                return .{ .start = found.index, .end = found.index + 1 };
+            },
+            .pair => return self.findPairWatched(haystack, start, nul),
         }
     }
 
@@ -93,18 +122,56 @@ pub const Finder = struct {
         if (self.use_two_way) return self.findLinear(haystack, start, m);
         if (m > haystack.len or start > haystack.len - m) return null;
 
-        var anchor_from = start + pair.anchor_index;
-        while (pair.next(memchr.native_width, haystack, start, anchor_from)) |cand| {
-            self.candidates +|= 1;
-            if (cand.confirmed) {
-                self.confirms +|= 1;
-                return .{ .start = cand.origin, .end = cand.origin + m };
+        // 短模式的最坏情况是常数倍的线性时间，不切到标量 Two-Way。
+        // 长模式只在调用方把阈值设到 1 以下、并且预过滤跳不动时才切。
+        var guard: packed_pair.Guard = .{};
+        const watch = m > packed_pair.owns_search_max_len and self.fp_threshold < 1;
+        const at = pair.find(memchr.native_width, haystack, start, if (watch) &guard else null);
+        if (at) |pos| {
+            self.confirms +|= 1;
+            return .{ .start = pos, .end = pos + m };
+        }
+        if (guard.gave_up) {
+            self.use_two_way = true;
+            self.candidates = guard.candidates;
+            return self.findLinear(haystack, guard.restart, m);
+        }
+        return null;
+    }
+
+    fn findPairWatched(self: *Finder, haystack: []const u8, start: usize, nul: *?usize) ?matcher.Match {
+        const pair = self.kind.pair;
+        const m = pair.pattern.len;
+        if (self.use_two_way) {
+            if (memchr.find(memchr.native_width, haystack, start, 0)) |at| {
+                nul.* = at;
+                return null;
             }
-            if (shouldFallback(self)) {
-                self.use_two_way = true;
-                return self.findLinear(haystack, cand.origin + 1, m);
+            return self.findLinear(haystack, start, m);
+        }
+        if (m > haystack.len or start > haystack.len - m) {
+            if (start <= haystack.len) {
+                if (memchr.find(memchr.native_width, haystack, start, 0)) |at| nul.* = at;
             }
-            anchor_from = cand.anchor_at + 1;
+            return null;
+        }
+
+        var guard: packed_pair.Guard = .{};
+        const watch = m > packed_pair.owns_search_max_len and self.fp_threshold < 1;
+        const at = pair.findWatchingNul(memchr.native_width, haystack, start, if (watch) &guard else null, nul);
+        if (nul.* != null) return null;
+        if (at) |pos| {
+            self.confirms +|= 1;
+            return .{ .start = pos, .end = pos + m };
+        }
+        if (guard.gave_up) {
+            self.use_two_way = true;
+            self.candidates = guard.candidates;
+            if (memchr.find(memchr.native_width, haystack, guard.restart, 0)) |z| {
+                nul.* = z;
+                return null;
+            }
+            return self.findLinear(haystack, guard.restart, m);
         }
         return null;
     }
@@ -112,13 +179,6 @@ pub const Finder = struct {
     fn findLinear(self: *Finder, haystack: []const u8, start: usize, m: usize) ?matcher.Match {
         const at = self.two_way.find(haystack, start) orelse return null;
         return .{ .start = at, .end = at + m };
-    }
-
-    fn shouldFallback(self: *const Finder) bool {
-        if (self.candidates < 32) return false;
-        const misses = self.candidates - self.confirms;
-        const rate = @as(f32, @floatFromInt(misses)) / @as(f32, @floatFromInt(self.candidates));
-        return rate > self.fp_threshold;
     }
 };
 
@@ -162,7 +222,7 @@ test "换行、空模式、单字节、smart case" {
     try std.testing.expectEqual(@as(usize, 0), smart_lower.find("FOO", 0, .earliest).?.start);
 }
 
-test "多字节命中，以及假阳性过高后仍能找到" {
+test "多字节命中，短模式不因常见字节切到 Two-Way" {
     var finder = try Finder.init("qx", .{});
     try std.testing.expectEqual(@as(usize, 4), finder.find("qqq qx", 0, .earliest).?.start);
     try std.testing.expect(!finder.use_two_way);
@@ -178,11 +238,32 @@ test "多字节命中，以及假阳性过高后仍能找到" {
     hay[46] = 'a';
     hay[47] = 'b';
     try std.testing.expectEqual(@as(usize, 46), noisy.find(&hay, 0, .earliest).?.start);
+    try std.testing.expect(!noisy.use_two_way);
+}
+
+test "长模式在两个稀有字节挤在一起时改走 Two-Way，并且仍能找到" {
+    var rank: [256]u8 = @splat(100);
+    rank['a'] = 0;
+    rank['b'] = 1;
+    var pat: [33]u8 = @splat('c');
+    pat[0] = 'a';
+    pat[1] = 'b';
+    var noisy = try Finder.init(&pat, .{
+        .frequency = rank,
+        .prefilter_fp_threshold = 0.5,
+    });
+    var hay: [200]u8 = @splat('a');
+    for (0..80) |i| {
+        hay[i * 2] = 'a';
+        hay[i * 2 + 1] = 'b';
+    }
+    @memcpy(hay[hay.len - pat.len ..], pat[0..]);
+    try std.testing.expectEqual(hay.len - pat.len, noisy.find(&hay, 0, .earliest).?.start);
     try std.testing.expect(noisy.use_two_way);
 
     noisy.resetStats();
     try std.testing.expect(!noisy.use_two_way);
-    try std.testing.expectEqual(@as(usize, 0), noisy.candidates);
+    try std.testing.expectEqual(@as(u32, 0), noisy.candidates);
 }
 
 test "Finder 与朴素查找一致" {

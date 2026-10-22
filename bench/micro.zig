@@ -84,6 +84,22 @@ fn benchFinder(io: std.Io, buf: []u8) !void {
         }
     }.run, &slice_ctx);
     std.debug.print("search_slice_gbs {d:.3}\n", .{searched});
+
+    // 字母表里每个字母都出现。旧预过滤会在假阳性之后掉进标量 Two-Way。
+    fillAlphabet(buf);
+    const adversarial = try measureFinder(io, buf, "zrgneedle", .sensitive);
+    std.debug.print("finder_adversarial_gbs {d:.3}\n", .{adversarial});
+}
+
+fn fillAlphabet(buf: []u8) void {
+    const line = "abcdefghijklmnopqrstuvwxyz\n";
+    var i: usize = 0;
+    while (i + line.len <= buf.len) : (i += line.len) {
+        @memcpy(buf[i..][0..line.len], line);
+    }
+    if (i < buf.len) @memset(buf[i..], 'a');
+    const needle = "zrgneedle\n";
+    @memcpy(buf[buf.len - needle.len ..], needle);
 }
 
 const SliceCtx = struct {
@@ -148,7 +164,45 @@ fn benchSweep(gpa: std.mem.Allocator, io: std.Io) !void {
                 return a < b;
             }
         }.less);
-        std.debug.print("buffer_{s}_gbs {d:.3}\n", .{ name, samples[1] });
+        std.debug.print("file_{s}_gbs {d:.3}\n", .{ name, samples[1] });
+    }
+
+    // 一次读完整文件再搜，用来和 mmap 对比。文件比缓冲小，searchFile 不会映射。
+    {
+        var samples: [3]f64 = undefined;
+        for (&samples) |*sample| {
+            var sweep = Sweep{
+                .gpa = gpa,
+                .io = io,
+                .file = file,
+                .finder = try zrg.Finder.init("NEEDLE", .{}),
+                .buffer_size = sweep_bytes + 64,
+            };
+            const gbs = measure(io, sweep_bytes, struct {
+                fn run(ctx: *Sweep) usize {
+                    var nop = Nop{};
+                    ctx.finder.resetStats();
+                    const result = zrg.searchFile(
+                        Nop,
+                        ctx.gpa,
+                        ctx.io,
+                        &nop,
+                        ctx.file,
+                        "sweep.txt",
+                        &ctx.finder,
+                        .{ .buffer_size = ctx.buffer_size },
+                    ) catch return 0;
+                    return @intCast(result.matched_lines);
+                }
+            }.run, &sweep);
+            sample.* = gbs;
+        }
+        std.mem.sort(f64, &samples, {}, struct {
+            fn less(_: void, a: f64, b: f64) bool {
+                return a < b;
+            }
+        }.less);
+        std.debug.print("file_readall_gbs {d:.3}\n", .{samples[1]});
     }
 }
 

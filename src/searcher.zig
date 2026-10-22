@@ -21,8 +21,9 @@ pub const BinaryPolicy = enum {
 };
 
 pub const SearchConfig = struct {
-    /// 起始块大小。128 MiB 文件上 1 MiB 只比 256 KiB 快约 1.5%，默认保持 256 KiB。
-    pub const default_buffer_size: usize = 256 * 1024;
+    /// 起始块大小。1 GiB 热文件上 1 MiB 中位 109.7 ms，256 KiB 是 111.9 ms，
+    /// 8 MiB 回落到 124 ms。默认取 1 MiB。
+    pub const default_buffer_size: usize = 1024 * 1024;
     /// 单行字节上限。缓冲倍增到这里仍放不下一整行时返回 `error.LineTooLong`。
     pub const default_max_line_len: usize = 2 * 1024 * 1024;
 
@@ -74,6 +75,8 @@ const State = struct {
     matched_lines: u64 = 0,
     nul_offset: ?u64 = null,
     stopped: bool = false,
+    /// 这一块里很早就有匹配。后面的块改回先扫 NUL，避免每个密集块搜两遍。
+    prefer_prepass: bool = false,
 
     fn exceeded(self: *const State, config: SearchConfig) bool {
         const limit = config.max_count orelse return false;
@@ -142,7 +145,8 @@ pub fn searchReader(
     }.read, reader);
 }
 
-/// 从已打开的文件搜索。用 `readPositional`，不经过第二层缓冲。P0 不 mmap。
+/// 从已打开的文件搜索。用 `readPositional` 分块读进调用方缓冲。
+/// 整文件映射在这台机器的 1 GiB 热缓存上比分块读更慢，还把驻留撑到文件大小，所以不用。
 pub fn searchFile(
     comptime S: type,
     allocator: std.mem.Allocator,
@@ -199,7 +203,46 @@ fn drive(
         const new_at = filled;
         if (!eof) filled += n;
 
-        if (!eof and config.binary != .none and state.nul_offset == null) {
+        const search_end = if (eof) filled else lastComplete(buf[0..filled]);
+        // 换行符本身不计入单行上限，所以缓冲可以比上限多一个字节。
+        const pending = filled - search_end;
+        if (!eof and pending > config.max_line_len) return error.LineTooLong;
+        if (eof and pending > config.max_line_len) return error.LineTooLong;
+
+        const view_end = if (eof) filled else search_end;
+        // 文本快路径把 NUL 检查并进查找。单独再扫一遍 NUL，1 GiB 热文件大约要 19 ms，
+        // 单字节模式会因此慢过 rg。上下文和密集匹配仍走原来的先扫 NUL。
+        const fuse = search_end > state.pos and canFuse(matcher, config, &state);
+        var skip_match = false;
+        if (fuse) {
+            var nul_rel: ?usize = null;
+            const found = matcher.findWatched(buf[0..search_end], state.pos, &nul_rel);
+            if (nul_rel == null and search_end < filled) {
+                if (memchr.find(width, buf[search_end..filled], 0, 0)) |rel| nul_rel = search_end + rel;
+            }
+            if (nul_rel == null) {
+                if (found) |hit| {
+                    if (memchr.find(width, buf[hit.start..filled], 0, 0)) |rel| {
+                        nul_rel = hit.start + rel;
+                    } else if (hit.start < state.pos + 4096) {
+                        state.prefer_prepass = true;
+                    }
+                } else {
+                    skip_match = true;
+                    state.pos = view_end;
+                }
+            }
+            if (nul_rel) |rel| {
+                state.nul_offset = state.abs_base + rel;
+                const cont = callBinary(S, sink, state.nul_offset.?);
+                if (config.binary == .quit or !cont) {
+                    filled = new_at;
+                    state.stopped = true;
+                    break;
+                }
+                skip_match = false;
+            }
+        } else if (!eof and config.binary != .none and state.nul_offset == null) {
             if (memchr.find(width, buf[new_at..filled], 0, 0)) |rel| {
                 state.nul_offset = state.abs_base + new_at + rel;
                 const cont = callBinary(S, sink, state.nul_offset.?);
@@ -211,14 +254,7 @@ fn drive(
             }
         }
 
-        const search_end = if (eof) filled else lastComplete(buf[0..filled]);
-        // 换行符本身不计入单行上限，所以缓冲可以比上限多一个字节。
-        const pending = filled - search_end;
-        if (!eof and pending > config.max_line_len) return error.LineTooLong;
-        if (eof and pending > config.max_line_len) return error.LineTooLong;
-
-        if (search_end > state.pos or eof) {
-            const view_end = if (eof) filled else search_end;
+        if (!skip_match and (search_end > state.pos or eof)) {
             if (!try matchBuffer(S, sink, matcher, buf[0..view_end], &state, config)) {
                 state.stopped = true;
                 break;
@@ -251,6 +287,12 @@ fn grow(allocator: std.mem.Allocator, buf: []u8, config: SearchConfig) error{ Li
     const next = @min(limit, doubled);
     if (next <= buf.len) return error.LineTooLong;
     return allocator.realloc(buf, next);
+}
+
+fn canFuse(matcher: anytype, config: SearchConfig, state: *const State) bool {
+    if (state.prefer_prepass or state.nul_offset != null) return false;
+    if (config.binary == .none or config.invert or config.before != 0 or config.after != 0) return false;
+    return @hasDecl(@TypeOf(matcher.*), "findWatched");
 }
 
 fn bufferWindow(config: SearchConfig) usize {
@@ -834,6 +876,58 @@ test "切片：超长匹配行报错" {
     try testing.expectError(error.LineTooLong, result);
 }
 
+test "分块读把 NUL 并进查找" {
+    var reader = std.Io.Reader.fixed("ab\ncd\nMATCH\n");
+    var finder = try Finder.init("MATCH", .{});
+    var rec = Rec{};
+    defer rec.deinit(testing.allocator);
+    const result = try searchReader(Rec, testing.allocator, &rec, &reader, "", &finder, .{
+        .line_numbers = true,
+        .buffer_size = 4,
+        .max_line_len = 64,
+    });
+    try testing.expectEqual(Outcome.complete, result.outcome);
+    try testing.expectEqual(@as(?u64, null), result.nul_offset);
+    try testing.expectEqualStrings("3:MATCH\n", rec.text.items);
+
+    var bin_reader = std.Io.Reader.fixed("xxMATCH\x00yy\n");
+    var bin_finder = try Finder.init("MATCH", .{});
+    var bin = Rec{};
+    defer bin.deinit(testing.allocator);
+    const bin_result = try searchReader(Rec, testing.allocator, &bin, &bin_reader, "", &bin_finder, .{
+        .buffer_size = 64,
+        .max_line_len = 64,
+    });
+    try testing.expectEqual(Outcome.binary_matched, bin_result.outcome);
+    try testing.expectEqual(@as(?u64, 7), bin_result.nul_offset);
+    try testing.expectEqualStrings("binary file matches\n", bin.text.items);
+
+    var quit_reader = std.Io.Reader.fixed("MATCH\nfoo\x00\n");
+    var quit_finder = try Finder.init("MATCH", .{});
+    var quit = Rec{};
+    defer quit.deinit(testing.allocator);
+    const quit_result = try searchReader(Rec, testing.allocator, &quit, &quit_reader, "", &quit_finder, .{
+        .binary = .quit,
+        .buffer_size = 64,
+        .max_line_len = 64,
+    });
+    try testing.expectEqual(Outcome.binary_quit, quit_result.outcome);
+    try testing.expectEqual(@as(u64, 0), quit_result.matched_lines);
+    try testing.expectEqualStrings("", quit.text.items);
+
+    var byte_reader = std.Io.Reader.fixed("ab\ncd\nZ\n");
+    var byte_finder = try Finder.init("Z", .{});
+    var byte_rec = Rec{};
+    defer byte_rec.deinit(testing.allocator);
+    const byte_result = try searchReader(Rec, testing.allocator, &byte_rec, &byte_reader, "", &byte_finder, .{
+        .line_numbers = true,
+        .buffer_size = 3,
+        .max_line_len = 64,
+    });
+    try testing.expectEqual(Outcome.complete, byte_result.outcome);
+    try testing.expectEqualStrings("3:Z\n", byte_rec.text.items);
+}
+
 test "Reader 跨块保留半行" {
     const hay = "abcMATCH\nzzz\nMATCH\n";
     var reader = std.Io.Reader.fixed(hay);
@@ -872,6 +966,33 @@ test "文件读取与切片一致" {
     try testing.expectEqual(Outcome.complete, result.outcome);
     try testing.expectEqualStrings("1-a\n2:MATCH\n3-b\n", rec.text.items);
     try testing.expectEqualStrings("t.txt", rec.begun);
+}
+
+test "分块读文件和切片一致" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var hay: [4096 + 64]u8 = @splat('a');
+    hay[100] = '\n';
+    const needle = "MATCH";
+    @memcpy(hay[200..][0..needle.len], needle);
+    hay[200 + needle.len] = '\n';
+    @memcpy(hay[hay.len - needle.len ..], needle);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "big.txt", .data = &hay });
+    const file = try tmp.dir.openFile(testing.io, "big.txt", .{});
+    defer file.close(testing.io);
+
+    var finder = try Finder.init(needle, .{});
+    var rec = Rec{};
+    defer rec.deinit(testing.allocator);
+    const result = try searchFile(Rec, testing.allocator, testing.io, &rec, file, "big.txt", &finder, .{
+        .line_numbers = true,
+        .buffer_size = 128,
+        .max_line_len = hay.len,
+        .binary = .none,
+    });
+    try testing.expectEqual(Outcome.complete, result.outcome);
+    try testing.expectEqual(@as(u64, 2), rec.matches);
+    try testing.expect(std.mem.indexOf(u8, rec.text.items, "MATCH") != null);
 }
 
 test "Sink 返回 false 时停止" {

@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const ascii = @import("ascii.zig");
+const memchr = @import("memchr.zig");
 
 pub const Fold = enum {
     sensitive,
@@ -139,9 +140,27 @@ fn findNonPeriodic(self: TwoWay, haystack: []const u8, start: usize) ?usize {
     const n = haystack.len;
     const ell: isize = @as(isize, @intCast(self.crit)) - 1;
     const per = @max(self.crit, pat.len - self.crit) + 1;
-    var window = start;
+    const crit = self.crit;
+    const fold = self.fold == .ascii;
+    // 右半段非空时，第一个必须相等的字节用向量 memchr 跳过去。
+    // 失配后的位移仍按 Two-Way，最坏时间保持线性。
+    const forms: [2]u8 = if (crit < pat.len and fold)
+        ascii.caseVariants(pat[crit])
+    else if (crit < pat.len)
+        .{ pat[crit], pat[crit] }
+    else
+        .{ 0, 0 };
+    var window: usize = start;
     while (window <= n - pat.len) {
         var i: isize = ell + 1;
+        if (crit < pat.len) {
+            const at = memchr.findEither(memchr.native_width, haystack, window + crit, forms[0], forms[1]) orelse return null;
+            if (at < crit) return null;
+            const aligned = at - crit;
+            if (aligned > n - pat.len) return null;
+            window = aligned;
+            i = ell + 2;
+        }
         while (i < m and self.eq(pat[@intCast(i)], haystack[window + @as(usize, @intCast(i))])) {
             i += 1;
         }
@@ -153,7 +172,8 @@ fn findNonPeriodic(self: TwoWay, haystack: []const u8, start: usize) ?usize {
             if (i < 0) return window;
             window += per;
         } else {
-            window += @intCast(i - ell);
+            const shift: usize = @intCast(i - ell);
+            window += if (shift == 0) 1 else shift;
         }
     }
     return null;

@@ -4,6 +4,8 @@ zrg 的代码是原作。
 
 字节频率秩在 `src/finder/frequency.zig`。它是按英文散文和源码的常见程度手写的，不是从 memchr crate、ripgrep 或其他项目抄来的表。调用方可以换成自己的 `[256]u8`。
 
+长度不超过 32 的字面量用通用 SIMD 做配对过滤：一次加载两个偏移上的字节，向量比较后取与，只有同时命中才做整段确认。算法来自 Wojciech Muła 的文章 “SIMD-friendly algorithms for substring searching”（2016-11-28，http://0x80.pl/articles/simd-strfind.html ）。锚点按本仓库自己的字节频率秩挑选，不是文章里的首尾字节。长模式在至少 50 个候选且平均每次跳过少于 8 字节时改走 Two-Way。这两个阈值和“32 字节以内不回退”是 memchr 公开发表的预过滤策略里的常数，实现是按这个策略另写的，没有复制 memchr 或 ripgrep 的源码。
+
 Two-Way 按 Crochemore 与 Perrin 发表的算法实现：
 
 > Maxime Crochemore and Dominique Perrin, “Two-way string-matching”, Journal of the ACM, 38(3):651–675, 1991.

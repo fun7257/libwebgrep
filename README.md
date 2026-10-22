@@ -135,7 +135,7 @@ pub fn searchPath(
 }
 ```
 
-`searchReader` 的形状相同，只是把文件换成 `*std.Io.Reader`。默认缓冲 256 KiB，单行上限 2 MiB。超长行返回 `error.LineTooLong`，缓冲不会一直涨。
+`searchReader` 的形状相同，只是把文件换成 `*std.Io.Reader`。默认缓冲 1 MiB，单行上限 2 MiB。超长行返回 `error.LineTooLong`，缓冲不会一直涨。
 
 内置打印器有两种：
 

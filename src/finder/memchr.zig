@@ -1,4 +1,9 @@
-//! 单字节查找。热循环用手写 `@Vector`，不依赖编译器自动向量化。
+//! 单字节查找。
+//!
+//! `find` 直接调用 `std.mem.findScalarPos`。在 Apple M2 的 ReleaseFast 下，
+//! 手写版 55.8 GB/s，std 54.6 GB/s，差距约 2%，按设计改用 std。
+//! 两个不同字节的 `findEither`、反向查找和计数仍用手写 `@Vector`：
+//! std 的 `findScalarLast` 是标量循环，计数也没有对应的向量实现。
 //!
 //! 16 字节比较的结果收成 64 位半字节掩码：把比较结果看成 8 个 16 位通道，
 //! 右移 4 位再窄化成 8 位。匹配字节对应 4 个 1，所以下标是 `ctz / 4`，
@@ -14,8 +19,10 @@ pub const native_width: comptime_int = blk: {
 };
 
 /// 在 `haystack[start..]` 中查找第一个 `needle`。
+/// `width` 只用于保持和 `findEither` 相同的调用形式，实际走 std。
 pub fn find(comptime width: comptime_int, haystack: []const u8, start: usize, needle: u8) ?usize {
-    return findEither(width, haystack, start, needle, needle);
+    comptime checkWidth(width);
+    return std.mem.findScalarPos(u8, haystack, start, needle);
 }
 
 /// 查找第一个等于 `a` 或 `b` 的字节。两者相同时就是 `find`。

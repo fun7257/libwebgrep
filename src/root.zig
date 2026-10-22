@@ -29,6 +29,11 @@ pub const searchSlice = searcher.searchSlice;
 pub const searchReader = searcher.searchReader;
 pub const searchFile = searcher.searchFile;
 
+pub const text_printer = @import("printer/text.zig");
+pub const count_printer = @import("printer/count.zig");
+pub const TextPrinter = text_printer.Text;
+pub const CountPrinter = count_printer.Count;
+
 test "默认搜索配置" {
     const cfg: SearchConfig = .{};
     try std.testing.expectEqual(SearchConfig.default_buffer_size, cfg.buffer_size);
@@ -46,6 +51,8 @@ test {
     _ = @import("matcher.zig");
     _ = @import("sink.zig");
     _ = @import("searcher.zig");
+    _ = @import("printer/text.zig");
+    _ = @import("printer/count.zig");
     _ = @import("finder/memchr.zig");
     _ = @import("finder/two_way.zig");
     _ = @import("finder/ascii.zig");

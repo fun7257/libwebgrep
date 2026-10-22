@@ -21,7 +21,7 @@ pub const BinaryPolicy = enum {
 };
 
 pub const SearchConfig = struct {
-    /// 起始块大小。P0 结束前会按 64 KiB、128 KiB、256 KiB、1 MiB 的基准确认。
+    /// 起始块大小。128 MiB 文件上 1 MiB 只比 256 KiB 快约 1.5%，默认保持 256 KiB。
     pub const default_buffer_size: usize = 256 * 1024;
     /// 单行字节上限。缓冲倍增到这里仍放不下一整行时返回 `error.LineTooLong`。
     pub const default_max_line_len: usize = 2 * 1024 * 1024;

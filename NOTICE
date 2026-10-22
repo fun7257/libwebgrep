@@ -1,0 +1,13 @@
+# NOTICE
+
+zrg 的代码是原作。
+
+字节频率秩在 `src/finder/frequency.zig`。它是按英文散文和源码的常见程度手写的，不是从 memchr crate、ripgrep 或其他项目抄来的表。调用方可以换成自己的 `[256]u8`。
+
+Two-Way 按 Crochemore 与 Perrin 发表的算法实现：
+
+> Maxime Crochemore and Dominique Perrin, “Two-way string-matching”, Journal of the ACM, 38(3):651–675, 1991.
+
+实现是照论文描述写的，没有复制 memchr crate 或 ripgrep 的源码。
+
+二进制文件那两句说明与 ripgrep 15 的用户可见文案相同，用来让示例 CLI 的输出能逐字节对照。没有复制 ripgrep 的实现。ripgrep 的许可证是 Unlicense 或 MIT。

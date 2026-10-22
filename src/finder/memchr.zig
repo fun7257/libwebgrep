@@ -1,0 +1,270 @@
+//! 单字节查找。热循环用手写 `@Vector`，不依赖编译器自动向量化。
+//!
+//! 16 字节比较的结果收成 64 位半字节掩码：把比较结果看成 8 个 16 位通道，
+//! 右移 4 位再窄化成 8 位。匹配字节对应 4 个 1，所以下标是 `ctz / 4`，
+//! 个数是 `popcount / 4`。32 字节拆成两段 16 字节做同样的事。
+
+const std = @import("std");
+
+/// 运行时默认宽度。不超过 32：AVX-512 要等基准证明有收益再加。
+pub const native_width: comptime_int = blk: {
+    const suggested = std.simd.suggestVectorLength(u8) orelse 16;
+    if (suggested >= 32) break :blk 32;
+    break :blk 16;
+};
+
+/// 在 `haystack[start..]` 中查找第一个 `needle`。
+pub fn find(comptime width: comptime_int, haystack: []const u8, start: usize, needle: u8) ?usize {
+    return findEither(width, haystack, start, needle, needle);
+}
+
+/// 查找第一个等于 `a` 或 `b` 的字节。两者相同时就是 `find`。
+pub fn findEither(comptime width: comptime_int, haystack: []const u8, start: usize, a: u8, b: u8) ?usize {
+    comptime checkWidth(width);
+    if (start >= haystack.len) return null;
+
+    var i: usize = start;
+    const n = haystack.len;
+    if (n - i >= width) {
+        const stride = width * 4;
+        while (n - i >= stride) {
+            inline for (0..4) |k| {
+                const at = i + k * width;
+                if (firstIn(width, haystack[at..][0..width].*, a, b)) |rel| return at + rel;
+            }
+            i += stride;
+        }
+        while (n - i >= width) {
+            if (firstIn(width, haystack[i..][0..width].*, a, b)) |rel| return i + rel;
+            i += width;
+        }
+    }
+    return scalarEither(haystack, i, n, a, b);
+}
+
+/// 在 `haystack[start..end]` 中查找最后一个 `needle`。`end` 是开区间。
+pub fn findLast(comptime width: comptime_int, haystack: []const u8, start: usize, end: usize, needle: u8) ?usize {
+    comptime checkWidth(width);
+    const limit = @min(end, haystack.len);
+    if (start >= limit) return null;
+
+    var i: usize = limit;
+    while (i >= width and i - width >= start) {
+        const at = i - width;
+        if (lastIn(width, haystack[at..][0..width].*, needle)) |rel| return at + rel;
+        i = at;
+    }
+    while (i > start) {
+        i -= 1;
+        if (haystack[i] == needle) return i;
+    }
+    return null;
+}
+
+/// 统计 `haystack[start..end]` 里 `needle` 的个数。
+pub fn count(comptime width: comptime_int, haystack: []const u8, start: usize, end: usize, needle: u8) usize {
+    comptime checkWidth(width);
+    const limit = @min(end, haystack.len);
+    if (start >= limit) return 0;
+
+    var i: usize = start;
+    var total: usize = 0;
+    if (limit - i >= width) {
+        const stride = width * 4;
+        while (limit - i >= stride) {
+            inline for (0..4) |k| {
+                total += countIn(width, haystack[i + k * width ..][0..width].*, needle);
+            }
+            i += stride;
+        }
+        while (limit - i >= width) {
+            total += countIn(width, haystack[i..][0..width].*, needle);
+            i += width;
+        }
+    }
+    while (i < limit) : (i += 1) {
+        if (haystack[i] == needle) total += 1;
+    }
+    return total;
+}
+
+fn checkWidth(comptime width: comptime_int) void {
+    if (width != 16 and width != 32) @compileError("memchr 宽度只支持 16 和 32");
+}
+
+fn scalarEither(haystack: []const u8, start: usize, end: usize, a: u8, b: u8) ?usize {
+    var i = start;
+    while (i < end) : (i += 1) {
+        const c = haystack[i];
+        if (c == a or c == b) return i;
+    }
+    return null;
+}
+
+fn firstIn(comptime width: comptime_int, block: @Vector(width, u8), a: u8, b: u8) ?usize {
+    if (width == 32) {
+        const halves: [2]@Vector(16, u8) = @bitCast(block);
+        if (indexFromMask(mask16(halves[0], a, b))) |rel| return rel;
+        if (indexFromMask(mask16(halves[1], a, b))) |rel| return 16 + rel;
+        return null;
+    }
+    return indexFromMask(mask16(block, a, b));
+}
+
+fn lastIn(comptime width: comptime_int, block: @Vector(width, u8), needle: u8) ?usize {
+    if (width == 32) {
+        const halves: [2]@Vector(16, u8) = @bitCast(block);
+        if (lastFromMask(mask16(halves[1], needle, needle))) |rel| return 16 + rel;
+        if (lastFromMask(mask16(halves[0], needle, needle))) |rel| return rel;
+        return null;
+    }
+    return lastFromMask(mask16(block, needle, needle));
+}
+
+fn countIn(comptime width: comptime_int, block: @Vector(width, u8), needle: u8) usize {
+    if (width == 32) {
+        const halves: [2]@Vector(16, u8) = @bitCast(block);
+        return countMask(mask16(halves[0], needle, needle)) + countMask(mask16(halves[1], needle, needle));
+    }
+    return countMask(mask16(block, needle, needle));
+}
+
+/// 匹配字节在掩码里占 4 个连续的 1。没有匹配时返回 null。
+fn indexFromMask(mask: u64) ?usize {
+    if (mask == 0) return null;
+    return @as(usize, @ctz(mask)) / 4;
+}
+
+fn lastFromMask(mask: u64) ?usize {
+    if (mask == 0) return null;
+    return @as(usize, 63 - @clz(mask)) / 4;
+}
+
+fn countMask(mask: u64) usize {
+    return @as(usize, @popCount(mask)) / 4;
+}
+
+/// 16 字节比较收成 64 位半字节掩码。
+fn mask16(block: @Vector(16, u8), a: u8, b: u8) u64 {
+    const cmp = if (a == b)
+        block == @as(@Vector(16, u8), @splat(a))
+    else
+        (block == @as(@Vector(16, u8), @splat(a))) | (block == @as(@Vector(16, u8), @splat(b)));
+    const bytes: @Vector(16, u8) = @select(u8, cmp, @as(@Vector(16, u8), @splat(@as(u8, 0xFF))), @as(@Vector(16, u8), @splat(@as(u8, 0))));
+    const lanes: @Vector(8, u16) = @bitCast(bytes);
+    const shifted = lanes >> @as(@Vector(8, u16), @splat(@as(u16, 4)));
+    const narrowed: @Vector(8, u8) = @truncate(shifted);
+    return @bitCast(narrowed);
+}
+
+fn scalarFind(haystack: []const u8, start: usize, needle: u8) ?usize {
+    var i = start;
+    while (i < haystack.len) : (i += 1) {
+        if (haystack[i] == needle) return i;
+    }
+    return null;
+}
+
+fn scalarCount(haystack: []const u8, start: usize, end: usize, needle: u8) usize {
+    var n: usize = 0;
+    var i = start;
+    const limit = @min(end, haystack.len);
+    while (i < limit) : (i += 1) {
+        if (haystack[i] == needle) n += 1;
+    }
+    return n;
+}
+
+test "空输入和越界起点" {
+    inline for (.{ 16, 32 }) |w| {
+        try std.testing.expectEqual(@as(?usize, null), find(w, "", 0, 'a'));
+        try std.testing.expectEqual(@as(?usize, null), find(w, "abc", 3, 'a'));
+        try std.testing.expectEqual(@as(?usize, null), find(w, "abc", 4, 'a'));
+        try std.testing.expectEqual(@as(?usize, null), findLast(w, "", 0, 0, 'a'));
+        try std.testing.expectEqual(@as(usize, 0), count(w, "", 0, 0, 'a'));
+    }
+}
+
+test "每个偏移都能找到，也能数对" {
+    var buf: [96]u8 = undefined;
+    @memset(&buf, '.');
+    inline for (.{ 16, 32 }) |w| {
+        for (0..buf.len) |at| {
+            buf[at] = 'Q';
+            try std.testing.expectEqual(@as(?usize, at), find(w, &buf, 0, 'Q'));
+            try std.testing.expectEqual(@as(?usize, at), findLast(w, &buf, 0, buf.len, 'Q'));
+            try std.testing.expectEqual(@as(usize, 1), count(w, &buf, 0, buf.len, 'Q'));
+            if (at > 0) {
+                try std.testing.expectEqual(@as(?usize, null), find(w, &buf, at + 1, 'Q'));
+            }
+            buf[at] = '.';
+        }
+    }
+}
+
+test "同一向量里的多次命中" {
+    var buf: [32]u8 = undefined;
+    @memset(&buf, 0);
+    const hits = [_]usize{ 0, 1, 7, 8, 15, 16, 31 };
+    for (hits) |at| buf[at] = 1;
+    inline for (.{ 16, 32 }) |w| {
+        try std.testing.expectEqual(@as(?usize, 0), find(w, &buf, 0, 1));
+        try std.testing.expectEqual(@as(?usize, 1), find(w, &buf, 1, 1));
+        try std.testing.expectEqual(@as(?usize, 31), findLast(w, &buf, 0, buf.len, 1));
+        try std.testing.expectEqual(@as(?usize, 15), findLast(w, &buf, 0, 16, 1));
+        try std.testing.expectEqual(hits.len, count(w, &buf, 0, buf.len, 1));
+        try std.testing.expectEqual(@as(usize, 5), count(w, &buf, 0, 16, 1));
+    }
+}
+
+test "两个候选字节" {
+    var buf: [40]u8 = undefined;
+    @memset(&buf, 'a');
+    buf[3] = 'B';
+    buf[20] = 'b';
+    inline for (.{ 16, 32 }) |w| {
+        try std.testing.expectEqual(@as(?usize, 3), findEither(w, &buf, 0, 'b', 'B'));
+        try std.testing.expectEqual(@as(?usize, 20), findEither(w, &buf, 4, 'b', 'B'));
+        try std.testing.expectEqual(@as(?usize, null), findEither(w, &buf, 0, 'z', 'Z'));
+    }
+}
+
+test "与标量和 std.mem.findScalarPos 一致" {
+    var prng = std.Random.DefaultPrng.init(0x51);
+    const random = prng.random();
+    var buf: [300]u8 = undefined;
+    for (0..40) |_| {
+        random.bytes(&buf);
+        const needle = random.int(u8);
+        const start = random.intRangeAtMost(usize, 0, buf.len);
+        const end = random.intRangeAtMost(usize, start, buf.len);
+        inline for (.{ 16, 32 }) |w| {
+            try std.testing.expectEqual(scalarFind(&buf, start, needle), find(w, &buf, start, needle));
+            try std.testing.expectEqual(std.mem.findScalarPos(u8, &buf, start, needle), find(w, &buf, start, needle));
+            try std.testing.expectEqual(scalarCount(&buf, start, end, needle), count(w, &buf, start, end, needle));
+            var last: ?usize = null;
+            var i = start;
+            while (i < end) : (i += 1) {
+                if (buf[i] == needle) last = i;
+            }
+            try std.testing.expectEqual(last, findLast(w, &buf, start, end, needle));
+        }
+    }
+}
+
+test "memchr 模糊对照" {
+    try std.testing.fuzz({}, fuzzMemchr, .{});
+}
+
+fn fuzzMemchr(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    const n: usize = smith.slice(&buf);
+    const hay = buf[0..n];
+    const needle = smith.value(u8);
+    const start: usize = if (n == 0) 0 else smith.valueRangeAtMost(u32, 0, @intCast(n));
+    const end: usize = if (start == n) n else smith.valueRangeAtMost(u32, @intCast(start), @intCast(n));
+    inline for (.{ 16, 32 }) |w| {
+        try std.testing.expectEqual(scalarFind(hay, start, needle), find(w, hay, start, needle));
+        try std.testing.expectEqual(scalarCount(hay, start, end, needle), count(w, hay, start, end, needle));
+    }
+}

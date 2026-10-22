@@ -31,8 +31,11 @@ test "默认搜索配置" {
     try std.testing.expect(cfg.max_count == null);
 }
 
+pub const memchr = @import("finder/memchr.zig");
+
 test {
     _ = @import("matcher.zig");
     _ = @import("sink.zig");
     _ = @import("searcher.zig");
+    _ = @import("finder/memchr.zig");
 }

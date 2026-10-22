@@ -1,0 +1,17 @@
+.{
+    .name = .zrg,
+    .version = "0.0.0",
+    .fingerprint = 0x68f8db1b2a1731a6, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.17.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "examples",
+        "bench",
+        "README.md",
+        "DESIGN.md",
+        "BENCHMARKS.md",
+        "NOTICE",
+    },
+}

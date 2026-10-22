@@ -4,6 +4,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const sanitize_thread = b.option(bool, "sanitize-thread", "启用 ThreadSanitizer") orelse false;
+    const fuzz_filter = b.option([]const u8, "fuzz-filter", "只运行名称包含该子串的测试");
+    const test_filters: []const []const u8 = if (fuzz_filter) |filter| &.{filter} else &.{};
 
     const mod = b.addModule("zrg", .{
         .root_source_file = b.path("src/root.zig"),
@@ -35,12 +37,14 @@ pub fn build(b: *std.Build) void {
     const lib_tests = b.addTest(.{
         .name = "zrg-test",
         .root_module = mod,
+        .filters = test_filters,
     });
     const run_lib_tests = b.addRunArtifact(lib_tests);
 
     const exe_tests = b.addTest(.{
         .name = "zrg-cli-test",
         .root_module = exe.root_module,
+        .filters = test_filters,
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
@@ -72,6 +76,10 @@ pub fn build(b: *std.Build) void {
             }),
         });
         const run_micro = b.addRunArtifact(micro);
-        bench_step.dependOn(&run_micro.step);
+        const e2e = b.addSystemCommand(&.{ "bash", "bench/e2e.sh" });
+        e2e.setCwd(b.path("."));
+        e2e.step.dependOn(b.getInstallStep());
+        e2e.step.dependOn(&run_micro.step);
+        bench_step.dependOn(&e2e.step);
     }
 }

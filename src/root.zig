@@ -38,4 +38,10 @@ test {
     _ = @import("sink.zig");
     _ = @import("searcher.zig");
     _ = @import("finder/memchr.zig");
+    _ = @import("finder/two_way.zig");
+    _ = @import("finder/ascii.zig");
+    _ = @import("finder/frequency.zig");
+    _ = @import("finder/packed_pair.zig");
 }
+
+pub const two_way = @import("finder/two_way.zig");

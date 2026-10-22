@@ -19,3 +19,15 @@ Two-Way 按 Crochemore 与 Perrin 发表的算法实现：
 > David Chase and Yossi Lev, “Dynamic Circular Work-Stealing Deque”, SPAA ’05, pages 21–28, 2005. https://doi.org/10.1145/1073970.1073974
 
 实现是照论文描述另写的。Zig 0.14 起没有独立的内存栅栏，弹出和窃取用 seq_cst 的加载和存储代替。没有复制论文里的示例代码，也没有复制别的项目里的 Chase-Lev 实现。
+
+多模式的稠密自动机按 Aho 与 Corasick 的失败函数实现：
+
+> Alfred V. Aho and Margaret J. Corasick, “Efficient string matching: an aid to bibliographic search”, Communications of the ACM, 18(6):333–340, 1975.
+
+字节等价类、ASCII 折叠和 `leftmost_first` 的取舍是按公开描述另写的。Andrew Gallant 的 aho-corasick 文档说明了 leftmost-first 在同一起点上取得更早的模式。没有复制该项目或 ripgrep 的源码。
+
+Teddy 是半字节 SIMD 过滤。名字和做法来自 Geoff Langdale 在 Hyperscan 里公开的匹配器：用 `pshufb` 或 NEON `tbl` 按半字节查表，再把指纹各偏移的结果按位与，非 0 的路做确认。论文是：
+
+> Kun Qiu, Harry Chang, Yang Hong, Wenjun Zhu, Xiang Wang, and Baoqian Li, “Teddy: An Efficient SIMD-based Literal Matching Engine for Scalable Deep Packet Inspection”, ICPP ’21, 2021. https://doi.org/10.1145/3472456.3473512
+
+Langdale 在 https://branchfree.org/2024/06/29/hyperscan-papers-harry-and-teddy-simd-literal-matchers/ 把这篇和 Hyperscan 的 Teddy 对应起来。本仓库的实现是按这些公开描述另写的，指纹最长 3 字节，一组最多 8 个模式。没有复制 Hyperscan、aho-corasick 或 ripgrep 的源码。没有实现 FDR，也没有 AVX-512。

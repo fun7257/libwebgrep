@@ -150,3 +150,54 @@ echo "## 6b smart case，小写模式"
 run_pair "smart case" \
   "${common_rg[*]} -S zxzqneedle $big >/dev/null" \
   "${common_zrg[*]} -S zxzqneedle $big >/dev/null"
+
+# 多模式。32 MiB 足够，不重跑上面的 1 GiB。
+# 模式都非空，长度至少 2。10 个在 Teddy 打开时走 Teddy，100 和 1000 个走自动机。
+# aarch64 的默认构建打开 NEON。
+multi=corpus/large/multi.txt
+multi_target=$((32 << 20))
+if [[ ! -f $multi ]] || [[ $(file_size "$multi") -lt $multi_target ]]; then
+  echo "生成 $multi"
+  python3 - "$multi" "$multi_target" <<'PY'
+import sys
+path, target = sys.argv[1], int(sys.argv[2])
+line = b"the quick brown fox jumps over a dog 0123456789\n"
+hits = [b"alpha", b"beta", b"gamma", b"delta"]
+with open(path, "wb") as f:
+    left = target
+    n = 0
+    while left > 0:
+        chunk = line
+        if n % 64 == 0:
+            chunk = hits[n % len(hits)] + b" " + line
+        if len(chunk) > left:
+            chunk = chunk[:left]
+        f.write(chunk)
+        left -= len(chunk)
+        n += 1
+PY
+fi
+
+mkdir -p bench/tmp
+python3 - <<'PY'
+from pathlib import Path
+hits = ["alpha", "beta", "gamma", "delta"]
+out = Path("bench/tmp")
+for n in (10, 100, 1000):
+    lines = list(hits)
+    for i in range(len(hits), n):
+        lines.append(f"zq{i:04d}miss")
+    (out / f"pats{n}").write_text("\n".join(lines) + "\n")
+PY
+
+run_pair "7 多模式 10 个" \
+  "${common_rg[*]} -f bench/tmp/pats10 $multi >/dev/null" \
+  "${common_zrg[*]} -f bench/tmp/pats10 $multi >/dev/null"
+
+run_pair "8 多模式 100 个" \
+  "${common_rg[*]} -f bench/tmp/pats100 $multi >/dev/null" \
+  "${common_zrg[*]} -f bench/tmp/pats100 $multi >/dev/null"
+
+run_pair "9 多模式 1000 个" \
+  "${common_rg[*]} -f bench/tmp/pats1000 $multi >/dev/null" \
+  "${common_zrg[*]} -f bench/tmp/pats1000 $multi >/dev/null"

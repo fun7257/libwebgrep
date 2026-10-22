@@ -50,13 +50,11 @@ pub fn execute(
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
 ) u8 {
-    var parsed = parse(allocator, argv, stderr) catch {
+    var parsed = parse(allocator, io, argv, stderr) catch {
         stderr.flush() catch {};
         return 2;
     };
-    defer parsed.paths.deinit(allocator);
-    defer parsed.globs.deinit(allocator);
-    defer parsed.types.deinit(allocator);
+    defer parsed.deinit(allocator);
 
     if (parsed.help) {
         stdout.writeAll(usage) catch return 2;
@@ -68,15 +66,29 @@ pub fn execute(
     }
 
     var finder: zrg.Finder = undefined;
+    var many: ?zrg.Multi = null;
+    defer if (many) |*engine| engine.deinit();
     if (!parsed.files_only) {
-        finder = zrg.Finder.init(parsed.pattern, .{ .case = parsed.case_mode }) catch {
-            stderr.writeAll("zrg: 模式不能包含换行\n") catch {};
-            stderr.flush() catch {};
-            return 2;
-        };
+        if (parsed.explicit and parsed.patterns.items.len > 1) {
+            many = zrg.Multi.init(allocator, parsed.patterns.items, .{ .case = parsed.case_mode }) catch |err| {
+                switch (err) {
+                    error.PatternHasNewline => stderr.writeAll("zrg: 模式不能包含换行\n") catch {},
+                    error.OutOfMemory => stderr.writeAll("zrg: 内存不足\n") catch {},
+                }
+                stderr.flush() catch {};
+                return 2;
+            };
+        } else {
+            const text = if (parsed.explicit) parsed.patterns.items[0] else parsed.pattern;
+            finder = zrg.Finder.init(text, .{ .case = parsed.case_mode }) catch {
+                stderr.writeAll("zrg: 模式不能包含换行\n") catch {};
+                stderr.flush() catch {};
+                return 2;
+            };
+        }
     }
 
-    const config = zrg.SearchConfig{
+    var config = zrg.SearchConfig{
         .line_numbers = parsed.line_numbers or parsed.column or parsed.json,
         .invert = parsed.invert,
         .before = parsed.before,
@@ -84,6 +96,7 @@ pub fn execute(
         .max_count = parsed.max_count,
         .binary = parsed.binary,
     };
+    if (many != null) config.match_mode = .leftmost_first;
     const input_count: usize = if (parsed.paths.items.len == 0) 1 else parsed.paths.items.len;
     const spec = SinkSpec{
         .kind = sinkKind(parsed),
@@ -112,12 +125,13 @@ pub fn execute(
     };
 
     if (!parsed.files_only and parsed.paths.items.len == 0) {
-        const one = driveOne(
+        const one = driveInput(
             allocator,
             io,
             .{ .reader = &stdin_reader.interface },
             "<stdin>",
             &finder,
+            if (many) |*engine| engine else null,
             config,
             spec,
             stdout,
@@ -132,12 +146,13 @@ pub fn execute(
         for (parsed.paths.items) |path| {
             if (parsed.quiet and any_match) break;
             if (!parsed.files_only and std.mem.eql(u8, path, "-")) {
-                const one = driveOne(
+                const one = driveInput(
                     allocator,
                     io,
                     .{ .reader = &stdin_reader.interface },
                     "<stdin>",
                     &finder,
+                    if (many) |*engine| engine else null,
                     config,
                     spec,
                     stdout,
@@ -158,7 +173,8 @@ pub fn execute(
             };
             if (stat.kind == .directory) {
                 const summary = zrg.parallel.run(allocator, io, .{
-                    .pattern = parsed.pattern,
+                    .pattern = if (parsed.files_only) "" else if (parsed.explicit) parsed.patterns.items[0] else parsed.pattern,
+                    .patterns = if (many != null) parsed.patterns.items else &.{},
                     .find = .{ .case = parsed.case_mode },
                     .roots = &.{path},
                     .search = config,
@@ -206,12 +222,13 @@ pub fn execute(
                 continue;
             };
             defer file.close(io);
-            const one = driveOne(
+            const one = driveInput(
                 allocator,
                 io,
                 .{ .file = file },
                 path,
                 &finder,
+                if (many) |*engine| engine else null,
                 config,
                 spec,
                 stdout,
@@ -239,12 +256,17 @@ const usage =
     \\zrg：字面量行搜索的示例程序
     \\
     \\用法：zrg [选项] 模式 [路径...]
+    \\      zrg [选项] -e 模式 ... [路径...]
+    \\      zrg [选项] -f 模式文件 ... [路径...]
     \\
     \\没有路径时从标准输入读。单独的 - 也表示标准输入。
     \\模式始终按字面量匹配，不能包含换行。
+    \\用了 -e 或 -f 之后，位置参数都是路径。多个模式按 rg 的顺序：起点靠左优先，同一起点更早给出的模式优先。
     \\
     \\选项：
     \\  -F, --fixed-strings      接受并忽略（始终是字面量）
+    \\  -e, --regexp PATTERN     增加一个字面量模式，可重复
+    \\  -f, --file FILE          从文件读模式，一行一个，空行也算，可重复
     \\  -n, --line-number        打印行号
     \\      --column             打印列号，同时打开行号
     \\  -H, --with-filename      总是打印路径
@@ -353,13 +375,32 @@ fn openInput(io: std.Io, path: []const u8) std.Io.File.OpenError!std.Io.File {
     return std.Io.Dir.cwd().openFile(io, path, .{});
 }
 
-/// 搜索一个显式输入。目录不走这里。
-fn driveOne(
+fn driveInput(
     allocator: std.mem.Allocator,
     io: std.Io,
     input: Input,
     name: []const u8,
     finder: *zrg.Finder,
+    many: ?*zrg.Multi,
+    config: zrg.SearchConfig,
+    spec: SinkSpec,
+    stdout: *std.Io.Writer,
+    scratch: *std.Io.Writer.Allocating,
+    saw_output: *bool,
+) !One {
+    if (many) |engine| {
+        return driveOne(allocator, io, input, name, engine, config, spec, stdout, scratch, saw_output);
+    }
+    return driveOne(allocator, io, input, name, finder, config, spec, stdout, scratch, saw_output);
+}
+
+/// 搜索一个显式输入。目录不走这里。一个模式走 Finder，多个模式走 Multi。
+fn driveOne(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    input: Input,
+    name: []const u8,
+    finder: anytype,
     config: zrg.SearchConfig,
     spec: SinkSpec,
     stdout: *std.Io.Writer,
@@ -395,11 +436,12 @@ fn driveOne(
             return .{ .matched = result.matched_lines > 0, .matched_lines = result.matched_lines, .matches = result.matched_lines };
         },
         .json => {
+            const JsonSink = zrg.json_printer.Printer(@TypeOf(finder.*));
             scratch.clearRetainingCapacity();
-            var sink = zrg.json_printer.Json{ .writer = &scratch.writer, .finder = finder };
+            var sink = JsonSink{ .writer = &scratch.writer, .finder = finder };
             const result = switch (input) {
-                .file => |file| try zrg.searchFile(zrg.json_printer.Json, allocator, io, &sink, file, name, finder, config),
-                .reader => |reader| try zrg.searchReader(zrg.json_printer.Json, allocator, &sink, reader, name, finder, config),
+                .file => |file| try zrg.searchFile(JsonSink, allocator, io, &sink, file, name, finder, config),
+                .reader => |reader| try zrg.searchReader(JsonSink, allocator, &sink, reader, name, finder, config),
             };
             if (sink.write_error) |err| return err;
             if (sink.started and !sink.writeEnd(0)) {
@@ -453,6 +495,10 @@ fn driveOne(
 
 const Parsed = struct {
     pattern: []const u8 = "",
+    /// `-e` 或 `-f` 出现过。这时位置参数全部是路径。
+    explicit: bool = false,
+    patterns: std.ArrayList([]const u8) = .empty,
+    owned_patterns: std.ArrayList([]u8) = .empty,
     paths: std.ArrayList([]const u8) = .empty,
     line_numbers: bool = false,
     column: bool = false,
@@ -477,6 +523,15 @@ const Parsed = struct {
     max_count: ?u64 = null,
     binary: zrg.BinaryPolicy = .report,
     help: bool = false,
+
+    fn deinit(self: *Parsed, allocator: std.mem.Allocator) void {
+        for (self.owned_patterns.items) |item| allocator.free(item);
+        self.owned_patterns.deinit(allocator);
+        self.patterns.deinit(allocator);
+        self.paths.deinit(allocator);
+        self.globs.deinit(allocator);
+        self.types.deinit(allocator);
+    }
 };
 
 const ParseError = error{
@@ -484,22 +539,21 @@ const ParseError = error{
     BadNumber,
     UnknownFlag,
     NoPattern,
-    MultiplePatterns,
+    PatternFile,
     OutOfMemory,
     WriteFailed,
 };
 
-fn parse(allocator: std.mem.Allocator, argv: []const []const u8, stderr: *std.Io.Writer) ParseError!Parsed {
+fn parse(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8, stderr: *std.Io.Writer) ParseError!Parsed {
     var parsed = Parsed{};
-    errdefer parsed.paths.deinit(allocator);
-    errdefer parsed.globs.deinit(allocator);
-    errdefer parsed.types.deinit(allocator);
+    errdefer parsed.deinit(allocator);
     for (argv) |arg| {
         if (std.mem.eql(u8, arg, "--")) break;
         if (std.mem.eql(u8, arg, "--files")) parsed.files_only = true;
     }
 
-    var pattern: ?[]const u8 = null;
+    var positionals: std.ArrayList([]const u8) = .empty;
+    defer positionals.deinit(allocator);
     var end_flags = false;
     var index: usize = 0;
     while (index < argv.len) {
@@ -512,36 +566,36 @@ fn parse(allocator: std.mem.Allocator, argv: []const []const u8, stderr: *std.Io
         }
         if (!end_flags and arg.len > 1 and arg[0] == '-') {
             if (arg[1] == '-') {
-                index = try parseLong(allocator, &parsed, argv, index, stderr);
+                index = try parseLong(allocator, io, &parsed, argv, index, stderr);
             } else {
-                index = try parseShort(allocator, &parsed, &pattern, argv, index, stderr);
+                index = try parseShort(allocator, io, &parsed, argv, index, stderr);
             }
             continue;
         }
-        if (!parsed.files_only and pattern == null) {
-            pattern = arg;
-        } else {
-            try parsed.paths.append(allocator, arg);
-        }
+        try positionals.append(allocator, arg);
         index += 1;
     }
 
-    if (parsed.help or parsed.files_only) {
-        if (pattern) |text| parsed.pattern = text;
-        return parsed;
+    if (parsed.help or parsed.files_only or parsed.explicit) {
+        try parsed.paths.appendSlice(allocator, positionals.items);
+    } else if (positionals.items.len == 0) {
+        stderr.writeAll("zrg: 需要一个模式\n") catch {};
+        return error.NoPattern;
+    } else {
+        parsed.pattern = positionals.items[0];
+        try parsed.paths.appendSlice(allocator, positionals.items[1..]);
     }
-    if (pattern == null) {
+    if (!parsed.help and !parsed.files_only and parsed.explicit and parsed.patterns.items.len == 0) {
         stderr.writeAll("zrg: 需要一个模式\n") catch {};
         return error.NoPattern;
     }
-    parsed.pattern = pattern.?;
     return parsed;
 }
 
 fn parseShort(
     allocator: std.mem.Allocator,
+    io: std.Io,
     parsed: *Parsed,
-    pattern: *?[]const u8,
     argv: []const []const u8,
     index: usize,
     stderr: *std.Io.Writer,
@@ -564,7 +618,7 @@ fn parseShort(
             'a' => parsed.binary = .none,
             'F' => {},
             'l' => parsed.files_with_matches = true,
-            'A', 'B', 'C', 'm', 'e', 'j', 'g', 't' => {
+            'A', 'B', 'C', 'm', 'e', 'f', 'j', 'g', 't' => {
                 const flag = arg[k];
                 const rest = arg[k + 1 ..];
                 const value = if (rest.len != 0) rest else blk: {
@@ -575,7 +629,7 @@ fn parseShort(
                     break :blk argv[index + 1];
                 };
                 const took_next = rest.len == 0;
-                try applyShortValue(allocator, parsed, pattern, flag, value, stderr);
+                try applyShortValue(allocator, io, parsed, flag, value, stderr);
                 return index + 1 + @intFromBool(took_next);
             },
             else => {
@@ -589,8 +643,8 @@ fn parseShort(
 
 fn applyShortValue(
     allocator: std.mem.Allocator,
+    io: std.Io,
     parsed: *Parsed,
-    pattern: *?[]const u8,
     flag: u8,
     value: []const u8,
     stderr: *std.Io.Writer,
@@ -604,13 +658,8 @@ fn applyShortValue(
             parsed.after = n;
         },
         'm' => parsed.max_count = try parseU64(value, stderr),
-        'e' => {
-            if (pattern.* != null) {
-                stderr.writeAll("zrg: 目前只支持一个模式\n") catch {};
-                return error.MultiplePatterns;
-            }
-            pattern.* = value;
-        },
+        'e' => try addPattern(parsed, allocator, value),
+        'f' => try addPatternFile(parsed, allocator, io, value, stderr),
         'j' => parsed.threads = try parseU32(value, stderr),
         'g' => try parsed.globs.append(allocator, value),
         't' => try appendType(parsed, allocator, value, stderr),
@@ -618,10 +667,11 @@ fn applyShortValue(
     }
 }
 
-const LongValue = enum { after, before, context, max_count, color, threads, glob, type_name, max_depth, max_filesize };
+const LongValue = enum { after, before, context, max_count, color, threads, glob, type_name, max_depth, max_filesize, regexp, file };
 
 fn parseLong(
     allocator: std.mem.Allocator,
+    io: std.Io,
     parsed: *Parsed,
     argv: []const []const u8,
     index: usize,
@@ -668,6 +718,8 @@ fn parseLong(
             .type_name => try appendType(parsed, allocator, value, stderr),
             .max_depth => parsed.max_depth = try parseU32(value, stderr),
             .max_filesize => parsed.max_filesize = try parseSize(value, stderr),
+            .regexp => try addPattern(parsed, allocator, value),
+            .file => try addPatternFile(parsed, allocator, io, value, stderr),
         }
         return index + 1 + @intFromBool(took_next);
     }
@@ -691,7 +743,60 @@ fn longValueKind(name: []const u8) ?LongValue {
     if (std.mem.eql(u8, name, "type")) return .type_name;
     if (std.mem.eql(u8, name, "max-depth")) return .max_depth;
     if (std.mem.eql(u8, name, "max-filesize")) return .max_filesize;
+    if (std.mem.eql(u8, name, "regexp")) return .regexp;
+    if (std.mem.eql(u8, name, "file")) return .file;
     return null;
+}
+
+fn addPattern(parsed: *Parsed, allocator: std.mem.Allocator, text: []const u8) ParseError!void {
+    parsed.explicit = true;
+    const copy = try allocator.dupe(u8, text);
+    errdefer allocator.free(copy);
+    try parsed.owned_patterns.append(allocator, copy);
+    errdefer _ = parsed.owned_patterns.pop();
+    try parsed.patterns.append(allocator, copy);
+}
+
+fn addPatternFile(
+    parsed: *Parsed,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    stderr: *std.Io.Writer,
+) ParseError!void {
+    parsed.explicit = true;
+    const file = openInput(io, path) catch |err| {
+        stderr.print("zrg: 打不开模式文件 {s}：{t}\n", .{ path, err }) catch {};
+        return error.PatternFile;
+    };
+    defer file.close(io);
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(allocator);
+    var buf: [8192]u8 = undefined;
+    var off: u64 = 0;
+    while (true) {
+        var iov = [_][]u8{&buf};
+        const n = file.readPositional(io, &iov, off) catch |err| {
+            stderr.print("zrg: 打不开模式文件 {s}：{t}\n", .{ path, err }) catch {};
+            return error.PatternFile;
+        };
+        if (n == 0) break;
+        if (bytes.items.len + n > (1 << 20)) {
+            stderr.print("zrg: 模式文件太大：{s}\n", .{path}) catch {};
+            return error.PatternFile;
+        }
+        try bytes.appendSlice(allocator, buf[0..n]);
+        off += n;
+    }
+    var i: usize = 0;
+    while (i < bytes.items.len) {
+        const nl = std.mem.indexOfScalarPos(u8, bytes.items, i, '\n') orelse bytes.items.len;
+        var line = bytes.items[i..nl];
+        if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+        try addPattern(parsed, allocator, line);
+        if (nl == bytes.items.len) break;
+        i = nl + 1;
+    }
 }
 
 fn applyLongFlag(parsed: *Parsed, name: []const u8, stderr: *std.Io.Writer) ParseError!void {
@@ -1071,6 +1176,85 @@ test "目录列表和搜索排序后与 rg 一致" {
     try testing.expect(std.mem.indexOf(u8, json_text, "keep.txt") != null);
     try testing.expect(std.mem.indexOf(u8, json_text, "nope.txt") == null);
     try testing.expect(std.mem.indexOf(u8, json_text, "skip.log") == null);
+}
+
+fn expectLiteral(args: []const []const u8) !void {
+    var rg_args: std.ArrayList([]const u8) = .empty;
+    defer rg_args.deinit(testing.allocator);
+    try rg_args.appendSlice(testing.allocator, &.{ "rg", "--no-config", "--color=never" });
+    try rg_args.appendSlice(testing.allocator, args);
+    try expectArgv(args, rg_args.items);
+}
+
+fn expectArgv(z_args: []const []const u8, rg_args: []const []const u8) !void {
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var err_w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer err_w.deinit();
+    const code = execute(testing.allocator, testing.io, z_args, &out.writer, &err_w.writer);
+    const rg = try std.process.run(testing.allocator, testing.io, .{ .argv = rg_args });
+    defer testing.allocator.free(rg.stdout);
+    defer testing.allocator.free(rg.stderr);
+    const rg_code: u8 = switch (rg.term) {
+        .exited => |exited| exited,
+        else => return error.TestUnexpectedResult,
+    };
+    if (rg.stderr.len != 0) std.debug.print("rg stderr: {s}\n", .{rg.stderr});
+    if (!std.mem.eql(u8, rg.stdout, out.written())) {
+        std.debug.print("zrg:\n{s}\nrg:\n{s}\n", .{ out.written(), rg.stdout });
+    }
+    try testing.expectEqualStrings("", rg.stderr);
+    try testing.expectEqualStrings("", err_w.written());
+    try testing.expectEqualStrings(rg.stdout, out.written());
+    try testing.expectEqual(rg_code, code);
+}
+
+test "多个 -e 和 -f 与 rg 的顺序一致" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "t.txt", .data = "foobar\naaa\nfoo\nBAR\nFoo\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pats", .data = "foo\nbar\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "foo\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.txt", .data = "bar\n" });
+    const file = try pathOf(tmp.dir, "t.txt");
+    defer testing.allocator.free(file);
+    const pats = try pathOf(tmp.dir, "pats");
+    defer testing.allocator.free(pats);
+    const root = try dirRoot(tmp.dir);
+    defer testing.allocator.free(root);
+
+    try expectLiteral(&.{ "-F", "--column", "-e", "foo", "-e", "foobar", file });
+    try expectLiteral(&.{ "-F", "--column", "-e", "foobar", "-e", "foo", file });
+    try expectLiteral(&.{ "-F", "-n", "--column", "-e", "aa", "-e", "a", file });
+    try expectLiteral(&.{ "-F", "-n", "--column", "-e", "a", "-e", "aa", file });
+    try expectLiteral(&.{ "-F", "-f", pats, file });
+    try expectLiteral(&.{ "-F", "-S", "-e", "foo", "-e", "bar", file });
+    try expectLiteral(&.{ "-F", "-S", "-e", "Foo", "-e", "bar", file });
+
+    var json_out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer json_out.deinit();
+    var json_err: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer json_err.deinit();
+    const json_code = execute(testing.allocator, io, &.{ "--json", "-F", "-e", "foo", "-e", "foobar", file }, &json_out.writer, &json_err.writer);
+    try testing.expectEqual(@as(u8, 0), json_code);
+    try testing.expect(std.mem.indexOf(u8, json_out.written(), "\"text\":\"foo\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json_out.written(), "\"start\":0,\"end\":3") != null);
+    try testing.expect(std.mem.indexOf(u8, json_out.written(), "\"text\":\"foobar\"") == null);
+
+    var flipped: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer flipped.deinit();
+    var flipped_err: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer flipped_err.deinit();
+    const flipped_code = execute(testing.allocator, io, &.{ "--json", "-F", "-e", "foobar", "-e", "foo", file }, &flipped.writer, &flipped_err.writer);
+    try testing.expectEqual(@as(u8, 0), flipped_code);
+    try testing.expect(std.mem.indexOf(u8, flipped.written(), "\"text\":\"foobar\"") != null);
+    try testing.expect(std.mem.indexOf(u8, flipped.written(), "\"start\":0,\"end\":6") != null);
+
+    try expectSorted(
+        &.{ "-F", "-j", "1", "-e", "foo", "-e", "bar", root },
+        &.{ "rg", "--no-config", "--color=never", "-F", "-j", "1", "-e", "foo", "-e", "bar", root },
+    );
 }
 
 test "父目录被忽略时 git check-ignore 也拒绝再包含" {

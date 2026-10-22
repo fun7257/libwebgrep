@@ -5,7 +5,8 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const sanitize_thread = b.option(bool, "sanitize-thread", "启用 ThreadSanitizer") orelse false;
     const fuzz_filter = b.option([]const u8, "fuzz-filter", "只运行名称包含该子串的测试");
-    // 系统和 CPU 专属优化都走构建选项，默认关闭。通用路径不依赖它们。
+    // 系统和 CPU 专属优化都走构建选项。窗口映射和裸 getdents64 默认关闭。
+    // Teddy 在 aarch64 上默认 neon，其它架构默认关闭。通用路径不依赖它们。
     const want_linux_getdents = b.option(
         bool,
         "linux-getdents",
@@ -16,15 +17,38 @@ pub fn build(b: *std.Build) void {
         "mmap-windows",
         "大文件按 8 MiB 窗口映射后再搜索。默认关闭，走 readPositional",
     ) orelse false;
+    const TeddyIsa = enum { off, neon, ssse3, avx2 };
+    // aarch64 上 NEON 比稠密 DFA 快，测过之后才作为默认。x86 没有计时，仍要显式打开。
+    const teddy_default: TeddyIsa = if (target.result.cpu.arch == .aarch64) .neon else .off;
+    const teddy_request = b.option(
+        TeddyIsa,
+        "teddy",
+        "多模式 Teddy：off、neon、ssse3、avx2。aarch64 默认 neon，其他架构默认 off",
+    ) orelse teddy_default;
+    const teddy_matches = switch (teddy_request) {
+        .off => true,
+        .neon => target.result.cpu.arch == .aarch64,
+        .ssse3, .avx2 => target.result.cpu.arch == .x86_64,
+    };
+    const teddy: TeddyIsa = if (teddy_matches) teddy_request else .off;
+    // x86_64 的 Debug 走自研后端，编不出 pshufb / vpshufb。这两档改用 LLVM，不因此链接 libc。
+    // AVX2 还要打开 ymm。只加 avx2，标准库会补上它依赖的 avx 和 sse。
+    const use_llvm: ?bool = if (teddy == .ssse3 or teddy == .avx2) true else null;
+    const compile_target = if (teddy == .avx2) blk: {
+        var query = target.query;
+        query.cpu_features_add.addFeature(@backingInt(std.Target.x86.Feature.avx2));
+        break :blk b.resolveTargetQuery(query);
+    } else target;
     const linux_getdents = want_linux_getdents and target.result.os.tag == .linux;
     const options = b.addOptions();
     options.addOption(bool, "linux_getdents", linux_getdents);
     options.addOption(bool, "mmap_windows", mmap_windows);
+    options.addOption(TeddyIsa, "teddy", teddy);
     const test_filters: []const []const u8 = if (fuzz_filter) |filter| &.{filter} else &.{};
 
     const mod = b.addModule("zrg", .{
         .root_source_file = b.path("src/root.zig"),
-        .target = target,
+        .target = compile_target,
         .optimize = optimize,
         .sanitize_thread = sanitize_thread,
     });
@@ -32,9 +56,10 @@ pub fn build(b: *std.Build) void {
 
     const exe = b.addExecutable(.{
         .name = "zrg",
+        .use_llvm = use_llvm,
         .root_module = b.createModule(.{
             .root_source_file = b.path("examples/cli.zig"),
-            .target = target,
+            .target = compile_target,
             .optimize = optimize,
             .sanitize_thread = sanitize_thread,
             .imports = &.{
@@ -54,6 +79,7 @@ pub fn build(b: *std.Build) void {
         .name = "zrg-test",
         .root_module = mod,
         .filters = test_filters,
+        .use_llvm = use_llvm,
     });
     const run_lib_tests = b.addRunArtifact(lib_tests);
 
@@ -61,6 +87,7 @@ pub fn build(b: *std.Build) void {
         .name = "zrg-cli-test",
         .root_module = exe.root_module,
         .filters = test_filters,
+        .use_llvm = use_llvm,
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
@@ -80,6 +107,18 @@ pub fn build(b: *std.Build) void {
         check_step.dependOn(&fail.step);
         b.getInstallStep().dependOn(&fail.step);
     }
+    if (!teddy_matches) {
+        const message = switch (teddy_request) {
+            .neon => "-Dteddy=neon 只适用于 aarch64",
+            .ssse3 => "-Dteddy=ssse3 只适用于 x86_64",
+            .avx2 => "-Dteddy=avx2 只适用于 x86_64",
+            .off => unreachable,
+        };
+        const fail = b.addFail(message);
+        test_step.dependOn(&fail.step);
+        check_step.dependOn(&fail.step);
+        b.getInstallStep().dependOn(&fail.step);
+    }
 
     const bench_step = b.step("bench", "ReleaseFast 基准（内核微基准，随后是端到端脚本）");
     if (optimize != .fast) {
@@ -88,9 +127,10 @@ pub fn build(b: *std.Build) void {
     } else {
         const micro = b.addExecutable(.{
             .name = "zrg-bench",
+            .use_llvm = use_llvm,
             .root_module = b.createModule(.{
                 .root_source_file = b.path("bench/micro.zig"),
-                .target = target,
+                .target = compile_target,
                 .optimize = optimize,
                 .imports = &.{
                     .{ .name = "zrg", .module = mod },

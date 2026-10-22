@@ -1,6 +1,6 @@
 # 设计
 
-P0 实现内核和单个输入上的 Searcher。P1 加上目录遍历、忽略规则、并行调度、JSON Lines 和文件名列表。下面每节对应已经落地的模块。和任务说明不一致的地方写在最后，并附上本机数据。
+P0 实现内核和单个输入上的 Searcher。P1 加上目录遍历、忽略规则、并行调度、JSON Lines 和文件名列表。P2 加上多模式：单字节集合、Aho-Corasick，以及按构建选项打开的 Teddy。下面每节对应已经落地的模块。和任务说明不一致的地方写在最后，并附上本机数据。
 
 宿主是 Apple M2（8 核，8 GiB）。性能数字都来自这台机器上的 ReleaseFast，不能当成 x86_64 的结果。
 
@@ -8,7 +8,7 @@ P0 实现内核和单个输入上的 Searcher。P1 加上目录遍历、忽略�
 
 四层里目前可以用的是前三层。
 
-- 内核：`src/finder/`。在一段内存里找一个字面量。不分配，不碰 I/O。
+- 内核：`src/finder/`。在一段内存里找一个或一组字面量。单模式查找不分配。多模式的自动机在构造时分配，查找不分配。不碰 I/O。
 - Searcher：`src/searcher.zig`、`src/sink.zig`、`src/matcher.zig`。切片、`*std.Io.Reader`、已打开的文件。负责行边界、行号、上下文、反选和 NUL。
 - 编排层：`src/walk/`、`src/parallel.zig`。目录遍历、忽略规则、`std.Io.Group` 调度。
 - C ABI（P3）：`src/c_api.zig` 和 `include/zrg.h` 还没有。
@@ -53,13 +53,65 @@ P0 实现内核和单个输入上的 Searcher。P1 加上目录遍历、忽略�
 
 长于 32 字节时才可能回退。条件和 memchr 的 PrefilterState 一致：至少 50 个候选，且平均每次跳过少于 8 字节，就把 `use_two_way` 粘住，从失败候选的下一个字节继续。`prefilter_fp_threshold` 小于 1 时启用这组判断，大于等于 1 时一直留在 packed pair。默认 0.80 是启用。不超过 32 字节的模式忽略这个阈值。只统计确认失败的候选，所以这个 `f32` 实际是开关，不是 80% 的比率。`resetStats` 在每个新输入开始时清零。
 
-单个字面量下 `earliest` 和 `leftmost_first` 是同一处匹配。多模式的区分留到 P2。
+单个字面量下 `earliest` 和 `leftmost_first` 是同一处匹配。多模式的两种顺序见「多模式」。
 
 ## Matcher
 
 `find(haystack, start, mode) ?Match`。可选的 `requiredLiteral` 返回模式本身和偏移 0。Searcher 在匹配器提供这个方法时先用它预过滤，再用 `find` 验证。正则没有实现。
 
-`CaseMode` 有 `sensitive`、`insensitive`、`smart`。smart 在模式含有 `A-Z` 时区分大小写。大小写只折叠 ASCII。
+`CaseMode` 有 `sensitive`、`insensitive`、`smart`。单个模式的 smart 在该模式含有 `A-Z` 时区分大小写。多模式的 smart 看整个集合：任意一条含有 ASCII 大写，整次搜索都区分大小写。大小写只折叠 ASCII。
+
+## 多模式
+
+`src/finder/multi.zig` 的 `Multi` 持有一组字面量。模式字节由调用方持有，生命周期要盖过 `Multi`。任何一条含有 `\n` 都返回 `error.PatternHasNewline`。热路径上的 `find` 不分配。复制这个结构只复制指针。表在 `deinit` 之前只读，工人可以共享。只有创建者调用 `deinit`。`resetStats` 是空操作。
+
+`Multi.init` 按下面的顺序选实现：
+
+1. 至少一条，并且全部长度是 1：`src/finder/byteset.zig`。不分配。不超过 16 个不同字节时用 `@Vector` 比较，更多则查 256 项的表。先登记的模式编号留下。这种集合里 `earliest` 和 `leftmost_first` 是同一次命中。
+2. `-Dteddy` 不是 `off`，模式数在 1 到 32，并且没有空模式：Teddy。不分配。
+3. 其余：`src/finder/aho.zig` 的稠密 DFA。构造时分配转移表和输出链，查找不分配。空集合走这里。
+
+没有 FDR，也没有 AVX-512。
+
+### 两种顺序
+
+库的 `SearchConfig.match_mode` 默认仍是 `.earliest`。示例 CLI 在两个及以上模式时改成 `.leftmost_first`，用来对齐 `rg -F` 的列号和 JSON 子匹配。单个模式仍走 `Finder`，两种顺序结果相同，P0 和 P1 的单模式路径不经过 `Multi`。
+
+`leftmost_first` 取起点最小的那一次。同一起点上，模式列表里更靠前的那条胜出。这是 `rg -F` 在 2026-10-22 的行为：`-e foo -e foobar` 在 `foobar` 上的子匹配是 `foo`，`[0,3)`；对调之后是 `foobar`，`[0,6)`。`-e a -e aa` 在 `aaa` 上是三次 `a`；`-e aa -e a` 是 `aa` 然后 `a`。命中不重叠，下一次从 `end` 继续。
+
+`earliest` 取结束位置最小的那一次。结束位置相同则起点更小，再相同则模式编号更小。`foobar` 和 `foo` 同时能配上 `foobar` 时，`earliest` 是更早结束的 `foo`。`abcdef` 和 `de` 配 `abcdef` 时，`leftmost_first` 是 `[0,6)`，`earliest` 是 `de` 的 `[3,5)`。
+
+模式不能包含换行，所以两种顺序在「这一行有没有命中」上一致。列号是 `leftmost_first` 那次的起点，从 1 数。打印的仍是整行。
+
+### 空模式
+
+空模式匹配每个位置，包括行尾。模式文件末尾单独的一个换行不另加空模式。中间的空行，以及文件内容就是一个换行，算一条空模式。`\r\n` 去掉末尾的 `\r`。模式文件上限 1 MiB，再大则示例 CLI 报「模式文件太大」。
+
+空模式不放进自动机的转移。记下第一条空模式的编号。`earliest`，或者这条空模式就是 0 号，就在当前起点立刻返回。`leftmost_first` 在空模式不是 0 号时继续看同一起点上更靠前的非空模式。
+
+Searcher 一行上报一次，然后把位置设到这一行的结尾，所以空命中不会让文件循环空转。JSON 在子匹配的 `end` 不超过当前扫描位置时停下。全部模式都为空时，`isEmpty` 只写一个 `[0,0)`。这和 rg 按每个字节写一串空子匹配不一样，见文末偏差。
+
+### Aho-Corasick
+
+按失败函数建 trie，再收成每个状态、每个字节等价类一项的稠密转移。等价类合并「在所有状态上转移都相同」的字节。忽略 ASCII 大小写时，建 trie 和扫输入都先折叠。输出链给出到达这个状态的全部模式。实现是照 Aho 与 Corasick 1975 年的算法另写的，来源说明在 `NOTICE`。
+
+### Teddy
+
+少量模式的半字节过滤，放在 `src/finder/teddy.zig`。每 8 个模式一组，一个字节里的一位对应一个模式，最多 4 组、32 个模式。指纹长度是 `min(最短模式, 3)`，取每条模式的前几个字节。每个指纹偏移有一张 16 字节的低半字节表和一张高半字节表。忽略大小写时，两种 ASCII 形式都写进表，确认时用 `ascii.eq`。
+
+一次处理 `lanes` 个起点：把窗口里的字节拆成半字节，查表后按位与。非 0 的路再按置位确认。假阳性可以留下，漏掉才是错。剩下不足 `lanes` 字节时，标量确认全部模式。真正的输入字节不会被写成 0；只有窗口外面补的位置是 0。`earliest` 自己跟踪更早的结束位置，不用「第一个起点」当过滤器，所以更晚出现的短模式可以赢。
+
+查表指令按 ISA 分文件，只在 `-Dteddy` 对上那个架构时被分析：
+
+| 取值 | 文件 | 宽度 | 指令 | 本机状态 |
+| --- | --- | --- | --- | --- |
+| `neon` | `teddy_neon.zig` | 16 | `tbl`、`ext` | 在这台 M2 上跑过查找和移位测试 |
+| `ssse3` | `teddy_ssse3.zig` | 16 | `pshufb`、`palignr` | 只对 `x86_64-linux-musl` 交叉编译过，没有运行 |
+| `avx2` | `teddy_avx2.zig` | 32 | `vpshufb`，再用 `vperm2i128` 接上 `vpalignr` | 同上。`vpalignr` 不跨 16 字节边界，所以先把相邻两段拼成跨巷的 32 字节 |
+
+x86 的内联汇编是 AT&T，目的操作数在最后，和标准库 `sha2` 里的 `vpalignr` 相同。SSSE3 和 AVX2 的操作数顺序没有在 x86 机器上执行过。顺序如果写反，会静默漏匹配。
+
+aarch64 默认打开 `neon`。同一轮 32 MiB、10 个模式：rg 10.6 ms ± 0.3，自动机 93.4 ms ± 0.1，NEON 57.6 ms ± 0.3。NEON 比自动机快，仍然大约是 rg 的 5.5 倍。100 和 1000 个模式超过 32，继续走自动机。x86 默认 `off`，没有计时。`-Dteddy=off` 在 aarch64 上也可以强制走自动机。测量细节在 `BENCHMARKS.md`。
 
 ## Searcher
 
@@ -100,18 +152,21 @@ P0 实现内核和单个输入上的 Searcher。P1 加上目录遍历、忽略�
 
 ## 构建特性
 
-系统和 CPU 专属的优化不进默认路径。用构建选项打开，对应源文件只在选项为真时被分析。默认的 `zig build test` 不编译这两份文件。
+窗口映射和裸 `getdents64` 不进默认路径。用构建选项打开，对应源文件只在选项为真时被分析。默认的 `zig build test` 不编译这两份文件。
 
-P1 没有 CPU 分派，也没有 `-Dcpu`。向量宽度仍是 P0 的 `suggestVectorLength`。这台 M2 是 16。AVX-512、Teddy、Aho-Corasick 留到后面的阶段。
+Teddy 是多模式的 CPU 专属路径，源文件按 ISA 分开，用 `-Dteddy` 选择。aarch64 默认 `neon`，因为同一轮测量里它比稠密 DFA 快，数字见「多模式」和 `BENCHMARKS.md`。它仍然大约是 rg 的 5.5 倍。其它架构默认 `off`。x86 的两档没有计时，必须显式打开。没有运行时 CPU 分派，也没有 `-Dcpu`。向量宽度仍是 P0 的 `suggestVectorLength`。这台 M2 是 16。AVX-512 没做。
 
 | 选项 | 默认 | 源文件 | 做什么 |
 | --- | --- | --- | --- |
 | `-Dmmap-windows` | 关 | `src/io/mmap_window.zig` | 比搜索缓冲大的文件按 8 MiB、页对齐的窗口映射，再拷进已有的搜索缓冲。小于等于缓冲、或者映射失败，退回 `readPositional`。打开文件时只有 `OutOfMemory` 会传出去。 |
 | `-Dlinux-getdents` | 关 | `src/walk/linux_getdents.zig` | Linux 上用裸 `getdents64` 枚举目录。目标不是 Linux 时，`test`、`check`、`install` 失败，报错是「-Dlinux-getdents 只适用于 os 为 linux 的目标」。 |
+| `-Dteddy` | aarch64 为 `neon`，其它为 `off` | `teddy.zig`，再加 `teddy_neon.zig`、`teddy_ssse3.zig`、`teddy_avx2.zig` 里的一份 | 取值 `off`、`neon`、`ssse3`、`avx2`。`neon` 只适用于 aarch64，后两个只适用于 x86_64。架构不符时选项记成 `off`，并且 `test`、`check`、`install` 失败。报错分别是「-Dteddy=neon 只适用于 aarch64」「-Dteddy=ssse3 只适用于 x86_64」「-Dteddy=avx2 只适用于 x86_64」。 |
 
 窗口丢掉时通知内核可以回收这些页。Linux 调用 `std.os.linux.madvise`，这是系统调用，不链接 libc，所以 musl 目标不用 `-lc`。macOS 用系统 libc 里的 `madvise`。Windows 和 WASI 跳过。
 
-这两项都还没有一组端到端数字说明它们比默认路径快，所以默认关闭。默认目录枚举是 `std.Io.Dir.Reader` 加调用方的 32 KiB 缓冲。Linux 上标准库自己会走 `getdents64`，裸系统调用留着是为了以后能单独测。
+窗口映射和裸 `getdents64` 都还没有一组端到端数字说明它们比默认路径快，所以默认关闭。默认目录枚举是 `std.Io.Dir.Reader` 加调用方的 32 KiB 缓冲。Linux 上标准库自己会走 `getdents64`，裸系统调用留着是为了以后能单独测。
+
+SSSE3 和 AVX2 让可执行文件、测试和微基准改用 LLVM 后端，不因此链接 libc。自研 x86 后端编不出 `pshufb`。AVX2 还把 `avx2` 加进目标特性，否则 LLVM 分配不了 ymm。NEON 用目标自己的后端。`-Dteddy=off` 在 aarch64 上仍走自动机。
 
 文件身份不是性能开关，也不做成构建选项。`src/walk/file_id.zig` 按操作系统在编译期选择：Linux 用 `statx` 的 `EMPTY_PATH`，设备号是 `(major << 32) | minor`；其他 POSIX 用 `fstat`；Windows 的 `File.Stat` 没有设备号，设备号记 0，只用 inode。跟随符号链接时用这一对数字识别环。
 
@@ -151,7 +206,7 @@ P1 没有 CPU 分派，也没有 `-Dcpu`。向量宽度仍是 P0 的 `suggestVec
 
 Zig 0.14 起没有独立的 `@fence`。push 先用 unordered 写槽，再用 release 写 bottom。pop 用 seq_cst 写 bottom，再 seq_cst 读 top。steal 用 seq_cst 读 top，再 seq_cst 读 bottom。旧缓冲通过 `prev` 留到 `deinit`。这是按论文另写的，没有复制示例代码。
 
-`src/parallel.zig` 用 `std.Io.Group.concurrent` 起 N 个长期工人。N 为 1 时不建 Group，调用线程跑同一套循环。`-j 0` 和默认值都是 `std.Thread.getCpuCount()`。工人的返回类型要能转成 `std.Io.Cancelable!void`。每个工人有自己的 Finder、scratch 和按文件分配的输出缓冲。Finder 的模式切片指向调用方，复制是安全的。
+`src/parallel.zig` 用 `std.Io.Group.concurrent` 起 N 个长期工人。N 为 1 时不建 Group，调用线程跑同一套循环。`-j 0` 和默认值都是 `std.Thread.getCpuCount()`。工人的返回类型要能转成 `std.Io.Cancelable!void`。单个模式时，每个工人有自己的 Finder。两个及以上模式时，主线程建一个 `Multi`，工人共享这只读指针，各自持有一个空模式的 Finder 占位，并且不释放 `Multi`。创建者在工人结束之后 `deinit`。scratch 和按文件分配的输出缓冲仍是每个工人一份。模式切片指向调用方。
 
 遍历到的文件，二进制策略不是 `.none` 时改成 `.quit`。命令行上直接给出的文件仍是 `.report`，除非 `-a`。输出先攒一个文件，再拿一把 `std.Io.Mutex` 一次写出。提前停止用 `std.atomic.Value(bool)`，每个文件和每一块都看。`std.Io` 取消返回 `error.Canceled`。
 
@@ -161,7 +216,7 @@ Zig 0.14 起没有独立的 `@fence`。push 先用 unordered 写槽，再用 rel
 
 ## 打印
 
-`src/printer/json.zig` 写 JSON Lines，字段对齐 `rg --json`：begin、match、context、end、summary。没有命中的文件不写事件，调用方仍把它算进 `summary.searches`。一行里的多个命中由打印器再用 Finder 扫这一行。`lines.text` 总是补一个换行；文件末尾本来没有换行时，这里和 rg 不完全一样，所以不逐字节比较。比较的是路径、匹配文本和子匹配区间。耗时字段不必相同。`end` 里的 `bytes_printed` 目前写 0。
+`src/printer/json.zig` 写 JSON Lines，字段对齐 `rg --json`：begin、match、context、end、summary。没有命中的文件不写事件，调用方仍把它算进 `summary.searches`。打印器对匹配器是泛型，`Json` 仍是单模式 `Finder` 的别名。一行里的多个命中用同一个匹配器、按 `leftmost_first` 再扫这一行。`lines.text` 总是补一个换行；文件末尾本来没有换行时，这里和 rg 不完全一样，所以不逐字节比较。比较的是路径、匹配文本和子匹配区间。耗时字段不必相同。`end` 里的 `bytes_printed` 目前写 0。
 
 示例 CLI 在所有根结束之后写一条 summary。`parallel.Run.write_summary` 默认是 false，单次目录调用自己不写。
 
@@ -179,15 +234,17 @@ Zig 0.14 起没有独立的 `@fence`。push 先用 unordered 写槽，再用 rel
 
 模式的优先级是：`--files`，然后 `-q`，然后 `--json`，然后 `-l`，然后 `-c`，最后是文本。`--column` 和 `--json` 都会打开行号。`--binary`、`--no-config`、`--color` 被接受并忽略。`--no-config` 不会关掉 gitignore，和 rg 一样。
 
+`-e` / `--regexp` 和 `-f` / `--file` 可以重复。`-f` 一行一个模式，空行保留。出现过其中任意一个，后面的位置参数全部是路径，写在标志前面的位置参数也是路径。一条模式仍走 `Finder`。两条及以上走 `Multi`，并把 `match_mode` 设成 `leftmost_first`。示例 CLI 把 `-e` 和 `-f` 的字节复制下来，这样切片能活过解析。目录搜索会再构造一次自动机。一次只搜文件时只构造一次。打不开模式文件时报「打不开模式文件」，太大时报「模式文件太大」，模式含换行时报「模式不能包含换行」，分配失败时报「内存不足」。
+
 ## 测试
 
-`zig build test` 跑库测试和示例 CLI 测试。源码里有 80 个 `test` 声明。默认构建不编译 `src/io/mmap_window.zig`，所以跑 79 个：库 72 个，示例 CLI 7 个。`-Dmmap-windows` 多跑窗口映射那 1 个，本机通过。
+`zig build test` 跑库测试和示例 CLI 测试。源码里有 90 个 `test` 声明。`src/io/mmap_window.zig` 默认不编进测试，那 1 个不算进去。本机是 aarch64，默认 `-Dteddy=neon`，会编进 `teddy.zig` 和 `teddy_neon.zig` 各 1 个，一共 89 个：库 81 个，示例 CLI 8 个。`-Dteddy=off` 不编这两份，是 87 个。`-Dmmap-windows` 再多窗口映射那 1 个。本机默认测试和 `-Dteddy=off` 的退出码都是 0。`json.zig` 格式化之后又跑了一次默认 `zig build test`，退出码 0。`teddy_ssse3.zig` 和 `teddy_avx2.zig` 没有测试声明。
 
-示例 CLI 用临时文件对照 `rg --no-config --color=never -F -j 1`，覆盖 `-n`、`-C`、`-v`、`-c`、`-i`、`-S`、`--column`、`-m`、`-q`、`-a` 和二进制说明。目录用例在排序后对照 `--files`、字面量搜索、`-g`、`--max-depth`、`--max-filesize`、`-t`、`--no-ignore`、`-l`、`-c`。`--hidden` 期望列出 `.gitignore`，并且不列出 `.git/config`。另一则用例用 `git check-ignore` 核对父目录排除。
+示例 CLI 用临时文件对照 `rg --no-config --color=never -F -j 1`，覆盖 `-n`、`-C`、`-v`、`-c`、`-i`、`-S`、`--column`、`-m`、`-q`、`-a` 和二进制说明。目录用例在排序后对照 `--files`、字面量搜索、`-g`、`--max-depth`、`--max-filesize`、`-t`、`--no-ignore`、`-l`、`-c`。`--hidden` 期望列出 `.gitignore`，并且不列出 `.git/config`。另一则用例用 `git check-ignore` 核对父目录排除。多模式用例按字节对照 `--column` 的两种模式顺序、`-f`、`-S`，并在排序后对照目录里的 `-e`。JSON 核对 `foo` / `foobar` 的子匹配区间。
 
-`zig build test -Dsanitize-thread=true` 在这台 M2 上退出码 0，墙钟约 29 秒。队列和两个工人的测试都在里面。
+`zig build test -Dsanitize-thread=true` 是 P1 在这台 M2 上跑的，退出码 0，墙钟约 29 秒。P2 没有重跑。多模式工人共享的表在释放前只读。
 
-内核模糊测试是 P0 跑的，这一阶段没有改查找内核，没有重跑。当时三个过滤器和三个交叉编译目标一起跑完，墙钟 48 秒，退出码都是 0。对照的是标量或 `std.mem` 的朴素查找。
+单模式内核的模糊测试是 P0 跑的。P1 和 P2 都没有改那三条路径，没有重跑。当时三个过滤器和三个交叉编译目标一起跑完，墙钟 48 秒，退出码都是 0。对照的是标量或 `std.mem` 的朴素查找。
 
 | 测试 | 运行次数 | 独立输入 | 覆盖 |
 | --- | ---: | ---: | --- |
@@ -195,7 +252,18 @@ Zig 0.14 起没有独立的 `@fence`。push 先用 unordered 写槽，再用 rel
 | packed pair | 100419 | 382 | 233/9073（2.57%） |
 | Two-Way | 100429 | 394 | 207/8578（2.41%） |
 
-`zig build check` 在 `x86_64-linux-musl`、`x86_64-windows`、`aarch64-linux-musl` 上编译库、示例和测试，三个目标都通过。`-Dlinux-getdents` 在 `x86_64-linux-musl` 上能编过。在本机 macOS 上，这个选项让 `test` 失败，报错就是上面那句。`-Dmmap-windows` 在本机测试通过，并在这三个交叉目标上编过。Linux 的 `madvise` 走系统调用，musl 不需要再链接 libc。没有在那些目标上运行。
+多模式模糊测试在把模式里的每个换行都换掉之后跑过。过滤名是 `多模式模糊对照`，ReleaseFast，`--fuzz=100K`。haystack 不超过 40 字节，1 到 3 条模式。对照是标量查找，两种匹配顺序、开和关 ASCII 忽略大小写都比。工具没有打印墙钟。
+
+| 构建 | 运行次数 | 独立输入 | 覆盖 |
+| --- | ---: | ---: | --- |
+| `-Dteddy=off` | 100447 | 412 | 526/8791 |
+| `-Dteddy=neon` | 100385 | 328 | 641/8922 |
+
+两次退出码都是 0。
+
+`zig build check` 在 `x86_64-linux-musl`、`x86_64-windows`、`aarch64-linux-musl` 上编译库、示例和测试，三个目标都通过。aarch64 那次是默认 `neon`，所以编译了 NEON Teddy。`-Dteddy=ssse3` 和 `-Dteddy=avx2` 对 `x86_64-linux-musl` 的 `check` 也通过，用的是 LLVM，AVX2 加了目标特性。这两档没有在 x86 上运行。`-Dlinux-getdents` 在 `x86_64-linux-musl` 上能编过。在本机 macOS 上，这个选项让 `test` 失败，报错就是上面那句。`-Dmmap-windows` 在本机测试通过，并在这三个交叉目标上编过。Linux 的 `madvise` 走系统调用，musl 不需要再链接 libc。
+
+`zig build test -Dtarget=aarch64-linux -fqemu` 退出码 1。Zig 0.17 只在宿主操作系统和目标操作系统相同、CPU 不同时选择 qemu。本机是 aarch64-macos，目标是 aarch64-linux，操作系统不同，不会调用 qemu。本机的 Homebrew qemu 11.1.2 只有 `qemu-system-*`，没有用户态 `qemu-aarch64`。构建生成了静态的 aarch64 Linux ELF，没有运行。交叉编译的证据是上面的 `check`。
 
 ## 和任务说明的偏差
 
@@ -213,12 +281,19 @@ Zig 0.14 起没有独立的 `@fence`。push 先用 unordered 写槽，再用 rel
 12. 本机没有 x86 吞吐数据。`zig build check` 已确认 `x86_64-linux-musl`、`x86_64-windows`、`aarch64-linux-musl` 能编过，没有在那些目标上跑测试。
 13. `-i` 在这份 ASCII 文件上比 rg 快，是因为 zrg 只做 ASCII 折叠，rg 的 `-i` 做更多。Unicode 大小写还没有做。
 14. `--hidden` 仍然跳过名为 `.git` 的条目。这是有意的，比 rg 严。测试把这个差固定下来。
-15. P1 没有按 CPU 特性分派。没有 `-Dcpu`。
+15. 没有运行时 CPU 分派，也没有 `-Dcpu`。Teddy 按构建选项选 ISA，数字在第 22 条。
 16. `-Dlinux-getdents` 和 `-Dmmap-windows` 默认关闭。前者在非 Linux 目标上直接让构建失败。窗口映射在 Linux 上用 `madvise` 系统调用，避免 musl 目标去链接 libc。
 17. `--max-filesize` 的后缀按 1024，只认一个 `K`、`M` 或 `G`。
 18. Chase-Lev 用 seq_cst 负载和存储代替独立栅栏，因为 Zig 0.14 起没有 `@fence`。
 19. JSON 的 summary 由示例 CLI 在全部根结束之后写一条。单次 `parallel.run` 默认不写。`end.stats.bytes_printed` 写 0。
 20. Windows 上的文件身份没有设备号，环检测只看 inode。同一卷上的不同文件 inode 不同；跨卷时设备号都是 0。
 21. 不读全局 `core.excludesFile`。
+22. 多模式比 rg 慢。32 MiB、10 个模式的同一轮里，rg 10.6 ms ± 0.3，自动机 93.4 ms ± 0.1，NEON Teddy 57.6 ms ± 0.3。NEON 大约是 rg 的 5.5 倍。因为它比自动机快，aarch64 默认打开。100 和 1000 个模式超过 Teddy 的 32 条上限，仍走自动机，分别是 94.4 ms ± 0.4 和 98.7 ms ± 0.3，rg 是 13.0 ms ± 0.2 和 12.7 ms ± 0.2。x86 的 Teddy 默认关闭，没有计时。
+23. `leftmost_first` 在同一起点上取得更早加入的模式，不是更长的那条。列号和 JSON 子匹配用这个顺序。库默认仍是 `earliest`。
+24. 空模式的 JSON 在长度为零时停下，全部为空时只写一个 `[0,0)`。rg 会按位置写出一串空子匹配。文本输出一行只报一次。
+25. SSSE3 和 AVX2 只交叉编译过。`vpalignr` 的操作数顺序没有在 x86 上执行。写反会静默漏匹配。
+26. `aarch64-linux` 的测试二进制没有跑起来。`-fqemu` 在 macOS 上不会调用用户态 qemu，本机也没有 `qemu-aarch64`。
+27. 目录搜索会再构造一次 `Multi`。示例 CLI 在解析时已经构造过一次。单文件基准只走前一次。
+28. 单模式路径保持 `Finder`。`Multi` 不参与 1 GiB 那几组，那些数字没有重测。
 
-还没做：Teddy、Aho-Corasick、C ABI、UTF-16、真正的压缩包读取、Unicode 折叠表。`src/source.zig` 只定了接口和一个内存目录。
+还没做：C ABI、UTF-16、真正的压缩包读取、Unicode 折叠表、FDR、AVX-512、运行时 CPU 分派。`src/source.zig` 只定了接口和一个内存目录。

@@ -46,6 +46,8 @@ test "默认搜索配置" {
 pub const memchr = @import("finder/memchr.zig");
 pub const finder = @import("finder/finder.zig");
 pub const Finder = finder.Finder;
+pub const multi = @import("finder/multi.zig");
+pub const Multi = multi.Multi;
 
 test {
     _ = @import("matcher.zig");
@@ -59,6 +61,18 @@ test {
     _ = @import("finder/frequency.zig");
     _ = @import("finder/packed_pair.zig");
     _ = @import("finder/finder.zig");
+    _ = @import("finder/byteset.zig");
+    _ = @import("finder/aho.zig");
+    _ = @import("finder/multi.zig");
+    if (@import("build_options").teddy != .off) {
+        _ = @import("finder/teddy.zig");
+        switch (@import("build_options").teddy) {
+            .neon => _ = @import("finder/teddy_neon.zig"),
+            .ssse3 => _ = @import("finder/teddy_ssse3.zig"),
+            .avx2 => _ = @import("finder/teddy_avx2.zig"),
+            .off => {},
+        }
+    }
 }
 
 pub const two_way = @import("finder/two_way.zig");

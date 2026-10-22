@@ -16,6 +16,7 @@ const files_printer = @import("printer/files.zig");
 const json_printer = @import("printer/json.zig");
 const count_printer = @import("printer/count.zig");
 const text_printer = @import("printer/text.zig");
+const multi_mod = @import("finder/multi.zig");
 const searcher = @import("searcher.zig");
 const walker = @import("walk/walker.zig");
 
@@ -41,6 +42,8 @@ pub const Stats = struct {
 
 pub const Run = struct {
     pattern: []const u8 = "",
+    /// 多于一个时走多模式。空切片表示只用 `pattern`。
+    patterns: []const []const u8 = &.{},
     find: matcher.FindOptions = .{},
     roots: []const []const u8,
     search: searcher.SearchConfig = .{},
@@ -67,6 +70,8 @@ const Shared = struct {
     search: searcher.SearchConfig,
     emit: Emit,
     finder: finder_mod.Finder,
+    /// 非 null 时工人共享这一份只读自动机，不再使用 `finder`。
+    many: ?*multi_mod.Multi = null,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
     column: bool,
@@ -169,7 +174,15 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, req: Run) !Stats {
     try session.prepareGlobs(io, req.walk.globs);
 
     const started = std.Io.Timestamp.now(io, .awake);
-    const finder = try finder_mod.Finder.init(req.pattern, req.find);
+    var many: ?multi_mod.Multi = null;
+    defer if (many) |*engine| engine.deinit();
+    if (req.patterns.len > 1) {
+        many = try multi_mod.Multi.init(allocator, req.patterns, req.find);
+    }
+    const finder = if (many != null)
+        try finder_mod.Finder.init("", .{})
+    else
+        try finder_mod.Finder.init(req.pattern, req.find);
     var shared = Shared{
         .allocator = allocator,
         .io = io,
@@ -179,6 +192,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, req: Run) !Stats {
         .search = req.search,
         .emit = req.emit,
         .finder = finder,
+        .many = if (many) |*engine| engine else null,
         .stdout = req.stdout,
         .stderr = req.stderr,
         .column = req.column,
@@ -403,6 +417,11 @@ fn printPath(worker: *Worker, path: []const u8) !void {
 }
 
 fn searchOpen(worker: *Worker, file: std.Io.File, path: []const u8, size: u64) !void {
+    if (worker.shared.many) |many| return searchWith(worker, many, file, path, size);
+    return searchWith(worker, &worker.finder, file, path, size);
+}
+
+fn searchWith(worker: *Worker, engine: anytype, file: std.Io.File, path: []const u8, size: u64) !void {
     worker.buf.clearRetainingCapacity();
     const cfg = worker.config();
     const started = std.Io.Timestamp.now(worker.shared.io, .awake);
@@ -414,7 +433,7 @@ fn searchOpen(worker: *Worker, file: std.Io.File, path: []const u8, size: u64) !
                 .show_path = true,
                 .column = worker.shared.column,
             };
-            const result = try searcher.searchFile(text_printer.Text, worker.shared.allocator, worker.shared.io, &sink, file, path, &worker.finder, cfg);
+            const result = try searcher.searchFile(text_printer.Text, worker.shared.allocator, worker.shared.io, &sink, file, path, engine, cfg);
             if (sink.write_error) |err| return err;
             const bytes = worker.buf.written();
             try worker.flush(bytes);
@@ -422,7 +441,7 @@ fn searchOpen(worker: *Worker, file: std.Io.File, path: []const u8, size: u64) !
         },
         .count => {
             var sink = count_printer.Count{ .writer = &worker.buf.writer, .show_path = true };
-            const result = try searcher.searchFile(count_printer.Count, worker.shared.allocator, worker.shared.io, &sink, file, path, &worker.finder, cfg);
+            const result = try searcher.searchFile(count_printer.Count, worker.shared.allocator, worker.shared.io, &sink, file, path, engine, cfg);
             if (sink.write_error) |err| return err;
             const bytes = worker.buf.written();
             try worker.flush(bytes);
@@ -430,7 +449,7 @@ fn searchOpen(worker: *Worker, file: std.Io.File, path: []const u8, size: u64) !
         },
         .files_with_matches => {
             var sink = files_printer.Files{ .writer = &worker.buf.writer };
-            const result = try searcher.searchFile(files_printer.Files, worker.shared.allocator, worker.shared.io, &sink, file, path, &worker.finder, cfg);
+            const result = try searcher.searchFile(files_printer.Files, worker.shared.allocator, worker.shared.io, &sink, file, path, engine, cfg);
             if (sink.write_error) |err| return err;
             const bytes = worker.buf.written();
             try worker.flush(bytes);
@@ -438,16 +457,17 @@ fn searchOpen(worker: *Worker, file: std.Io.File, path: []const u8, size: u64) !
         },
         .quiet => {
             var sink = Quiet{ .stop = &worker.shared.stop };
-            const result = try searcher.searchFile(Quiet, worker.shared.allocator, worker.shared.io, &sink, file, path, &worker.finder, cfg);
+            const result = try searcher.searchFile(Quiet, worker.shared.allocator, worker.shared.io, &sink, file, path, engine, cfg);
             worker.shared.addSearch(result, result.matched_lines, size, 0);
         },
         .json => {
-            var sink = json_printer.Json{
+            const JsonSink = json_printer.Printer(@TypeOf(engine.*));
+            var sink = JsonSink{
                 .writer = &worker.buf.writer,
-                .finder = &worker.finder,
+                .finder = engine,
                 .bytes_searched = size,
             };
-            const result = try searcher.searchFile(json_printer.Json, worker.shared.allocator, worker.shared.io, &sink, file, path, &worker.finder, cfg);
+            const result = try searcher.searchFile(JsonSink, worker.shared.allocator, worker.shared.io, &sink, file, path, engine, cfg);
             if (sink.write_error) |err| return err;
             const elapsed = elapsedNanos(started.durationTo(std.Io.Timestamp.now(worker.shared.io, .awake)));
             if (sink.started and !sink.writeEnd(elapsed)) {
@@ -559,5 +579,36 @@ test "两个工人不会丢匹配" {
     });
     try testing.expectEqual(@as(u64, 4), stats.matched_lines);
     try testing.expectEqual(@as(u64, 3), stats.searches_with_match);
+    try testing.expectEqual(@as(u32, 0), stats.errors);
+}
+
+test "目录搜索共享只读的多模式自动机" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "foobar\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.txt", .data = "nope\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "c.txt", .data = "bar\n" });
+
+    const root = try tempRoot(tmp.dir);
+    defer testing.allocator.free(root);
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var err_w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer err_w.deinit();
+    var saw = false;
+    const stats = try run(testing.allocator, io, .{
+        .patterns = &.{ "foo", "bar" },
+        .roots = &.{root},
+        .search = .{ .match_mode = .leftmost_first },
+        .walk = .{ .threads = 1 },
+        .emit = .count,
+        .stdout = &out.writer,
+        .stderr = &err_w.writer,
+        .saw_output = &saw,
+    });
+    try testing.expectEqual(@as(u64, 2), stats.matched_lines);
+    try testing.expectEqual(@as(u64, 2), stats.searches_with_match);
+    try testing.expectEqual(@as(u64, 3), stats.searches);
     try testing.expectEqual(@as(u32, 0), stats.errors);
 }

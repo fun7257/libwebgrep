@@ -10,191 +10,203 @@ const std = @import("std");
 const Finder = @import("../finder/finder.zig").Finder;
 const sink = @import("../sink.zig");
 
-pub const Json = struct {
-    writer: *std.Io.Writer,
-    finder: *Finder,
-    path: []const u8 = "",
-    started: bool = false,
-    matched_lines: u64 = 0,
-    matches: u64 = 0,
-    binary_offset: ?u64 = null,
-    bytes_searched: u64 = 0,
-    write_error: ?std.Io.Writer.Error = null,
+pub fn Printer(comptime M: type) type {
+    return struct {
+        const Self = @This();
 
-    pub fn begin(self: *Json, path: []const u8) bool {
-        self.path = path;
-        self.started = false;
-        self.matched_lines = 0;
-        self.matches = 0;
-        self.binary_offset = null;
-        self.write_error = null;
-        return true;
-    }
+        writer: *std.Io.Writer,
+        finder: *M,
+        path: []const u8 = "",
+        started: bool = false,
+        matched_lines: u64 = 0,
+        matches: u64 = 0,
+        binary_offset: ?u64 = null,
+        bytes_searched: u64 = 0,
+        write_error: ?std.Io.Writer.Error = null,
 
-    pub fn matched(self: *Json, line: sink.Line) bool {
-        if (!self.ensureBegin()) return false;
-        if (!self.writeLine("match", line, true)) return false;
-        self.matched_lines += 1;
-        return true;
-    }
+        pub fn begin(self: *Self, path: []const u8) bool {
+            self.path = path;
+            self.started = false;
+            self.matched_lines = 0;
+            self.matches = 0;
+            self.binary_offset = null;
+            self.write_error = null;
+            return true;
+        }
 
-    pub fn context(self: *Json, line: sink.Line) bool {
-        if (!self.ensureBegin()) return false;
-        return self.writeLine("context", line, false);
-    }
+        pub fn matched(self: *Self, line: sink.Line) bool {
+            if (!self.ensureBegin()) return false;
+            if (!self.writeLine("match", line, true)) return false;
+            self.matched_lines += 1;
+            return true;
+        }
 
-    pub fn binary(self: *Json, offset: u64) bool {
-        self.binary_offset = offset;
-        return true;
-    }
+        pub fn context(self: *Self, line: sink.Line) bool {
+            if (!self.ensureBegin()) return false;
+            return self.writeLine("context", line, false);
+        }
 
-    pub fn finish(self: *Json, result: sink.Result) bool {
-        if (result.nul_offset) |offset| self.binary_offset = offset;
-        return self.write_error == null;
-    }
+        pub fn binary(self: *Self, offset: u64) bool {
+            self.binary_offset = offset;
+            return true;
+        }
 
-    pub fn writeEnd(self: *Json, elapsed_ns: u64) bool {
-        if (!self.started or self.write_error != null) return self.write_error == null;
-        self.writer.writeAll("{\"type\":\"end\",\"data\":{\"path\":{\"text\":") catch |err| {
-            self.write_error = err;
-            return false;
-        };
-        writeJsonString(self.writer, self.path) catch |err| {
-            self.write_error = err;
-            return false;
-        };
-        self.writer.writeAll("},\"binary_offset\":") catch |err| {
-            self.write_error = err;
-            return false;
-        };
-        writeOptionalU64(self.writer, self.binary_offset) catch |err| {
-            self.write_error = err;
-            return false;
-        };
-        self.writer.writeAll(",\"stats\":{") catch |err| {
-            self.write_error = err;
-            return false;
-        };
-        writeStats(self.writer, elapsed_ns, .{
-            .searches = 1,
-            .searches_with_match = if (self.matched_lines > 0) 1 else 0,
-            .bytes_searched = self.bytes_searched,
-            .bytes_printed = 0,
-            .matched_lines = self.matched_lines,
-            .matches = self.matches,
-        }) catch |err| {
-            self.write_error = err;
-            return false;
-        };
-        self.writer.writeAll("}}}\n") catch |err| {
-            self.write_error = err;
-            return false;
-        };
-        return true;
-    }
+        pub fn finish(self: *Self, result: sink.Result) bool {
+            if (result.nul_offset) |offset| self.binary_offset = offset;
+            return self.write_error == null;
+        }
 
-    fn ensureBegin(self: *Json) bool {
-        if (self.started) return true;
-        self.started = true;
-        self.writer.writeAll("{\"type\":\"begin\",\"data\":{\"path\":{\"text\":") catch |err| {
-            self.write_error = err;
-            return false;
-        };
-        writeJsonString(self.writer, self.path) catch |err| {
-            self.write_error = err;
-            return false;
-        };
-        self.writer.writeAll("}}}\n") catch |err| {
-            self.write_error = err;
-            return false;
-        };
-        return true;
-    }
-
-    fn writeLine(self: *Json, kind: []const u8, line: sink.Line, with_matches: bool) bool {
-        self.writer.print("{{\"type\":\"{s}\",\"data\":{{\"path\":{{\"text\":", .{kind}) catch |err| {
-            self.write_error = err;
-            return false;
-        };
-        writeJsonString(self.writer, self.path) catch |err| {
-            self.write_error = err;
-            return false;
-        };
-        self.writer.writeAll("},\"lines\":{\"text\":") catch |err| {
-            self.write_error = err;
-            return false;
-        };
-        writeJsonStringNewline(self.writer, line.bytes) catch |err| {
-            self.write_error = err;
-            return false;
-        };
-        self.writer.writeAll("},\"line_number\":") catch |err| {
-            self.write_error = err;
-            return false;
-        };
-        writeOptionalU64(self.writer, line.number) catch |err| {
-            self.write_error = err;
-            return false;
-        };
-        self.writer.print(",\"absolute_offset\":{d},\"submatches\":", .{line.offset}) catch |err| {
-            self.write_error = err;
-            return false;
-        };
-        if (with_matches) {
-            self.writeSubmatches(line) catch |err| {
+        pub fn writeEnd(self: *Self, elapsed_ns: u64) bool {
+            if (!self.started or self.write_error != null) return self.write_error == null;
+            self.writer.writeAll("{\"type\":\"end\",\"data\":{\"path\":{\"text\":") catch |err| {
                 self.write_error = err;
                 return false;
             };
-        } else {
-            self.writer.writeAll("[]") catch |err| {
+            writeJsonString(self.writer, self.path) catch |err| {
                 self.write_error = err;
                 return false;
             };
+            self.writer.writeAll("},\"binary_offset\":") catch |err| {
+                self.write_error = err;
+                return false;
+            };
+            writeOptionalU64(self.writer, self.binary_offset) catch |err| {
+                self.write_error = err;
+                return false;
+            };
+            self.writer.writeAll(",\"stats\":{") catch |err| {
+                self.write_error = err;
+                return false;
+            };
+            writeStats(self.writer, elapsed_ns, .{
+                .searches = 1,
+                .searches_with_match = if (self.matched_lines > 0) 1 else 0,
+                .bytes_searched = self.bytes_searched,
+                .bytes_printed = 0,
+                .matched_lines = self.matched_lines,
+                .matches = self.matches,
+            }) catch |err| {
+                self.write_error = err;
+                return false;
+            };
+            self.writer.writeAll("}}}\n") catch |err| {
+                self.write_error = err;
+                return false;
+            };
+            return true;
         }
-        self.writer.writeAll("}}\n") catch |err| {
-            self.write_error = err;
-            return false;
-        };
-        return true;
-    }
 
-    fn writeSubmatches(self: *Json, line: sink.Line) !void {
-        try self.writer.writeByte('[');
-        if (line.match == null) {
-            try self.writer.writeByte(']');
-            return;
+        fn ensureBegin(self: *Self) bool {
+            if (self.started) return true;
+            self.started = true;
+            self.writer.writeAll("{\"type\":\"begin\",\"data\":{\"path\":{\"text\":") catch |err| {
+                self.write_error = err;
+                return false;
+            };
+            writeJsonString(self.writer, self.path) catch |err| {
+                self.write_error = err;
+                return false;
+            };
+            self.writer.writeAll("}}}\n") catch |err| {
+                self.write_error = err;
+                return false;
+            };
+            return true;
         }
-        if (self.finder.pattern.len == 0) {
-            try writeSubmatch(self.writer, "", 0, 0);
-            self.matches += 1;
-            try self.writer.writeByte(']');
-            return;
-        }
-        var pos: usize = 0;
-        var first = true;
-        while (pos <= line.bytes.len) {
-            const found = self.finder.find(line.bytes, pos, .earliest) orelse break;
-            if (!first) try self.writer.writeByte(',');
-            first = false;
-            const end = @max(found.end, found.start);
-            const text = if (end <= line.bytes.len) line.bytes[found.start..end] else "";
-            try writeSubmatch(self.writer, text, found.start, end);
-            self.matches += 1;
-            if (found.end <= pos) break;
-            pos = found.end;
-            if (pos >= line.bytes.len) break;
-        }
-        if (first) {
-            if (line.match) |span| {
-                const end = @min(span.end, line.bytes.len);
-                const start = @min(span.start, end);
-                try writeSubmatch(self.writer, line.bytes[start..end], start, span.end);
-                self.matches += 1;
+
+        fn writeLine(self: *Self, kind: []const u8, line: sink.Line, with_matches: bool) bool {
+            self.writer.print("{{\"type\":\"{s}\",\"data\":{{\"path\":{{\"text\":", .{kind}) catch |err| {
+                self.write_error = err;
+                return false;
+            };
+            writeJsonString(self.writer, self.path) catch |err| {
+                self.write_error = err;
+                return false;
+            };
+            self.writer.writeAll("},\"lines\":{\"text\":") catch |err| {
+                self.write_error = err;
+                return false;
+            };
+            writeJsonStringNewline(self.writer, line.bytes) catch |err| {
+                self.write_error = err;
+                return false;
+            };
+            self.writer.writeAll("},\"line_number\":") catch |err| {
+                self.write_error = err;
+                return false;
+            };
+            writeOptionalU64(self.writer, line.number) catch |err| {
+                self.write_error = err;
+                return false;
+            };
+            self.writer.print(",\"absolute_offset\":{d},\"submatches\":", .{line.offset}) catch |err| {
+                self.write_error = err;
+                return false;
+            };
+            if (with_matches) {
+                self.writeSubmatches(line) catch |err| {
+                    self.write_error = err;
+                    return false;
+                };
+            } else {
+                self.writer.writeAll("[]") catch |err| {
+                    self.write_error = err;
+                    return false;
+                };
             }
+            self.writer.writeAll("}}\n") catch |err| {
+                self.write_error = err;
+                return false;
+            };
+            return true;
         }
-        try self.writer.writeByte(']');
-    }
-};
+
+        fn writeSubmatches(self: *Self, line: sink.Line) !void {
+            try self.writer.writeByte('[');
+            if (line.match == null) {
+                try self.writer.writeByte(']');
+                return;
+            }
+            if (matcherIsEmpty(self.finder)) {
+                try writeSubmatch(self.writer, "", 0, 0);
+                self.matches += 1;
+                try self.writer.writeByte(']');
+                return;
+            }
+            var pos: usize = 0;
+            var first = true;
+            while (pos <= line.bytes.len) {
+                const found = self.finder.find(line.bytes, pos, .leftmost_first) orelse break;
+                if (!first) try self.writer.writeByte(',');
+                first = false;
+                const end = @max(found.end, found.start);
+                const text = if (end <= line.bytes.len) line.bytes[found.start..end] else "";
+                try writeSubmatch(self.writer, text, found.start, end);
+                self.matches += 1;
+                if (found.end <= pos) break;
+                pos = found.end;
+                if (pos >= line.bytes.len) break;
+            }
+            if (first) {
+                if (line.match) |span| {
+                    const end = @min(span.end, line.bytes.len);
+                    const start = @min(span.start, end);
+                    try writeSubmatch(self.writer, line.bytes[start..end], start, span.end);
+                    self.matches += 1;
+                }
+            }
+            try self.writer.writeByte(']');
+        }
+    };
+}
+
+pub const Json = Printer(Finder);
+
+fn matcherIsEmpty(finder: anytype) bool {
+    const T = @TypeOf(finder.*);
+    if (@hasDecl(T, "isEmpty")) return finder.isEmpty();
+    return finder.pattern.len == 0;
+}
 
 pub const Totals = struct {
     searches: u64,

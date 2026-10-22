@@ -32,6 +32,8 @@ test "默认搜索配置" {
 }
 
 pub const memchr = @import("finder/memchr.zig");
+pub const finder = @import("finder/finder.zig");
+pub const Finder = finder.Finder;
 
 test {
     _ = @import("matcher.zig");
@@ -42,6 +44,7 @@ test {
     _ = @import("finder/ascii.zig");
     _ = @import("finder/frequency.zig");
     _ = @import("finder/packed_pair.zig");
+    _ = @import("finder/finder.zig");
 }
 
 pub const two_way = @import("finder/two_way.zig");

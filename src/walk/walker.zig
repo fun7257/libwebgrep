@@ -5,7 +5,6 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
-const file_id = @import("file_id.zig");
 const glob = @import("glob.zig");
 const ignore = @import("ignore.zig");
 const list_dir = @import("list_dir.zig");
@@ -13,7 +12,6 @@ const types = @import("types.zig");
 
 pub const Config = struct {
     hidden: bool = false,
-    follow_symlinks: bool = false,
     read_ignore: bool = true,
     /// null 表示不限制。1 只看起始目录里的文件，0 什么也不列。和 rg 的 `--max-depth` 一致。
     max_depth: ?u32 = null,
@@ -56,7 +54,6 @@ pub const Job = struct {
     rel: []u8,
     ignore: *const ignore.Set,
     depth: u32,
-    ancestors: []file_id.Id,
     allocator: std.mem.Allocator,
     /// 非 null 时这个任务只搜这些文件名，不再列目录。名字由本任务释放。
     files: ?[][]u8 = null,
@@ -68,7 +65,6 @@ pub const Job = struct {
         }
         self.dir.close(io);
         self.allocator.free(self.rel);
-        if (self.ancestors.len != 0) self.allocator.free(self.ancestors);
         self.allocator.destroy(self);
     }
 };
@@ -124,7 +120,23 @@ pub fn createRoot(host: *Host, root_path: []const u8) !*Job {
     const dir = try openRoot(host.io, shown);
     errdefer dir.close(host.io);
     const base = loadExclude(host, shown) catch &host.session.empty;
-    return createJob(host, dir, shown, "", base, 1, &.{});
+    return createJob(host, dir, shown, "", base, 1);
+}
+
+/// 打开目录和 stat 的默认行为会解析符号链接。遍历必须关掉这类布尔选项，
+/// 否则子目录或 `.git` 可能把读取带到调用方交给库的根外面。
+fn withoutLinkResolve(options: anytype) @TypeOf(options) {
+    var out = options;
+    const info = @typeInfo(@TypeOf(options)).@"struct";
+    comptime var found = false;
+    inline for (info.field_names, info.field_types) |field_name, field_type| {
+        if (comptime field_type == bool and std.mem.endsWith(u8, field_name, "symlinks")) {
+            found = true;
+            @field(out, field_name) = false;
+        }
+    }
+    if (comptime !found) @compileError("目录选项里没有可关闭的符号链接解析");
+    return out;
 }
 
 pub fn process(host: *Host, job: *Job) void {
@@ -139,7 +151,7 @@ pub fn process(host: *Host, job: *Job) void {
                 report(host, job, name, error.NameTooLong);
                 continue;
             };
-            visitFile(host, job, name, rel, &scratch, null);
+            visitFile(host, job, name, rel, &scratch);
         }
         return;
     }
@@ -194,7 +206,7 @@ fn flushFiles(host: *Host, job: *Job, batch: *FileBatch) void {
         for (names) |name| {
             var rel_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
             const rel = joinRel(&rel_buf, job.rel, name) catch continue;
-            visitFile(host, job, name, rel, &scratch, null);
+            visitFile(host, job, name, rel, &scratch);
         }
         return;
     };
@@ -205,7 +217,7 @@ fn flushFiles(host: *Host, job: *Job, batch: *FileBatch) void {
         for (names) |name| {
             var rel_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
             const rel = joinRel(&rel_buf, job.rel, name) catch continue;
-            visitFile(host, job, name, rel, &scratch, null);
+            visitFile(host, job, name, rel, &scratch);
         }
     };
 }
@@ -225,24 +237,26 @@ fn handleEntry(host: *Host, job: *Job, entry: std.Io.Dir.Entry, batch: *FileBatc
 
     switch (entry.kind) {
         .directory => {
-            const child_dir = job.dir.openDir(host.io, name, .{
-                .iterate = true,
-                .follow_symlinks = false,
-            }) catch |err| {
+            const child_dir = job.dir.openDir(
+                host.io,
+                name,
+                withoutLinkResolve(std.Io.Dir.OpenOptions{ .iterate = true }),
+            ) catch |err| {
                 report(host, job, name, err);
                 return;
             };
-            descend(host, job, name, rel, &scratch, child_dir, null);
+            descend(host, job, name, rel, &scratch, child_dir);
         },
         .file => {
             if (host.config.threads > 1 and !ignore.isIgnored(job.ignore, rel, false, &scratch) and allowFile(host, rel) and types.matches(host.config.types, name)) {
                 batch.names[batch.len] = name;
                 batch.len += 1;
             } else {
-                visitFile(host, job, name, rel, &scratch, null);
+                visitFile(host, job, name, rel, &scratch);
             }
         },
-        .sym_link => if (host.config.follow_symlinks) followLink(host, job, name, rel, &scratch),
+        // 链接本身不进入。目标即使在搜索根内也不读，遍历也不能顺着链接越出根。
+        .sym_link => {},
         else => {},
     }
 }
@@ -254,7 +268,6 @@ fn descend(
     rel: []const u8,
     scratch: []u8,
     child_dir: std.Io.Dir,
-    known: ?file_id.Id,
 ) void {
     if (ignore.isIgnored(job.ignore, rel, true, scratch) or blockDirectory(host, rel)) {
         child_dir.close(host.io);
@@ -266,22 +279,7 @@ fn descend(
             return;
         }
     }
-    var ancestors = job.ancestors;
-    var owned_ancestors: ?[]file_id.Id = null;
-    defer if (owned_ancestors) |ids| host.allocator.free(ids);
-    if (known) |id| {
-        if (seen(job.ancestors, id)) {
-            child_dir.close(host.io);
-            return;
-        }
-        owned_ancestors = extendAncestors(host.allocator, job.ancestors, id) catch |err| {
-            child_dir.close(host.io);
-            report(host, job, name, err);
-            return;
-        };
-        ancestors = owned_ancestors.?;
-    }
-    const child = createJob(host, child_dir, job.root, rel, job.ignore, job.depth + 1, ancestors) catch |err| {
+    const child = createJob(host, child_dir, job.root, rel, job.ignore, job.depth + 1) catch |err| {
         child_dir.close(host.io);
         report(host, job, name, err);
         return;
@@ -298,21 +296,22 @@ fn visitFile(
     name: []const u8,
     rel: []const u8,
     scratch: []u8,
-    size_override: ?u64,
 ) void {
     if (ignore.isIgnored(job.ignore, rel, false, scratch)) return;
     if (!allowFile(host, rel)) return;
     if (!types.matches(host.config.types, name)) return;
 
-    var size = size_override orelse 0;
+    var size: u64 = 0;
     if (host.config.max_filesize) |limit| {
-        if (size_override == null) {
-            const stat = job.dir.statFile(host.io, name, .{}) catch |err| {
-                report(host, job, name, err);
-                return;
-            };
-            size = stat.size;
-        }
+        const stat = job.dir.statFile(
+            host.io,
+            name,
+            withoutLinkResolve(std.Io.Dir.StatFileOptions{}),
+        ) catch |err| {
+            report(host, job, name, err);
+            return;
+        };
+        size = stat.size;
         if (size > limit) return;
     }
 
@@ -331,32 +330,6 @@ fn visitFile(
         return;
     };
     if (control == .stop) host.stop.store(true, .release);
-}
-
-fn followLink(host: *Host, job: *Job, name: []const u8, rel: []const u8, scratch: []u8) void {
-    const stat = job.dir.statFile(host.io, name, .{ .follow_symlinks = true }) catch |err| {
-        report(host, job, name, err);
-        return;
-    };
-    switch (stat.kind) {
-        .directory => {
-            const opened = job.dir.openDir(host.io, name, .{
-                .iterate = true,
-                .follow_symlinks = true,
-            }) catch |err| {
-                report(host, job, name, err);
-                return;
-            };
-            const id = file_id.fromFile(host.io, .{ .handle = opened.handle, .flags = .{ .nonblocking = false } }) catch |err| {
-                opened.close(host.io);
-                report(host, job, name, err);
-                return;
-            };
-            descend(host, job, name, rel, scratch, opened, id);
-        },
-        .file => visitFile(host, job, name, rel, scratch, stat.size),
-        else => {},
-    }
 }
 
 fn duplicateDir(dir: std.Io.Dir) ?std.Io.Dir {
@@ -389,7 +362,6 @@ fn createFileJob(host: *Host, parent: *Job, names: []const []const u8) !*Job {
         .rel = rel_copy,
         .ignore = parent.ignore,
         .depth = parent.depth,
-        .ancestors = &.{},
         .allocator = host.allocator,
         .files = owned,
     };
@@ -403,15 +375,11 @@ fn createJob(
     rel: []const u8,
     parent: *const ignore.Set,
     depth: u32,
-    ancestors: []const file_id.Id,
 ) !*Job {
     const job = try host.allocator.create(Job);
     errdefer host.allocator.destroy(job);
     const rel_copy = try host.allocator.dupe(u8, rel);
     errdefer host.allocator.free(rel_copy);
-    const ancestor_copy = try host.allocator.alloc(file_id.Id, ancestors.len);
-    errdefer if (ancestor_copy.len != 0) host.allocator.free(ancestor_copy);
-    @memcpy(ancestor_copy, ancestors);
     const rules = try loadRules(host, dir, parent, rel_copy.len);
     job.* = .{
         .dir = dir,
@@ -419,7 +387,6 @@ fn createJob(
         .rel = rel_copy,
         .ignore = rules,
         .depth = depth,
-        .ancestors = ancestor_copy,
         .allocator = host.allocator,
     };
     return job;
@@ -493,7 +460,7 @@ fn readExclude(host: *Host, root_path: []const u8) !?ExcludeFile {
     while (true) {
         const git = try std.fmt.allocPrint(host.allocator, "{s}/.git", .{abs});
         defer host.allocator.free(git);
-        if (std.Io.Dir.cwd().statFile(host.io, git, .{ .follow_symlinks = false })) |stat| {
+        if (std.Io.Dir.cwd().statFile(host.io, git, withoutLinkResolve(std.Io.Dir.StatFileOptions{}))) |stat| {
             if (stat.kind == .directory) {
                 const exclude = try std.fmt.allocPrint(host.allocator, "{s}/.git/info/exclude", .{abs});
                 defer host.allocator.free(exclude);
@@ -575,18 +542,6 @@ fn trimSlash(path: []const u8) []const u8 {
     return path[0..end];
 }
 
-fn seen(ancestors: []const file_id.Id, id: file_id.Id) bool {
-    for (ancestors) |old| if (old.eql(id)) return true;
-    return false;
-}
-
-fn extendAncestors(allocator: std.mem.Allocator, parent: []const file_id.Id, id: file_id.Id) ![]file_id.Id {
-    const out = try allocator.alloc(file_id.Id, parent.len + 1);
-    @memcpy(out[0..parent.len], parent);
-    out[parent.len] = id;
-    return out;
-}
-
 fn report(host: *Host, job: *Job, name: []const u8, err: anyerror) void {
     var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const rel = joinRel(&buf, job.rel, name) catch job.rel;
@@ -661,4 +616,82 @@ test "遍历跳过 gitignore、隐藏文件和 .git" {
 
     try std.testing.expectEqual(@as(usize, 1), found.items.len);
     try std.testing.expect(std.mem.endsWith(u8, found.items[0], "/keep.txt"));
+}
+
+fn countWalkError(ctx: *anyopaque, path: []const u8, err: anyerror) void {
+    const n: *usize = @ptrCast(@alignCast(ctx));
+    n.* += 1;
+    std.debug.print("walk {s}: {t}\n", .{ path, err });
+}
+
+test "符号链接不跟随，也不越出搜索根" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "outside.txt", .data = "outside" });
+    try tmp.dir.createDir(io, "escaped", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "escaped/secret.txt", .data = "secret" });
+    try tmp.dir.createDir(io, "root", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "root/inside.txt", .data = "inside" });
+    try tmp.dir.createDir(io, "root/sub", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "root/sub/nested.txt", .data = "nested" });
+    try tmp.dir.symLink(io, "inside.txt", "root/link_inside", .{});
+    try tmp.dir.symLink(io, "../outside.txt", "root/link_outside", .{});
+    try tmp.dir.symLink(io, "sub", "root/link_sub", .{ .is_directory = true });
+    try tmp.dir.symLink(io, "../escaped", "root/link_dir", .{ .is_directory = true });
+    try tmp.dir.symLink(io, "nested.txt", "root/sub/link_nested", .{});
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPathFile(io, "root", &path_buf);
+    const root = path_buf[0..path_len];
+
+    var session = Session.init(std.testing.allocator);
+    defer session.deinit();
+    var stop = std.atomic.Value(bool).init(false);
+    var stack: std.ArrayList(*Job) = .empty;
+    defer stack.deinit(std.testing.allocator);
+    var found: std.ArrayList([]u8) = .empty;
+    defer {
+        for (found.items) |item| std.testing.allocator.free(item);
+        found.deinit(std.testing.allocator);
+    }
+    var errors: usize = 0;
+    var host = Host{
+        .allocator = std.testing.allocator,
+        .io = io,
+        .config = .{},
+        .session = &session,
+        .stop = &stop,
+        .push = noopPush,
+        .push_ctx = &stack,
+        .on_file = collectFile,
+        .file_ctx = &found,
+        .on_error = countWalkError,
+        .error_ctx = &errors,
+    };
+    const job = try createRoot(&host, root);
+    try stack.append(std.testing.allocator, job);
+    while (stack.pop()) |item| process(&host, item);
+
+    try std.testing.expectEqual(@as(usize, 0), errors);
+    const expected = [_][]const u8{ "inside.txt", "sub/nested.txt" };
+    try std.testing.expectEqual(expected.len, found.items.len);
+    var matched = std.mem.zeroes([expected.len]bool);
+    for (found.items) |path| {
+        try std.testing.expect(std.mem.startsWith(u8, path, root));
+        try std.testing.expect(path.len > root.len and path[root.len] == '/');
+        const rel = path[root.len + 1 ..];
+        var ok = false;
+        for (expected, 0..) |want, i| {
+            if (!std.mem.eql(u8, rel, want)) continue;
+            try std.testing.expect(!matched[i]);
+            matched[i] = true;
+            ok = true;
+        }
+        if (!ok) {
+            std.debug.print("unexpected walk path: {s}\n", .{path});
+            return error.TestUnexpectedResult;
+        }
+    }
+    for (matched) |hit| try std.testing.expect(hit);
 }

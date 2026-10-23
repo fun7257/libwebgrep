@@ -54,7 +54,7 @@ pub const Run = struct {
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
     column: bool = false,
-    /// 文本上下文分组之间写 `--`。
+    /// 保留给调用方。库内不再为分组写出分隔文本。
     use_separator: bool = false,
     saw_output: *bool,
     /// 为真时在结束时写一条 JSON summary。调用方要自己汇总多次调用时保持默认，不写。
@@ -141,12 +141,6 @@ const Worker = struct {
         if (bytes.len == 0) return;
         self.shared.lock.lockUncancelable(self.shared.io);
         defer self.shared.lock.unlock(self.shared.io);
-        if (self.shared.use_separator and self.shared.saw.*) {
-            self.shared.stdout.writeAll("--\n") catch |err| {
-                self.shared.write_failed.store(true, .release);
-                return err;
-            };
-        }
         self.shared.stdout.writeAll(bytes) catch |err| {
             self.shared.write_failed.store(true, .release);
             return err;

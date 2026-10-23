@@ -28,6 +28,11 @@ pub const Result = sink_mod.Result;
 pub const Outcome = sink_mod.Outcome;
 pub const LimitHit = sink_mod.LimitHit;
 pub const SoftError = sink_mod.SoftError;
+pub const Flow = sink_mod.Flow;
+pub const Summary = sink_mod.Summary;
+pub const Progress = sink_mod.Progress;
+pub const Heartbeat = sink_mod.Heartbeat;
+pub const ResumeState = sink_mod.ResumeState;
 
 pub const BinaryPolicy = searcher.BinaryPolicy;
 pub const Encoding = searcher.Encoding;
@@ -37,11 +42,8 @@ pub const searchReader = searcher.searchReader;
 pub const searchFile = searcher.searchFile;
 pub const searchSource = searcher.searchSource;
 pub const searchSourceSlice = searcher.searchSourceSlice;
-
-pub const text_printer = @import("printer/text.zig");
-pub const count_printer = @import("printer/count.zig");
-pub const TextPrinter = text_printer.Text;
-pub const CountPrinter = count_printer.Count;
+pub const resumeSourceSlice = searcher.resumeSourceSlice;
+pub const openSourcePull = searcher.openSourcePull;
 
 test "默认搜索配置" {
     const cfg: SearchConfig = .{};
@@ -71,8 +73,7 @@ test {
     _ = @import("matcher.zig");
     _ = @import("sink.zig");
     _ = @import("searcher.zig");
-    _ = @import("printer/text.zig");
-    _ = @import("printer/count.zig");
+    _ = @import("ndjson_fixture.zig");
     _ = @import("finder/memchr.zig");
     _ = @import("finder/two_way.zig");
     _ = @import("finder/ascii.zig");
@@ -105,8 +106,6 @@ pub const walk_types = @import("walk/types.zig");
 pub const walk_list = @import("walk/list_dir.zig");
 pub const walker = @import("walk/walker.zig");
 pub const parallel = @import("parallel.zig");
-pub const json_printer = @import("printer/json.zig");
-pub const files_printer = @import("printer/files.zig");
 
 test {
     _ = @import("source.zig");
@@ -118,6 +117,4 @@ test {
     _ = @import("walk/list_dir.zig");
     _ = @import("walk/walker.zig");
     _ = @import("parallel.zig");
-    _ = @import("printer/json.zig");
-    _ = @import("printer/files.zig");
 }

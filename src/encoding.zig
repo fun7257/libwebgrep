@@ -104,6 +104,17 @@ pub fn utf16Span(bytes: []const u8, start: usize, end: usize) Utf16Span {
     return .{ .start = u16_start, .end = u16_end };
 }
 
+/// 转成可搜索字节之后的长度。原始字节原样返回输入长度。
+pub fn decodedSize(kind: Sniff, input: []const u8) usize {
+    const mode: coded_mode = switch (kind) {
+        .utf8 => .utf8,
+        .utf16le => .utf16le,
+        .utf16be => .utf16be,
+        else => return input.len,
+    };
+    return convertedLen(mode, input);
+}
+
 pub fn convertAlloc(allocator: std.mem.Allocator, kind: Sniff, input: []const u8) error{OutOfMemory}![]u8 {
     const mode: coded_mode = switch (kind) {
         .utf8 => .utf8,
@@ -130,6 +141,8 @@ pub const Decoder = struct {
     out_i: usize = 0,
     raw_buf: []u8 = &.{},
     saw_eof: bool = false,
+    /// 解码输入缓冲的字节上限。超过就返回 `DecodeLimit`，不再扩容。
+    max_in: usize = std.math.maxInt(usize),
 
     const Mode = enum { undecided, raw, utf8, utf16le, utf16be };
 
@@ -325,10 +338,11 @@ pub const Decoder = struct {
         return n;
     }
 
-    fn appendIn(self: *Decoder, allocator: std.mem.Allocator, bytes: []const u8) !void {
+    fn appendIn(self: *Decoder, allocator: std.mem.Allocator, bytes: []const u8) error{ OutOfMemory, DecodeLimit }!void {
         if (bytes.len == 0) return;
         self.compactIn();
         const need = self.in_len + bytes.len;
+        if (need > self.max_in) return error.DecodeLimit;
         if (self.in.len < need) {
             const cap = @max(need, if (self.in.len == 0) need else self.in.len * 2);
             if (self.in.len == 0) {
@@ -397,7 +411,7 @@ fn PullError(comptime readFn: anytype) type {
         .error_union => |eu| eu.error_set,
         else => error{},
     };
-    return set || error{OutOfMemory};
+    return set || error{ OutOfMemory, DecodeLimit };
 }
 
 fn prefixAscii(bytes: []const u8, end: usize) bool {

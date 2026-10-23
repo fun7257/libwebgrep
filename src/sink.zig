@@ -17,7 +17,23 @@ pub const Span = struct {
     u16_end: usize = 0,
 };
 
+/// 这次搜索为什么停下。`decompressed_bytes` 先留在这里，解压实现之前不会由扫描自己累计。
+pub const LimitHit = enum {
+    none,
+    max_results,
+    max_bytes,
+    deadline,
+    decompressed_bytes,
+    cancelled,
+};
+
+/// 单个来源上的软错误。只有这一个标签，里面没有路径，也没有系统调用细节。
+pub const SoftError = enum {
+    read_failed,
+};
+
 /// 一次搜索的结果。`binary_offset` 和 `nul_offset` 都是这次输入里第一次看到 NUL 的绝对偏移。
+/// 致命错误走函数的 error。软错误、有匹配、无匹配都是成功返回的结果，靠下面的字段区分。
 pub const Result = struct {
     outcome: Outcome = .complete,
     /// `matched` 被调用的次数。计数打印器和退出码用它。
@@ -28,6 +44,14 @@ pub const Result = struct {
     nul_offset: ?u64 = null,
     /// 实际读过的字节。目录搜索用它记账，不再为了这个数对每个文件 `fstat`。
     bytes_read: u64 = 0,
+    /// 预算或取消让搜索停下时的原因。正常扫完是 `none`。
+    limit_hit: LimitHit = .none,
+    /// 计数没有把输入扫完。预算或取消在看到结尾之前停下时为真。
+    partial: bool = false,
+    /// 下次可以从这个可搜索字节偏移接着搜。只在 `max_results` 停下时有值。
+    resume_at: ?u64 = null,
+    /// 这个来源读失败。搜索调用本身仍然成功返回。
+    soft_error: ?SoftError = null,
 };
 
 /// 一个输入的结束原因。
@@ -37,6 +61,68 @@ pub const Outcome = enum {
     stopped,
     binary_quit,
     binary_matched,
+};
+
+/// 这一次来源上的二进制状态。
+pub const BinaryStatus = enum {
+    /// 没有按二进制处理。没看到 NUL，或者调用方要求按文本处理。
+    none,
+    /// 看到了 NUL。继续确认有没有匹配，但是不返回行内容。
+    detected,
+    /// 看到了 NUL。停止读取，后面的内容不再交给调用方。
+    suppressed,
+};
+
+/// 服务入口上的一行。`bytes`、`text`、`raw`、`matches` 只在本次回调期间有效。
+pub const LineEvent = struct {
+    /// 调用方分配的来源标识。库不解释它。
+    source_id: []const u8,
+    /// 从 1 开始。NUL 记录模式是记录号。
+    line_number: u64,
+    /// 从 1 开始的字节列，按 `bytes` 计。没有匹配时为 null。和 `u16_column` 是两个数。
+    column: ?u64 = null,
+    /// 按起点排序后，第一个匹配的 UTF-16 列，从 1 开始。没有匹配时为 null。
+    u16_column: ?u64 = null,
+    /// 这一行起点在可搜索字节流里的绝对偏移。
+    absolute_offset: u64,
+    bytes: []const u8,
+    text: []const u8 = &.{},
+    raw: []const u8 = &.{},
+    /// 半开字节区间，相对 `bytes`，按起点排序。
+    /// 只显示命中片段时用这些区间切 `bytes`。没有单独的片段输出模式。
+    /// core 只给出区间，不插入颜色码或标记。
+    matches: []const Span = &.{},
+    truncated: bool = false,
+    /// 去掉分隔符之后的原始内容长度。
+    line_len: u64 = 0,
+    /// `bytes` 在原始行内容里的起点。
+    window_start: u64 = 0,
+    binary_status: BinaryStatus = .none,
+};
+
+/// 一个来源结束。没有命中时也会产生。
+pub const EndEvent = struct {
+    source_id: []const u8,
+    binary_status: BinaryStatus = .none,
+    binary_offset: ?u64 = null,
+    matched_lines: u64 = 0,
+    bytes_read: u64 = 0,
+    outcome: Outcome = .complete,
+    limit_hit: LimitHit = .none,
+    partial: bool = false,
+    resume_at: ?u64 = null,
+    soft_error: ?SoftError = null,
+};
+
+/// 服务入口的事件。每产生一个就回调一次，不把多行攒起来再交。
+/// begin、match、context、end 都只带来源标识。
+pub const Event = union(enum) {
+    begin: struct { source_id: []const u8 },
+    match: LineEvent,
+    context: LineEvent,
+    /// 上下文不连续。不是一段分隔文本。
+    context_break: struct { source_id: []const u8 },
+    end: EndEvent,
 };
 
 /// 交给 Sink 的一行。
@@ -59,7 +145,15 @@ pub const Line = struct {
     /// 超长行时 `bytes` 是窗口，区间相对窗口。
     match: ?Span,
     /// 匹配起点的 UTF-16 列，从 1 开始。没有匹配时为 null。
+    /// 这是发现这一行的那次匹配，和按起点排序后的字节列分开。
     u16_column: ?u64 = null,
+    /// 这一行的全部匹配，相对 `bytes`，按起点排序。只在本次回调期间有效。
+    /// 只显示命中片段时用这些区间。core 不另做片段输出，也不插入颜色或标记。
+    matches: []const Span = &.{},
+    /// 从 1 开始的字节列，按 `bytes` 计，取 `matches` 里起点最小的那次。没有匹配时为 null。
+    column: ?u64 = null,
+    /// 交出行时已经知道的二进制状态。
+    binary_status: BinaryStatus = .none,
     /// 原始行长于单行上限时为真。`bytes` 只是窗口。
     truncated: bool = false,
     /// 去掉分隔符（以及 LF 模式下行尾一个 CR）之后的原始内容长度。

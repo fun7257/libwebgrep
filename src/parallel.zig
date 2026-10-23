@@ -1,3 +1,6 @@
+//! 这不是服务入口。`Run.roots` 只给目录遍历用，N7 会从公共 API 去掉。
+//! 服务入口是 `searcher.searchSource` 和 `searcher.searchSourceSlice`。
+//!
 //! 目录搜索的调度。每个工人有自己的 Chase-Lev 队列、Finder 和搜索缓冲。
 //!
 //! 工人从自己的队列尾部取任务（后进先出），从别人的队列头部偷（先进先出）。
@@ -453,6 +456,10 @@ fn printPath(worker: *Worker, path: []const u8) !void {
     _ = worker.shared.bytes_printed.fetchAdd(bytes.len, .monotonic);
 }
 
+fn noteSoft(worker: *Worker, path: []const u8, result: searcher.Result) void {
+    if (result.soft_error != null) worker.shared.note(path, error.ReadFailed);
+}
+
 fn searchOpen(worker: *Worker, file: std.Io.File, path: []const u8) !void {
     if (worker.shared.many) |many| return searchWith(worker, many, file, path);
     return searchWith(worker, &worker.finder, file, path);
@@ -471,6 +478,7 @@ fn searchWith(worker: *Worker, engine: anytype, file: std.Io.File, path: []const
                 .column = worker.shared.column,
             };
             const result = try searcher.searchFile(text_printer.Text, worker.shared.allocator, worker.shared.io, &sink, file, path, engine, cfg);
+            noteSoft(worker, path, result);
             if (sink.write_error) |err| return err;
             const bytes = worker.buf.written();
             try worker.flush(bytes);
@@ -479,6 +487,7 @@ fn searchWith(worker: *Worker, engine: anytype, file: std.Io.File, path: []const
         .count => {
             var sink = count_printer.Count{ .writer = &worker.buf.writer, .show_path = true };
             const result = try searcher.searchFile(count_printer.Count, worker.shared.allocator, worker.shared.io, &sink, file, path, engine, cfg);
+            noteSoft(worker, path, result);
             if (sink.write_error) |err| return err;
             const bytes = worker.buf.written();
             try worker.flush(bytes);
@@ -487,6 +496,7 @@ fn searchWith(worker: *Worker, engine: anytype, file: std.Io.File, path: []const
         .files_with_matches => {
             var sink = files_printer.Files{ .writer = &worker.buf.writer };
             const result = try searcher.searchFile(files_printer.Files, worker.shared.allocator, worker.shared.io, &sink, file, path, engine, cfg);
+            noteSoft(worker, path, result);
             if (sink.write_error) |err| return err;
             const bytes = worker.buf.written();
             try worker.flush(bytes);
@@ -495,16 +505,16 @@ fn searchWith(worker: *Worker, engine: anytype, file: std.Io.File, path: []const
         .quiet => {
             var sink = Quiet{ .shared = worker.shared };
             const result = try searcher.searchFile(Quiet, worker.shared.allocator, worker.shared.io, &sink, file, path, engine, cfg);
+            noteSoft(worker, path, result);
             worker.shared.addSearch(result, result.matched_lines, result.bytes_read, 0);
         },
         .json => {
-            const JsonSink = json_printer.Printer(@TypeOf(engine.*));
-            var sink = JsonSink{
+            var sink = json_printer.Json{
                 .writer = &worker.buf.writer,
-                .finder = engine,
                 .bytes_searched = 0,
             };
-            const result = try searcher.searchFile(JsonSink, worker.shared.allocator, worker.shared.io, &sink, file, path, engine, cfg);
+            const result = try searcher.searchFile(json_printer.Json, worker.shared.allocator, worker.shared.io, &sink, file, path, engine, cfg);
+            noteSoft(worker, path, result);
             if (sink.write_error) |err| return err;
             sink.bytes_searched = result.bytes_read;
             const elapsed = elapsedNanos(started.durationTo(std.Io.Timestamp.now(worker.shared.io, .awake)));

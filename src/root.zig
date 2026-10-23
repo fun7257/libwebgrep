@@ -17,11 +17,17 @@ pub const FindOptions = matcher.FindOptions;
 
 pub const Span = sink_mod.Span;
 pub const Line = sink_mod.Line;
+pub const BinaryStatus = sink_mod.BinaryStatus;
+pub const Event = sink_mod.Event;
+pub const LineEvent = sink_mod.LineEvent;
+pub const EndEvent = sink_mod.EndEvent;
 pub const AnySink = sink_mod.AnySink;
 pub const anyVtable = sink_mod.anyVtable;
 pub const SliceIter = sink_mod.SliceIter;
 pub const Result = sink_mod.Result;
 pub const Outcome = sink_mod.Outcome;
+pub const LimitHit = sink_mod.LimitHit;
+pub const SoftError = sink_mod.SoftError;
 
 pub const BinaryPolicy = searcher.BinaryPolicy;
 pub const Encoding = searcher.Encoding;
@@ -29,6 +35,8 @@ pub const SearchConfig = searcher.SearchConfig;
 pub const searchSlice = searcher.searchSlice;
 pub const searchReader = searcher.searchReader;
 pub const searchFile = searcher.searchFile;
+pub const searchSource = searcher.searchSource;
+pub const searchSourceSlice = searcher.searchSourceSlice;
 
 pub const text_printer = @import("printer/text.zig");
 pub const count_printer = @import("printer/count.zig");
@@ -44,6 +52,12 @@ test "默认搜索配置" {
     try std.testing.expect(!cfg.null_data);
     try std.testing.expectEqual(MatchMode.earliest, cfg.match_mode);
     try std.testing.expect(cfg.max_count == null);
+    try std.testing.expect(cfg.max_source_bytes == null);
+    try std.testing.expect(cfg.max_request_bytes == null);
+    try std.testing.expect(cfg.time_budget_ns == null);
+    try std.testing.expect(cfg.cancel == null);
+    try std.testing.expect(!cfg.exists);
+    try std.testing.expect(cfg.max_concurrency == null);
 }
 
 pub const memchr = @import("finder/memchr.zig");

@@ -51,8 +51,8 @@ pub const Text = struct {
     }
 
     pub fn contextBreak(self: *Text) bool {
+        // 断点是这次回调。打印器不写分隔文本。
         if (self.suppress) return true;
-        if (!self.raw("--\n")) return false;
         self.wrote_line = true;
         return true;
     }
@@ -168,7 +168,6 @@ test "文本：行号、上下文、列号和路径" {
         \\2-b
         \\3:MATCH
         \\4-c
-        \\--
         \\6-e
         \\7:MATCH2
         \\8-f
@@ -226,15 +225,15 @@ test "文本：空行、无结尾换行、CRLF" {
 }
 
 test "文本：小文件里的 NUL 只报告一句" {
-    var out = try run("xxMATCH\x00yy\n", "MATCH", .{ .line_numbers = true }, false, false, "bin.txt");
+    var out = try run("xxMATCH\x00yy\n", "MATCH", .{ .line_numbers = true, .binary = .report }, false, false, "bin.txt");
     defer out.deinit();
     try testing.expectEqualStrings("binary file matches (found \"\\0\" byte around offset 7)\n", out.written());
 
-    var headed = try run("xxMATCH\x00yy\n", "MATCH", .{}, true, false, "bin.txt");
+    var headed = try run("xxMATCH\x00yy\n", "MATCH", .{ .binary = .report }, true, false, "bin.txt");
     defer headed.deinit();
     try testing.expectEqualStrings("bin.txt: binary file matches (found \"\\0\" byte around offset 7)\n", headed.written());
 
-    var miss = try run("xx\x00yy\n", "MATCH", .{}, false, false, "");
+    var miss = try run("xx\x00yy\n", "MATCH", .{ .binary = .report }, false, false, "");
     defer miss.deinit();
     try testing.expectEqualStrings("", miss.written());
 

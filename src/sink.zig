@@ -14,11 +14,14 @@ pub const Span = struct {
     end: usize,
 };
 
-/// 一次搜索的结果。`nul_offset` 是这次输入里第一次看到 NUL 的绝对偏移。
+/// 一次搜索的结果。`binary_offset` 和 `nul_offset` 都是这次输入里第一次看到 NUL 的绝对偏移。
 pub const Result = struct {
     outcome: Outcome = .complete,
     /// `matched` 被调用的次数。计数打印器和退出码用它。
     matched_lines: u64 = 0,
+    /// 检测到 NUL 时的绝对偏移。没有 NUL 就是 null。
+    binary_offset: ?u64 = null,
+    /// 与 `binary_offset` 相同。
     nul_offset: ?u64 = null,
     /// 实际读过的字节。目录搜索用它记账，不再为了这个数对每个文件 `fstat`。
     bytes_read: u64 = 0,
@@ -43,7 +46,14 @@ pub const Line = struct {
     number: ?u64,
     /// 相对 `bytes`。普通上下文行和反选命中行没有匹配区间。
     /// 反选时，被当作上下文印出的模式行会带上区间，供列号使用。
+    /// 超长行时 `bytes` 是窗口，区间相对窗口。
     match: ?Span,
+    /// 原始行长于单行上限时为真。`bytes` 只是窗口。
+    truncated: bool = false,
+    /// 去掉换行和行尾一个 CR 之后的原始内容长度。
+    line_len: u64 = 0,
+    /// `bytes` 在原始行内容里的起点。
+    window_start: u64 = 0,
 };
 
 /// 运行时多态的 Sink。本身满足 comptime Sink 的方法形状，可以直接传给 `search`。
@@ -188,6 +198,7 @@ pub fn SliceIter(comptime M: type) type {
                 .offset = start,
                 .number = number,
                 .match = .{ .start = mstart, .end = mend },
+                .line_len = content_end - start,
             };
         }
     };

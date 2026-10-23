@@ -149,7 +149,7 @@ aarch64 默认打开 `neon`，因为空窗口跳过之后 NEON 比稠密自动�
 
 `Line.bytes` 指向内部缓冲或调用方切片，回调返回后不能再留着。同时给出绝对偏移、可选行号和行内匹配区间。一行里的全部匹配在 `Line.matches`，按起点排序。
 
-服务入口是 `searchSource` 和 `searchSourceSlice`。调用方传入 reader 或内存切片，以及自己分配的来源标识。事件是 begin、match、context、context_break、end，每个都只带来源标识。行号默认打开。`searchFile` 和 `parallel.run` 不是服务入口，N7 移除。
+服务入口是 `searchSource` 和 `searchSourceSlice`。调用方传入 reader 或内存切片，以及自己分配的来源标识。事件是 begin、match、context、context_break、end，每个都只带来源标识。行号默认打开。`src/root.zig` 不导出 `searchFile`、`parallel.run` 和 `walker.openRoot`。
 
 `AnySink` 是同一组方法的虚表。适配按方法名在编译期生成：没有额外参数的方法收成一个参数，其余收成两个。Searcher 用 `callOpt` 调用可选方法，方法名是编译期参数。`SliceIter` 是单输入、无上下文的拉式适配。
 
@@ -165,7 +165,7 @@ aarch64 默认打开 `neon`，因为空窗口跳过之后 NEON 比稠密自动�
 
 | 选项 | 默认 | 源文件 | 做什么 |
 | --- | --- | --- | --- |
-| `-Dmmap-windows` | 关 | `src/io/mmap_window.zig` | 比搜索缓冲大的文件按 8 MiB、页对齐的窗口映射，再拷进已有的搜索缓冲。小于等于缓冲、或者映射失败，退回 `readPositional`。打开文件时只有 `OutOfMemory` 会传出去。 |
+| `-Dmmap-windows` | 关 | `src/io/window_map.zig` | 比搜索缓冲大的文件按 8 MiB、页对齐的窗口映射，再拷进已有的搜索缓冲。小于等于缓冲、或者映射失败，退回 `readPositional`。打开文件时只有 `OutOfMemory` 会传出去。 |
 | `-Dlinux-getdents` | 关 | `src/walk/linux_getdents.zig` | Linux 上用裸 `getdents64` 枚举目录。目标不是 Linux 时，`test`、`check`、`install` 失败，报错是「-Dlinux-getdents 只适用于 os 为 linux 的目标」。 |
 | `-Dteddy` | aarch64 为 `neon`，其它为 `off` | `teddy.zig`，再加 `teddy_neon.zig`、`teddy_ssse3.zig`、`teddy_avx2.zig` 里的一份 | 取值 `off`、`neon`、`ssse3`、`avx2`。`neon` 只适用于 aarch64，后两个只适用于 x86_64。架构不符时选项记成 `off`，并且 `test`、`check`、`install` 失败。报错分别是「-Dteddy=neon 只适用于 aarch64」「-Dteddy=ssse3 只适用于 x86_64」「-Dteddy=avx2 只适用于 x86_64」。 |
 
@@ -184,29 +184,29 @@ SSSE3 和 AVX2 让可执行文件、测试和微基准改用 LLVM 后端，不�
 - 仓库里没有 AMX、`pthread_set_qos_class_self_np`，也没有按统一内存改映射的实现。Darwin 上 `hw.perflevel0.physicalcpu` 大于 0 且小于逻辑 CPU 数时，默认工人数用性能核数。目录搜索要等最慢的工人。显式传入的线程数原样使用。
 - 文件映射在 macOS 上不作为默认。顺序访问的建议也没有做。默认路径保持 `readPositional`。整文件映射会把驻留撑到文件大小。
 
-文件身份不是性能开关，也不做成构建选项。`src/walk/file_id.zig` 按操作系统在编译期选择：Linux 用 `statx` 的 `EMPTY_PATH`，设备号是 `(major << 32) | minor`；其他 POSIX 用 `fstat`；Windows 的 `File.Stat` 没有设备号，设备号记 0，只用 inode。跟随符号链接时用这一对数字识别环。
+文件身份不是性能开关，也不做成构建选项。`src/walk/file_id.zig` 按操作系统在编译期选择：Linux 用 `statx` 的 `EMPTY_PATH`，设备号是 `(major << 32) | minor`；其他 POSIX 用 `fstat`；Windows 的 `File.Stat` 没有设备号，设备号记 0，只用 inode。遍历用设备号判断子目录是不是另一块文件系统。Windows 上设备号是 0，这项比较不起作用。
 
 ## 目录遍历
 
 `src/walk/walker.zig` 从搜索根往下走。路径按字节拼接，不假定 UTF-8。
 
 - 默认跳过以 `.` 开头的名字。名为 `.git` 的条目始终跳过，包括一个叫 `.git` 的普通文件，也包括 `--hidden`。这比 rg 严：`rg --hidden --files` 会列出 `.git/config`，libwebgrep 不会。`.gitignore` 在 `--hidden` 下会列出来。
-- 默认不跟随符号链接。`--follow` 才跟随，目录用设备号加 inode 防环。
+- 默认不跟随符号链接，也没有打开它的字段。目录用设备号判断是否还在同一块文件系统上，默认不跨过去。
 - `--max-depth`：起始目录的深度是 1。0 什么也不列。当前深度的文件仍然列出，子目录在深度达到上限时不再进入。
-- `max_filesize` 只作用于遍历发现的文件。大小等于上限的留下，大于上限的跳过。调用方传入字节数。直接交给 `searchFile` 的文件不套这个上限。
+- 每个来源的大小上限和扫描字节上限是同一个数。遍历里大于它的文件直接跳过；调用方直接给出的流读到这个上限也停。大小等于上限的文件留下。
 - 打不开的目录记一笔并继续。读不了的忽略文件跳过，不中断遍历。`LineTooLong` 记入错误并继续。错误交给 `on_error`。
 
 显示路径：根 `foo` 加相对路径 `a/b` 得到 `foo/a/b`。根是 `.` 时保留 `./` 前缀，用来对齐 rg。其它根不额外加 `./`。末尾的 `/` 和 `\\` 会去掉，只保留单独的根分隔符。
 
 ## 忽略规则
 
-`src/walk/ignore.zig` 解析 gitignore 的一个子集：注释、行首转义、`!`、尾部 `/`、锚定的 `/`、不跨 `/` 的 `*` 和 `?`、`**/`、字符类。同一份文件里后写的胜出。更深的目录覆盖父目录。同一目录先读 `.gitignore`，再读 `.ignore`，所以 `.ignore` 胜出。`.git/info/exclude` 挂在最外层，路径相对仓库根。不读全局 `core.excludesFile`。
+`src/walk/ignore.zig` 解析 gitignore 的一个子集：注释、行首转义、`!`、尾部 `/`、锚定的 `/`、不跨 `/` 的 `*` 和 `?`、`**/`、字符类。同一份文件里后写的胜出。更深的目录覆盖父目录。同一目录先读 `.gitignore`，再读 `.ignore`，所以 `.ignore` 胜出。不读取搜索根之上的规则，也不读全局忽略，这两项没有开关。
 
 父目录被排除之后，里面的文件不能被重新包含。`dir/` 会挡住 `!dir/keep.txt`。`*.log` 后面的 `!keep.log` 可以带回 `keep.log` 和 `sub/keep.log`，因为父目录本身没有被排除。这和 `git check-ignore` 一致，也和 `rg --files` 一致。
 
 一次搜索用一个 arena 持有这些集合。发布时用 `std.Io.Mutex`（`lockUncancelable`）。发布之后工人只读。任务自己持有路径字节和 `Dir`，弹出它的工人负责释放。子目录的规则在子任务入队之前发布。
 
-搜索根上面还有仓库时，exclude 规则要先接上仓库相对前缀。接不上调用方的临时缓冲就按忽略处理。
+搜索根之上的忽略文本不会被读进来。根里面的 `.gitignore` 和 `.ignore` 仍由遍历加载；有没有总开关留给后面的文件管线。
 
 ## Glob 和类型
 
@@ -230,7 +230,7 @@ Zig 0.14 起没有独立的 `@fence`。push 先用 unordered 写槽，再用 rel
 
 遍历到的文件，二进制策略不是 `.none` 时改成 `.quit`。直接交给 `searchFile` 的策略由调用方的 `SearchConfig` 决定。输出先攒一个文件，再拿一把 `std.Io.Mutex` 一次写出。提前停止用 `std.atomic.Value(bool)`，搜索热路径只原子读它。写失败、取消和 quiet 命中都在空闲锁下置位并 `broadcast`。空闲等待本身是取消点。`std.Io` 取消返回 `error.Canceled`。
 
-调用方按自己的顺序逐个根调用 `parallel.run`。同一次目录搜索里的结果顺序不稳定。
+目录调度留在库内，公共入口不调用 `parallel.run`。同一次目录搜索里的结果顺序不稳定。
 
 并行用的分配器必须能跨线程。库测试里两个工人用 `std.heap.smp_allocator`。
 
@@ -250,7 +250,7 @@ Zig 0.14 起没有独立的 `@fence`。push 先用 unordered 写槽，再用 rel
 
 ## 测试
 
-`zig build test` 只跑库测试。示例命令行和它的 8 个对照测试已经删除。整理时源码里有 92 个 `test` 声明，其中示例 CLI 8 个；`src/io/mmap_window.zig` 默认不编进测试。本机是 aarch64，默认 `-Dteddy=neon`，会编进 `teddy.zig` 和 `teddy_neon.zig`。`-Dteddy=off` 不编那两份。`-Dmmap-windows` 再多窗口映射那 1 个。`teddy_ssse3.zig` 和 `teddy_avx2.zig` 没有测试声明。整理当时本机默认 `zig build test` 退出码是 0。`-Dteddy=avx2` 对 `x86_64-linux-musl` 的 `check` 当时通过，用来编过 32 宽的下标路径。
+`zig build test` 只跑库测试。示例命令行和它的 8 个对照测试已经删除。整理时源码里有 92 个 `test` 声明，其中示例 CLI 8 个；`src/io/window_map.zig` 默认不编进测试。本机是 aarch64，默认 `-Dteddy=neon`，会编进 `teddy.zig` 和 `teddy_neon.zig`。`-Dteddy=off` 不编那两份。`-Dmmap-windows` 再多窗口映射那 1 个。`teddy_ssse3.zig` 和 `teddy_avx2.zig` 没有测试声明。整理当时本机默认 `zig build test` 退出码是 0。`-Dteddy=avx2` 对 `x86_64-linux-musl` 的 `check` 当时通过，用来编过 32 宽的下标路径。
 
 基准场景另外有两个库测试锁着，计时不在 `zig build test` 里。`基准场景的模式落到各自的引擎` 核对四组模式的分派和命中位置，并种进一个模式字节，避免未命中变成空转。`基准场景的切片命中和基准同一配置` 用和 `bench/micro.zig` 相同的默认 `searchSlice` 配置核对行数。模式表和 `fillScenarioText` 两边共用。基准再核对大输入上的命中数、文件读到的字节和目录的文件数，对不上就失败。
 

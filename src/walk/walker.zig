@@ -5,6 +5,7 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const file_id = @import("file_id.zig");
 const glob = @import("glob.zig");
 const ignore = @import("ignore.zig");
 const list_dir = @import("list_dir.zig");
@@ -15,12 +16,15 @@ pub const Config = struct {
     read_ignore: bool = true,
     /// null 表示不限制。1 只看起始目录里的文件，0 什么也不列。和 rg 的 `--max-depth` 一致。
     max_depth: ?u32 = null,
+    /// 和来源扫描字节上限是同一个数。大于它的文件在遍历时跳过。null 表示这一层不按大小预跳过。
     max_filesize: ?u64 = null,
     globs: []const []const u8 = &.{},
     types: []const []const u8 = &.{},
     /// 0 表示由调度层选择。Darwin 上性能核更少时用性能核数，否则用逻辑 CPU 数。
     threads: u32 = 0,
     skip_git: bool = true,
+    /// 默认不进入与搜索根不同设备的目录。调用方可以关掉。没有打开链接跟随的字段。
+    one_file_system: bool = true,
 };
 
 pub const Control = enum { cont, stop };
@@ -54,6 +58,8 @@ pub const Job = struct {
     rel: []u8,
     ignore: *const ignore.Set,
     depth: u32,
+    /// 这个目录所在设备。0 表示没取到，不据此判断跨设备。
+    dev: u64 = 0,
     allocator: std.mem.Allocator,
     /// 非 null 时这个任务只搜这些文件名，不再列目录。名字由本任务释放。
     files: ?[][]u8 = null,
@@ -108,19 +114,18 @@ pub const Session = struct {
     }
 };
 
-pub fn openRoot(io: std.Io, path: []const u8) !std.Io.Dir {
-    const options = std.Io.Dir.OpenOptions{ .iterate = true };
+fn openRoot(io: std.Io, path: []const u8) !std.Io.Dir {
+    const options = withoutLinkResolve(std.Io.Dir.OpenOptions{ .iterate = true });
     if (std.fs.path.isAbsolute(path)) return std.Io.Dir.openDirAbsolute(io, path, options);
     return std.Io.Dir.cwd().openDir(io, path, options);
 }
 
-/// 打开一个搜索根并装上 exclude / gitignore。调用方把返回的任务放进队列。
+/// 打开一个搜索根。不读取根之上的忽略规则。调用方把返回的任务放进队列。
 pub fn createRoot(host: *Host, root_path: []const u8) !*Job {
     const shown = trimSlash(root_path);
     const dir = try openRoot(host.io, shown);
     errdefer dir.close(host.io);
-    const base = loadExclude(host, shown) catch &host.session.empty;
-    return createJob(host, dir, shown, "", base, 1);
+    return createJob(host, dir, shown, "", &host.session.empty, 1);
 }
 
 /// 打开目录和 stat 的默认行为会解析符号链接。遍历必须关掉这类布尔选项，
@@ -261,6 +266,12 @@ fn handleEntry(host: *Host, job: *Job, entry: std.Io.Dir.Entry, batch: *FileBatc
     }
 }
 
+fn directoryDevice(dir: std.Io.Dir) ?u64 {
+    const id = file_id.fromDir(dir) catch return null;
+    if (id.dev == 0) return null;
+    return id.dev;
+}
+
 fn descend(
     host: *Host,
     job: *Job,
@@ -269,6 +280,14 @@ fn descend(
     scratch: []u8,
     child_dir: std.Io.Dir,
 ) void {
+    if (host.config.one_file_system and job.dev != 0) {
+        if (directoryDevice(child_dir)) |child_dev| {
+            if (child_dev != job.dev) {
+                child_dir.close(host.io);
+                return;
+            }
+        }
+    }
     if (ignore.isIgnored(job.ignore, rel, true, scratch) or blockDirectory(host, rel)) {
         child_dir.close(host.io);
         return;
@@ -362,6 +381,7 @@ fn createFileJob(host: *Host, parent: *Job, names: []const []const u8) !*Job {
         .rel = rel_copy,
         .ignore = parent.ignore,
         .depth = parent.depth,
+        .dev = parent.dev,
         .allocator = host.allocator,
         .files = owned,
     };
@@ -387,6 +407,7 @@ fn createJob(
         .rel = rel_copy,
         .ignore = rules,
         .depth = depth,
+        .dev = directoryDevice(dir) orelse 0,
         .allocator = host.allocator,
     };
     return job;
@@ -420,75 +441,6 @@ fn loadRules(
     const set = try arena.create(ignore.Set);
     set.* = try ignore.build(arena, host.allocator, parent, prefix, &.{}, owned);
     return set;
-}
-
-fn loadExclude(host: *Host, root_path: []const u8) !*const ignore.Set {
-    if (!host.config.read_ignore) return &host.session.empty;
-    const found = (try readExclude(host, root_path)) orelse return &host.session.empty;
-    defer host.allocator.free(found.prefix);
-    defer host.allocator.free(found.bytes);
-    if (found.bytes.len == 0) return &host.session.empty;
-
-    host.session.lock.lockUncancelable(host.io);
-    defer host.session.lock.unlock(host.io);
-    const arena = host.session.arena.allocator();
-    var globs: std.ArrayList(glob.Glob) = .empty;
-    try ignore.parseInto(arena, found.bytes, &globs);
-    if (globs.items.len == 0) {
-        globs.deinit(arena);
-        return &host.session.empty;
-    }
-    const owned = try arena.dupe(glob.Glob, globs.items);
-    globs.deinit(arena);
-    const prefix = try arena.dupe(u8, found.prefix);
-    const set = try arena.create(ignore.Set);
-    set.* = try ignore.build(arena, host.allocator, null, 0, prefix, owned);
-    return set;
-}
-
-const ExcludeFile = struct {
-    prefix: []u8,
-    bytes: []u8,
-};
-
-fn readExclude(host: *Host, root_path: []const u8) !?ExcludeFile {
-    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const n = std.Io.Dir.cwd().realPathFile(host.io, root_path, &buf) catch return null;
-    const root_abs = try host.allocator.dupe(u8, buf[0..n]);
-    defer host.allocator.free(root_abs);
-    var abs = buf[0..n];
-    while (true) {
-        const git = try std.fmt.allocPrint(host.allocator, "{s}/.git", .{abs});
-        defer host.allocator.free(git);
-        if (std.Io.Dir.cwd().statFile(host.io, git, withoutLinkResolve(std.Io.Dir.StatFileOptions{}))) |stat| {
-            if (stat.kind == .directory) {
-                const exclude = try std.fmt.allocPrint(host.allocator, "{s}/.git/info/exclude", .{abs});
-                defer host.allocator.free(exclude);
-                const bytes = std.Io.Dir.cwd().readFileAlloc(
-                    host.io,
-                    exclude,
-                    host.allocator,
-                    .limited(1 << 20),
-                ) catch try host.allocator.alloc(u8, 0);
-                const prefix = repoPrefix(abs, root_abs);
-                return .{
-                    .prefix = try host.allocator.dupe(u8, prefix),
-                    .bytes = bytes,
-                };
-            }
-        } else |_| {}
-        const parent = std.fs.path.dirname(abs) orelse return null;
-        if (parent.len == abs.len) return null;
-        abs = buf[0..parent.len];
-    }
-}
-
-fn repoPrefix(repo: []const u8, root_abs: []const u8) []const u8 {
-    if (std.mem.eql(u8, repo, root_abs)) return "";
-    if (root_abs.len > repo.len and std.mem.startsWith(u8, root_abs, repo) and root_abs[repo.len] == '/') {
-        return root_abs[repo.len + 1 ..];
-    }
-    return "";
 }
 
 fn readOptional(host: *Host, dir: std.Io.Dir, name: []const u8) ?[]u8 {
@@ -694,4 +646,129 @@ test "符号链接不跟随，也不越出搜索根" {
         }
     }
     for (matched) |hit| try std.testing.expect(hit);
+}
+
+fn silentWalkError(_: *anyopaque, _: []const u8, _: anyerror) void {}
+
+fn freeFound(found: *std.ArrayList([]u8)) void {
+    for (found.items) |item| std.testing.allocator.free(item);
+    found.deinit(std.testing.allocator);
+}
+
+fn sawBase(found: []const []const u8, base: []const u8) bool {
+    for (found) |path| {
+        if (path.len < base.len) continue;
+        if (!std.mem.endsWith(u8, path, base)) continue;
+        if (path.len == base.len or path[path.len - base.len - 1] == '/') return true;
+    }
+    return false;
+}
+
+fn collectWalk(root: []const u8, config: Config, found: *std.ArrayList([]u8)) !void {
+    const io = std.testing.io;
+    var session = Session.init(std.testing.allocator);
+    defer session.deinit();
+    var stop = std.atomic.Value(bool).init(false);
+    var stack: std.ArrayList(*Job) = .empty;
+    defer stack.deinit(std.testing.allocator);
+    var host = Host{
+        .allocator = std.testing.allocator,
+        .io = io,
+        .config = config,
+        .session = &session,
+        .stop = &stop,
+        .push = noopPush,
+        .push_ctx = &stack,
+        .on_file = collectFile,
+        .file_ctx = found,
+        .on_error = silentWalkError,
+        .error_ctx = undefined,
+    };
+    const job = try createRoot(&host, root);
+    try stack.append(std.testing.allocator, job);
+    while (stack.pop()) |item| process(&host, item);
+}
+
+test "不读搜索根之上的 gitignore 和 exclude" {
+    inline for (@typeInfo(Config).@"struct".field_names) |field| {
+        try std.testing.expect(std.mem.indexOf(u8, field, "parent") == null);
+    }
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = ".gitignore", .data = "*.log\n" });
+    try tmp.dir.createDir(io, ".git", .default_dir);
+    try tmp.dir.createDir(io, ".git/info", .default_dir);
+    const exclude_name = ".git/info/" ++ "exclude";
+    try tmp.dir.writeFile(io, .{ .sub_path = exclude_name, .data = "*.md\n" });
+    try tmp.dir.createDir(io, "root", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "root/keep.txt", .data = "a" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "root/keep.md", .data = "a" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "root/keep.log", .data = "a" });
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPathFile(io, "root", &path_buf);
+    var found: std.ArrayList([]u8) = .empty;
+    defer freeFound(&found);
+    try collectWalk(path_buf[0..path_len], .{}, &found);
+    try std.testing.expect(sawBase(found.items, "keep.txt"));
+    try std.testing.expect(sawBase(found.items, "keep.md"));
+    try std.testing.expect(sawBase(found.items, "keep.log"));
+}
+
+test "不读全局 excludes" {
+    inline for (@typeInfo(Config).@"struct".field_names) |field| {
+        try std.testing.expect(std.mem.indexOf(u8, field, "global") == null);
+        try std.testing.expect(std.mem.indexOf(u8, field, "excludes") == null);
+    }
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.createDir(io, ".config", .default_dir);
+    try tmp.dir.createDir(io, ".config/git", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = ".config/git/ignore", .data = "*.txt\n" });
+    try tmp.dir.createDir(io, "root", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "root/keep.txt", .data = "a" });
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPathFile(io, "root", &path_buf);
+    var found: std.ArrayList([]u8) = .empty;
+    defer freeFound(&found);
+    try collectWalk(path_buf[0..path_len], .{}, &found);
+    try std.testing.expect(sawBase(found.items, "keep.txt"));
+}
+
+test "默认不跨文件系统" {
+    try std.testing.expect((Config{}).one_file_system);
+    inline for (@typeInfo(Config).@"struct".field_names) |field| {
+        try std.testing.expect(!std.mem.endsWith(u8, field, "symlinks"));
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.createDir(io, "sub", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "sub/inside.txt", .data = "a" });
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+    var same: std.ArrayList([]u8) = .empty;
+    defer freeFound(&same);
+    try collectWalk(path_buf[0..path_len], .{}, &same);
+    try std.testing.expect(sawBase(same.items, "inside.txt"));
+
+    const marker = "n7-cross.txt";
+    var shm = try std.Io.Dir.openDirAbsolute(io, "/dev/shm", .{});
+    defer shm.close(io);
+    try shm.writeFile(io, .{ .sub_path = marker, .data = "secret\n" });
+    defer shm.deleteFile(io, marker) catch {};
+
+    var blocked: std.ArrayList([]u8) = .empty;
+    defer freeFound(&blocked);
+    try collectWalk("/dev", .{ .max_depth = 2 }, &blocked);
+    try std.testing.expect(!sawBase(blocked.items, marker));
+
+    var opened: std.ArrayList([]u8) = .empty;
+    defer freeFound(&opened);
+    try collectWalk("/dev", .{ .one_file_system = false, .max_depth = 2 }, &opened);
+    try std.testing.expect(sawBase(opened.items, marker));
 }

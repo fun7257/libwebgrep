@@ -400,12 +400,9 @@ pub fn searchReader(
     }.read, reader);
 }
 
-/// 从已打开的文件搜索。默认用 `readPositional` 分块读进调用方缓冲。
-/// 整文件映射在这台机器的 1 GiB 热缓存上比分块读更慢，还把驻留撑到文件大小，所以不用。
-/// `-Dmmap-windows` 才改走 8 MiB 窗口映射，默认关闭。
-///
-/// 这不是服务入口。`name` 只供旧的 Sink 使用。服务入口是 `searchSource` 和
-/// `searchSourceSlice`。N7 会把本函数移出公共 API。
+/// 从已经打开的文件里读。调用方自己持有文件，这里不接收路径。
+/// 默认用 `readPositional`。窗口映射只在构建选项打开时才会编译进来，默认构建不走那条路径。
+/// 本函数不从 `src/root.zig` 导出。服务入口是 `searchSource` 和 `searchSourceSlice`。
 pub fn searchFile(
     comptime S: type,
     allocator: std.mem.Allocator,
@@ -417,12 +414,12 @@ pub fn searchFile(
     config: SearchConfig,
 ) ReadError!Result {
     resetStats(matcher);
-    if (comptime build_options.mmap_windows) {
-        const mmap_window = @import("io/mmap_window.zig");
-        if (try mmap_window.open(io, file, bufferWindow(config))) |opened| {
+    if (comptime build_options.window_map) {
+        const window_map = @import("io/window_map.zig");
+        if (try window_map.open(io, file, bufferWindow(config))) |opened| {
             var ctx = opened;
             defer ctx.close();
-            return drive(S, allocator, sink, matcher, config, name, mmap_window.readBytes, &ctx);
+            return drive(S, allocator, sink, matcher, config, name, window_map.readBytes, &ctx);
         }
     }
     const Ctx = struct { io: std.Io, file: std.Io.File, offset: u64 = 0 };
@@ -4941,6 +4938,53 @@ test "预算来自调用方参数" {
     try testing.expectEqual(sink_mod.LimitHit.max_bytes, served.limit_hit);
 }
 
+test "直接传入的流也受来源大小上限约束" {
+    var finder = try Finder.init("MATCH", .{});
+    var sink = Quiet{};
+    var reader = std.Io.Reader.fixed("MATCH\nMORE MATCH\n");
+    const stopped = try searchSource(Quiet, testing.allocator, &sink, &reader, "direct", &finder, .{
+        .max_source_bytes = 6,
+        .max_request_bytes = SearchConfig.max_request_bytes_hard_cap,
+        .binary = .none,
+        .buffer_size = 8,
+        .max_line_len = 64,
+        .encoding = .none,
+    });
+    try testing.expectEqual(@as(u64, 6), stopped.bytes_read);
+    try testing.expectEqual(sink_mod.LimitHit.max_bytes, stopped.limit_hit);
+    try testing.expect(stopped.partial);
+    try testing.expect(stopped.bytes_read < "MATCH\nMORE MATCH\n".len);
+
+    const armed = serviceConfig(.{});
+    try testing.expectEqual(SearchConfig.default_max_source_bytes, armed.max_source_bytes.?);
+    try testing.expectEqual(SearchConfig.default_max_request_bytes, armed.max_request_bytes.?);
+    try testing.expect(armed.max_source_bytes.? <= SearchConfig.max_source_bytes_hard_cap);
+    try testing.expectEqual(SearchConfig.default_time_budget_ns, armed.time_budget_ns.?);
+    try testing.expectEqual(BinaryPolicy.quit, (SearchConfig{}).binary);
+
+    const total: usize = @intCast(SearchConfig.default_max_source_bytes + 32);
+    const big = try testing.allocator.alloc(u8, total);
+    defer testing.allocator.free(big);
+    @memset(big, 'a');
+    var at: usize = 15;
+    while (at < big.len) : (at += 16) big[at] = '\n';
+    @memcpy(big[0..5], "MATCH");
+    var wide = std.Io.Reader.fixed(big);
+    const capped = try searchSource(Quiet, testing.allocator, &sink, &wide, "direct-default", &finder, .{
+        .binary = .none,
+        .buffer_size = 64 * 1024,
+        .max_line_len = 64,
+        .encoding = .none,
+    });
+    try testing.expectEqual(SearchConfig.default_max_source_bytes, capped.bytes_read);
+    try testing.expectEqual(sink_mod.LimitHit.max_bytes, capped.limit_hit);
+    try testing.expect(capped.bytes_read < big.len);
+}
+
+test "默认构建不映射文件" {
+    try testing.expect(!build_options.window_map);
+}
+
 test "软错误与有无匹配可区分" {
     var finder = try Finder.init("MATCH", .{});
     var sink = Quiet{};
@@ -5062,10 +5106,10 @@ test "limit_hit 覆盖每种停止原因" {
     var sink = Quiet{};
 
     const plain = try searchSlice(Quiet, &sink, "MATCH\n", "", &finder, .{ .binary = .none });
-    seen[@intFromEnum(plain.limit_hit)] = true;
+    seen[@backingInt(plain.limit_hit)] = true;
 
     const bytes = try driveCapped(&finder, "MATCH\nMATCH\nMORE\n", 6, null);
-    seen[@intFromEnum(bytes.result.limit_hit)] = true;
+    seen[@backingInt(bytes.result.limit_hit)] = true;
 
     var deadline = DeadlineGate{ .rest = "MATCH\nMATCH\nTAIL\n" };
     const timed = try drive(DeadlineGate, testing.allocator, &deadline, &finder, .{
@@ -5076,7 +5120,7 @@ test "limit_hit 覆盖每种停止原因" {
         .clock = DeadlineGate.now,
         .clock_ctx = &deadline,
     }, "", DeadlineGate.read, &deadline);
-    seen[@intFromEnum(timed.limit_hit)] = true;
+    seen[@backingInt(timed.limit_hit)] = true;
 
     var cancel = CancelGate{ .rest = "MATCH\nMATCH\nTAIL\n" };
     const stopped = try drive(CancelGate, testing.allocator, &cancel, &finder, .{
@@ -5087,7 +5131,7 @@ test "limit_hit 覆盖每种停止原因" {
         .close_input = CancelGate.close,
         .close_ctx = &cancel,
     }, "", CancelGate.read, &cancel);
-    seen[@intFromEnum(stopped.limit_hit)] = true;
+    seen[@backingInt(stopped.limit_hit)] = true;
 
     var page = Page{};
     defer page.deinit();
@@ -5095,7 +5139,7 @@ test "limit_hit 覆盖每种停止原因" {
         .max_results = 1,
         .binary = .none,
     });
-    seen[@intFromEnum(capped.limit_hit)] = true;
+    seen[@backingInt(capped.limit_hit)] = true;
 
     var raw: u8 = 0;
     const inflated = try drive(Quiet, testing.allocator, &sink, &finder, .{
@@ -5105,10 +5149,10 @@ test "limit_hit 覆盖每种停止原因" {
         .decompressed_bytes = 8,
         .max_decompressed_bytes = 4,
     }, "", badRead, &raw);
-    seen[@intFromEnum(inflated.limit_hit)] = true;
+    seen[@backingInt(inflated.limit_hit)] = true;
 
     for (std.enums.values(sink_mod.LimitHit)) |reason| {
-        try testing.expect(seen[@intFromEnum(reason)]);
+        try testing.expect(seen[@backingInt(reason)]);
     }
 }
 

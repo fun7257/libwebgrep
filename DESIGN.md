@@ -49,11 +49,11 @@ P0 实现内核和单个输入上的 Searcher。P1 加上目录遍历、忽略�
 
 `find(haystack, start, mode) ?Match`。可选的 `requiredLiteral` 返回模式本身和偏移 0。Searcher 在匹配器提供这个方法时先用它预过滤，再用 `find` 验证。正则没有实现。
 
-`CaseMode` 有 `sensitive`、`insensitive`、`smart`。单个模式的 smart 在该模式含有 `A-Z` 时区分大小写。多模式的 smart 看整个集合：任意一条含有 ASCII 大写，整次搜索都区分大小写。大小写只折叠 ASCII。
+`CaseMode` 有 `sensitive`、`insensitive`、`smart`。`smart` 按每条模式判断：全是小写才忽略大小写，出现 `A-Z` 就区分大小写。这和 rg 不同，rg 的 `-S` 是整组判断：整组里出现大写就全部区分大小写。大小写只折叠 ASCII。
 
 ## 多模式
 
-`src/finder/multi.zig` 的 `Multi` 持有一组字面量。模式字节由调用方持有，生命周期要盖过 `Multi`。任何一条含有 `\n` 都返回 `error.PatternHasNewline`。热路径上的 `find` 不分配。复制这个结构只复制指针。表在 `deinit` 之前只读，工人可以共享。只有创建者调用 `deinit`。`resetStats` 是空操作。
+`src/finder/multi.zig` 的 `Multi` 持有一组字面量。模式字节由调用方持有，生命周期要盖过 `Multi`。任何一条含有 `\n` 都返回 `error.PatternHasNewline`。构造前先检查条数和字节总长，调用方可以在硬顶之内把上限调低；超限返回 `error.PatternCountExceeded` 或 `error.PatternBytesExceeded`，此时还没有分配自动机、Teddy 表或邻接对表。热路径上的 `find` 不分配。复制这个结构只复制指针。表在 `deinit` 之前只读，工人可以共享。只有创建者调用 `deinit`。`resetStats` 是空操作。智能大小写各条不一致时，`find` 改走标量扫描。
 
 `Multi.init` 按下面的顺序选实现：
 
@@ -126,7 +126,7 @@ aarch64 默认打开 `neon`，因为空窗口跳过之后 NEON 比稠密自动�
 - 行号只在上报时用向量 `count` 数从上一个位置到这里的换行。
 - `-A/-B/-C` 用滚动状态保留前 N 行。after 计数跨块延续。绝对偏移不连续时调用 `contextBreak`。
 - `max_count` 只统计主循环找到的命中。after 窗口里后来抬成匹配的行仍然调用 `matched`，所以 `-c` 会把它们算进去。这和 ripgrep 15 一致。
-- Sink 返回 false，或达到 max_count 且 after 窗口用完，就停止。
+- 达到 `max_count` 后不再向上游读下一块。缓冲里已经有的 after 行仍会交出去。调用方提供 `close_input` 时，达到上限就调用它。Sink 返回 false 也会停止。
 
 没有上下文、没有反选、还没见过 NUL 时，流式读取把 NUL 检查并进这次查找已经加载的向量。下标更小的那个锚点覆盖了向量区间，不再为 NUL 多加载一次。匹配起点之后的尾部和锚点覆盖不到的前缀用标量补上。这一块里 4096 字节以内就有匹配时，后面的块改回先扫 NUL，避免密集文件每一块搜两遍。`quit` 或 Sink 的 `binary` 返回 false 时，丢掉含有 NUL 的这一次读入，不再搜索它。`report` 继续读，直到知道有没有匹配。有上下文、反选，以及 `searchSlice`，仍是先把要搜的范围扫一遍 NUL。
 

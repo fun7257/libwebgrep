@@ -94,7 +94,7 @@ if (many.find(haystack, 0, .leftmost_first)) |match| {
 }
 ```
 
-`leftmost_first` 取起点最靠左的那次，同一起点上更早给出的模式胜出。`earliest` 取更早结束的那次。库的搜索配置默认是 `earliest`。全部是单字节时两种结果相同。两条里只要有一条含 ASCII 大写，smart case 就让整组区分大小写。
+`leftmost_first` 取起点最靠左的那次，同一起点上更早给出的模式胜出。`earliest` 取更早结束的那次。库的搜索配置默认是 `earliest`。全部是单字节时两种结果相同。智能大小写按每条模式判断：全是小写才忽略大小写。这和 rg 不同，rg 在整组里出现大写就全部区分大小写。
 
 直接拿查找器扫字节，不处理行：
 

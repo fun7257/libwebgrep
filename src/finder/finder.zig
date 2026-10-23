@@ -29,7 +29,8 @@ pub const Finder = struct {
         pair: packed_pair.PackedPair,
     };
 
-    pub fn init(pattern: []const u8, options: matcher.FindOptions) error{PatternHasNewline}!Finder {
+    pub fn init(pattern: []const u8, options: matcher.FindOptions) (matcher.LimitError || error{PatternHasNewline})!Finder {
+        try matcher.checkPatternLimits(&.{pattern}, options);
         if (std.mem.findScalar(u8, pattern, '\n') != null) return error.PatternHasNewline;
 
         const ignore_case = switch (options.case) {
@@ -179,6 +180,32 @@ pub const Finder = struct {
     fn findLinear(self: *Finder, haystack: []const u8, start: usize, m: usize) ?matcher.Match {
         const at = self.two_way.find(haystack, start) orelse return null;
         return .{ .start = at, .end = at + m };
+    }
+
+    /// 行内容（不含换行，也不含行尾的一个 CR）是否和这条模式相同。
+    pub fn acceptsSpan(self: *const Finder, haystack: []const u8, start: usize, end: usize) bool {
+        if (start > end or end > haystack.len) return false;
+        return ascii.eql(self.pattern, haystack[start..end], self.ignore_case);
+    }
+
+    /// 和 `find` 一样，但 `allow` 拒绝时从匹配起点的下一个字节继续。
+    /// 单模式在同一起点只有一种长度。
+    pub fn findAllowed(
+        self: *Finder,
+        haystack: []const u8,
+        start: usize,
+        mode: matcher.MatchMode,
+        comptime allow: fn ([]const u8, usize, usize) bool,
+    ) ?matcher.Match {
+        var pos = start;
+        while (pos <= haystack.len) {
+            const found = self.find(haystack, pos, mode) orelse return null;
+            if (found.start < pos) return null;
+            if (allow(haystack, found.start, found.end)) return found;
+            if (found.start >= haystack.len) return null;
+            pos = found.start + 1;
+        }
+        return null;
     }
 };
 

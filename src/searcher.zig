@@ -2,6 +2,7 @@
 //!
 //! 先在缓冲里找匹配，命中后再向两侧找 `\n`。没有命中的区域不逐行扫描。
 //! 模式里的换行由 Finder 拒绝；这里假定匹配器不会跨行。
+//! 行终止符仍是 LF。交给 Sink 的行内容去掉结尾的 `\n`，再去掉紧挨着的一个 `\r`。
 //!
 //! 切片搜索不分配内存。Reader 和文件搜索使用调用方传入的分配器，缓冲从
 //! `buffer_size` 倍增到 `max_line_len`，超过则返回 `error.LineTooLong`。
@@ -34,7 +35,21 @@ pub const SearchConfig = struct {
     /// 这个输入上最多报告多少条匹配行。null 表示不限。
     /// 计入上限的是主循环找到的命中。`-A` 窗口里额外抬成匹配的行不占用额度，
     /// 但仍然调用 `matched`，因此计数打印器会把它们算进去。这和 ripgrep 15 一致。
+    /// 达到上限后不再读下一块。缓冲里已经读入的 after 行仍会交出去。
     max_count: ?u64 = null,
+    /// 整词。只看匹配外侧那个字节是不是 ASCII 单词字符（字母、数字、下划线）。
+    /// 这是半边界：`-2` 能命中 `(-2)`，不能命中 `x-2` 或 `-2y`。
+    /// 和 `whole_line` 同时打开时不检查词边界。
+    whole_word: bool = false,
+    /// 整行。去掉 LF 和紧挨着的一个 CR 之后，行内容必须和某一条模式相同。
+    whole_line: bool = false,
+    /// 行内容必须包含这里的每一条才输出。按字节比较，不折叠大小写。空表示不额外要求。
+    contains: []const []const u8 = &.{},
+    /// 行内容必须不含这里的每一条。按字节比较。和 `invert` 是两个开关。
+    excludes: []const []const u8 = &.{},
+    /// 匹配行数达到 `max_count` 时调用，用来关闭上游。没提供就不调用。
+    close_input: ?*const fn (?*anyopaque) void = null,
+    close_ctx: ?*anyopaque = null,
     binary: BinaryPolicy = .report,
     buffer_size: usize = default_buffer_size,
     max_line_len: usize = default_max_line_len,
@@ -222,6 +237,10 @@ fn drive(
     var filled: usize = 0;
 
     while (!state.stopped) {
+        if (state.exceeded(config)) {
+            state.stopped = true;
+            break;
+        }
         if (flagIsSet(config)) {
             state.stopped = true;
             break;
@@ -329,6 +348,7 @@ fn grow(allocator: std.mem.Allocator, buf: []u8, config: SearchConfig) error{ Li
 fn canFuse(matcher: anytype, config: SearchConfig, state: *const State) bool {
     if (state.prefer_prepass or state.nul_offset != null) return false;
     if (config.binary == .none or config.invert or config.before != 0 or config.after != 0) return false;
+    if (config.whole_word or config.whole_line or config.contains.len != 0 or config.excludes.len != 0) return false;
     return @hasDecl(@TypeOf(matcher.*), "findWatched");
 }
 
@@ -368,7 +388,8 @@ fn matchBuffer(
     }
     if (state.stopped) return false;
     if (!try afterContext(S, sink, matcher, buf, buf.len, state, config)) return false;
-    if (state.exceeded(config) and state.after_left == 0) return false;
+    // 上限已经达到时，缓冲里的 after 行刚才交过了，不能再为后面的行去读。
+    if (state.exceeded(config)) return false;
     state.pos = buf.len;
     return !state.stopped;
 }
@@ -388,26 +409,82 @@ fn findLine(matcher: anytype, buf: []const u8, state: *State, config: SearchConf
     if (state.exceeded(config)) return null;
     var pos = state.pos;
     while (pos < buf.len) {
-        const found = matcher.find(buf, pos, config.match_mode) orelse return null;
-        if (found.start > buf.len) return null;
-        const start = lineStart(buf, found.start);
+        const found = if (config.whole_line)
+            matcher.find(buf, pos, config.match_mode)
+        else
+            nextMatch(matcher, buf, pos, config);
+        const hit = found orelse return null;
+        if (hit.start > buf.len or hit.start < pos) return null;
+        const start = lineStart(buf, hit.start);
         if (start == buf.len) {
             pos = buf.len;
             continue;
         }
-        const end = lineEnd(buf, @max(found.end, start));
+        const end = lineEnd(buf, @max(hit.end, start));
         if (end == start) {
             pos = @min(buf.len, start + 1);
+            continue;
+        }
+        const content_end = contentEnd(buf, .{ .start = start, .end = end });
+        if (config.whole_line and !acceptsWholeLine(matcher, buf, start, content_end)) {
+            pos = end;
+            continue;
+        }
+        if (!linePassesFilters(buf, start, content_end, config)) {
+            pos = end;
             continue;
         }
         return .{
             .start = start,
             .end = end,
-            .mstart = found.start,
-            .mend = found.end,
+            .mstart = if (config.whole_line) start else hit.start,
+            .mend = if (config.whole_line) content_end else hit.end,
         };
     }
     return null;
+}
+
+fn nextMatch(matcher: anytype, buf: []const u8, pos: usize, config: SearchConfig) ?matcher_mod.Match {
+    if (config.whole_word and @hasDecl(@TypeOf(matcher.*), "findAllowed")) {
+        return matcher.findAllowed(buf, pos, config.match_mode, wordBounded);
+    }
+    return matcher.find(buf, pos, config.match_mode);
+}
+
+fn acceptsWholeLine(matcher: anytype, buf: []const u8, start: usize, end: usize) bool {
+    if (end < start or end > buf.len) return false;
+    const T = @TypeOf(matcher.*);
+    if (@hasDecl(T, "acceptsSpan")) return matcher.acceptsSpan(buf, start, end);
+    const found = matcher.find(buf[start..end], 0, .leftmost_first) orelse return false;
+    return found.start == 0 and found.end == end - start;
+}
+
+fn linePassesFilters(buf: []const u8, start: usize, end: usize, config: SearchConfig) bool {
+    if (config.contains.len == 0 and config.excludes.len == 0) return true;
+    if (end < start or end > buf.len) return false;
+    const text = buf[start..end];
+    for (config.contains) |pat| {
+        if (std.mem.indexOf(u8, text, pat) == null) return false;
+    }
+    for (config.excludes) |pat| {
+        if (std.mem.indexOf(u8, text, pat) != null) return false;
+    }
+    return true;
+}
+
+fn isWordByte(b: u8) bool {
+    return switch (b) {
+        '0'...'9', 'A'...'Z', 'a'...'z', '_' => true,
+        else => false,
+    };
+}
+
+/// 半边界：只看匹配外侧的字节，不要求匹配两端自身是单词字符。
+fn wordBounded(haystack: []const u8, start: usize, end: usize) bool {
+    if (start > haystack.len or end > haystack.len or start > end) return false;
+    if (start > 0 and isWordByte(haystack[start - 1])) return false;
+    if (end < haystack.len and isWordByte(haystack[end])) return false;
+    return true;
 }
 
 fn matchInvert(
@@ -436,6 +513,8 @@ fn matchInvert(
     var cursor = gap.start;
     while (nextLine(buf, cursor, gap.end)) |line| {
         cursor = line.end;
+        const content_end = contentEnd(buf, line);
+        if (!linePassesFilters(buf, line.start, content_end, config)) continue;
         state.limit_count += 1;
         if (!try sinkMatched(S, sink, matcher, buf, line, null, state, config)) return false;
         if (state.exceeded(config)) return false;
@@ -568,15 +647,24 @@ fn sinkBreak(
 }
 
 fn lineIsReportedHit(matcher: anytype, buf: []const u8, line: Range, config: SearchConfig) bool {
+    const content_end = contentEnd(buf, line);
+    if (!linePassesFilters(buf, line.start, content_end, config)) return false;
     const hit = matchInLine(matcher, buf, line, config) != null;
     return if (config.invert) !hit else hit;
 }
 
 fn matchInLine(matcher: anytype, buf: []const u8, line: Range, config: SearchConfig) ?BufMatch {
     const end = contentEnd(buf, line);
-    const content = buf[line.start..end];
-    const found = matcher.find(content, 0, config.match_mode) orelse return null;
-    return .{ .start = line.start + found.start, .end = line.start + found.end };
+    if (config.whole_line) {
+        if (!acceptsWholeLine(matcher, buf, line.start, end)) return null;
+        return .{ .start = line.start, .end = end };
+    }
+    const found = nextMatch(matcher, buf, line.start, config) orelse return null;
+    // 空行的内容终点和起点重合，空模式在这里仍算命中。
+    if (found.start < line.start or found.start > end or found.end > line.end) return null;
+    if (found.start == end and found.end > end) return null;
+    if (found.start >= line.end) return null;
+    return .{ .start = found.start, .end = @min(found.end, end) };
 }
 
 fn spanFrom(buf: []const u8, line: Range, content_end: usize, known: ?BufMatch) ?Span {
@@ -590,8 +678,10 @@ fn spanFrom(buf: []const u8, line: Range, content_end: usize, known: ?BufMatch) 
 }
 
 fn contentEnd(buf: []const u8, line: Range) usize {
-    if (line.end > line.start and line.end <= buf.len and buf[line.end - 1] == '\n') return line.end - 1;
-    return line.end;
+    var end = line.end;
+    if (end > line.start and end <= buf.len and buf[end - 1] == '\n') end -= 1;
+    if (end > line.start and end <= buf.len and buf[end - 1] == '\r') end -= 1;
+    return end;
 }
 
 fn countLines(buf: []const u8, upto: usize, state: *State) void {
@@ -646,6 +736,9 @@ fn preceding(bytes: []const u8, count: usize) usize {
 }
 
 fn finishSink(comptime S: type, sink: *S, state: *State, config: SearchConfig) Result {
+    if (state.exceeded(config)) {
+        if (config.close_input) |close| close(config.close_ctx);
+    }
     var outcome: Outcome = if (state.stopped) .stopped else .complete;
     if (state.nul_offset != null and config.binary == .quit) outcome = .binary_quit;
     if (state.nul_offset != null and config.binary == .report and state.matched_lines > 0) {
@@ -818,7 +911,7 @@ test "切片：反选和反选上下文" {
     , ctx.text.items);
 }
 
-test "切片：空行、无结尾换行、CRLF 保留 CR" {
+test "切片：空行、无结尾换行、CRLF 去掉 CR" {
     var empty_lines = try run("a\n\nMATCH\n\nb\n", "MATCH", .{
         .line_numbers = true,
         .before = 1,
@@ -838,7 +931,7 @@ test "切片：空行、无结尾换行、CRLF 保留 CR" {
 
     var crlf = try run("a\r\nMATCH\r\nb\r\n", "MATCH", .{ .line_numbers = true });
     defer crlf.deinit(testing.allocator);
-    try testing.expectEqualStrings("2:MATCH\r\n", crlf.text.items);
+    try testing.expectEqualStrings("2:MATCH\n", crlf.text.items);
 }
 
 test "切片：空模式匹配每一行，列号是第一个匹配的字节" {
@@ -1210,4 +1303,258 @@ test "基准场景的切片命中和基准同一配置" {
         const result = try searchSlice(Sink, &sink, &hay, "", &many, .{});
         try testing.expectEqual(group.lines, result.matched_lines);
     }
+}
+
+test "CRLF 行内容不含 CR，整行匹配不把 CR 算进去" {
+    var plain = try run("a\r\nMATCH\r\nb\r\n", "MATCH", .{ .line_numbers = true, .binary = .none });
+    defer plain.deinit(testing.allocator);
+    try testing.expectEqualStrings("2:MATCH\n", plain.text.items);
+    try testing.expect(std.mem.indexOfScalar(u8, plain.text.items, '\r') == null);
+
+    var whole = try run("a\r\nMATCH\r\nb\r\n", "MATCH", .{
+        .line_numbers = true,
+        .whole_line = true,
+        .binary = .none,
+    });
+    defer whole.deinit(testing.allocator);
+    try testing.expectEqualStrings("2:MATCH\n", whole.text.items);
+
+    var with_cr = try run("MATCH\r\n", "MATCH\r", .{ .whole_line = true, .binary = .none });
+    defer with_cr.deinit(testing.allocator);
+    try testing.expectEqualStrings("", with_cr.text.items);
+
+    var longer = try run("MATCHX\r\n", "MATCH", .{ .whole_line = true, .binary = .none });
+    defer longer.deinit(testing.allocator);
+    try testing.expectEqualStrings("", longer.text.items);
+}
+
+test "整词的半边界" {
+    var paren = try run("(-2)\n", "-2", .{ .whole_word = true, .line_numbers = true, .binary = .none });
+    defer paren.deinit(testing.allocator);
+    try testing.expectEqualStrings("1:(-2)\n", paren.text.items);
+
+    var left = try run("x-2\n", "-2", .{ .whole_word = true, .binary = .none });
+    defer left.deinit(testing.allocator);
+    try testing.expectEqualStrings("", left.text.items);
+
+    var right = try run("-2y\n", "-2", .{ .whole_word = true, .binary = .none });
+    defer right.deinit(testing.allocator);
+    try testing.expectEqualStrings("", right.text.items);
+
+    var word = try run("foo bar\nfoobar\n", "foo", .{ .whole_word = true, .line_numbers = true, .binary = .none });
+    defer word.deinit(testing.allocator);
+    try testing.expectEqualStrings("1:foo bar\n", word.text.items);
+
+    const Multi = @import("finder/multi.zig").Multi;
+    var multi = try Multi.init(testing.allocator, &.{ "fo", "foo" }, .{});
+    defer multi.deinit();
+    var rec = Rec{};
+    defer rec.deinit(testing.allocator);
+    _ = try searchSlice(Rec, &rec, "(foo)\nxfo\nfoo\n", "", &multi, .{
+        .whole_word = true,
+        .line_numbers = true,
+        .binary = .none,
+    });
+    try testing.expectEqualStrings("1:(foo)\n3:foo\n", rec.text.items);
+}
+
+test "整行优先于整词" {
+    const both = SearchConfig{
+        .whole_word = true,
+        .whole_line = true,
+        .line_numbers = true,
+        .binary = .none,
+    };
+    var word_only = try run("(-2)\n", "-2", .{ .whole_word = true, .line_numbers = true, .binary = .none });
+    defer word_only.deinit(testing.allocator);
+    try testing.expectEqualStrings("1:(-2)\n", word_only.text.items);
+
+    var paren = try run("(-2)\n", "-2", both);
+    defer paren.deinit(testing.allocator);
+    try testing.expectEqualStrings("", paren.text.items);
+
+    var exact = try run("-2\r\n", "-2", both);
+    defer exact.deinit(testing.allocator);
+    try testing.expectEqualStrings("1:-2\n", exact.text.items);
+
+    var stuck = try run("x-2\n-2y\n", "-2", both);
+    defer stuck.deinit(testing.allocator);
+    try testing.expectEqualStrings("", stuck.text.items);
+}
+
+const LimitGate = struct { reads: usize = 0 };
+
+fn searchOrReject(
+    allocator: std.mem.Allocator,
+    patterns: []const []const u8,
+    options: matcher_mod.FindOptions,
+    gate: *LimitGate,
+) !Result {
+    const Multi = @import("finder/multi.zig").Multi;
+    var multi = try Multi.init(allocator, patterns, options);
+    defer multi.deinit();
+    const Sink = struct {
+        pub fn matched(_: *@This(), _: Line) bool {
+            return true;
+        }
+    };
+    var sink = Sink{};
+    return drive(Sink, allocator, &sink, &multi, .{
+        .binary = .none,
+        .buffer_size = 8,
+        .max_line_len = 64,
+    }, "", struct {
+        fn read(raw: *anyopaque, dest: []u8) ReadError!usize {
+            _ = dest;
+            const ctx: *LimitGate = @ptrCast(@alignCast(raw));
+            ctx.reads += 1;
+            return 0;
+        }
+    }.read, gate);
+}
+
+test "模式条数和总长度在构造前被拒绝" {
+    const Multi = @import("finder/multi.zig").Multi;
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const alloc = failing.allocator();
+    var gate = LimitGate{};
+
+    var pats: [matcher_mod.pattern_count_hard_cap + 1][]const u8 = undefined;
+    for (&pats) |*slot| slot.* = "a";
+    try testing.expectError(error.PatternCountExceeded, searchOrReject(alloc, &pats, .{}, &gate));
+    try testing.expectEqual(@as(usize, 0), gate.reads);
+    try testing.expectEqual(@as(usize, 0), failing.allocations);
+
+    try testing.expectError(error.PatternCountExceeded, searchOrReject(alloc, &pats, .{
+        .max_pattern_count = matcher_mod.pattern_count_hard_cap + 50,
+    }, &gate));
+    try testing.expectEqual(@as(usize, 0), gate.reads);
+
+    try testing.expectError(error.PatternCountExceeded, Multi.init(alloc, &.{ "a", "b" }, .{ .max_pattern_count = 1 }));
+    try testing.expectError(error.PatternBytesExceeded, Multi.init(alloc, &.{"abcd"}, .{ .max_pattern_bytes = 3 }));
+    try testing.expectError(error.PatternCountExceeded, Finder.init("a", .{ .max_pattern_count = 0 }));
+
+    const big = try testing.allocator.alloc(u8, matcher_mod.pattern_bytes_hard_cap + 1);
+    defer testing.allocator.free(big);
+    @memset(big, 'b');
+    try testing.expectError(error.PatternBytesExceeded, searchOrReject(alloc, &.{big}, .{
+        .max_pattern_bytes = matcher_mod.pattern_bytes_hard_cap + 10,
+    }, &gate));
+    try testing.expectError(error.PatternBytesExceeded, Finder.init(big, .{}));
+    try testing.expectEqual(@as(usize, 0), gate.reads);
+
+    var ok = try Multi.init(testing.allocator, &.{ "foo", "bar" }, .{
+        .max_pattern_count = 8,
+        .max_pattern_bytes = 64,
+    });
+    defer ok.deinit();
+    try testing.expect(ok.find("foo", 0, .leftmost_first) != null);
+    try testing.expect(ok.find("bar", 0, .leftmost_first) != null);
+    try testing.expect(ok.find("nope", 0, .leftmost_first) == null);
+}
+
+const CountedRead = struct {
+    rest: []const u8,
+    reads: usize = 0,
+    closed: u32 = 0,
+
+    fn read(raw: *anyopaque, dest: []u8) ReadError!usize {
+        const self: *CountedRead = @ptrCast(@alignCast(raw));
+        self.reads += 1;
+        if (self.rest.len == 0) return 0;
+        const n = @min(dest.len, self.rest.len);
+        @memcpy(dest[0..n], self.rest[0..n]);
+        self.rest = self.rest[n..];
+        return n;
+    }
+
+    fn close(raw: ?*anyopaque) void {
+        const self: *CountedRead = @ptrCast(@alignCast(raw.?));
+        self.closed += 1;
+    }
+};
+
+test "max_count 之后不再读上游" {
+    const hay = "MATCH\nMATCH2\nbbbb\n";
+    var ctx = CountedRead{ .rest = hay };
+    var finder = try Finder.init("MATCH", .{});
+    var rec = Rec{};
+    defer rec.deinit(testing.allocator);
+    const result = try drive(Rec, testing.allocator, &rec, &finder, .{
+        .max_count = 1,
+        .after = 4,
+        .line_numbers = true,
+        .binary = .none,
+        .buffer_size = 13,
+        .max_line_len = 64,
+        .close_input = CountedRead.close,
+        .close_ctx = &ctx,
+    }, "", CountedRead.read, &ctx);
+    try testing.expectEqual(@as(usize, 1), ctx.reads);
+    try testing.expectEqual(@as(u32, 1), ctx.closed);
+    try testing.expectEqual(@as(u64, 13), result.bytes_read);
+    try testing.expect(ctx.rest.len > 0);
+    try testing.expectEqualStrings("1:MATCH\n2:MATCH2\n", rec.text.items);
+    try testing.expectEqual(Outcome.stopped, result.outcome);
+
+    var open = CountedRead{ .rest = "MATCH\n" };
+    var again = Rec{};
+    defer again.deinit(testing.allocator);
+    const full = try drive(Rec, testing.allocator, &again, &finder, .{
+        .max_count = 5,
+        .line_numbers = true,
+        .binary = .none,
+        .buffer_size = 8,
+        .max_line_len = 64,
+        .close_input = CountedRead.close,
+        .close_ctx = &open,
+    }, "", CountedRead.read, &open);
+    try testing.expectEqual(@as(u32, 0), open.closed);
+    try testing.expect(open.reads >= 2);
+    try testing.expectEqual(Outcome.complete, full.outcome);
+    try testing.expectEqualStrings("1:MATCH\n", again.text.items);
+}
+
+test "AND 与 NOT 同时过滤，且与反选不同" {
+    const hay =
+        \\foo bar
+        \\foo
+        \\bar
+        \\foo bar baz
+        \\bar baz
+        \\zzz
+        \\foo qux bar
+        \\
+    ;
+    const filtered = SearchConfig{
+        .line_numbers = true,
+        .binary = .none,
+        .contains = &.{ "foo", "bar" },
+        .excludes = &.{ "baz", "qux" },
+    };
+    var both = try run(hay, "foo", filtered);
+    defer both.deinit(testing.allocator);
+    try testing.expectEqualStrings("1:foo bar\n", both.text.items);
+
+    var inverted = try run(hay, "foo", .{ .line_numbers = true, .binary = .none, .invert = true });
+    defer inverted.deinit(testing.allocator);
+    try testing.expectEqualStrings(
+        \\3:bar
+        \\5:bar baz
+        \\6:zzz
+        \\
+    , inverted.text.items);
+
+    var together = try run(hay, "foo", .{
+        .line_numbers = true,
+        .binary = .none,
+        .invert = true,
+        .contains = &.{"bar"},
+        .excludes = &.{"baz"},
+    });
+    defer together.deinit(testing.allocator);
+    try testing.expectEqualStrings("3:bar\n", together.text.items);
+    try testing.expect(!std.mem.eql(u8, both.text.items, inverted.text.items));
+    try testing.expect(!std.mem.eql(u8, together.text.items, inverted.text.items));
+    try testing.expect(!std.mem.eql(u8, together.text.items, both.text.items));
 }

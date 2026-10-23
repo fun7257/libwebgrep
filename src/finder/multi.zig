@@ -5,8 +5,12 @@
 //! 锚点字节不超过 16 种时自动机仍先做单字节向量预过滤。
 //! Teddy 由 `-Dteddy` 选择。aarch64 默认是 neon，其他架构默认关闭。
 //!
+//! 智能大小写按每条模式判断：全是小写才忽略大小写。判断不一致时走标量扫描，
+//! 一致时仍走上面的引擎。这和 rg 整组判断不同，说明写在 `matcher.zig`。
+//!
 //! 模式字节由调用方持有，并且不能含有换行。复制本结构只复制指针，表在
 //! `deinit` 之前只读，工人可以共享。只有创建者调用 `deinit`。
+//! 条数和字节总长在分配这些表之前检查。
 
 const std = @import("std");
 const aho = @import("aho.zig");
@@ -26,50 +30,78 @@ pub const Multi = struct {
     kind: Kind,
     ignore_case: bool,
     empty_only: bool,
+    /// 调用方持有。整行比较和整词的逐条确认用它，不另外复制模式字节。
+    patterns: []const []const u8,
+
+    const Mixed = struct {
+        ignore: []bool,
+        allocator: std.mem.Allocator,
+    };
 
     const Kind = union(enum) {
         bytes: byteset.Set,
         pairs: pairs.Engine,
         ac: aho.Ac,
         teddy: if (teddy_on) teddy_mod.Engine else void,
+        mixed: Mixed,
     };
 
     pub fn init(
         allocator: std.mem.Allocator,
         patterns: []const []const u8,
         options: matcher.FindOptions,
-    ) error{ PatternHasNewline, OutOfMemory }!Multi {
+    ) (matcher.LimitError || error{ PatternHasNewline, OutOfMemory })!Multi {
+        // 超限在分配邻接对表、Teddy 或自动机之前返回，调用方还没开始扫描。
+        try matcher.checkPatternLimits(patterns, options);
         for (patterns) |pat| {
             if (std.mem.findScalar(u8, pat, '\n') != null) return error.PatternHasNewline;
         }
-        const ignore = ignoreCase(patterns, options.case);
-        if (allSingleByte(patterns)) {
-            return .{
-                .kind = .{ .bytes = byteset.Set.init(patterns, ignore) },
-                .ignore_case = ignore,
-                .empty_only = false,
-            };
-        }
-        if (try pairs.Engine.create(allocator, patterns, ignore)) |engine| {
-            return .{
-                .kind = .{ .pairs = engine },
-                .ignore_case = ignore,
-                .empty_only = false,
-            };
-        }
-        if (comptime teddy_on) {
-            if (teddyEligible(patterns)) {
+        if (uniformIgnore(patterns, options.case)) |ignore| {
+            if (allSingleByte(patterns)) {
                 return .{
-                    .kind = .{ .teddy = teddy_mod.Engine.init(patterns, ignore) },
+                    .kind = .{ .bytes = byteset.Set.init(patterns, ignore) },
                     .ignore_case = ignore,
                     .empty_only = false,
+                    .patterns = patterns,
                 };
             }
+            if (try pairs.Engine.create(allocator, patterns, ignore)) |engine| {
+                return .{
+                    .kind = .{ .pairs = engine },
+                    .ignore_case = ignore,
+                    .empty_only = false,
+                    .patterns = patterns,
+                };
+            }
+            if (comptime teddy_on) {
+                if (teddyEligible(patterns)) {
+                    return .{
+                        .kind = .{ .teddy = teddy_mod.Engine.init(patterns, ignore) },
+                        .ignore_case = ignore,
+                        .empty_only = false,
+                        .patterns = patterns,
+                    };
+                }
+            }
+            return .{
+                .kind = .{ .ac = try aho.build(allocator, patterns, ignore) },
+                .ignore_case = ignore,
+                .empty_only = onlyEmpty(patterns),
+                .patterns = patterns,
+            };
         }
+
+        const flags = try allocator.alloc(bool, patterns.len);
+        errdefer allocator.free(flags);
+        for (patterns, flags) |pat, *flag| flag.* = patternIgnoresCase(pat, .smart);
         return .{
-            .kind = .{ .ac = try aho.build(allocator, patterns, ignore) },
-            .ignore_case = ignore,
-            .empty_only = onlyEmpty(patterns),
+            .kind = .{ .mixed = .{
+                .ignore = flags,
+                .allocator = allocator,
+            } },
+            .ignore_case = false,
+            .empty_only = false,
+            .patterns = patterns,
         };
     }
 
@@ -81,6 +113,7 @@ pub const Multi = struct {
             .teddy => |*engine| {
                 if (comptime teddy_on) engine.deinit();
             },
+            .mixed => |*mixed| mixed.allocator.free(mixed.ignore),
         }
         self.* = undefined;
     }
@@ -96,6 +129,7 @@ pub const Multi = struct {
             .pairs => "pairs",
             .ac => "ac",
             .teddy => "teddy",
+            .mixed => "mixed",
         };
     }
 
@@ -104,6 +138,7 @@ pub const Multi = struct {
     }
 
     pub fn find(self: *Multi, haystack: []const u8, start: usize, mode: matcher.MatchMode) ?matcher.Match {
+        if (self.kind == .mixed) return self.scan(haystack, start, mode, allowAll);
         switch (self.kind) {
             .bytes => |*set| {
                 const at = set.find(haystack, start) orelse return null;
@@ -115,7 +150,72 @@ pub const Multi = struct {
                 if (comptime teddy_on) return engine.find(haystack, start, mode);
                 unreachable;
             },
+            .mixed => unreachable,
         }
+    }
+
+    /// 行内容是否和其中某一条模式相同。大小写按那一条自己的规则。
+    pub fn acceptsSpan(self: *const Multi, haystack: []const u8, start: usize, end: usize) bool {
+        if (start > end or end > haystack.len) return false;
+        const span = haystack[start..end];
+        for (self.patterns, 0..) |pat, i| {
+            if (ascii.eql(pat, span, self.foldOf(i))) return true;
+        }
+        return false;
+    }
+
+    /// 逐条确认，让同一起点上没被选中的另一条模式仍能通过 `allow`。
+    /// 整词要用这个：引擎只返回一条，短的那条被词边界拒绝时，长的那条可能成立。
+    pub fn findAllowed(
+        self: *Multi,
+        haystack: []const u8,
+        start: usize,
+        mode: matcher.MatchMode,
+        comptime allow: fn ([]const u8, usize, usize) bool,
+    ) ?matcher.Match {
+        return self.scan(haystack, start, mode, allow);
+    }
+
+    fn foldOf(self: *const Multi, index: usize) bool {
+        switch (self.kind) {
+            .mixed => |*mixed| return mixed.ignore[index],
+            else => return self.ignore_case,
+        }
+    }
+
+    fn scan(
+        self: *const Multi,
+        haystack: []const u8,
+        start: usize,
+        mode: matcher.MatchMode,
+        comptime allow: fn ([]const u8, usize, usize) bool,
+    ) ?matcher.Match {
+        if (start > haystack.len) return null;
+        const flags: ?[]const bool = switch (self.kind) {
+            .mixed => |*mixed| mixed.ignore,
+            else => null,
+        };
+        var best: ?Naive = null;
+        var i = start;
+        while (i <= haystack.len) : (i += 1) {
+            for (self.patterns, 0..) |pat, id_usize| {
+                if (i + pat.len > haystack.len) continue;
+                const fold = if (flags) |list| list[id_usize] else self.ignore_case;
+                if (!ascii.eql(pat, haystack[i..][0..pat.len], fold)) continue;
+                if (!allow(haystack, i, i + pat.len)) continue;
+                const cand = Naive{ .start = i, .end = i + pat.len, .id = @intCast(id_usize) };
+                if (best) |cur| {
+                    if (better(cand, cur, mode)) best = cand;
+                } else best = cand;
+            }
+            if (mode == .leftmost_first) {
+                if (best) |cand| return .{ .start = cand.start, .end = cand.end };
+            } else if (best) |cand| {
+                if (i >= cand.end) return .{ .start = cand.start, .end = cand.end };
+            }
+        }
+        const found = best orelse return null;
+        return .{ .start = found.start, .end = found.end };
     }
 
     pub fn findWatched(self: *Multi, haystack: []const u8, start: usize, nul: *?usize) ?matcher.Match {
@@ -133,15 +233,35 @@ pub const Multi = struct {
     }
 };
 
-pub fn ignoreCase(patterns: []const []const u8, mode: matcher.CaseMode) bool {
+fn allowAll(haystack: []const u8, start: usize, end: usize) bool {
+    _ = haystack;
+    _ = start;
+    _ = end;
+    return true;
+}
+
+/// 这一条模式在 `mode` 下是否忽略 ASCII 大小写。
+/// `smart` 只看这一条：全是小写才折叠。旁边有大写的模式不会把这一条改成区分大小写。
+pub fn patternIgnoresCase(pattern: []const u8, mode: matcher.CaseMode) bool {
+    return switch (mode) {
+        .sensitive => false,
+        .insensitive => true,
+        .smart => !ascii.patternHasUpper(pattern),
+    };
+}
+
+/// 全部模式的大小写判断一致时返回那个值。`smart` 下不一致则返回 null。
+fn uniformIgnore(patterns: []const []const u8, mode: matcher.CaseMode) ?bool {
     switch (mode) {
         .sensitive => return false,
         .insensitive => return true,
         .smart => {
-            for (patterns) |pat| {
-                if (ascii.patternHasUpper(pat)) return false;
+            if (patterns.len == 0) return true;
+            const first = patternIgnoresCase(patterns[0], .smart);
+            for (patterns[1..]) |pat| {
+                if (patternIgnoresCase(pat, .smart) != first) return null;
             }
-            return true;
+            return first;
         },
     }
 }
@@ -298,18 +418,39 @@ test "同一行上的非重叠命中和空模式" {
     try std.testing.expectEqual(@as(usize, 0), miss.end);
 }
 
-test "ASCII 忽略大小写，smart 看全部模式" {
+test "智能大小写按每个模式判断" {
     var folded = try Multi.init(std.testing.allocator, &.{ "Ab", "zz" }, .{ .case = .insensitive });
     defer folded.deinit();
+    try std.testing.expect(folded.kind != .mixed);
     try std.testing.expectEqual(@as(usize, 2), folded.find("xxaby", 0, .leftmost_first).?.start);
 
-    try std.testing.expect(!ignoreCase(&.{ "Foo", "bar" }, .smart));
-    try std.testing.expect(ignoreCase(&.{ "foo", "bar" }, .smart));
+    try std.testing.expect(!patternIgnoresCase("Foo", .smart));
+    try std.testing.expect(patternIgnoresCase("bar", .smart));
+    try std.testing.expect(patternIgnoresCase("foo", .smart));
+
+    // Foo 含大写，仍区分大小写。bar 全是小写，单独忽略大小写。
+    // rg 会因为整组里有 Foo 而让 bar 也区分大小写。
     var smart = try Multi.init(std.testing.allocator, &.{ "Foo", "bar" }, .{ .case = .smart });
     defer smart.deinit();
+    try std.testing.expect(smart.kind == .mixed);
     try std.testing.expect(smart.find("foo", 0, .leftmost_first) == null);
-    try std.testing.expect(smart.find("BAR", 0, .leftmost_first) == null);
+    try std.testing.expectEqual(@as(usize, 0), smart.find("BAR", 0, .leftmost_first).?.start);
     try std.testing.expectEqual(@as(usize, 0), smart.find("Foo", 0, .leftmost_first).?.start);
+    try std.testing.expectEqual(@as(usize, 0), smart.find("Bar", 0, .leftmost_first).?.start);
+    try std.testing.expectEqual(@as(usize, 0), smart.find("FooBAR", 0, .earliest).?.start);
+    try std.testing.expectEqual(@as(usize, 3), smart.find("FooBAR", 0, .earliest).?.end);
+
+    var lower = try Multi.init(std.testing.allocator, &.{ "foo", "bar" }, .{ .case = .smart });
+    defer lower.deinit();
+    try std.testing.expect(lower.kind != .mixed);
+    try std.testing.expectEqual(@as(usize, 0), lower.find("FOO", 0, .leftmost_first).?.start);
+    try std.testing.expectEqual(@as(usize, 0), lower.find("BAR", 0, .leftmost_first).?.start);
+
+    var mixed_case = try Multi.init(std.testing.allocator, &.{ "Ab", "zz" }, .{ .case = .smart });
+    defer mixed_case.deinit();
+    try std.testing.expect(mixed_case.find("ab", 0, .leftmost_first) == null);
+    try std.testing.expectEqual(@as(usize, 0), mixed_case.find("Ab", 0, .leftmost_first).?.start);
+    try std.testing.expectEqual(@as(usize, 0), mixed_case.find("ZZ", 0, .leftmost_first).?.start);
 }
 
 test "经典失败链和随机对照" {

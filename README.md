@@ -128,6 +128,8 @@ _ = try libwebgrep.searchSlice(libwebgrep.AnySink, &any, haystack, "", &finder, 
 
 ## 搜索一个文件
 
+服务入口是 `searchSource`（reader）和 `searchSourceSlice`（内存切片），再加上调用方分配的来源标识。`searchFile` 和 `parallel.run` 不是服务入口，N7 会从公共 API 去掉。
+
 会分配或做 I/O 的函数显式接收分配器和 `std.Io`。热路径上的逐块查找不再分配，也不加锁。
 
 ```zig

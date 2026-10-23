@@ -86,6 +86,10 @@ pub const Outcome = sink_mod.Outcome;
 pub const Result = sink_mod.Result;
 pub const Line = sink_mod.Line;
 pub const Span = sink_mod.Span;
+pub const BinaryStatus = sink_mod.BinaryStatus;
+pub const Event = sink_mod.Event;
+pub const LineEvent = sink_mod.LineEvent;
+pub const EndEvent = sink_mod.EndEvent;
 
 pub const SliceError = error{ ContextLinesExceeded, OutOfMemory };
 pub const ReadError = error{ OutOfMemory, ReadFailed, ContextLinesExceeded } || std.Io.File.ReadPositionalError;
@@ -116,6 +120,7 @@ const State = struct {
     matched_lines: u64 = 0,
     bytes_read: u64 = 0,
     nul_offset: ?u64 = null,
+    binary_status: sink_mod.BinaryStatus = .none,
     stopped: bool = false,
     /// 已经交给 Sink 的最后一行的终点绝对偏移（含换行）。断点用它判断，不看缓冲下标。
     last_abs_end: u64 = 0,
@@ -177,7 +182,8 @@ fn materialize(haystack: []const u8, config: SearchConfig) SliceError!Prepared {
     }
 }
 
-/// 在 `haystack` 上搜索。没有 BOM 时行切片直接指向 `haystack`。`name` 传给 `begin`，可以是空串。
+/// 旧回调入口，在 `haystack` 上搜索。没有 BOM 时行切片直接指向 `haystack`。
+/// `name` 只传给旧的 `begin`。服务入口是 `searchSourceSlice`。
 pub fn searchSlice(
     comptime S: type,
     sink: *S,
@@ -214,8 +220,8 @@ fn searchPrepared(
 
     if (watchesBinary(config)) {
         if (memchr.find(width, haystack, 0, 0)) |nul| {
-            state.nul_offset = nul;
-            const cont = callOpt(S, "binary", sink, .{nul});
+            noteBinary(&state, config, nul);
+            const cont = callOpt(S, "binary", sink, .{state.nul_offset.?});
             if (config.binary == .quit) {
                 const window = bufferWindow(config);
                 if (nul < @min(haystack.len, window)) {
@@ -237,7 +243,8 @@ fn searchPrepared(
     return finishSink(S, sink, &state, config);
 }
 
-/// 从 `reader` 搜索。短读视为 EOF。缓冲在线程内由这一次调用独占，结束时释放。
+/// 旧回调入口，从 `reader` 搜索。短读视为 EOF。缓冲在线程内由这一次调用独占，结束时释放。
+/// `name` 只传给旧的 `begin`。服务入口是 `searchSource`。
 pub fn searchReader(
     comptime S: type,
     allocator: std.mem.Allocator,
@@ -259,6 +266,9 @@ pub fn searchReader(
 /// 从已打开的文件搜索。默认用 `readPositional` 分块读进调用方缓冲。
 /// 整文件映射在这台机器的 1 GiB 热缓存上比分块读更慢，还把驻留撑到文件大小，所以不用。
 /// `-Dmmap-windows` 才改走 8 MiB 窗口映射，默认关闭。
+///
+/// 这不是服务入口。`name` 只供旧的 Sink 使用。服务入口是 `searchSource` 和
+/// `searchSourceSlice`。N7 会把本函数移出公共 API。
 pub fn searchFile(
     comptime S: type,
     allocator: std.mem.Allocator,
@@ -289,6 +299,116 @@ pub fn searchFile(
             return n;
         }
     }.read, &ctx);
+}
+
+/// 服务入口：搜索一段内存里的字节。
+/// `source_id` 由调用方分配，库不解释。
+/// 行号从 1 开始。NUL 记录模式计的是记录号。
+/// `S` 提供 `pub fn event(self: *S, ev: Event) bool`。返回 false 就停止。
+/// 行字节和匹配区间只在这次回调期间有效。每产生一个事件就调用一次。
+pub fn searchSourceSlice(
+    comptime S: type,
+    sink: *S,
+    source_id: []const u8,
+    haystack: []const u8,
+    matcher: anytype,
+    config: SearchConfig,
+) SliceError!Result {
+    const cfg = serviceConfig(config);
+    var bridge = EventBridge(S){
+        .inner = sink,
+        .source_id = source_id,
+        .config = cfg,
+    };
+    return searchSlice(EventBridge(S), &bridge, haystack, "", matcher, cfg);
+}
+
+/// 服务入口：从 reader 搜索。短读视为结束。
+/// `source_id` 由调用方分配，库不解释。
+/// 行号从 1 开始。NUL 记录模式计的是记录号。
+/// `S` 提供 `pub fn event(self: *S, ev: Event) bool`。返回 false 就停止。
+/// 行字节和匹配区间只在这次回调期间有效。每产生一个事件就调用一次。
+pub fn searchSource(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    sink: *S,
+    reader: *std.Io.Reader,
+    source_id: []const u8,
+    matcher: anytype,
+    config: SearchConfig,
+) ReadError!Result {
+    const cfg = serviceConfig(config);
+    var bridge = EventBridge(S){
+        .inner = sink,
+        .source_id = source_id,
+        .config = cfg,
+    };
+    return searchReader(EventBridge(S), allocator, &bridge, reader, "", matcher, cfg);
+}
+
+fn serviceConfig(config: SearchConfig) SearchConfig {
+    var cfg = config;
+    cfg.line_numbers = true;
+    return cfg;
+}
+
+fn EventBridge(comptime S: type) type {
+    return struct {
+        inner: *S,
+        source_id: []const u8,
+        config: SearchConfig,
+
+        const Bridge = @This();
+
+        pub fn begin(self: *Bridge, _: []const u8) bool {
+            return self.inner.event(.{ .begin = .{ .source_id = self.source_id } });
+        }
+
+        pub fn matched(self: *Bridge, line: Line) bool {
+            return self.inner.event(.{ .match = lineEvent(self.source_id, line) });
+        }
+
+        pub fn context(self: *Bridge, line: Line) bool {
+            return self.inner.event(.{ .context = lineEvent(self.source_id, line) });
+        }
+
+        pub fn contextBreak(self: *Bridge) bool {
+            return self.inner.event(.{ .context_break = .{ .source_id = self.source_id } });
+        }
+
+        pub fn finish(self: *Bridge, result: Result) bool {
+            return self.inner.event(.{ .end = .{
+                .source_id = self.source_id,
+                .binary_status = binaryStatus(self.config, result.nul_offset),
+                .binary_offset = result.binary_offset,
+                .matched_lines = result.matched_lines,
+                .bytes_read = result.bytes_read,
+                .outcome = result.outcome,
+            } });
+        }
+    };
+}
+
+fn lineEvent(source_id: []const u8, line: Line) sink_mod.LineEvent {
+    const u16_column = if (line.matches.len > 0)
+        @as(u64, line.matches[0].u16_start) + 1
+    else
+        line.u16_column;
+    return .{
+        .source_id = source_id,
+        .line_number = line.number orelse 0,
+        .column = line.column,
+        .u16_column = u16_column,
+        .absolute_offset = line.offset,
+        .bytes = line.bytes,
+        .text = if (line.text.len == 0) line.bytes else line.text,
+        .raw = if (line.raw.len == 0) line.bytes else line.raw,
+        .matches = line.matches,
+        .truncated = line.truncated,
+        .line_len = line.line_len,
+        .window_start = line.window_start,
+        .binary_status = line.binary_status,
+    };
 }
 
 fn drive(
@@ -420,7 +540,7 @@ fn drive(
                 }
             }
             if (nul_rel) |rel| {
-                state.nul_offset = state.abs_base + rel;
+                noteBinary(&state, config, state.abs_base + rel);
                 const cont = callOpt(S, "binary", sink, .{state.nul_offset.?});
                 if (config.binary == .quit or !cont) {
                     filled = chunk_at;
@@ -431,7 +551,7 @@ fn drive(
             }
         } else if (!eof and watchesBinary(config) and state.nul_offset == null) {
             if (memchr.find(width, buf[chunk_at..filled], 0, 0)) |rel| {
-                state.nul_offset = state.abs_base + chunk_at + rel;
+                noteBinary(&state, config, state.abs_base + chunk_at + rel);
                 const cont = callOpt(S, "binary", sink, .{state.nul_offset.?});
                 if (config.binary == .quit or !cont) {
                     filled = chunk_at;
@@ -502,6 +622,16 @@ fn recordSep(config: SearchConfig) u8 {
 /// NUL 只在 LF 分行、并且不是 NUL 记录模式时当成二进制信号。
 fn watchesBinary(config: SearchConfig) bool {
     return config.binary != .none and !config.null_data;
+}
+
+fn noteBinary(state: *State, config: SearchConfig, offset: u64) void {
+    if (state.nul_offset == null) state.nul_offset = offset;
+    state.binary_status = binaryStatus(config, state.nul_offset);
+}
+
+fn binaryStatus(config: SearchConfig, nul: ?u64) sink_mod.BinaryStatus {
+    if (nul == null or !watchesBinary(config)) return .none;
+    return if (config.binary == .quit) .suppressed else .detected;
 }
 
 fn lastComplete(buf: []const u8, config: SearchConfig) usize {
@@ -716,6 +846,85 @@ fn beforeContext(
 
 const ContextKind = enum { before, after };
 
+fn spanBefore(_: void, a: Span, b: Span) bool {
+    if (a.start == b.start) return a.end < b.end;
+    return a.start < b.start;
+}
+
+fn growSpans(alloc: ?std.mem.Allocator, store: []Span, heap: *[]Span, n: usize) SliceError![]Span {
+    const a = alloc orelse return error.OutOfMemory;
+    const bigger_n = @max(store.len * 2, n + 1);
+    if (heap.len == 0) {
+        const bigger = try a.alloc(Span, bigger_n);
+        @memcpy(bigger[0..n], store[0..n]);
+        heap.* = bigger;
+        return bigger;
+    }
+    heap.* = try a.realloc(heap.*, bigger_n);
+    return heap.*;
+}
+
+/// 这一行里不重叠的匹配，相对预览窗口，按起点排序。
+/// 空模式只留一个零宽区间，避免按每个字节空转。
+fn gatherSpans(
+    alloc: ?std.mem.Allocator,
+    inline_buf: []Span,
+    heap: *[]Span,
+    matcher: anytype,
+    buf: []const u8,
+    line: Range,
+    preview: Preview,
+    known: ?BufMatch,
+    config: SearchConfig,
+) SliceError![]Span {
+    if (known == null) return inline_buf[0..0];
+    var store = inline_buf;
+    var n: usize = 0;
+    if (config.whole_line) {
+        if (preview.span) |span| {
+            store[0] = span;
+            n = 1;
+        }
+        return store[0..n];
+    }
+    const content_end = contentEnd(buf, line, config);
+    const win_lo = preview.start;
+    const win_hi = preview.end;
+    var pos = line.start;
+    while (pos <= content_end and pos <= buf.len) {
+        const found = nextMatch(matcher, buf, pos, config) orelse break;
+        if (found.start < pos or found.start > buf.len or found.start > content_end) break;
+        if (found.start == content_end and found.end > content_end) break;
+        const mend = @min(found.end, content_end);
+        const empty = found.start == mend;
+        const in_window = found.start >= win_lo and found.start < win_hi;
+        const empty_at_point = empty and found.start == win_lo and win_lo == win_hi;
+        if (in_window or empty_at_point) {
+            if (n == store.len) store = try growSpans(alloc, store, heap, n);
+            if (empty_at_point) {
+                store[n] = .{ .start = 0, .end = 0 };
+            } else {
+                store[n] = .{
+                    .start = found.start - win_lo,
+                    .end = @min(mend, win_hi) - win_lo,
+                };
+            }
+            n += 1;
+        }
+        if (empty or found.end <= pos) break;
+        pos = found.end;
+    }
+    if (n == 0) {
+        if (preview.span) |span| {
+            if (store.len == 0) store = try growSpans(alloc, store, heap, 0);
+            store[0] = span;
+            n = 1;
+        }
+    }
+    std.mem.sort(Span, store[0..n], {}, spanBefore);
+    return store[0..n];
+}
+
 fn sinkLine(
     comptime S: type,
     comptime name: []const u8,
@@ -723,14 +932,23 @@ fn sinkLine(
     state: *State,
     bytes: []const u8,
     span: ?Span,
+    matches: []Span,
     offset: u64,
     number: ?u64,
     truncated: bool,
     line_len: u64,
     window_start: u64,
 ) bool {
+    var one: [1]Span = undefined;
+    var multi = matches;
+    if (multi.len == 0) {
+        if (span) |found| {
+            one[0] = .{ .start = found.start, .end = found.end };
+            multi = &one;
+        }
+    }
     var scratch: [1024]u8 = undefined;
-    const line = buildLine(state, &scratch, bytes, span, offset, number, truncated, line_len, window_start);
+    const line = buildLine(state, &scratch, bytes, span, multi, offset, number, truncated, line_len, window_start);
     return callOpt(S, name, sink, .{line});
 }
 
@@ -739,6 +957,7 @@ fn buildLine(
     scratch: []u8,
     bytes: []const u8,
     span: ?Span,
+    matches: []Span,
     offset: u64,
     number: ?u64,
     truncated: bool,
@@ -746,8 +965,15 @@ fn buildLine(
     window_start: u64,
 ) Line {
     const text = lossyText(state, scratch, bytes);
+    for (matches) |*item| {
+        const from = @min(item.start, bytes.len);
+        const to = @min(@max(item.end, from), bytes.len);
+        const units = encoding.utf16Span(bytes, from, to);
+        item.u16_start = units.start;
+        item.u16_end = units.end;
+    }
     var match = span;
-    var column: ?u64 = null;
+    var u16_column: ?u64 = null;
     if (span) |found| {
         const from = @min(found.start, bytes.len);
         const to = @min(@max(found.end, from), bytes.len);
@@ -758,8 +984,9 @@ fn buildLine(
             .u16_start = units.start,
             .u16_end = units.end,
         };
-        column = units.start + 1;
+        u16_column = units.start + 1;
     }
+    const column: ?u64 = if (matches.len > 0) @as(u64, matches[0].start) + 1 else null;
     return .{
         .bytes = bytes,
         .text = text,
@@ -767,7 +994,10 @@ fn buildLine(
         .offset = offset,
         .number = number,
         .match = match,
-        .u16_column = column,
+        .matches = matches,
+        .column = column,
+        .u16_column = u16_column,
+        .binary_status = state.binary_status,
         .truncated = truncated,
         .line_len = line_len,
         .window_start = window_start,
@@ -811,6 +1041,20 @@ fn sinkMatched(
     countLines(buf, line.start, state, config);
     const withheld = config.binary == .report and state.nul_offset != null;
     const bytes = if (withheld) buf[line.start..line.start] else buf[preview.start..preview.end];
+    var inline_spans: [32]Span = undefined;
+    var span_heap: []Span = &.{};
+    defer if (span_heap.len != 0) if (state.text_alloc) |alloc| alloc.free(span_heap);
+    const matches = if (withheld) inline_spans[0..0] else try gatherSpans(
+        state.text_alloc,
+        &inline_spans,
+        &span_heap,
+        matcher,
+        buf,
+        line,
+        preview,
+        known,
+        config,
+    );
     const keep = sinkLine(
         S,
         "matched",
@@ -818,6 +1062,7 @@ fn sinkMatched(
         state,
         bytes,
         if (withheld) null else preview.span,
+        matches,
         line_abs,
         state.line_number,
         preview.truncated and !withheld,
@@ -831,7 +1076,6 @@ fn sinkMatched(
     state.has_sunk = true;
     state.matched_lines += 1;
     if (!keep) state.stopped = true;
-    _ = matcher;
     return keep;
 }
 
@@ -852,6 +1096,20 @@ fn sinkContext(
     countLines(buf, line.start, state, config);
     const withheld = config.binary == .report and state.nul_offset != null;
     const bytes = if (withheld) buf[line.start..line.start] else buf[preview.start..preview.end];
+    var inline_spans: [32]Span = undefined;
+    var span_heap: []Span = &.{};
+    defer if (span_heap.len != 0) if (state.text_alloc) |alloc| alloc.free(span_heap);
+    const matches = if (withheld) inline_spans[0..0] else try gatherSpans(
+        state.text_alloc,
+        &inline_spans,
+        &span_heap,
+        matcher,
+        buf,
+        line,
+        preview,
+        known,
+        config,
+    );
     const keep = sinkLine(
         S,
         "context",
@@ -859,6 +1117,7 @@ fn sinkContext(
         state,
         bytes,
         if (withheld) null else preview.span,
+        matches,
         line_abs,
         state.line_number,
         preview.truncated and !withheld,
@@ -1238,6 +1497,7 @@ fn emitRing(
             .start = slot.mstart,
             .end = slot.mend,
         };
+        var none: [0]Span = .{};
         const keep = sinkLine(
             S,
             "context",
@@ -1245,6 +1505,7 @@ fn emitRing(
             state,
             if (withheld) raw[0..0] else raw,
             span,
+            &none,
             slot.abs,
             slot.number,
             slot.truncated and !withheld,
@@ -1429,10 +1690,11 @@ fn emitHold(
     const bytes = if (withheld) raw[0..0] else raw;
     const truncated = state.long_line_len > config.max_line_len and !withheld;
     const window = if (withheld) 0 else state.long_window_start;
+    var none: [0]Span = .{};
     const keep = if (as_match)
-        sinkLine(S, "matched", sink, state, bytes, span, state.long_origin, state.long_number, truncated, state.long_line_len, window)
+        sinkLine(S, "matched", sink, state, bytes, span, &none, state.long_origin, state.long_number, truncated, state.long_line_len, window)
     else
-        sinkLine(S, "context", sink, state, bytes, span, state.long_origin, state.long_number, truncated, state.long_line_len, window);
+        sinkLine(S, "context", sink, state, bytes, span, &none, state.long_origin, state.long_number, truncated, state.long_line_len, window);
     if (as_match) state.matched_lines += 1;
     state.last_abs_end = end_abs;
     state.has_sunk = true;
@@ -1572,7 +1834,7 @@ fn pumpLong(
 ) ReadError!bool {
     if (watchesBinary(config) and state.nul_offset == null and new_at < filled.*) {
         if (memchr.find(width, buf.*[new_at..filled.*], 0, 0)) |rel| {
-            state.nul_offset = state.abs_base + new_at + rel;
+            noteBinary(state, config, state.abs_base + new_at + rel);
             const cont = callOpt(S, "binary", sink, .{state.nul_offset.?});
             if (config.binary == .quit or !cont) return false;
         }
@@ -3097,4 +3359,304 @@ test "非法 UTF-8 同时给出有损文本和原始字节" {
     try testing.expectEqual(@as(usize, 2), bad.u1);
     try testing.expectEqualStrings("a\xffb", bad.raw[0..bad.raw_len]);
     try testing.expectEqualStrings("a\u{FFFD}b", bad.text[0..bad.text_len]);
+}
+
+const EvKind = enum { begin, match, context, brk, end };
+
+const Saved = struct {
+    kind: EvKind,
+    id: []u8,
+    line_number: u64 = 0,
+    column: ?u64 = null,
+    u16_column: ?u64 = null,
+    offset: u64 = 0,
+    bytes: []u8 = &.{},
+    matches: []Span = &.{},
+    truncated: bool = false,
+    line_len: u64 = 0,
+    window_start: u64 = 0,
+    status: BinaryStatus = .none,
+    matched_lines: u64 = 0,
+
+    fn free(self: *Saved) void {
+        const a = testing.allocator;
+        if (self.id.len != 0) a.free(self.id);
+        if (self.bytes.len != 0) a.free(self.bytes);
+        if (self.matches.len != 0) a.free(self.matches);
+    }
+};
+
+const Bag = struct {
+    items: std.ArrayList(Saved) = .empty,
+
+    fn deinit(self: *Bag) void {
+        self.reset();
+    }
+
+    fn reset(self: *Bag) void {
+        for (self.items.items) |*item| item.free();
+        self.items.deinit(testing.allocator);
+        self.items = .empty;
+    }
+
+    pub fn event(self: *Bag, ev: Event) bool {
+        const saved: Saved = switch (ev) {
+            .begin => |b| bare(.begin, b.source_id),
+            .context_break => |b| bare(.brk, b.source_id),
+            .end => |e| blk: {
+                var row = bare(.end, e.source_id);
+                row.status = e.binary_status;
+                row.matched_lines = e.matched_lines;
+                break :blk row;
+            },
+            .match => |line| fromLine(.match, line),
+            .context => |line| fromLine(.context, line),
+        };
+        self.items.append(testing.allocator, saved) catch unreachable;
+        return true;
+    }
+
+    fn kindCount(self: *const Bag, kind: EvKind) usize {
+        var n: usize = 0;
+        for (self.items.items) |item| {
+            if (item.kind == kind) n += 1;
+        }
+        return n;
+    }
+
+    fn matchAt(self: *const Bag, n: usize) *const Saved {
+        var seen: usize = 0;
+        for (self.items.items) |*item| {
+            if (item.kind != .match) continue;
+            if (seen == n) return item;
+            seen += 1;
+        }
+        unreachable;
+    }
+};
+
+fn bare(kind: EvKind, id: []const u8) Saved {
+    return .{
+        .kind = kind,
+        .id = testing.allocator.dupe(u8, id) catch unreachable,
+    };
+}
+
+fn fromLine(kind: EvKind, line: LineEvent) Saved {
+    const a = testing.allocator;
+    return .{
+        .kind = kind,
+        .id = a.dupe(u8, line.source_id) catch unreachable,
+        .line_number = line.line_number,
+        .column = line.column,
+        .u16_column = line.u16_column,
+        .offset = line.absolute_offset,
+        .bytes = if (line.bytes.len == 0) &.{} else a.dupe(u8, line.bytes) catch unreachable,
+        .matches = if (line.matches.len == 0) &.{} else a.dupe(Span, line.matches) catch unreachable,
+        .truncated = line.truncated,
+        .line_len = line.line_len,
+        .window_start = line.window_start,
+        .status = line.binary_status,
+    };
+}
+
+fn searchId(bag: *Bag, id: []const u8, hay: []const u8, pattern: []const u8, config: SearchConfig) !Result {
+    var finder = try Finder.init(pattern, .{});
+    return searchSourceSlice(Bag, bag, id, hay, &finder, config);
+}
+
+test "服务入口只接受来源 ID" {
+    var bag = Bag{};
+    defer bag.deinit();
+    const slice_result = try searchId(&bag, "sid-7", "MATCH\n", "MATCH", .{});
+    try testing.expectEqual(Outcome.complete, slice_result.outcome);
+    try testing.expect(bag.kindCount(.begin) == 1);
+    try testing.expect(bag.kindCount(.end) == 1);
+    try testing.expect(bag.kindCount(.match) == 1);
+    for (bag.items.items) |item| try testing.expectEqualStrings("sid-7", item.id);
+
+    bag.reset();
+    var reader = std.Io.Reader.fixed("MATCH\n");
+    var finder = try Finder.init("MATCH", .{});
+    const read_result = try searchSource(Bag, testing.allocator, &bag, &reader, "sid-8", &finder, .{});
+    try testing.expectEqual(Outcome.complete, read_result.outcome);
+    try testing.expect(bag.kindCount(.match) == 1);
+    for (bag.items.items) |item| try testing.expectEqualStrings("sid-8", item.id);
+    try testing.expect(bag.items.items[0].kind == .begin);
+    try testing.expect(bag.items.items[bag.items.items.len - 1].kind == .end);
+}
+
+test "事件带行号、字节列号和绝对偏移" {
+    var bag = Bag{};
+    defer bag.deinit();
+    _ = try searchId(&bag, "pos", "éMATCH\nzz\nMATCH\n", "MATCH", .{});
+    const first = bag.matchAt(0);
+    try testing.expectEqual(@as(u64, 1), first.line_number);
+    try testing.expectEqual(@as(?u64, 3), first.column);
+    try testing.expectEqual(@as(?u64, 2), first.u16_column);
+    try testing.expectEqual(@as(u64, 0), first.offset);
+    try testing.expect(first.column != first.u16_column);
+
+    const second = bag.matchAt(1);
+    try testing.expectEqual(@as(u64, 3), second.line_number);
+    try testing.expectEqual(@as(?u64, 1), second.column);
+    try testing.expectEqual(@as(u64, 11), second.offset);
+
+    bag.reset();
+    _ = try searchId(&bag, "rec", "a\nb\x00zzMATCH", "MATCH", .{ .null_data = true });
+    const record = bag.matchAt(0);
+    try testing.expectEqual(@as(u64, 2), record.line_number);
+    try testing.expectEqual(@as(?u64, 3), record.column);
+    try testing.expectEqual(@as(u64, 4), record.offset);
+    try testing.expectEqualStrings("zzMATCH", record.bytes);
+}
+
+test "一行多个匹配区间按起点排序" {
+    var bag = Bag{};
+    defer bag.deinit();
+    _ = try searchId(&bag, "many", "abXabYab\n", "ab", .{});
+    const line = bag.matchAt(0);
+    try testing.expectEqual(@as(usize, 3), line.matches.len);
+    try testing.expectEqual(@as(usize, 0), line.matches[0].start);
+    try testing.expectEqual(@as(usize, 2), line.matches[0].end);
+    try testing.expectEqual(@as(usize, 3), line.matches[1].start);
+    try testing.expectEqual(@as(usize, 5), line.matches[1].end);
+    try testing.expectEqual(@as(usize, 6), line.matches[2].start);
+    try testing.expectEqual(@as(usize, 8), line.matches[2].end);
+    try testing.expect(line.matches[0].start <= line.matches[1].start);
+    try testing.expect(line.matches[1].start <= line.matches[2].start);
+    try testing.expectEqualStrings("ab", line.bytes[line.matches[0].start..line.matches[0].end]);
+    try testing.expectEqualStrings("ab", line.bytes[line.matches[2].start..line.matches[2].end]);
+    try testing.expectEqual(@as(?u64, 1), line.column);
+    try testing.expect(std.mem.indexOfScalar(u8, line.bytes, 0x1b) == null);
+}
+
+test "每个事件只有来源 ID" {
+    var bag = Bag{};
+    defer bag.deinit();
+    _ = try searchId(&bag, "id-9", "a\nb\nMATCH\nc\nd\ne\nMATCH2\nf\n", "MATCH", .{
+        .before = 1,
+        .after = 1,
+        .binary = .none,
+    });
+    try testing.expect(bag.kindCount(.begin) == 1);
+    try testing.expect(bag.kindCount(.match) == 2);
+    try testing.expect(bag.kindCount(.context) >= 1);
+    try testing.expect(bag.kindCount(.brk) == 1);
+    try testing.expect(bag.kindCount(.end) == 1);
+    for (bag.items.items) |item| try testing.expectEqualStrings("id-9", item.id);
+}
+
+test "二进制状态三种取值" {
+    var bag = Bag{};
+    defer bag.deinit();
+    _ = try searchId(&bag, "plain", "MATCH\n", "MATCH", .{});
+    try testing.expectEqual(BinaryStatus.none, bag.items.items[bag.items.items.len - 1].status);
+
+    bag.reset();
+    _ = try searchId(&bag, "text", "xxMATCH\x00yy\n", "MATCH", .{ .binary = .none });
+    try testing.expectEqual(BinaryStatus.none, bag.items.items[bag.items.items.len - 1].status);
+    try testing.expect(std.mem.indexOfScalar(u8, bag.matchAt(0).bytes, 0) != null);
+
+    bag.reset();
+    _ = try searchId(&bag, "seen", "xxMATCH\x00yy\n", "MATCH", .{ .binary = .report });
+    try testing.expectEqual(BinaryStatus.detected, bag.items.items[bag.items.items.len - 1].status);
+
+    bag.reset();
+    _ = try searchId(&bag, "skip", "ab\x00MATCH\n", "MATCH", .{ .binary = .quit });
+    try testing.expectEqual(BinaryStatus.suppressed, bag.items.items[bag.items.items.len - 1].status);
+    try testing.expectEqual(@as(u64, 0), bag.items.items[bag.items.items.len - 1].matched_lines);
+    try testing.expectEqual(@as(usize, 0), bag.kindCount(.match));
+}
+
+test "截断字段来自超长行窗口" {
+    var hay: [80]u8 = undefined;
+    @memset(&hay, 'z');
+    const match_at: usize = 40;
+    @memcpy(hay[match_at..][0..5], "MATCH");
+    var bag = Bag{};
+    defer bag.deinit();
+    _ = try searchId(&bag, "win", &hay, "MATCH", .{ .max_line_len = 16, .binary = .none });
+    const line = bag.matchAt(0);
+    try testing.expect(line.truncated);
+    try testing.expectEqual(@as(u64, hay.len), line.line_len);
+    try testing.expectEqual(@as(u64, 0), line.offset);
+    try testing.expect(line.bytes.len <= 16);
+    try testing.expect(line.bytes.len > 0);
+    try testing.expectEqualStrings(hay[line.window_start..][0..line.bytes.len], line.bytes);
+    try testing.expect(line.matches.len >= 1);
+    try testing.expectEqual(@as(u64, match_at), line.window_start + line.matches[0].start);
+}
+
+test "未命中来源也有 begin 和 end" {
+    var bag = Bag{};
+    defer bag.deinit();
+    const result = try searchId(&bag, "miss", "nope\n", "MATCH", .{});
+    try testing.expectEqual(@as(u64, 0), result.matched_lines);
+    try testing.expectEqual(@as(usize, 2), bag.items.items.len);
+    try testing.expect(bag.items.items[0].kind == .begin);
+    try testing.expect(bag.items.items[1].kind == .end);
+    try testing.expectEqualStrings("miss", bag.items.items[0].id);
+    try testing.expectEqualStrings("miss", bag.items.items[1].id);
+    try testing.expectEqual(@as(u64, 0), bag.items.items[1].matched_lines);
+    try testing.expectEqual(@as(usize, 0), bag.kindCount(.match));
+}
+
+test "行首空白原样返回" {
+    var bag = Bag{};
+    defer bag.deinit();
+    _ = try searchId(&bag, "pad", "  MATCH\n", "MATCH", .{});
+    const line = bag.matchAt(0);
+    try testing.expectEqualStrings("  MATCH", line.bytes);
+    try testing.expectEqual(@as(u64, 0), line.offset);
+    try testing.expectEqual(@as(usize, 1), line.matches.len);
+    try testing.expectEqual(@as(usize, 2), line.matches[0].start);
+    try testing.expectEqual(@as(usize, 7), line.matches[0].end);
+    try testing.expectEqual(@as(?u64, 3), line.column);
+    try testing.expect(std.mem.indexOfScalar(u8, line.bytes, 0x1b) == null);
+    try testing.expect(std.mem.indexOf(u8, line.bytes, "<") == null);
+}
+
+test "事件逐条回调" {
+    var scratch: [8]u8 = undefined;
+    var src = std.testing.Reader.init(&scratch, &.{.{ .buffer = "M\nM\n" }});
+    src.artificial_limit = .limited(2);
+    const Watch = struct {
+        src: *std.testing.Reader,
+        n: u32 = 0,
+        offset_at_begin: usize = 99,
+        offset_at_first: usize = 99,
+        matches: u32 = 0,
+        end_before_second: bool = false,
+
+        pub fn event(self: *@This(), ev: Event) bool {
+            self.n += 1;
+            switch (ev) {
+                .begin => self.offset_at_begin = self.src.next_offset,
+                .match => {
+                    self.matches += 1;
+                    if (self.matches == 1) self.offset_at_first = self.src.next_offset;
+                },
+                .end => if (self.matches < 2) {
+                    self.end_before_second = true;
+                },
+                else => {},
+            }
+            return true;
+        }
+    };
+    var watch = Watch{ .src = &src };
+    var finder = try Finder.init("M", .{});
+    const result = try searchSource(Watch, testing.allocator, &watch, &src.interface, "stream", &finder, .{
+        .buffer_size = 2,
+        .max_line_len = 64,
+        .binary = .none,
+        .encoding = .none,
+    });
+    try testing.expectEqual(Outcome.complete, result.outcome);
+    try testing.expectEqual(@as(usize, 0), watch.offset_at_begin);
+    try testing.expectEqual(@as(usize, 2), watch.offset_at_first);
+    try testing.expectEqual(@as(u32, 2), watch.matches);
+    try testing.expectEqual(@as(u32, 4), watch.n);
+    try testing.expect(!watch.end_before_second);
 }

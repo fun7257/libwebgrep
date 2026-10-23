@@ -17,7 +17,23 @@ pub const Span = struct {
     u16_end: usize = 0,
 };
 
+/// 这次搜索为什么停下。`decompressed_bytes` 先留在这里，解压实现之前不会由扫描自己累计。
+pub const LimitHit = enum {
+    none,
+    max_results,
+    max_bytes,
+    deadline,
+    decompressed_bytes,
+    cancelled,
+};
+
+/// 单个来源上的软错误。只有这一个标签，里面没有路径，也没有系统调用细节。
+pub const SoftError = enum {
+    read_failed,
+};
+
 /// 一次搜索的结果。`binary_offset` 和 `nul_offset` 都是这次输入里第一次看到 NUL 的绝对偏移。
+/// 致命错误走函数的 error。软错误、有匹配、无匹配都是成功返回的结果，靠下面的字段区分。
 pub const Result = struct {
     outcome: Outcome = .complete,
     /// `matched` 被调用的次数。计数打印器和退出码用它。
@@ -28,6 +44,14 @@ pub const Result = struct {
     nul_offset: ?u64 = null,
     /// 实际读过的字节。目录搜索用它记账，不再为了这个数对每个文件 `fstat`。
     bytes_read: u64 = 0,
+    /// 预算或取消让搜索停下时的原因。正常扫完是 `none`。
+    limit_hit: LimitHit = .none,
+    /// 计数没有把输入扫完。预算或取消在看到结尾之前停下时为真。
+    partial: bool = false,
+    /// 下次可以从这个可搜索字节偏移接着搜。只在 `max_results` 停下时有值。
+    resume_at: ?u64 = null,
+    /// 这个来源读失败。搜索调用本身仍然成功返回。
+    soft_error: ?SoftError = null,
 };
 
 /// 一个输入的结束原因。
@@ -84,6 +108,10 @@ pub const EndEvent = struct {
     matched_lines: u64 = 0,
     bytes_read: u64 = 0,
     outcome: Outcome = .complete,
+    limit_hit: LimitHit = .none,
+    partial: bool = false,
+    resume_at: ?u64 = null,
+    soft_error: ?SoftError = null,
 };
 
 /// 服务入口的事件。每产生一个就回调一次，不把多行攒起来再交。

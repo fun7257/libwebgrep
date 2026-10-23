@@ -26,6 +26,8 @@ pub const anyVtable = sink_mod.anyVtable;
 pub const SliceIter = sink_mod.SliceIter;
 pub const Result = sink_mod.Result;
 pub const Outcome = sink_mod.Outcome;
+pub const LimitHit = sink_mod.LimitHit;
+pub const SoftError = sink_mod.SoftError;
 
 pub const BinaryPolicy = searcher.BinaryPolicy;
 pub const Encoding = searcher.Encoding;
@@ -50,6 +52,12 @@ test "默认搜索配置" {
     try std.testing.expect(!cfg.null_data);
     try std.testing.expectEqual(MatchMode.earliest, cfg.match_mode);
     try std.testing.expect(cfg.max_count == null);
+    try std.testing.expect(cfg.max_source_bytes == null);
+    try std.testing.expect(cfg.max_request_bytes == null);
+    try std.testing.expect(cfg.time_budget_ns == null);
+    try std.testing.expect(cfg.cancel == null);
+    try std.testing.expect(!cfg.exists);
+    try std.testing.expect(cfg.max_concurrency == null);
 }
 
 pub const memchr = @import("finder/memchr.zig");

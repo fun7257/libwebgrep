@@ -47,7 +47,7 @@ libwebgrep 原名 zrg（webgrep core），是用纯 Zig 0.17 编写的服务端�
 - [ ] B08 [MVP][P0][core] 整行匹配，与 B07 同时开启时以整行为准，判定时正确处理行尾的 \r（rg -x）
 - [ ] B09 [MVP][P0][core] 按行反选，与"无匹配来源列表"（G05）是两个不同的功能（rg -v）
 - [ ] B10 [MVP][P0][core] 每个来源的匹配行数上限，达到后立即停止读取并关闭上游（rg -m）
-- [ ] B11 [MVP][P0][core] 存在性查询：找到第一个匹配就返回，并取消上游读取（rg -q）
+- [x] B11 [MVP][P0][core] 存在性查询：找到第一个匹配就返回，并取消上游读取（rg -q）
 - [ ] B12 [MVP][P0 末或 P1][core] AND/NOT 链式过滤：同时满足所有"包含"和"不包含"条件的行才输出（参照 Loki 的 |= 与 !=；rg 没有此功能）
 - [ ] B13 [后续][core] 有序数据优化：出现过匹配之后，遇到第一条不匹配的行就停止（rg --stop-on-nonmatch）
 - [ ] B14 [后续][能力] 替换预览：只在结果中给出替换后的文本，不修改数据，匹配区间附带替换文本（rg -r）
@@ -100,8 +100,8 @@ libwebgrep 原名 zrg（webgrep core），是用纯 Zig 0.17 编写的服务端�
 - [ ] F07 [MVP][P0][core] 每个事件都带来源 ID，不带服务器路径
 - [ ] F08 [MVP][P0][core] 二进制状态字段，取值为 none、detected、suppressed
 - [ ] F09 [MVP][P0][core] 截断相关字段：truncated、原始行长、预览窗口的位置
-- [ ] F10 [MVP][P0][core] 停止原因字段 limit_hit，取值为 none、max_results、max_bytes、deadline、decompressed_bytes、cancelled
-- [ ] F11 [MVP][P0][core] partial 标记：计数类结果因预算耗尽而没有扫完时置位
+- [x] F10 [MVP][P0][core] 停止原因字段 limit_hit，取值为 none、max_results、max_bytes、deadline、decompressed_bytes、cancelled
+- [x] F11 [MVP][P0][core] partial 标记：计数类结果因预算耗尽而没有扫完时置位
 - [ ] F12 [后续][core] 发生转码或解压时，额外提供该位置在原始数据中的偏移
 
 ## 八、输出模式与统计
@@ -123,17 +123,17 @@ libwebgrep 原名 zrg（webgrep core），是用纯 Zig 0.17 编写的服务端�
 - [ ] H05 [MVP][P0][能力] 事件结构可以无损地序列化为 NDJSON，供 SSE 或 WebSocket 推送；序列化由 API 层完成，不在 core 中（rg --json）
 
 ## 十、资源与安全（rg 没有这些，但公开服务必须具备）
-- [ ] I01 [MVP][P0][core] 扫描字节上限，按来源和按请求分别设置（CWE-400；OWASP API4:2023）
-- [ ] I02 [MVP][P0][core] 时间预算（截止时间），读取循环和匹配循环中都会检查
-- [ ] I03 [MVP][P0][core] 取消令牌：客户端断开时取消搜索，并关闭上游读取
-- [ ] I04 [MVP][P0][core] 全局最大结果数，配合游标续查实现分页
-- [ ] I05 [MVP][P0][core] 输出字节上限，也覆盖全文高亮和片段输出
-- [ ] I06 [MVP][P0][core] 内存上限：前置上下文缓冲、解码缓冲、事件队列都有界（CWE-770）
+- [x] I01 [MVP][P0][core] 扫描字节上限，按来源和按请求分别设置（CWE-400；OWASP API4:2023）
+- [x] I02 [MVP][P0][core] 时间预算（截止时间），读取循环和匹配循环中都会检查
+- [x] I03 [MVP][P0][core] 取消令牌：客户端断开时取消搜索，并关闭上游读取
+- [x] I04 [MVP][P0][core] 全局最大结果数，配合游标续查实现分页
+- [x] I05 [MVP][P0][core] 输出字节上限，也覆盖全文高亮和片段输出
+- [x] I06 [MVP][P0][core] 内存上限：前置上下文缓冲、解码缓冲、事件队列都有界（CWE-770）
 - [ ] I07 [MVP][P0][core] 构建匹配器之前，先校验模式长度和模式数量的上限
-- [ ] I08 [MVP][P0][core] 配额与并发钩子：各项预算由服务层按租户或 IP 注入，core 不自行决定
-- [ ] I09 [MVP][P0][core] 类型化错误：致命错误、每个来源的软错误、"有匹配/无匹配"三者分开表达。不照搬 rg 把软错误也归入退出码 2 的做法
-- [ ] I10 [MVP][P0][core] 返回给调用方的错误不包含内部路径等细节，细节只通过服务端日志钩子输出（OWASP Error Handling）
-- [ ] I11 [MVP][core] core 不读取任何环境变量或配置文件（rg RIPGREP_CONFIG_PATH / --no-config）
+- [x] I08 [MVP][P0][core] 配额与并发钩子：各项预算由服务层按租户或 IP 注入，core 不自行决定
+- [x] I09 [MVP][P0][core] 类型化错误：致命错误、每个来源的软错误、"有匹配/无匹配"三者分开表达。不照搬 rg 把软错误也归入退出码 2 的做法
+- [x] I10 [MVP][P0][core] 返回给调用方的错误不包含内部路径等细节，细节只通过服务端日志钩子输出（OWASP Error Handling）
+- [x] I11 [MVP][core] core 不读取任何环境变量或配置文件（rg RIPGREP_CONFIG_PATH / --no-config）
 - [ ] I12 [MVP][core] 安全默认值，并且都可以由服务层覆盖：
   - 二进制内容默认跳过
   - 不跟随符号链接

@@ -11,6 +11,11 @@
 //! 没有 BOM 时切片搜索不分配。需要转码的切片用 `decode_allocator`。Reader 和文件搜索
 //! 使用调用方传入的分配器。读缓冲从 `buffer_size` 涨到单行上限，不再为了装下整行继续涨。
 //! 超过上限的行仍按流查找，交出去的是匹配附近的窗口。前置上下文放在环形缓冲里，不回退读取。
+//!
+//! 预算、取消和截止时间都由调用方传入。服务入口在缺省时填上单输入默认值，不能超过硬顶。
+//! 库不读环境变量，也不自己选租户配额。停止原因写在 `limit_hit` 上。
+//! 输入没扫完时 `partial` 为真。来源读失败是软错误，和致命错误、有匹配、无匹配分开。
+//! 返回给调用方的错误不含路径；路径只交给调用方提供的日志函数。
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -37,6 +42,23 @@ pub const SearchConfig = struct {
     pub const default_max_line_len: usize = 2 * 1024 * 1024;
     /// 上下文行数硬顶。调用方可以把实际上限调低，不能超过这里。
     pub const context_lines_hard_cap: u32 = 10;
+    /// 单行字节硬顶。调用方可以在这之下覆盖 `max_line_len`。
+    pub const max_line_len_hard_cap: usize = 8 * 1024 * 1024;
+    /// 服务入口没写扫描上限时用这个。旧入口保持不限，直到调用方传入。
+    pub const default_max_source_bytes: u64 = 16 * 1024 * 1024;
+    pub const max_source_bytes_hard_cap: u64 = 64 * 1024 * 1024;
+    pub const default_max_request_bytes: u64 = 16 * 1024 * 1024;
+    pub const max_request_bytes_hard_cap: u64 = 64 * 1024 * 1024;
+    pub const default_time_budget_ns: u64 = 30 * std.time.ns_per_s;
+    pub const max_time_budget_ns: u64 = 120 * std.time.ns_per_s;
+    pub const default_max_output_bytes: u64 = 1024 * 1024;
+    pub const max_output_bytes_hard_cap: u64 = 8 * 1024 * 1024;
+    pub const default_max_decode_bytes: usize = 4 * 1024 * 1024;
+    pub const max_decode_bytes_hard_cap: usize = 8 * 1024 * 1024;
+    pub const default_max_queued_event_bytes: usize = default_max_line_len;
+    pub const max_queued_event_bytes_hard_cap: usize = max_line_len_hard_cap;
+    pub const default_max_before_bytes: usize = context_lines_hard_cap * default_max_line_len;
+    pub const max_before_bytes_hard_cap: usize = context_lines_hard_cap * max_line_len_hard_cap;
 
     line_numbers: bool = false,
     invert: bool = false,
@@ -79,7 +101,43 @@ pub const SearchConfig = struct {
     /// 非 null 时复用这块缓冲。扩容后把新切片写回去。null 时这次调用自己分配、自己释放。
     scratch: ?*[]u8 = null,
     /// 非 null 且为真时，下一块开始前停止。遍历用它做提前结束。
+    /// 这不是取消令牌：不关闭上游，也不写成 `limit_hit = cancelled`。
     stop: ?*const std.atomic.Value(bool) = null,
+    /// 这个来源最多扫描多少字节。达到后不再读。null 表示旧入口不另加来源上限。
+    max_source_bytes: ?u64 = null,
+    /// 这次请求最多扫描多少字节。和来源上限同时生效，先到的那个停。
+    max_request_bytes: ?u64 = null,
+    /// 请求级最多交出多少条匹配行。达到后 end 事件带 `resume_at`。
+    /// 和 `max_count` 不同：`max_count` 是单个来源的行数上限，不带续查位置。
+    max_results: ?u64 = null,
+    /// 从可搜索字节流的这个偏移继续。之前的字节不再产出匹配。
+    resume_from: u64 = 0,
+    /// 行事件（匹配和上下文）累计字节上限。窗口里的字节算进这一个上限。
+    max_output_bytes: ?u64 = null,
+    /// 从搜索开始允许的最长时间，纳秒。null 表示旧入口不限。
+    time_budget_ns: ?u64 = null,
+    /// 非 null 时用它代替单调时钟。测试靠它断言「超时后停止」，不看具体毫秒。
+    clock: ?*const fn (?*anyopaque) i128 = null,
+    clock_ctx: ?*anyopaque = null,
+    /// 取消令牌。置位后停止搜索，并关闭上游。
+    cancel: ?*const std.atomic.Value(bool) = null,
+    /// 已经计入的解压字节。解压器落地之前保持调用方传入的值。
+    decompressed_bytes: u64 = 0,
+    /// 解压字节上限。达到后 `limit_hit = decompressed_bytes`。
+    max_decompressed_bytes: ?u64 = null,
+    /// 前置上下文缓冲的字节上限。null 时用硬顶。
+    max_before_bytes: ?usize = null,
+    /// 解码输入缓冲的字节上限。null 时用硬顶。
+    max_decode_bytes: ?usize = null,
+    /// 等回调取走的那一条行事件的字节上限。同步回调不攒队列。
+    max_queued_event_bytes: ?usize = null,
+    /// 调用方注入的并发上限。单输入搜索不据此创建线程，也不改写这个数。
+    max_concurrency: ?u32 = null,
+    /// 存在性查询。找到第一条匹配就返回，并关闭上游。不是有匹配来源列表。
+    exists: bool = false,
+    /// 细节日志。库不写 stderr。消息可以含路径；返回的错误不含。
+    log: ?*const fn (?*anyopaque, []const u8) void = null,
+    log_ctx: ?*anyopaque = null,
 };
 
 pub const Outcome = sink_mod.Outcome;
@@ -91,8 +149,21 @@ pub const Event = sink_mod.Event;
 pub const LineEvent = sink_mod.LineEvent;
 pub const EndEvent = sink_mod.EndEvent;
 
-pub const SliceError = error{ ContextLinesExceeded, OutOfMemory };
-pub const ReadError = error{ OutOfMemory, ReadFailed, ContextLinesExceeded } || std.Io.File.ReadPositionalError;
+pub const SliceError = error{
+    ContextLinesExceeded,
+    OutOfMemory,
+    DecodeLimit,
+    BufferLimit,
+    BudgetExceeded,
+};
+pub const ReadError = error{
+    OutOfMemory,
+    ReadFailed,
+    ContextLinesExceeded,
+    DecodeLimit,
+    BufferLimit,
+    BudgetExceeded,
+} || std.Io.File.ReadPositionalError;
 
 const width = memchr.native_width;
 
@@ -145,6 +216,22 @@ const State = struct {
     /// 有损文本放不进栈缓冲时用。只在回调返回前有效。
     text_alloc: ?std.mem.Allocator = null,
     text_buf: []u8 = &.{},
+    /// 日志里用的来源名。不放进返回的错误。
+    label: []const u8 = "",
+    started_ns: i128 = 0,
+    deadline_armed: bool = false,
+    limit_hit: sink_mod.LimitHit = .none,
+    resume_at: ?u64 = null,
+    soft_error: ?sink_mod.SoftError = null,
+    need_close: bool = false,
+    closed: bool = false,
+    output_bytes: u64 = 0,
+    output_blocked: bool = false,
+    results_out: u64 = 0,
+    queued_bytes: usize = 0,
+    hit_byte_cap: bool = false,
+    scanned_all: bool = false,
+    decompressed_bytes: u64 = 0,
 
     fn exceeded(self: *const State, config: SearchConfig) bool {
         const limit = config.max_count orelse return false;
@@ -164,16 +251,21 @@ const Prepared = struct {
 
 fn materialize(haystack: []const u8, config: SearchConfig) SliceError!Prepared {
     if (config.encoding != .auto) return .{ .bytes = haystack };
+    const cap = decodeCap(config);
     switch (encoding.sniff(haystack, true)) {
         .raw, .need_more => return .{ .bytes = haystack },
         .utf8 => {
             const rest = if (haystack.len >= 3) haystack[3..] else haystack[0..0];
             if (encoding.validUtf8(rest)) return .{ .bytes = rest };
+            if (encoding.decodedSize(.utf8, rest) > cap) return error.DecodeLimit;
             const alloc = config.decode_allocator orelse return error.OutOfMemory;
             const owned = try encoding.convertAlloc(alloc, .utf8, rest);
             return .{ .bytes = owned, .owned = owned, .alloc = alloc };
         },
         .utf16le, .utf16be => |kind| {
+            if (encoding.decodedSize(kind, if (haystack.len >= 2) haystack[2..] else haystack[0..0]) > cap) {
+                return error.DecodeLimit;
+            }
             const alloc = config.decode_allocator orelse return error.OutOfMemory;
             const payload = if (haystack.len >= 2) haystack[2..] else haystack[0..0];
             const owned = try encoding.convertAlloc(alloc, kind, payload);
@@ -205,32 +297,43 @@ fn searchPrepared(
     matcher: anytype,
     config: SearchConfig,
 ) SliceError!Result {
-    try rejectWideContext(config);
+    validateBudgets(config) catch |err| {
+        logDetail(config, name, err);
+        return err;
+    };
     resetStats(matcher);
     var state = State{};
+    state.label = name;
+    state.decompressed_bytes = config.decompressed_bytes;
+    armDeadline(&state, config);
     state.text_alloc = config.decode_allocator;
     defer if (state.text_buf.len != 0) if (state.text_alloc) |alloc| alloc.free(state.text_buf);
     state.ring.cap = beforeCount(config);
     state.ring.stride = config.max_line_len;
     if (config.line_numbers) state.line_number = 1;
+    const view = budgetView(haystack, &state, config);
     if (!callOpt(S, "begin", sink, .{name})) {
         state.stopped = true;
         return finishSink(S, sink, &state, config);
     }
+    if (rejectEmptyResults(&state, config)) return finishSink(S, sink, &state, config);
+    if (stopForBudget(&state, config)) return finishSink(S, sink, &state, config);
 
     if (watchesBinary(config)) {
-        if (memchr.find(width, haystack, 0, 0)) |nul| {
-            noteBinary(&state, config, nul);
+        if (memchr.find(width, view, 0, 0)) |nul| {
+            noteBinary(&state, config, state.abs_base + nul);
             const cont = callOpt(S, "binary", sink, .{state.nul_offset.?});
             if (config.binary == .quit) {
                 const window = bufferWindow(config);
-                if (nul < @min(haystack.len, window)) {
+                if (nul < @min(view.len, window)) {
+                    if (state.hit_byte_cap) noteLimit(&state, .max_bytes);
                     return finishSink(S, sink, &state, config);
                 }
                 const boundary = (nul / window) * window;
-                if (!try matchBuffer(S, sink, matcher, haystack[0..boundary], &state, config)) {
+                if (!try matchBuffer(S, sink, matcher, view[0..boundary], &state, config)) {
                     state.stopped = true;
                 }
+                if (state.hit_byte_cap) noteLimit(&state, .max_bytes);
                 return finishSink(S, sink, &state, config);
             }
             if (!cont) state.stopped = true;
@@ -238,8 +341,11 @@ fn searchPrepared(
     }
 
     if (!state.stopped) {
-        if (!try matchBuffer(S, sink, matcher, haystack, &state, config)) state.stopped = true;
+        if (!try matchBuffer(S, sink, matcher, view, &state, config)) state.stopped = true;
     }
+    const consumed = (!state.stopped or state.pos >= view.len) and !state.output_blocked;
+    if (consumed and !state.hit_byte_cap and state.soft_error == null) state.scanned_all = true;
+    if (state.hit_byte_cap) noteLimit(&state, .max_bytes);
     return finishSink(S, sink, &state, config);
 }
 
@@ -349,6 +455,20 @@ pub fn searchSource(
 fn serviceConfig(config: SearchConfig) SearchConfig {
     var cfg = config;
     cfg.line_numbers = true;
+    if (cfg.max_source_bytes == null) cfg.max_source_bytes = SearchConfig.default_max_source_bytes;
+    if (cfg.max_request_bytes == null) cfg.max_request_bytes = SearchConfig.default_max_request_bytes;
+    if (cfg.time_budget_ns == null) cfg.time_budget_ns = SearchConfig.default_time_budget_ns;
+    if (cfg.max_output_bytes == null) cfg.max_output_bytes = SearchConfig.default_max_output_bytes;
+    if (cfg.max_decode_bytes == null) cfg.max_decode_bytes = SearchConfig.default_max_decode_bytes;
+    if (cfg.max_queued_event_bytes == null) {
+        const want = @max(cfg.max_line_len, SearchConfig.default_max_queued_event_bytes);
+        cfg.max_queued_event_bytes = @min(want, SearchConfig.max_queued_event_bytes_hard_cap);
+    }
+    if (cfg.max_before_bytes == null) {
+        const need = beforeContextCapacity(cfg);
+        const want = @max(need, SearchConfig.default_max_before_bytes);
+        cfg.max_before_bytes = @min(want, SearchConfig.max_before_bytes_hard_cap);
+    }
     return cfg;
 }
 
@@ -384,6 +504,10 @@ fn EventBridge(comptime S: type) type {
                 .matched_lines = result.matched_lines,
                 .bytes_read = result.bytes_read,
                 .outcome = result.outcome,
+                .limit_hit = result.limit_hit,
+                .partial = result.partial,
+                .resume_at = result.resume_at,
+                .soft_error = result.soft_error,
             } });
         }
     };
@@ -421,8 +545,14 @@ fn drive(
     comptime readFn: anytype,
     read_ctx: *anyopaque,
 ) ReadError!Result {
-    try rejectWideContext(config);
+    validateBudgets(config) catch |err| {
+        logDetail(config, name, err);
+        return err;
+    };
     var state = State{};
+    state.label = name;
+    state.decompressed_bytes = config.decompressed_bytes;
+    armDeadline(&state, config);
     state.text_alloc = allocator;
     defer if (state.text_buf.len != 0) allocator.free(state.text_buf);
     state.ring.cap = beforeCount(config);
@@ -442,6 +572,7 @@ fn drive(
         state.stopped = true;
         return finishSink(S, sink, &state, config);
     }
+    if (rejectEmptyResults(&state, config)) return finishSink(S, sink, &state, config);
 
     const initial = bufferWindow(config);
     const cap0 = @max(initial, 1);
@@ -462,6 +593,7 @@ fn drive(
     defer if (!borrowed) allocator.free(buf);
     var filled: usize = 0;
     var decoder = encoding.Decoder.init(config.encoding);
+    decoder.max_in = decodeCap(config);
     defer decoder.deinit(allocator);
 
     while (!state.stopped) {
@@ -473,6 +605,7 @@ fn drive(
             state.stopped = true;
             break;
         }
+        if (stopForBudget(&state, config)) break;
         if (filled == buf.len) {
             if (try grow(allocator, buf, config)) |next| {
                 buf = next;
@@ -482,7 +615,22 @@ fn drive(
                 break;
             } else if (config.scratch) |slot| slot.* = buf;
         }
-        const pulled = try decoder.pull(allocator, readFn, read_ctx, bufferWindow(config), buf[filled..], &state.bytes_read);
+        var dest = buf[filled..];
+        if (scanRemaining(&state, config)) |left| {
+            if (left == 0) {
+                noteLimit(&state, .max_bytes);
+                break;
+            }
+            if (dest.len > left) dest = dest[0..left];
+        }
+        const pulled = decoder.pull(allocator, readFn, read_ctx, bufferWindow(config), dest, &state.bytes_read) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            if (err == error.DecodeLimit) return error.DecodeLimit;
+            state.soft_error = .read_failed;
+            logDetail(config, name, err);
+            state.need_close = true;
+            break;
+        };
         const eof = pulled.eof;
         if (pulled.n == 0 and !eof and filled == 0) continue;
         var chunk_at = filled;
@@ -564,11 +712,15 @@ fn drive(
         if (!skip_match and (search_end > state.pos or eof)) {
             if (!try matchBuffer(S, sink, matcher, buf[0..view_end], &state, config)) {
                 state.stopped = true;
+                if (eof and state.pos >= view_end and !state.output_blocked) state.scanned_all = true;
                 break;
             }
         }
 
-        if (eof) break;
+        if (eof) {
+            state.scanned_all = !state.output_blocked and state.soft_error == null;
+            break;
+        }
         if (state.stopped) break;
 
         const consumed = search_end;
@@ -591,6 +743,202 @@ fn drive(
 fn flagIsSet(config: SearchConfig) bool {
     const flag = config.stop orelse return false;
     return flag.load(.acquire);
+}
+
+fn cancelIsSet(config: SearchConfig) bool {
+    const flag = config.cancel orelse return false;
+    return flag.load(.acquire);
+}
+
+fn logDetail(config: SearchConfig, label: []const u8, err: anyerror) void {
+    const log = config.log orelse return;
+    var buf: [192]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "{s}: {s}", .{ label, @errorName(err) }) catch label;
+    log(config.log_ctx, msg);
+}
+
+fn monotonicNs() i128 {
+    var ts: std.posix.timespec = undefined;
+    switch (std.posix.errno(std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts))) {
+        .SUCCESS => {
+            const sec: i128 = ts.sec;
+            const nsec: i128 = ts.nsec;
+            return sec * std.time.ns_per_s + nsec;
+        },
+        else => return 0,
+    }
+}
+
+fn readClock(config: SearchConfig) i128 {
+    if (config.clock) |clock| return clock(config.clock_ctx);
+    return monotonicNs();
+}
+
+fn armDeadline(state: *State, config: SearchConfig) void {
+    if (config.time_budget_ns == null) return;
+    state.started_ns = readClock(config);
+    state.deadline_armed = true;
+}
+
+fn pastDeadline(state: *const State, config: SearchConfig) bool {
+    if (!state.deadline_armed) return false;
+    const budget = config.time_budget_ns orelse return false;
+    return readClock(config) - state.started_ns >= @as(i128, budget);
+}
+
+fn scanCap(config: SearchConfig) ?u64 {
+    var cap: ?u64 = null;
+    if (config.max_source_bytes) |n| cap = n;
+    if (config.max_request_bytes) |n| cap = if (cap) |cur| @min(cur, n) else n;
+    return cap;
+}
+
+fn overBytes(state: *const State, config: SearchConfig) bool {
+    const cap = scanCap(config) orelse return false;
+    return state.bytes_read >= cap;
+}
+
+fn scanRemaining(state: *const State, config: SearchConfig) ?usize {
+    const cap = scanCap(config) orelse return null;
+    if (state.bytes_read >= cap) return 0;
+    const left = cap - state.bytes_read;
+    if (left > std.math.maxInt(usize)) return std.math.maxInt(usize);
+    return @intCast(left);
+}
+
+fn overDecompressed(state: *const State, config: SearchConfig) bool {
+    const cap = config.max_decompressed_bytes orelse return false;
+    return state.decompressed_bytes >= cap;
+}
+
+fn noteLimit(state: *State, reason: sink_mod.LimitHit) void {
+    if (state.limit_hit == .none) state.limit_hit = reason;
+    state.stopped = true;
+    state.need_close = true;
+}
+
+fn stopForBudget(state: *State, config: SearchConfig) bool {
+    if (pastDeadline(state, config)) {
+        noteLimit(state, .deadline);
+        return true;
+    }
+    if (cancelIsSet(config)) {
+        noteLimit(state, .cancelled);
+        return true;
+    }
+    if (overBytes(state, config)) {
+        noteLimit(state, .max_bytes);
+        return true;
+    }
+    if (overDecompressed(state, config)) {
+        noteLimit(state, .decompressed_bytes);
+        return true;
+    }
+    return false;
+}
+
+fn stopInMatch(state: *State, config: SearchConfig) bool {
+    if (pastDeadline(state, config)) {
+        noteLimit(state, .deadline);
+        return true;
+    }
+    if (cancelIsSet(config)) {
+        noteLimit(state, .cancelled);
+        return true;
+    }
+    return false;
+}
+
+fn rejectEmptyResults(state: *State, config: SearchConfig) bool {
+    const cap = config.max_results orelse return false;
+    if (cap != 0) return false;
+    state.resume_at = state.abs_base;
+    noteLimit(state, .max_results);
+    return true;
+}
+
+fn closeOnce(state: *State, config: SearchConfig) void {
+    if (state.closed or !state.need_close) return;
+    state.closed = true;
+    if (config.close_input) |close| close(config.close_ctx);
+}
+
+fn decodeCap(config: SearchConfig) usize {
+    return config.max_decode_bytes orelse SearchConfig.max_decode_bytes_hard_cap;
+}
+
+fn budgetView(haystack: []const u8, state: *State, config: SearchConfig) []const u8 {
+    var bytes = haystack;
+    if (config.resume_from > 0) {
+        const off: usize = if (config.resume_from >= haystack.len) haystack.len else @intCast(config.resume_from);
+        state.abs_base = off;
+        bytes = haystack[off..];
+    }
+    if (scanCap(config)) |cap| {
+        if (@as(u64, bytes.len) > cap) {
+            bytes = bytes[0..@intCast(cap)];
+            state.hit_byte_cap = true;
+        }
+    }
+    return bytes;
+}
+
+fn validateBudgets(config: SearchConfig) error{ ContextLinesExceeded, BudgetExceeded, BufferLimit }!void {
+    try rejectWideContext(config);
+    if (config.max_line_len > SearchConfig.max_line_len_hard_cap) return error.BudgetExceeded;
+    if (config.max_source_bytes) |n| if (n > SearchConfig.max_source_bytes_hard_cap) return error.BudgetExceeded;
+    if (config.max_request_bytes) |n| if (n > SearchConfig.max_request_bytes_hard_cap) return error.BudgetExceeded;
+    if (config.time_budget_ns) |n| if (n > SearchConfig.max_time_budget_ns) return error.BudgetExceeded;
+    if (config.max_output_bytes) |n| if (n > SearchConfig.max_output_bytes_hard_cap) return error.BudgetExceeded;
+    if (config.max_decode_bytes) |n| if (n > SearchConfig.max_decode_bytes_hard_cap) return error.BudgetExceeded;
+    if (config.max_queued_event_bytes) |n| if (n > SearchConfig.max_queued_event_bytes_hard_cap) return error.BudgetExceeded;
+    if (config.max_before_bytes) |n| if (n > SearchConfig.max_before_bytes_hard_cap) return error.BudgetExceeded;
+    if (config.max_decompressed_bytes) |n| if (n > SearchConfig.max_source_bytes_hard_cap) return error.BudgetExceeded;
+    const before_cap = config.max_before_bytes orelse SearchConfig.max_before_bytes_hard_cap;
+    if (beforeContextCapacity(config) > before_cap) return error.BufferLimit;
+}
+
+fn releaseQueue(state: *State) void {
+    state.queued_bytes = 0;
+}
+
+fn guardLine(state: *State, config: SearchConfig, nbytes: usize) error{BufferLimit}!bool {
+    if (config.max_queued_event_bytes) |cap| {
+        if (nbytes > cap) {
+            logDetail(config, state.label, error.BufferLimit);
+            return error.BufferLimit;
+        }
+        state.queued_bytes = nbytes;
+    }
+    if (config.max_output_bytes) |cap| {
+        const used = state.output_bytes;
+        if (used >= cap or @as(u64, nbytes) > cap - used) {
+            state.output_blocked = true;
+            state.stopped = true;
+            state.need_close = true;
+            state.queued_bytes = 0;
+            return false;
+        }
+        state.output_bytes = used + nbytes;
+    }
+    return true;
+}
+
+/// 找到的匹配已经交出去了。返回 false 表示不要再找下一条。
+fn noteHitLimit(state: *State, config: SearchConfig, end_abs: u64) bool {
+    if (config.exists) {
+        state.stopped = true;
+        state.need_close = true;
+        return false;
+    }
+    if (config.max_results) |cap| {
+        if (state.results_out >= cap) {
+            state.resume_at = end_abs;
+            noteLimit(state, .max_results);
+            return false;
+        }
+    }
+    return true;
 }
 
 fn grow(allocator: std.mem.Allocator, buf: []u8, config: SearchConfig) error{OutOfMemory}!?[]u8 {
@@ -650,9 +998,14 @@ fn matchBuffer(
 ) SliceError!bool {
     while (state.pos < buf.len) {
         if (state.stopped) return false;
+        if (stopInMatch(state, config)) return false;
         if (config.invert) {
             if (!try matchInvert(S, sink, matcher, buf, state, config)) break;
         } else if (try findLine(matcher, buf, state, config)) |line| {
+            if (state.abs_base + @as(u64, line.start) < config.resume_from) {
+                state.pos = line.end;
+                continue;
+            }
             state.limit_count += 1;
             if (beforeCount(config) > 0 or afterCount(config) > 0) {
                 if (!try afterContext(S, sink, matcher, buf, line.start, state, config)) return false;
@@ -1055,6 +1408,7 @@ fn sinkMatched(
         known,
         config,
     );
+    if (!try guardLine(state, config, bytes.len)) return false;
     const keep = sinkLine(
         S,
         "matched",
@@ -1069,13 +1423,16 @@ fn sinkMatched(
         preview.line_len,
         if (withheld) 0 else preview.window_start,
     );
+    releaseQueue(state);
     state.last_line_visited = line.end;
     state.last_abs_end = state.abs_base + line.end;
     state.remembered_until = @max(state.remembered_until, line.end);
     state.after_left = afterCount(config);
     state.has_sunk = true;
     state.matched_lines += 1;
+    state.results_out += 1;
     if (!keep) state.stopped = true;
+    if (!noteHitLimit(state, config, state.abs_base + line.end)) return false;
     return keep;
 }
 
@@ -1110,6 +1467,7 @@ fn sinkContext(
         known,
         config,
     );
+    if (!try guardLine(state, config, bytes.len)) return false;
     const keep = sinkLine(
         S,
         "context",
@@ -1124,6 +1482,7 @@ fn sinkContext(
         preview.line_len,
         if (withheld) 0 else preview.window_start,
     );
+    releaseQueue(state);
     state.last_line_visited = line.end;
     state.last_abs_end = state.abs_base + line.end;
     state.remembered_until = @max(state.remembered_until, line.end);
@@ -1238,20 +1597,24 @@ fn preceding(bytes: []const u8, count: usize) usize {
 }
 
 fn finishSink(comptime S: type, sink: *S, state: *State, config: SearchConfig) Result {
-    if (state.exceeded(config)) {
-        if (config.close_input) |close| close(config.close_ctx);
-    }
+    if (state.exceeded(config)) state.need_close = true;
+    closeOnce(state, config);
     var outcome: Outcome = if (state.stopped) .stopped else .complete;
     if (state.nul_offset != null and config.binary == .quit) outcome = .binary_quit;
     if (state.nul_offset != null and config.binary == .report and state.matched_lines > 0) {
         outcome = .binary_matched;
     }
+    const partial = (state.limit_hit != .none or state.output_blocked) and !state.scanned_all;
     const result = Result{
         .outcome = outcome,
         .matched_lines = state.matched_lines,
         .nul_offset = state.nul_offset,
         .binary_offset = state.nul_offset,
         .bytes_read = state.bytes_read,
+        .limit_hit = state.limit_hit,
+        .partial = partial,
+        .resume_at = state.resume_at,
+        .soft_error = state.soft_error,
     };
     _ = callOpt(S, "finish", sink, .{result});
     return result;
@@ -1498,12 +1861,17 @@ fn emitRing(
             .end = slot.mend,
         };
         var none: [0]Span = .{};
+        const shown = if (withheld) raw[0..0] else raw;
+        if (!try guardLine(state, config, shown.len)) {
+            state.ring.clear();
+            return false;
+        }
         const keep = sinkLine(
             S,
             "context",
             sink,
             state,
-            if (withheld) raw[0..0] else raw,
+            shown,
             span,
             &none,
             slot.abs,
@@ -1512,6 +1880,7 @@ fn emitRing(
             slot.line_len,
             if (withheld) 0 else slot.window_start,
         );
+        releaseQueue(state);
         state.last_abs_end = slot.end_abs;
         state.has_sunk = true;
         if (!keep) {
@@ -1688,6 +2057,7 @@ fn emitHold(
     };
     if (!try sinkBreakAt(S, sink, state.long_origin, state, config)) return false;
     const bytes = if (withheld) raw[0..0] else raw;
+    if (!try guardLine(state, config, bytes.len)) return false;
     const truncated = state.long_line_len > config.max_line_len and !withheld;
     const window = if (withheld) 0 else state.long_window_start;
     var none: [0]Span = .{};
@@ -1695,10 +2065,15 @@ fn emitHold(
         sinkLine(S, "matched", sink, state, bytes, span, &none, state.long_origin, state.long_number, truncated, state.long_line_len, window)
     else
         sinkLine(S, "context", sink, state, bytes, span, &none, state.long_origin, state.long_number, truncated, state.long_line_len, window);
-    if (as_match) state.matched_lines += 1;
+    releaseQueue(state);
+    if (as_match) {
+        state.matched_lines += 1;
+        state.results_out += 1;
+    }
     state.last_abs_end = end_abs;
     state.has_sunk = true;
     if (!keep) state.stopped = true;
+    if (as_match and !noteHitLimit(state, config, end_abs)) return false;
     return keep;
 }
 
@@ -1832,6 +2207,7 @@ fn pumpLong(
     state: *State,
     config: SearchConfig,
 ) ReadError!bool {
+    if (stopInMatch(state, config)) return false;
     if (watchesBinary(config) and state.nul_offset == null and new_at < filled.*) {
         if (memchr.find(width, buf.*[new_at..filled.*], 0, 0)) |rel| {
             noteBinary(state, config, state.abs_base + new_at + rel);
@@ -3659,4 +4035,587 @@ test "事件逐条回调" {
     try testing.expectEqual(@as(u32, 2), watch.matches);
     try testing.expectEqual(@as(u32, 4), watch.n);
     try testing.expect(!watch.end_before_second);
+}
+
+const Quiet = struct {
+    pub fn event(_: *@This(), _: Event) bool {
+        return true;
+    }
+};
+
+fn badRead(_: *anyopaque, _: []u8) error{BrokenStream}!usize {
+    return error.BrokenStream;
+}
+
+const CapLog = struct {
+    buf: [160]u8 = undefined,
+    len: usize = 0,
+
+    fn write(ctx: ?*anyopaque, message: []const u8) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        const n = @min(message.len, self.buf.len);
+        @memcpy(self.buf[0..n], message[0..n]);
+        self.len = n;
+    }
+};
+
+fn driveCapped(finder: *Finder, hay: []const u8, source_cap: ?u64, request_cap: ?u64) !struct {
+    result: Result,
+    rest: usize,
+    closed: u32,
+} {
+    var ctx = CountedRead{ .rest = hay };
+    var sink = Quiet{};
+    const result = try drive(Quiet, testing.allocator, &sink, finder, .{
+        .max_source_bytes = source_cap,
+        .max_request_bytes = request_cap,
+        .binary = .none,
+        .buffer_size = 8,
+        .max_line_len = 64,
+        .close_input = CountedRead.close,
+        .close_ctx = &ctx,
+    }, "", CountedRead.read, &ctx);
+    return .{ .result = result, .rest = ctx.rest.len, .closed = ctx.closed };
+}
+
+test "来源字节上限和请求字节上限都会停" {
+    const hay = "MATCH\nMATCH\nMORE\n";
+    var finder = try Finder.init("MATCH", .{});
+    const source = try driveCapped(&finder, hay, 6, null);
+    try testing.expectEqual(@as(u64, 6), source.result.bytes_read);
+    try testing.expect(source.rest > 0);
+    try testing.expectEqual(@as(u32, 1), source.closed);
+    try testing.expectEqual(sink_mod.LimitHit.max_bytes, source.result.limit_hit);
+    try testing.expect(source.result.partial);
+
+    const request = try driveCapped(&finder, hay, null, 6);
+    try testing.expectEqual(@as(u64, 6), request.result.bytes_read);
+    try testing.expect(request.rest > 0);
+    try testing.expectEqual(sink_mod.LimitHit.max_bytes, request.result.limit_hit);
+    try testing.expectEqual(@as(u32, 1), request.closed);
+
+    const request_wins = try driveCapped(&finder, hay, 100, 6);
+    try testing.expectEqual(@as(u64, 6), request_wins.result.bytes_read);
+    const source_wins = try driveCapped(&finder, hay, 6, 100);
+    try testing.expectEqual(@as(u64, 6), source_wins.result.bytes_read);
+
+    const open = try driveCapped(&finder, hay, null, null);
+    try testing.expectEqual(@as(u64, hay.len), open.result.bytes_read);
+    try testing.expectEqual(@as(usize, 0), open.rest);
+    try testing.expectEqual(sink_mod.LimitHit.none, open.result.limit_hit);
+    try testing.expect(!open.result.partial);
+    try testing.expectEqual(@as(u32, 0), open.closed);
+}
+
+const DeadlineGate = struct {
+    rest: []const u8,
+    reads: usize = 0,
+    matches: u32 = 0,
+    blocked: bool = false,
+
+    fn read(raw: *anyopaque, dest: []u8) ReadError!usize {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.reads += 1;
+        if (self.reads > 1) {
+            self.blocked = true;
+            return 0;
+        }
+        const n = @min(dest.len, @min(self.rest.len, 12));
+        @memcpy(dest[0..n], self.rest[0..n]);
+        self.rest = self.rest[n..];
+        return n;
+    }
+
+    fn now(raw: ?*anyopaque) i128 {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        if (self.matches == 0) return 0;
+        return 1_000_000;
+    }
+
+    pub fn matched(self: *@This(), _: Line) bool {
+        self.matches += 1;
+        return true;
+    }
+};
+
+test "截止时间在匹配循环中生效" {
+    var gate = DeadlineGate{ .rest = "MATCH\nMATCH\nTAIL\n" };
+    var finder = try Finder.init("MATCH", .{});
+    const result = try drive(DeadlineGate, testing.allocator, &gate, &finder, .{
+        .binary = .none,
+        .buffer_size = 64,
+        .max_line_len = 64,
+        .time_budget_ns = 1,
+        .clock = DeadlineGate.now,
+        .clock_ctx = &gate,
+    }, "", DeadlineGate.read, &gate);
+    try testing.expectEqual(@as(usize, 1), gate.reads);
+    try testing.expect(!gate.blocked);
+    try testing.expectEqual(@as(u32, 1), gate.matches);
+    try testing.expectEqual(sink_mod.LimitHit.deadline, result.limit_hit);
+    try testing.expect(result.partial);
+    try testing.expectEqual(@as(u64, 1), result.matched_lines);
+}
+
+const CancelGate = struct {
+    rest: []const u8,
+    reads: usize = 0,
+    matches: u32 = 0,
+    closed: u32 = 0,
+    flag: std.atomic.Value(bool) = .init(false),
+
+    fn read(raw: *anyopaque, dest: []u8) ReadError!usize {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.reads += 1;
+        if (self.reads > 1) return 0;
+        const n = @min(dest.len, @min(self.rest.len, 12));
+        @memcpy(dest[0..n], self.rest[0..n]);
+        self.rest = self.rest[n..];
+        return n;
+    }
+
+    fn close(raw: ?*anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        self.closed += 1;
+    }
+
+    pub fn matched(self: *@This(), _: Line) bool {
+        self.matches += 1;
+        self.flag.store(true, .release);
+        return true;
+    }
+};
+
+test "取消令牌关闭上游" {
+    var gate = CancelGate{ .rest = "MATCH\nMATCH\nTAIL\n" };
+    var finder = try Finder.init("MATCH", .{});
+    const result = try drive(CancelGate, testing.allocator, &gate, &finder, .{
+        .binary = .none,
+        .buffer_size = 64,
+        .max_line_len = 64,
+        .cancel = &gate.flag,
+        .close_input = CancelGate.close,
+        .close_ctx = &gate,
+    }, "", CancelGate.read, &gate);
+    try testing.expectEqual(@as(u32, 1), gate.matches);
+    try testing.expectEqual(@as(usize, 1), gate.reads);
+    try testing.expectEqual(@as(u32, 1), gate.closed);
+    try testing.expectEqual(sink_mod.LimitHit.cancelled, result.limit_hit);
+    try testing.expect(result.partial);
+}
+
+const Page = struct {
+    lines: std.ArrayList([]u8) = .empty,
+    cursor: ?u64 = null,
+    limit: sink_mod.LimitHit = .none,
+    partial: bool = false,
+
+    fn deinit(self: *Page) void {
+        for (self.lines.items) |line| testing.allocator.free(line);
+        self.lines.deinit(testing.allocator);
+    }
+
+    pub fn event(self: *Page, ev: Event) bool {
+        switch (ev) {
+            .match => |line| {
+                const copy = testing.allocator.dupe(u8, line.bytes) catch unreachable;
+                self.lines.append(testing.allocator, copy) catch unreachable;
+            },
+            .end => |end| {
+                self.cursor = end.resume_at;
+                self.limit = end.limit_hit;
+                self.partial = end.partial;
+            },
+            else => {},
+        }
+        return true;
+    }
+};
+
+test "最大结果数带继续位置" {
+    const hay = "aa MATCH\nbb MATCH\ncc MATCH\n";
+    var finder = try Finder.init("MATCH", .{});
+    var first = Page{};
+    defer first.deinit();
+    const opened = try searchSourceSlice(Page, &first, "page", hay, &finder, .{
+        .max_results = 1,
+        .binary = .none,
+    });
+    try testing.expectEqual(sink_mod.LimitHit.max_results, opened.limit_hit);
+    try testing.expectEqual(sink_mod.LimitHit.max_results, first.limit);
+    try testing.expect(first.partial);
+    try testing.expectEqual(@as(usize, 1), first.lines.items.len);
+    try testing.expectEqualStrings("aa MATCH", first.lines.items[0]);
+    const cursor = first.cursor orelse return error.TestExpectedEqual;
+    try testing.expectEqual(cursor, opened.resume_at.?);
+
+    var second = Page{};
+    defer second.deinit();
+    const continued = try searchSourceSlice(Page, &second, "page", hay, &finder, .{
+        .resume_from = cursor,
+        .binary = .none,
+    });
+    try testing.expectEqual(sink_mod.LimitHit.none, continued.limit_hit);
+    try testing.expect(!continued.partial);
+    try testing.expectEqual(@as(usize, 2), second.lines.items.len);
+    try testing.expectEqualStrings("bb MATCH", second.lines.items[0]);
+    try testing.expectEqualStrings("cc MATCH", second.lines.items[1]);
+}
+
+const OutCount = struct {
+    matches: u32 = 0,
+    contexts: u32 = 0,
+
+    pub fn event(self: *OutCount, ev: Event) bool {
+        switch (ev) {
+            .match => self.matches += 1,
+            .context => self.contexts += 1,
+            else => {},
+        }
+        return true;
+    }
+};
+
+test "输出字节上限停止再产生行事件" {
+    var finder = try Finder.init("MATCH", .{});
+    var lines = OutCount{};
+    _ = try searchSourceSlice(OutCount, &lines, "out", "MATCH\nMATCH\n", &finder, .{
+        .max_output_bytes = 5,
+        .binary = .none,
+    });
+    try testing.expectEqual(@as(u32, 1), lines.matches);
+    try testing.expectEqual(@as(u32, 0), lines.contexts);
+
+    var around = OutCount{};
+    _ = try searchSourceSlice(OutCount, &around, "ctx", "ab\nMATCH\n", &finder, .{
+        .max_output_bytes = 2,
+        .before = 1,
+        .binary = .none,
+    });
+    try testing.expectEqual(@as(u32, 1), around.contexts);
+    try testing.expectEqual(@as(u32, 0), around.matches);
+}
+
+const QueueSink = struct {
+    called: bool = false,
+    live: u32 = 0,
+    max_live: u32 = 0,
+
+    pub fn matched(self: *QueueSink, _: Line) bool {
+        self.called = true;
+        self.live += 1;
+        self.max_live = @max(self.max_live, self.live);
+        self.live -= 1;
+        return true;
+    }
+};
+
+const DecodeFeed = struct {
+    left: usize = 8000,
+    sent: usize = 0,
+    reads: usize = 0,
+
+    fn read(raw: *anyopaque, dest: []u8) ReadError!usize {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.reads += 1;
+        var i: usize = 0;
+        if (self.sent == 0 and dest.len >= 2) {
+            dest[0] = 0xff;
+            dest[1] = 0xfe;
+            i = 2;
+            self.sent = 2;
+        }
+        while (i < dest.len and self.left > 0) {
+            dest[i] = 'a';
+            i += 1;
+            self.left -= 1;
+            self.sent += 1;
+        }
+        return i;
+    }
+};
+
+test "三种缓冲都有上限" {
+    var finder = try Finder.init("MATCH", .{});
+    var reads: usize = 0;
+    const CountRead = struct {
+        fn read(raw: *anyopaque, dest: []u8) ReadError!usize {
+            _ = dest;
+            const n: *usize = @ptrCast(@alignCast(raw));
+            n.* += 1;
+            return 0;
+        }
+    };
+    var sink = Quiet{};
+    try testing.expectError(error.BufferLimit, drive(Quiet, testing.allocator, &sink, &finder, .{
+        .before = 4,
+        .max_line_len = 64,
+        .max_before_bytes = 8,
+        .binary = .none,
+        .buffer_size = 16,
+    }, "", CountRead.read, &reads));
+    try testing.expectEqual(@as(usize, 0), reads);
+
+    var feed = DecodeFeed{};
+    var counted = CountAlloc{ .parent = testing.allocator };
+    try testing.expectError(error.DecodeLimit, drive(Quiet, counted.allocator(), &sink, &finder, .{
+        .encoding = .auto,
+        .max_decode_bytes = 8,
+        .buffer_size = 32,
+        .max_line_len = 64,
+        .binary = .none,
+    }, "", DecodeFeed.read, &feed));
+    try testing.expect(feed.reads <= 2);
+    try testing.expect(feed.left > 0);
+    try testing.expect(counted.peak < 8192);
+
+    var queued = QueueSink{};
+    try testing.expectError(error.BufferLimit, searchSlice(QueueSink, &queued, "MATCH\n", "q", &finder, .{
+        .max_queued_event_bytes = 2,
+        .binary = .none,
+    }));
+    try testing.expect(!queued.called);
+
+    queued = .{};
+    _ = try searchSlice(QueueSink, &queued, "MATCH\nMATCH\n", "", &finder, .{
+        .max_queued_event_bytes = 8,
+        .binary = .none,
+    });
+    try testing.expect(queued.called);
+    try testing.expectEqual(@as(u32, 1), queued.max_live);
+}
+
+test "预算来自调用方参数" {
+    const hay = "MATCH\nMATCH\nMORE\n";
+    var finder = try Finder.init("MATCH", .{});
+    const tight = try driveCapped(&finder, hay, 4, null);
+    const loose = try driveCapped(&finder, hay, 100, null);
+    try testing.expect(tight.result.bytes_read < loose.result.bytes_read);
+    try testing.expectEqual(@as(u64, hay.len), loose.result.bytes_read);
+
+    const caller = SearchConfig{ .max_concurrency = 3 };
+    try testing.expectEqual(@as(?u32, 3), caller.max_concurrency);
+    try testing.expect((SearchConfig{}).max_source_bytes == null);
+
+    var rec = Rec{};
+    defer rec.deinit(testing.allocator);
+    try testing.expectError(error.BudgetExceeded, searchSlice(Rec, &rec, "M\n", "", &finder, .{
+        .max_source_bytes = SearchConfig.max_source_bytes_hard_cap + 1,
+    }));
+    try testing.expectError(error.BudgetExceeded, searchSlice(Rec, &rec, "M\n", "", &finder, .{
+        .time_budget_ns = SearchConfig.max_time_budget_ns + 1,
+    }));
+
+    var reader = std.Io.Reader.fixed(hay);
+    var quiet = Quiet{};
+    const served = try searchSource(Quiet, testing.allocator, &quiet, &reader, "tenant", &finder, .{
+        .max_source_bytes = 6,
+        .binary = .none,
+        .buffer_size = 8,
+        .max_line_len = 64,
+    });
+    try testing.expectEqual(@as(u64, 6), served.bytes_read);
+    try testing.expectEqual(sink_mod.LimitHit.max_bytes, served.limit_hit);
+}
+
+test "软错误与有无匹配可区分" {
+    var finder = try Finder.init("MATCH", .{});
+    var sink = Quiet{};
+    const matched = try searchSlice(Quiet, &sink, "MATCH\n", "", &finder, .{ .binary = .none });
+    try testing.expect(matched.soft_error == null);
+    try testing.expect(matched.matched_lines > 0);
+
+    const missed = try searchSlice(Quiet, &sink, "nope\n", "", &finder, .{ .binary = .none });
+    try testing.expect(missed.soft_error == null);
+    try testing.expectEqual(@as(u64, 0), missed.matched_lines);
+    try testing.expectEqual(Outcome.complete, missed.outcome);
+
+    var raw: u8 = 0;
+    const soft = try drive(Quiet, testing.allocator, &sink, &finder, .{
+        .binary = .none,
+        .buffer_size = 8,
+        .max_line_len = 32,
+    }, "src", badRead, &raw);
+    try testing.expectEqual(sink_mod.SoftError.read_failed, soft.soft_error.?);
+    try testing.expect(soft.soft_error != missed.soft_error);
+    try testing.expectEqual(@as(u64, 0), soft.matched_lines);
+
+    var rec = Rec{};
+    defer rec.deinit(testing.allocator);
+    try testing.expectError(error.ContextLinesExceeded, searchSlice(Rec, &rec, "M\n", "", &finder, .{
+        .context = SearchConfig.context_lines_hard_cap + 1,
+    }));
+}
+
+test "返回的错误不含路径" {
+    const secret = "/var/lib/secret/path.txt";
+    var log = CapLog{};
+    var finder = try Finder.init("MATCH", .{});
+    var sink = Quiet{};
+    try testing.expectError(error.BufferLimit, searchSlice(Quiet, &sink, "MATCH\n", secret, &finder, .{
+        .max_queued_event_bytes = 1,
+        .binary = .none,
+        .log = CapLog.write,
+        .log_ctx = &log,
+    }));
+    try testing.expect(std.mem.indexOf(u8, log.buf[0..log.len], secret) != null);
+    try testing.expect(std.mem.indexOf(u8, @errorName(error.BufferLimit), secret) == null);
+
+    log.len = 0;
+    var raw: u8 = 0;
+    const soft = try drive(Quiet, testing.allocator, &sink, &finder, .{
+        .binary = .none,
+        .buffer_size = 8,
+        .max_line_len = 32,
+        .log = CapLog.write,
+        .log_ctx = &log,
+    }, secret, badRead, &raw);
+    try testing.expectEqual(sink_mod.SoftError.read_failed, soft.soft_error.?);
+    try testing.expect(std.mem.indexOf(u8, log.buf[0..log.len], secret) != null);
+    try testing.expect(std.mem.indexOf(u8, @tagName(soft.soft_error.?), "/") == null);
+}
+
+test "core 不读取环境变量" {
+    var finder = try Finder.init("MATCH", .{});
+    var sink = Quiet{};
+    const open = try searchSlice(Quiet, &sink, "MATCH\n", "", &finder, .{});
+    try testing.expectEqual(Outcome.complete, open.outcome);
+    try testing.expectEqual(sink_mod.LimitHit.none, open.limit_hit);
+    try testing.expectEqual(@as(u64, 1), open.matched_lines);
+    const cfg = SearchConfig{ .max_concurrency = 2 };
+    try testing.expectEqual(@as(?u32, 2), cfg.max_concurrency);
+    try testing.expect(cfg.max_source_bytes == null);
+    try testing.expect(cfg.time_budget_ns == null);
+}
+
+const ExistsGate = struct {
+    rest: []const u8,
+    reads: usize = 0,
+    matches: u32 = 0,
+    closed: u32 = 0,
+
+    fn read(raw: *anyopaque, dest: []u8) ReadError!usize {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.reads += 1;
+        if (self.reads > 1) return 0;
+        const n = @min(dest.len, @min(self.rest.len, 6));
+        @memcpy(dest[0..n], self.rest[0..n]);
+        self.rest = self.rest[n..];
+        return n;
+    }
+
+    fn close(raw: ?*anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        self.closed += 1;
+    }
+
+    pub fn matched(self: *@This(), _: Line) bool {
+        self.matches += 1;
+        return true;
+    }
+};
+
+test "存在性查询在第一条匹配后停止" {
+    var gate = ExistsGate{ .rest = "MATCH\nMORE MATCH\n" };
+    var finder = try Finder.init("MATCH", .{});
+    const result = try drive(ExistsGate, testing.allocator, &gate, &finder, .{
+        .exists = true,
+        .binary = .none,
+        .buffer_size = 32,
+        .max_line_len = 64,
+        .close_input = ExistsGate.close,
+        .close_ctx = &gate,
+    }, "", ExistsGate.read, &gate);
+    try testing.expectEqual(@as(u32, 1), gate.matches);
+    try testing.expectEqual(@as(usize, 1), gate.reads);
+    try testing.expectEqual(@as(u32, 1), gate.closed);
+    try testing.expectEqual(@as(u64, 1), result.matched_lines);
+    try testing.expectEqual(sink_mod.LimitHit.none, result.limit_hit);
+}
+
+test "limit_hit 覆盖每种停止原因" {
+    var seen: [@typeInfo(sink_mod.LimitHit).@"enum".field_names.len]bool = @splat(false);
+    var finder = try Finder.init("MATCH", .{});
+    var sink = Quiet{};
+
+    const plain = try searchSlice(Quiet, &sink, "MATCH\n", "", &finder, .{ .binary = .none });
+    seen[@intFromEnum(plain.limit_hit)] = true;
+
+    const bytes = try driveCapped(&finder, "MATCH\nMATCH\nMORE\n", 6, null);
+    seen[@intFromEnum(bytes.result.limit_hit)] = true;
+
+    var deadline = DeadlineGate{ .rest = "MATCH\nMATCH\nTAIL\n" };
+    const timed = try drive(DeadlineGate, testing.allocator, &deadline, &finder, .{
+        .binary = .none,
+        .buffer_size = 64,
+        .max_line_len = 64,
+        .time_budget_ns = 1,
+        .clock = DeadlineGate.now,
+        .clock_ctx = &deadline,
+    }, "", DeadlineGate.read, &deadline);
+    seen[@intFromEnum(timed.limit_hit)] = true;
+
+    var cancel = CancelGate{ .rest = "MATCH\nMATCH\nTAIL\n" };
+    const stopped = try drive(CancelGate, testing.allocator, &cancel, &finder, .{
+        .binary = .none,
+        .buffer_size = 64,
+        .max_line_len = 64,
+        .cancel = &cancel.flag,
+        .close_input = CancelGate.close,
+        .close_ctx = &cancel,
+    }, "", CancelGate.read, &cancel);
+    seen[@intFromEnum(stopped.limit_hit)] = true;
+
+    var page = Page{};
+    defer page.deinit();
+    const capped = try searchSourceSlice(Page, &page, "p", "MATCH\nMATCH\n", &finder, .{
+        .max_results = 1,
+        .binary = .none,
+    });
+    seen[@intFromEnum(capped.limit_hit)] = true;
+
+    var raw: u8 = 0;
+    const inflated = try drive(Quiet, testing.allocator, &sink, &finder, .{
+        .binary = .none,
+        .buffer_size = 8,
+        .max_line_len = 32,
+        .decompressed_bytes = 8,
+        .max_decompressed_bytes = 4,
+    }, "", badRead, &raw);
+    seen[@intFromEnum(inflated.limit_hit)] = true;
+
+    for (std.enums.values(sink_mod.LimitHit)) |reason| {
+        try testing.expect(seen[@intFromEnum(reason)]);
+    }
+}
+
+test "未扫完的计数带 partial" {
+    var finder = try Finder.init("MATCH", .{});
+    var watch = Page{};
+    defer watch.deinit();
+    var reader = std.Io.Reader.fixed("MATCH\nMATCH\nMORE\n");
+    const stopped = try searchSource(Page, testing.allocator, &watch, &reader, "count", &finder, .{
+        .max_source_bytes = 6,
+        .binary = .none,
+        .buffer_size = 8,
+        .max_line_len = 64,
+    });
+    try testing.expect(stopped.partial);
+    try testing.expect(watch.partial);
+    try testing.expect(stopped.matched_lines < 2);
+    try testing.expectEqual(stopped.partial, watch.partial);
+
+    var full_watch = Page{};
+    defer full_watch.deinit();
+    var full = std.Io.Reader.fixed("MATCH\nMATCH\n");
+    const done = try searchSource(Page, testing.allocator, &full_watch, &full, "count", &finder, .{
+        .binary = .none,
+        .buffer_size = 8,
+        .max_line_len = 64,
+        .max_source_bytes = SearchConfig.default_max_source_bytes,
+        .max_request_bytes = SearchConfig.default_max_request_bytes,
+    });
+    try testing.expect(!done.partial);
+    try testing.expect(!full_watch.partial);
+    try testing.expectEqual(@as(u64, 2), done.matched_lines);
 }

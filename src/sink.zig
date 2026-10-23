@@ -8,10 +8,13 @@
 const std = @import("std");
 const matcher = @import("matcher.zig");
 
-/// 匹配或上下文在行内的字节区间，相对 `Line.bytes`。
+/// 匹配或上下文在行内的区间，相对 `Line.bytes` / `Line.raw`。
+/// `u16_start`、`u16_end` 是同一段在有损文本上的 UTF-16 码元，半开，扫描时算好。
 pub const Span = struct {
     start: usize,
     end: usize,
+    u16_start: usize = 0,
+    u16_end: usize = 0,
 };
 
 /// 一次搜索的结果。`binary_offset` 和 `nul_offset` 都是这次输入里第一次看到 NUL 的绝对偏移。
@@ -38,19 +41,28 @@ pub const Outcome = enum {
 
 /// 交给 Sink 的一行。
 pub const Line = struct {
-    /// 不含结尾的 `\n`，并去掉行尾的一个 `\r`。只在本次回调期间有效。
+    /// 搜索用的行字节。不含记录分隔符；LF 模式下再去掉行尾的一个 `\r`。
+    /// 只在本次回调期间有效。
     bytes: []const u8,
-    /// 该行第一个字节在输入中的绝对偏移。
+    /// 非法 UTF-8 换成 U+FFFD 之后的文本。合法时与 `bytes` 同一段。
+    /// 只在本次回调期间有效。库不把这些字节做成 base64。
+    text: []const u8 = &.{},
+    /// 这一行的原始字节，字节偏移相对它。通常与 `bytes` 相同。
+    /// 只在本次回调期间有效。
+    raw: []const u8 = &.{},
+    /// 该行第一个字节在可搜索字节流里的绝对偏移。转码之后从转码结果计。
     offset: u64,
-    /// 从 1 开始。未打开行号时为 null。
+    /// 从 1 开始。未打开行号时为 null。NUL 记录模式按记录计数。
     number: ?u64,
-    /// 相对 `bytes`。普通上下文行和反选命中行没有匹配区间。
+    /// 相对 `raw`。普通上下文行和反选命中行没有匹配区间。
     /// 反选时，被当作上下文印出的模式行会带上区间，供列号使用。
     /// 超长行时 `bytes` 是窗口，区间相对窗口。
     match: ?Span,
+    /// 匹配起点的 UTF-16 列，从 1 开始。没有匹配时为 null。
+    u16_column: ?u64 = null,
     /// 原始行长于单行上限时为真。`bytes` 只是窗口。
     truncated: bool = false,
-    /// 去掉换行和行尾一个 CR 之后的原始内容长度。
+    /// 去掉分隔符（以及 LF 模式下行尾一个 CR）之后的原始内容长度。
     line_len: u64 = 0,
     /// `bytes` 在原始行内容里的起点。
     window_start: u64 = 0,
@@ -193,11 +205,21 @@ pub fn SliceIter(comptime M: type) type {
             self.pos = end;
             const mstart = found.start - start;
             const mend = @min(found.end, content_end) - start;
+            const raw = self.haystack[start..content_end];
+            const units = @import("encoding.zig").utf16Span(raw, mstart, mend);
             return .{
-                .bytes = self.haystack[start..content_end],
+                .bytes = raw,
+                .text = raw,
+                .raw = raw,
                 .offset = start,
                 .number = number,
-                .match = .{ .start = mstart, .end = mend },
+                .match = .{
+                    .start = mstart,
+                    .end = mend,
+                    .u16_start = units.start,
+                    .u16_end = units.end,
+                },
+                .u16_column = units.start + 1,
                 .line_len = content_end - start,
             };
         }

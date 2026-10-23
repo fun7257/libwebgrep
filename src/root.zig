@@ -38,7 +38,7 @@ test "默认搜索配置" {
     const cfg: SearchConfig = .{};
     try std.testing.expectEqual(SearchConfig.default_buffer_size, cfg.buffer_size);
     try std.testing.expectEqual(SearchConfig.default_max_line_len, cfg.max_line_len);
-    try std.testing.expectEqual(BinaryPolicy.report, cfg.binary);
+    try std.testing.expectEqual(BinaryPolicy.quit, cfg.binary);
     try std.testing.expectEqual(MatchMode.earliest, cfg.match_mode);
     try std.testing.expect(cfg.max_count == null);
 }

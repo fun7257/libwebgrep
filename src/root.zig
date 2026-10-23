@@ -17,6 +17,10 @@ pub const FindOptions = matcher.FindOptions;
 
 pub const Span = sink_mod.Span;
 pub const Line = sink_mod.Line;
+pub const BinaryStatus = sink_mod.BinaryStatus;
+pub const Event = sink_mod.Event;
+pub const LineEvent = sink_mod.LineEvent;
+pub const EndEvent = sink_mod.EndEvent;
 pub const AnySink = sink_mod.AnySink;
 pub const anyVtable = sink_mod.anyVtable;
 pub const SliceIter = sink_mod.SliceIter;
@@ -29,6 +33,8 @@ pub const SearchConfig = searcher.SearchConfig;
 pub const searchSlice = searcher.searchSlice;
 pub const searchReader = searcher.searchReader;
 pub const searchFile = searcher.searchFile;
+pub const searchSource = searcher.searchSource;
+pub const searchSourceSlice = searcher.searchSourceSlice;
 
 pub const text_printer = @import("printer/text.zig");
 pub const count_printer = @import("printer/count.zig");

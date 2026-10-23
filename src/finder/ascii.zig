@@ -10,6 +10,14 @@ pub fn eq(a: u8, b: u8, ignore_case: bool) bool {
     return fold(a) == fold(b);
 }
 
+pub fn eql(a: []const u8, b: []const u8, ignore_case: bool) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (!eq(x, y, ignore_case)) return false;
+    }
+    return true;
+}
+
 /// 字母的小写和大写。非字母两个位置相同。
 pub fn caseVariants(b: u8) [2]u8 {
     const lower = fold(b);

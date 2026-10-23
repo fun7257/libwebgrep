@@ -35,7 +35,7 @@ pub const Outcome = enum {
 
 /// 交给 Sink 的一行。
 pub const Line = struct {
-    /// 不含结尾的 `\n`。只在本次回调期间有效。
+    /// 不含结尾的 `\n`，并去掉行尾的一个 `\r`。只在本次回调期间有效。
     bytes: []const u8,
     /// 该行第一个字节在输入中的绝对偏移。
     offset: u64,
@@ -208,8 +208,10 @@ fn lineEnd(haystack: []const u8, from: usize) usize {
 }
 
 fn withoutNewlineEnd(haystack: []const u8, start: usize, end: usize) usize {
-    if (end > start and haystack[end - 1] == '\n') return end - 1;
-    return end;
+    var cut = end;
+    if (cut > start and haystack[cut - 1] == '\n') cut -= 1;
+    if (cut > start and haystack[cut - 1] == '\r') cut -= 1;
+    return cut;
 }
 
 const testing = std.testing;

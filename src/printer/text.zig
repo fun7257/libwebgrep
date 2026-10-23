@@ -2,7 +2,7 @@
 //!
 //! 匹配行用 `:`，上下文行用 `-`。列号是 1 起的字节偏移，而且只在 `column` 为真、
 //! 这一行带了匹配区间时才打印。普通上下文没有区间；反选里被当成上下文的模式行有。
-//! 行切片不含结尾的 `\n`，这里补上。`\r` 原样保留。
+//! 行切片不含结尾的 `\n`，行尾的一个 `\r` 已由 Searcher 去掉，这里补上 `\n`。
 //!
 //! 二进制句子与 ripgrep 15 相同。`binary` 在任何行写出之前被调用时，先压住行，
 //! 确认有匹配后再只写那句说明。已经写出过行时，把说明接在后面。
@@ -222,7 +222,7 @@ test "文本：空行、无结尾换行、CRLF" {
 
     var crlf = try run("a\r\nMATCH\r\n", "MATCH", .{ .line_numbers = true }, false, false, "");
     defer crlf.deinit();
-    try testing.expectEqualStrings("2:MATCH\r\n", crlf.written());
+    try testing.expectEqualStrings("2:MATCH\n", crlf.written());
 }
 
 test "文本：小文件里的 NUL 只报告一句" {

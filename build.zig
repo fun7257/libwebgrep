@@ -12,7 +12,7 @@ pub fn build(b: *std.Build) void {
         "linux-getdents",
         "Linux 上用裸 getdents64 枚举目录。默认关闭，走 std.Io.Dir.Reader",
     ) orelse false;
-    const mmap_windows = b.option(
+    const window_map = b.option(
         bool,
         "mmap-windows",
         "大文件按 8 MiB 窗口映射后再搜索。默认关闭，走 readPositional",
@@ -42,7 +42,7 @@ pub fn build(b: *std.Build) void {
     const linux_getdents = want_linux_getdents and target.result.os.tag == .linux;
     const options = b.addOptions();
     options.addOption(bool, "linux_getdents", linux_getdents);
-    options.addOption(bool, "mmap_windows", mmap_windows);
+    options.addOption(bool, "window_map", window_map);
     options.addOption(TeddyIsa, "teddy", teddy);
     const test_filters: []const []const u8 = if (fuzz_filter) |filter| &.{filter} else &.{};
 
@@ -53,6 +53,14 @@ pub fn build(b: *std.Build) void {
         .sanitize_thread = sanitize_thread,
     });
     mod.addOptions("build_options", options);
+
+    const internal_mod = b.createModule(.{
+        .root_source_file = b.path("src/internal.zig"),
+        .target = compile_target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+    });
+    internal_mod.addOptions("build_options", options);
 
     const lib_tests = b.addTest(.{
         .name = "libwebgrep-test",
@@ -101,7 +109,7 @@ pub fn build(b: *std.Build) void {
                 .target = compile_target,
                 .optimize = optimize,
                 .imports = &.{
-                    .{ .name = "libwebgrep", .module = mod },
+                    .{ .name = "libwebgrep_internal", .module = internal_mod },
                 },
             }),
         });

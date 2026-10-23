@@ -39,7 +39,6 @@ pub const Encoding = searcher.Encoding;
 pub const SearchConfig = searcher.SearchConfig;
 pub const searchSlice = searcher.searchSlice;
 pub const searchReader = searcher.searchReader;
-pub const searchFile = searcher.searchFile;
 pub const searchSource = searcher.searchSource;
 pub const searchSourceSlice = searcher.searchSourceSlice;
 pub const resumeSourceSlice = searcher.resumeSourceSlice;
@@ -60,6 +59,57 @@ test "默认搜索配置" {
     try std.testing.expect(cfg.cancel == null);
     try std.testing.expect(!cfg.exists);
     try std.testing.expect(cfg.max_concurrency == null);
+}
+
+fn checkSearchFn(comptime F: type) !void {
+    const info = @typeInfo(F);
+    try std.testing.expect(info == .@"fn");
+    inline for (info.@"fn".param_types) |maybe| {
+        const T = maybe orelse continue;
+        try std.testing.expect(T != std.Io.File);
+        try std.testing.expect(T != std.Io.Dir);
+        try std.testing.expect(T != *std.Io.File);
+        try std.testing.expect(T != *std.Io.Dir);
+    }
+}
+
+test "公共搜索入口没有路径参数" {
+    try std.testing.expect(!@hasDecl(@This(), "searchFile"));
+    try std.testing.expect(!@hasDecl(@This(), "parallel"));
+    try std.testing.expect(!@hasDecl(@This(), "walker"));
+    try checkSearchFn(@TypeOf(searchSlice));
+    try checkSearchFn(@TypeOf(searchReader));
+    try checkSearchFn(@TypeOf(searchSource));
+    try checkSearchFn(@TypeOf(searchSourceSlice));
+    try checkSearchFn(@TypeOf(resumeSourceSlice));
+    try checkSearchFn(@TypeOf(openSourcePull));
+
+    const Collect = struct {
+        left: bool = false,
+        right: bool = false,
+        matches: u32 = 0,
+        pub fn event(self: *@This(), ev: Event) bool {
+            switch (ev) {
+                .begin => |b| {
+                    if (std.mem.eql(u8, b.source_id, "left")) self.left = true;
+                    if (std.mem.eql(u8, b.source_id, "right")) self.right = true;
+                },
+                .match => self.matches += 1,
+                else => {},
+            }
+            return true;
+        }
+    };
+    var found = Collect{};
+    var left = try finder.Finder.init("LEFT", .{});
+    var right = try finder.Finder.init("RIGHT", .{});
+    const left_result = try searchSourceSlice(Collect, &found, "left", "LEFT\n", &left, .{});
+    const right_result = try searchSourceSlice(Collect, &found, "right", "RIGHT\n", &right, .{});
+    try std.testing.expectEqual(sink_mod.Outcome.complete, left_result.outcome);
+    try std.testing.expectEqual(sink_mod.Outcome.complete, right_result.outcome);
+    try std.testing.expect(found.left);
+    try std.testing.expect(found.right);
+    try std.testing.expectEqual(@as(u32, 2), found.matches);
 }
 
 pub const memchr = @import("finder/memchr.zig");
@@ -104,8 +154,6 @@ pub const walk_deque = @import("walk/deque.zig");
 pub const walk_file_id = @import("walk/file_id.zig");
 pub const walk_types = @import("walk/types.zig");
 pub const walk_list = @import("walk/list_dir.zig");
-pub const walker = @import("walk/walker.zig");
-pub const parallel = @import("parallel.zig");
 
 test {
     _ = @import("source.zig");

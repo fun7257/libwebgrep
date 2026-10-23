@@ -361,8 +361,10 @@ fn followLink(host: *Host, job: *Job, name: []const u8, rel: []const u8, scratch
 
 fn duplicateDir(dir: std.Io.Dir) ?std.Io.Dir {
     if (builtin.os.tag == .windows) return null;
-    const rc = std.c.fcntl(dir.handle, std.c.F.DUPFD_CLOEXEC, @as(std.c.fd_t, 0));
-    if (rc < 0) return null;
+    // `std.posix.system` 在没有链接 libc 时走 Linux 系统调用。
+    // `std.c.fcntl` 是 extern "c"，在 Linux 上会强制链接 libc。
+    const rc = std.posix.system.fcntl(dir.handle, std.posix.F.DUPFD_CLOEXEC, @as(usize, 0));
+    if (std.posix.errno(rc) != .SUCCESS) return null;
     return .{ .handle = @intCast(rc) };
 }
 

@@ -147,7 +147,9 @@ aarch64 默认打开 `neon`，因为空窗口跳过之后 NEON 比稠密自动�
 - `binary(offset) bool`
 - `finish(result) bool`
 
-`Line.bytes` 指向内部缓冲或调用方切片，回调返回后不能再留着。同时给出绝对偏移、可选行号和行内匹配区间。
+`Line.bytes` 指向内部缓冲或调用方切片，回调返回后不能再留着。同时给出绝对偏移、可选行号和行内匹配区间。一行里的全部匹配在 `Line.matches`，按起点排序。
+
+服务入口是 `searchSource` 和 `searchSourceSlice`。调用方传入 reader 或内存切片，以及自己分配的来源标识。事件是 begin、match、context、context_break、end，每个都只带来源标识。行号默认打开。`searchFile` 和 `parallel.run` 不是服务入口，N7 移除。
 
 `AnySink` 是同一组方法的虚表。适配按方法名在编译期生成：没有额外参数的方法收成一个参数，其余收成两个。Searcher 用 `callOpt` 调用可选方法，方法名是编译期参数。`SliceIter` 是单输入、无上下文的拉式适配。
 
@@ -234,7 +236,7 @@ Zig 0.14 起没有独立的 `@fence`。push 先用 unordered 写槽，再用 rel
 
 ## 打印
 
-`src/printer/json.zig` 写 JSON Lines，字段对齐 `rg --json`：begin、match、context、end、summary。没有命中的文件不写事件，调用方仍把它算进 `summary.searches`。打印器对匹配器是泛型，`Json` 仍是单模式 `Finder` 的别名。一行里的多个命中用同一个匹配器、按 `leftmost_first` 再扫这一行。`lines.text` 总是补一个换行；文件末尾本来没有换行时，这里和 rg 不完全一样，所以不逐字节比较。比较的是路径、匹配文本和子匹配区间。耗时字段不必相同。`end` 里的 `bytes_printed` 目前写 0。
+`src/printer/json.zig` 写 JSON Lines，字段对齐 `rg --json`：begin、match、context、end、summary。没有命中的文件不写事件，调用方仍把它算进 `summary.searches`。子匹配直接用 Searcher 按起点排好的 `Line.matches`，打印器不再重扫这一行。`lines.text` 总是补一个换行；文件末尾本来没有换行时，这里和 rg 不完全一样，所以不逐字节比较。比较的是路径、匹配文本和子匹配区间。耗时字段不必相同。`end` 里的 `bytes_printed` 目前写 0。
 
 `parallel.Run.write_summary` 默认是 false，单次目录调用自己不写 JSON summary。调用方要汇总时自己打开。
 

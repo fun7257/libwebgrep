@@ -4,7 +4,7 @@
 //! `**/`、字符类。同一份规则里后写的胜出。调用方把更深层的集合链在父集合后面，
 //! 所以深层覆盖浅层。父目录一旦被忽略，里面的文件不再被重新包含。
 //!
-//! 不读全局 `core.excludesFile`。`.git/info/exclude` 由遍历层放进最外层集合。
+//! 规则文本由调用方放进集合。不读进程环境，也不沿父目录寻找忽略文件。
 
 const std = @import("std");
 const glob = @import("glob.zig");
@@ -19,7 +19,7 @@ pub const Set = struct {
     parent: ?*const Set = null,
     /// 这一层目录在搜索根相对路径里的字节长度。根目录是 0。
     prefix: usize = 0,
-    /// 仓库根在搜索根之上时，exclude 规则要先加上这段路径。
+    /// 规则要先接上的路径前缀。空表示相对这一层目录。
     repo_prefix: []const u8 = &.{},
     globs: []const glob.Glob = &.{},
     exact: std.StringHashMapUnmanaged([]const u32) = .empty,

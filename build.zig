@@ -12,7 +12,7 @@ pub fn build(b: *std.Build) void {
         "linux-getdents",
         "Linux 上用裸 getdents64 枚举目录。默认关闭，走 std.Io.Dir.Reader",
     ) orelse false;
-    const mmap_windows = b.option(
+    const window_map = b.option(
         bool,
         "mmap-windows",
         "大文件按 8 MiB 窗口映射后再搜索。默认关闭，走 readPositional",
@@ -42,7 +42,7 @@ pub fn build(b: *std.Build) void {
     const linux_getdents = want_linux_getdents and target.result.os.tag == .linux;
     const options = b.addOptions();
     options.addOption(bool, "linux_getdents", linux_getdents);
-    options.addOption(bool, "mmap_windows", mmap_windows);
+    options.addOption(bool, "window_map", window_map);
     options.addOption(TeddyIsa, "teddy", teddy);
     const test_filters: []const []const u8 = if (fuzz_filter) |filter| &.{filter} else &.{};
 
@@ -54,6 +54,14 @@ pub fn build(b: *std.Build) void {
     });
     mod.addOptions("build_options", options);
 
+    const internal_mod = b.createModule(.{
+        .root_source_file = b.path("src/internal.zig"),
+        .target = compile_target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+    });
+    internal_mod.addOptions("build_options", options);
+
     const lib_tests = b.addTest(.{
         .name = "libwebgrep-test",
         .root_module = mod,
@@ -62,13 +70,38 @@ pub fn build(b: *std.Build) void {
     });
     const run_lib_tests = b.addRunArtifact(lib_tests);
 
+    // 示例只有 docs/API.md 里的那一份。这里抽出它，编成测试，避免另写一份会漂移的副本。
+    const api_doc = readRepoFile(b, "docs/API.md");
+    const root_src = readRepoFile(b, "src/root.zig");
+    checkApiDoc(b, root_src, api_doc);
+    const example_wf = b.addWriteFiles();
+    const example_src = example_wf.add("api_doc_example.zig", extractApiExample(api_doc));
+    const example_mod = b.createModule(.{
+        .root_source_file = example_src,
+        .target = compile_target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .imports = &.{
+            .{ .name = "libwebgrep", .module = mod },
+        },
+    });
+    const example_tests = b.addTest(.{
+        .name = "api-doc-example",
+        .root_module = example_mod,
+        .filters = test_filters,
+        .use_llvm = use_llvm,
+    });
+    const run_example_tests = b.addRunArtifact(example_tests);
+
     const test_step = b.step("test", "运行单元测试");
     test_step.dependOn(&run_lib_tests.step);
+    test_step.dependOn(&run_example_tests.step);
 
     // 交叉编译时只编译，不运行。例如：
     // zig build check -Dtarget=x86_64-linux-musl
     const check_step = b.step("check", "编译库和测试，不运行");
     check_step.dependOn(&lib_tests.step);
+    check_step.dependOn(&example_tests.step);
     if (want_linux_getdents and target.result.os.tag != .linux) {
         const fail = b.addFail("-Dlinux-getdents 只适用于 os 为 linux 的目标");
         test_step.dependOn(&fail.step);
@@ -101,11 +134,117 @@ pub fn build(b: *std.Build) void {
                 .target = compile_target,
                 .optimize = optimize,
                 .imports = &.{
-                    .{ .name = "libwebgrep", .module = mod },
+                    .{ .name = "libwebgrep_internal", .module = internal_mod },
                 },
             }),
         });
         const run_micro = b.addRunArtifact(micro);
         bench_step.dependOn(&run_micro.step);
+    }
+}
+
+fn readRepoFile(b: *std.Build, sub_path: []const u8) []const u8 {
+    b.dependOnFileContents(b.path(sub_path));
+    const full = if (b.root.sub_path.len == 0)
+        sub_path
+    else
+        b.pathJoin(&.{ b.root.sub_path, sub_path });
+    return b.root.root_dir.handle.readFileAlloc(
+        b.graph.io,
+        full,
+        b.allocator,
+        .limited(4 * 1024 * 1024),
+    ) catch |err| {
+        std.process.fatal("读取 {s} 失败：{s}", .{ sub_path, @errorName(err) });
+    };
+}
+
+fn extractApiExample(md: []const u8) []const u8 {
+    const open = "```zig\n";
+    const marker = "test \"API 文档示例能跑通\"";
+    var rest = md;
+    var found: ?[]const u8 = null;
+    while (std.mem.indexOf(u8, rest, open)) |rel| {
+        if (rel != 0 and rest[rel - 1] != '\n') {
+            rest = rest[rel + 1 ..];
+            continue;
+        }
+        const tail = rest[rel + open.len ..];
+        const end = std.mem.indexOf(u8, tail, "\n```") orelse {
+            std.process.fatal("docs/API.md 的示例代码块没有结束", .{});
+        };
+        const after = tail[end + 1 ..];
+        const line_end = std.mem.indexOfScalar(u8, after, '\n') orelse after.len;
+        if (!std.mem.eql(u8, after[0..line_end], "```")) {
+            rest = tail[end + 1 ..];
+            continue;
+        }
+        const body = tail[0..end];
+        if (std.mem.indexOf(u8, body, marker) == null) {
+            rest = tail[end + 1 + line_end ..];
+            continue;
+        }
+        if (found != null) std.process.fatal("docs/API.md 里的 API 文档示例出现了两次", .{});
+        found = body;
+        rest = tail[end + 1 + line_end ..];
+    }
+    return found orelse std.process.fatal("docs/API.md 缺少能编译的 API 文档示例", .{});
+}
+
+fn checkApiDoc(b: *std.Build, root_src: []const u8, api_md: []const u8) void {
+    const required = [_][]const u8{
+        "\n## 范围\n",
+        "\n## 入口\n",
+        "\n## 来源\n",
+        "\n## 匹配\n",
+        "\n## 行与编码\n",
+        "\n## 二进制\n",
+        "\n## 上下文\n",
+        "\n## 事件\n",
+        "\n## 预算与错误\n",
+        "\n## 默认值\n",
+        "\n## 示例\n",
+        "智能大小写按模式分别判断",
+        "大小写折叠只支持 ASCII",
+        "二进制默认跳过",
+        "未命中的来源也有 begin 和 end",
+        "尚未提供",
+        "不接收文件系统路径",
+        "不执行外部命令",
+        "不输出终端文本或 NDJSON",
+        "切片只在回调返回前有效",
+    };
+    for (required) |text| {
+        if (std.mem.indexOf(u8, api_md, text) == null) {
+            std.process.fatal("docs/API.md 缺少：{s}", .{text});
+        }
+    }
+    const banned = [_][]const u8{ "路径参数", "ANSI", "PCRE", "子进程", "--" };
+    for (banned) |text| {
+        if (std.mem.indexOf(u8, api_md, text) != null) {
+            std.process.fatal("docs/API.md 含有不允许出现的文本：{s}", .{text});
+        }
+    }
+
+    var prev_doc = false;
+    var lines = std.mem.splitScalar(u8, root_src, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "///")) {
+            prev_doc = true;
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "pub const ")) {
+            const rest = line["pub const ".len..];
+            const name_len = std.mem.indexOfAny(u8, rest, " :=") orelse rest.len;
+            const name = std.mem.trim(u8, rest[0..name_len], " ");
+            if (!prev_doc) std.process.fatal("src/root.zig 的 {s} 缺少文档注释", .{name});
+            const heading = std.fmt.allocPrint(b.allocator, "\n### {s}\n", .{name}) catch @panic("OOM");
+            if (std.mem.indexOf(u8, api_md, heading) == null) {
+                std.process.fatal("docs/API.md 缺少小节 {s}", .{name});
+            }
+            prev_doc = false;
+            continue;
+        }
+        prev_doc = false;
     }
 }

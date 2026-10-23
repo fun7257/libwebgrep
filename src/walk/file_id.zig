@@ -19,6 +19,14 @@ pub const Id = struct {
 
 pub const Error = error{Unexpected} || std.Io.File.StatError;
 
+pub fn fromDir(dir: std.Io.Dir) Error!Id {
+    switch (builtin.os.tag) {
+        .linux => return linuxId(dir.handle),
+        .windows => return .{ .dev = 0, .ino = 0 },
+        else => return posixId(dir.handle),
+    }
+}
+
 pub fn fromFile(io: std.Io, file: std.Io.File) Error!Id {
     switch (builtin.os.tag) {
         .linux => return linuxId(file.handle),
@@ -32,7 +40,7 @@ pub fn fromFile(io: std.Io, file: std.Io.File) Error!Id {
 
 fn linuxId(handle: std.posix.fd_t) Error!Id {
     var stx = std.mem.zeroes(std.os.linux.Statx);
-    const rc = std.os.linux.statx(handle, "", std.os.linux.AT.EMPTY_PATH, .{ .INO = true }, &stx);
+    const rc = std.os.linux.statx(handle, "", std.os.linux.AT.EMPTY_PATH, std.os.linux.STATX.BASIC_STATS, &stx);
     switch (std.os.linux.errno(rc)) {
         .SUCCESS => {},
         else => return error.Unexpected,

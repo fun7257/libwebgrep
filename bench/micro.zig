@@ -10,7 +10,7 @@
 //! `parallel.run`，包含建工人和拆工人。
 
 const std = @import("std");
-const libwebgrep = @import("libwebgrep");
+const internal = @import("libwebgrep_internal");
 
 const bytes_64m = 64 * 1024 * 1024;
 const sweep_body = 128 * 1024 * 1024;
@@ -30,20 +30,20 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
     std.debug.print("libwebgrep bench width {d} walk_default_threads {d}\n", .{
-        libwebgrep.memchr.native_width,
-        libwebgrep.parallel.resolveThreads(0),
+        internal.memchr.native_width,
+        internal.parallel.resolveThreads(0),
     });
 
     const buf = try gpa.alloc(u8, bytes_64m);
     defer gpa.free(buf);
-    libwebgrep.multi.fillScenarioText(buf);
+    internal.multi.fillScenarioText(buf);
 
     try benchScalar(io, buf);
     try benchFinder(io, buf);
     try benchMulti(gpa, io, buf);
 
     fillAlphabet(buf);
-    var alphabet = try libwebgrep.Finder.init("libwebgrep", .{ .case = .sensitive });
+    var alphabet = try internal.Finder.init("libwebgrep", .{ .case = .sensitive });
     const alphabet_at = buf.len - "libwebgrep\n".len;
     var alphabet_ctx = FinderCtx{ .data = buf, .finder = &alphabet, .at = alphabet_at };
     try report(io, "finder_alphabet", buf.len, alphabet_at, finderRun, &alphabet_ctx);
@@ -83,8 +83,8 @@ fn missByte(ctx: *Miss) !usize {
     ctx.data[0] ^= 1;
     defer ctx.data[0] ^= 1;
     const hit = switch (ctx.kind) {
-        .find => libwebgrep.memchr.find(libwebgrep.memchr.native_width, ctx.data, 0, 0xff) != null,
-        .either => libwebgrep.memchr.findEither(libwebgrep.memchr.native_width, ctx.data, 0, 0xff, 0xfe) != null,
+        .find => internal.memchr.find(internal.memchr.native_width, ctx.data, 0, 0xff) != null,
+        .either => internal.memchr.findEither(internal.memchr.native_width, ctx.data, 0, 0xff, 0xfe) != null,
         .std => std.mem.findScalar(u8, ctx.data, 0xff) != null,
     };
     if (hit) return error.UnexpectedMatch;
@@ -93,10 +93,10 @@ fn missByte(ctx: *Miss) !usize {
 
 fn benchFinder(io: std.Io, buf: []u8) !void {
     const at = buf.len - sweep_tail.len;
-    var sensitive = try libwebgrep.Finder.init("NEEDLE", .{ .case = .sensitive });
-    var ignore = try libwebgrep.Finder.init("needle", .{ .case = .insensitive });
-    var smart = try libwebgrep.Finder.init("needle", .{ .case = .smart });
-    var slice_finder = try libwebgrep.Finder.init("NEEDLE", .{});
+    var sensitive = try internal.Finder.init("NEEDLE", .{ .case = .sensitive });
+    var ignore = try internal.Finder.init("needle", .{ .case = .insensitive });
+    var smart = try internal.Finder.init("needle", .{ .case = .smart });
+    var slice_finder = try internal.Finder.init("NEEDLE", .{});
 
     var sensitive_ctx = FinderCtx{ .data = buf, .finder = &sensitive, .at = at };
     var ignore_ctx = FinderCtx{ .data = buf, .finder = &ignore, .at = at };
@@ -110,7 +110,7 @@ fn benchFinder(io: std.Io, buf: []u8) !void {
 
 const FinderCtx = struct {
     data: []u8,
-    finder: *libwebgrep.Finder,
+    finder: *internal.Finder,
     at: usize,
 };
 
@@ -125,29 +125,29 @@ fn finderRun(ctx: *FinderCtx) !usize {
 
 const SliceCtx = struct {
     data: []u8,
-    finder: *libwebgrep.Finder,
+    finder: *internal.Finder,
 };
 
 fn sliceRun(ctx: *SliceCtx) !usize {
     ctx.data[0] ^= 1;
     defer ctx.data[0] ^= 1;
     var nop = Nop{};
-    const result = try libwebgrep.searchSlice(Nop, &nop, ctx.data, "", ctx.finder, .{});
+    const result = try internal.searchSlice(Nop, &nop, ctx.data, "", ctx.finder, .{});
     if (result.matched_lines != 1) return error.UnexpectedMatch;
     return 1;
 }
 
 const MultiCtx = struct {
     data: []u8,
-    many: *libwebgrep.Multi,
+    many: *internal.Multi,
     lines: u64,
 };
 
 fn benchMulti(gpa: std.mem.Allocator, io: std.Io, buf: []u8) !void {
-    try benchOneMulti(gpa, io, buf, "multi_bytes", libwebgrep.multi.scenario_bytes, 0);
-    try benchOneMulti(gpa, io, buf, "multi_pairs", libwebgrep.multi.scenario_pairs, 1);
-    try benchOneMulti(gpa, io, buf, "multi_teddy", libwebgrep.multi.scenario_teddy, 0);
-    try benchOneMulti(gpa, io, buf, "multi_ac", libwebgrep.multi.scenario_ac, 0);
+    try benchOneMulti(gpa, io, buf, "multi_bytes", internal.multi.scenario_bytes, 0);
+    try benchOneMulti(gpa, io, buf, "multi_pairs", internal.multi.scenario_pairs, 1);
+    try benchOneMulti(gpa, io, buf, "multi_teddy", internal.multi.scenario_teddy, 0);
+    try benchOneMulti(gpa, io, buf, "multi_ac", internal.multi.scenario_ac, 0);
 }
 
 fn benchOneMulti(
@@ -158,7 +158,7 @@ fn benchOneMulti(
     patterns: []const []const u8,
     lines: u64,
 ) !void {
-    var many = try libwebgrep.Multi.init(gpa, patterns, .{});
+    var many = try internal.Multi.init(gpa, patterns, .{});
     defer many.deinit();
     std.debug.print("engine {s} {s}\n", .{ name, many.engineName() });
     var ctx = MultiCtx{ .data = buf, .many = &many, .lines = lines };
@@ -169,7 +169,7 @@ fn multiRun(ctx: *MultiCtx) !usize {
     ctx.data[0] ^= 1;
     defer ctx.data[0] ^= 1;
     var nop = Nop{};
-    const result = try libwebgrep.searchSlice(Nop, &nop, ctx.data, "", ctx.many, .{});
+    const result = try internal.searchSlice(Nop, &nop, ctx.data, "", ctx.many, .{});
     if (result.matched_lines != ctx.lines) return error.UnexpectedMatch;
     return @intCast(result.matched_lines);
 }
@@ -199,7 +199,7 @@ fn benchSweep(gpa: std.mem.Allocator, io: std.Io) !void {
         .gpa = gpa,
         .io = io,
         .file = file,
-        .finder = try libwebgrep.Finder.init("NEEDLE", .{}),
+        .finder = try internal.Finder.init("NEEDLE", .{}),
         .buffer_size = 0,
         .file_bytes = sweep_bytes,
     };
@@ -215,14 +215,14 @@ const Sweep = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     file: std.Io.File,
-    finder: libwebgrep.Finder,
+    finder: internal.Finder,
     buffer_size: usize,
     file_bytes: u64,
 };
 
 fn fileRun(ctx: *Sweep) !usize {
     var nop = Nop{};
-    const result = try libwebgrep.searchFile(
+    const result = try internal.searchFile(
         Nop,
         ctx.gpa,
         ctx.io,
@@ -261,15 +261,12 @@ const WalkCtx = struct {
 fn walkRun(ctx: *WalkCtx) !usize {
     var saw = false;
     var out_buf: [64]u8 = undefined;
-    var err_buf: [64]u8 = undefined;
     var out: std.Io.Writer.Discarding = .init(&out_buf);
-    var err_w: std.Io.Writer.Discarding = .init(&err_buf);
-    const stats = try libwebgrep.parallel.run(ctx.gpa, ctx.io, .{
+    const stats = try internal.parallel.run(ctx.gpa, ctx.io, .{
         .pattern = "NEEDLE",
         .roots = &.{"bench/tmp/walk"},
         .emit = .count,
         .stdout = &out.writer,
-        .stderr = &err_w.writer,
         .saw_output = &saw,
         .walk = .{ .threads = ctx.threads, .read_ignore = false },
     });
@@ -339,7 +336,7 @@ fn writeDir(
 }
 
 const Nop = struct {
-    pub fn matched(self: *Nop, line: libwebgrep.Line) bool {
+    pub fn matched(self: *Nop, line: internal.Line) bool {
         _ = self;
         _ = line;
         return true;

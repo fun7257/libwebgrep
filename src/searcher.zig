@@ -135,7 +135,20 @@ pub const SearchConfig = struct {
     max_concurrency: ?u32 = null,
     /// 存在性查询。找到第一条匹配就返回，并关闭上游。不是有匹配来源列表。
     exists: bool = false,
-    /// 细节日志。库不写 stderr。消息可以含路径；返回的错误不含。
+    /// 只要没有匹配的来源。找到第一条匹配就停止这个来源，并且不把行交出去。
+    /// 和 `invert` 不同：反选仍逐行交出不包含模式的行。
+    files_without_match: bool = false,
+    /// 每扫描这么多可搜索字节发一条 progress。null 或 0 表示不发。
+    progress_interval: ?u64 = null,
+    /// 调用方把输入标成实时流。空读是空闲，不是错误，也不是结束。
+    live: bool = false,
+    /// 实时流空闲超过这个时间就发心跳。
+    idle_timeout_ns: ?u64 = null,
+    /// 置位后，实时流的下一次空读才是结束。
+    live_closed: ?*const std.atomic.Value(bool) = null,
+    /// 暂停后续搜。`resumeSourceSlice` 填入。
+    continuation: ?*const sink_mod.ResumeState = null,
+    /// 细节日志。消息可以含路径；返回的错误不含。库不把这些消息交给终端。
     log: ?*const fn (?*anyopaque, []const u8) void = null,
     log_ctx: ?*anyopaque = null,
 };
@@ -148,6 +161,11 @@ pub const BinaryStatus = sink_mod.BinaryStatus;
 pub const Event = sink_mod.Event;
 pub const LineEvent = sink_mod.LineEvent;
 pub const EndEvent = sink_mod.EndEvent;
+pub const Flow = sink_mod.Flow;
+pub const Summary = sink_mod.Summary;
+pub const Progress = sink_mod.Progress;
+pub const Heartbeat = sink_mod.Heartbeat;
+pub const ResumeState = sink_mod.ResumeState;
 
 pub const SliceError = error{
     ContextLinesExceeded,
@@ -189,7 +207,9 @@ const State = struct {
     /// 占用 max_count 的命中数。上下文里被抬成匹配的行不加。
     limit_count: u64 = 0,
     matched_lines: u64 = 0,
+    matches: u64 = 0,
     bytes_read: u64 = 0,
+    bytes_searched: u64 = 0,
     nul_offset: ?u64 = null,
     binary_status: sink_mod.BinaryStatus = .none,
     stopped: bool = false,
@@ -232,6 +252,12 @@ const State = struct {
     hit_byte_cap: bool = false,
     scanned_all: bool = false,
     decompressed_bytes: u64 = 0,
+    from_reader: bool = false,
+    paused: bool = false,
+    resume_line: u64 = 1,
+    next_progress: u64 = 0,
+    last_input_ns: i128 = 0,
+    idle_sent: bool = false,
 
     fn exceeded(self: *const State, config: SearchConfig) bool {
         const limit = config.max_count orelse return false;
@@ -305,15 +331,20 @@ fn searchPrepared(
     var state = State{};
     state.label = name;
     state.decompressed_bytes = config.decompressed_bytes;
-    armDeadline(&state, config);
+    armClock(&state, config);
     state.text_alloc = config.decode_allocator;
     defer if (state.text_buf.len != 0) if (state.text_alloc) |alloc| alloc.free(state.text_buf);
     state.ring.cap = beforeCount(config);
     state.ring.stride = config.max_line_len;
     if (config.line_numbers) state.line_number = 1;
+    restoreCounters(&state, config);
     const view = budgetView(haystack, &state, config);
     if (!callOpt(S, "begin", sink, .{name})) {
-        state.stopped = true;
+        noteRejected(S, &state, sink);
+        if (state.paused) {
+            state.resume_at = state.abs_base;
+            state.resume_line = state.line_number orelse 1;
+        }
         return finishSink(S, sink, &state, config);
     }
     if (rejectEmptyResults(&state, config)) return finishSink(S, sink, &state, config);
@@ -369,12 +400,9 @@ pub fn searchReader(
     }.read, reader);
 }
 
-/// 从已打开的文件搜索。默认用 `readPositional` 分块读进调用方缓冲。
-/// 整文件映射在这台机器的 1 GiB 热缓存上比分块读更慢，还把驻留撑到文件大小，所以不用。
-/// `-Dmmap-windows` 才改走 8 MiB 窗口映射，默认关闭。
-///
-/// 这不是服务入口。`name` 只供旧的 Sink 使用。服务入口是 `searchSource` 和
-/// `searchSourceSlice`。N7 会把本函数移出公共 API。
+/// 从已经打开的文件里读。调用方自己持有文件，这里不接收路径。
+/// 默认用 `readPositional`。窗口映射只在构建选项打开时才会编译进来，默认构建不走那条路径。
+/// 本函数不从 `src/root.zig` 导出。服务入口是 `searchSource` 和 `searchSourceSlice`。
 pub fn searchFile(
     comptime S: type,
     allocator: std.mem.Allocator,
@@ -386,12 +414,12 @@ pub fn searchFile(
     config: SearchConfig,
 ) ReadError!Result {
     resetStats(matcher);
-    if (comptime build_options.mmap_windows) {
-        const mmap_window = @import("io/mmap_window.zig");
-        if (try mmap_window.open(io, file, bufferWindow(config))) |opened| {
+    if (comptime build_options.window_map) {
+        const window_map = @import("io/window_map.zig");
+        if (try window_map.open(io, file, bufferWindow(config))) |opened| {
             var ctx = opened;
             defer ctx.close();
-            return drive(S, allocator, sink, matcher, config, name, mmap_window.readBytes, &ctx);
+            return drive(S, allocator, sink, matcher, config, name, window_map.readBytes, &ctx);
         }
     }
     const Ctx = struct { io: std.Io, file: std.Io.File, offset: u64 = 0 };
@@ -410,8 +438,10 @@ pub fn searchFile(
 /// 服务入口：搜索一段内存里的字节。
 /// `source_id` 由调用方分配，库不解释。
 /// 行号从 1 开始。NUL 记录模式计的是记录号。
-/// `S` 提供 `pub fn event(self: *S, ev: Event) bool`。返回 false 就停止。
+/// `S` 提供 `pub fn event(self: *S, ev: Event) bool` 或返回 `Flow`。
+/// 返回 false 或 `.stop` 就停止。`.pause` 先停住，`resumeSourceSlice` 再继续。
 /// 行字节和匹配区间只在这次回调期间有效。每产生一个事件就调用一次。
+/// 输入扫完之后再发 summary。没扫完、暂停、或实时流还开着时不发。
 pub fn searchSourceSlice(
     comptime S: type,
     sink: *S,
@@ -426,14 +456,36 @@ pub fn searchSourceSlice(
         .source_id = source_id,
         .config = cfg,
     };
-    return searchSlice(EventBridge(S), &bridge, haystack, "", matcher, cfg);
+    const result = try searchSlice(EventBridge(S), &bridge, haystack, "", matcher, cfg);
+    emitSummary(S, sink, source_id, cfg, result);
+    return result;
 }
 
-/// 服务入口：从 reader 搜索。短读视为结束。
+/// 从上次暂停的地方继续搜同一段内存。不重复 begin。
+pub fn resumeSourceSlice(
+    comptime S: type,
+    sink: *S,
+    source_id: []const u8,
+    haystack: []const u8,
+    matcher: anytype,
+    config: SearchConfig,
+    previous: Result,
+) SliceError!Result {
+    var saved = previous.resume_state;
+    saved.skip_begin = true;
+    var cfg = config;
+    cfg.resume_from = previous.resume_at orelse 0;
+    cfg.continuation = &saved;
+    return searchSourceSlice(S, sink, source_id, haystack, matcher, cfg);
+}
+
+/// 服务入口：从 reader 搜索。没有标成实时流时，短读视为结束。
 /// `source_id` 由调用方分配，库不解释。
 /// 行号从 1 开始。NUL 记录模式计的是记录号。
-/// `S` 提供 `pub fn event(self: *S, ev: Event) bool`。返回 false 就停止。
+/// `S` 提供 `pub fn event(self: *S, ev: Event) bool` 或返回 `Flow`。
+/// 返回 false 或 `.stop` 就停止。`.pause` 先停住。
 /// 行字节和匹配区间只在这次回调期间有效。每产生一个事件就调用一次。
+/// 输入扫完之后再发 summary。没扫完、暂停、或实时流还开着时不发。
 pub fn searchSource(
     comptime S: type,
     allocator: std.mem.Allocator,
@@ -449,7 +501,9 @@ pub fn searchSource(
         .source_id = source_id,
         .config = cfg,
     };
-    return searchReader(EventBridge(S), allocator, &bridge, reader, "", matcher, cfg);
+    const result = try searchReader(EventBridge(S), allocator, &bridge, reader, "", matcher, cfg);
+    emitSummary(S, sink, source_id, cfg, result);
+    return result;
 }
 
 fn serviceConfig(config: SearchConfig) SearchConfig {
@@ -472,36 +526,75 @@ fn serviceConfig(config: SearchConfig) SearchConfig {
     return cfg;
 }
 
+fn eventFlow(inner: anytype, ev: Event) Flow {
+    const Ret = @typeInfo(@TypeOf(@field(@TypeOf(inner.*), "event"))).@"fn".return_type.?;
+    if (Ret == bool) return if (inner.event(ev)) .cont else .stop;
+    if (Ret == Flow) return inner.event(ev);
+    @compileError("event 必须返回 bool 或 Flow");
+}
+
 fn EventBridge(comptime S: type) type {
     return struct {
         inner: *S,
         source_id: []const u8,
         config: SearchConfig,
+        last_flow: Flow = .cont,
 
         const Bridge = @This();
 
+        pub fn control(self: *Bridge) Flow {
+            return self.last_flow;
+        }
+
+        fn deliver(self: *Bridge, ev: Event) bool {
+            const flow = eventFlow(self.inner, ev);
+            self.last_flow = flow;
+            return flow == .cont;
+        }
+
         pub fn begin(self: *Bridge, _: []const u8) bool {
-            return self.inner.event(.{ .begin = .{ .source_id = self.source_id } });
+            if (self.config.continuation) |saved| if (saved.skip_begin) return true;
+            return self.deliver(.{ .begin = .{ .source_id = self.source_id } });
         }
 
         pub fn matched(self: *Bridge, line: Line) bool {
-            return self.inner.event(.{ .match = lineEvent(self.source_id, line) });
+            return self.deliver(.{ .match = lineEvent(self.source_id, line) });
         }
 
         pub fn context(self: *Bridge, line: Line) bool {
-            return self.inner.event(.{ .context = lineEvent(self.source_id, line) });
+            return self.deliver(.{ .context = lineEvent(self.source_id, line) });
         }
 
         pub fn contextBreak(self: *Bridge) bool {
-            return self.inner.event(.{ .context_break = .{ .source_id = self.source_id } });
+            return self.deliver(.{ .context_break = .{ .source_id = self.source_id } });
+        }
+
+        pub fn progress(self: *Bridge, bytes_searched: u64, match_count: u64, matched_lines: u64) bool {
+            return self.deliver(.{ .progress = .{
+                .source_id = self.source_id,
+                .bytes_searched = bytes_searched,
+                .matches = match_count,
+                .matched_lines = matched_lines,
+            } });
+        }
+
+        pub fn heartbeat(self: *Bridge, bytes_searched: u64, match_count: u64, matched_lines: u64) bool {
+            return self.deliver(.{ .heartbeat = .{
+                .source_id = self.source_id,
+                .bytes_searched = bytes_searched,
+                .matches = match_count,
+                .matched_lines = matched_lines,
+            } });
         }
 
         pub fn finish(self: *Bridge, result: Result) bool {
-            return self.inner.event(.{ .end = .{
+            if (result.paused) return true;
+            return self.deliver(.{ .end = .{
                 .source_id = self.source_id,
                 .binary_status = binaryStatus(self.config, result.nul_offset),
                 .binary_offset = result.binary_offset,
                 .matched_lines = result.matched_lines,
+                .matches = result.matches,
                 .bytes_read = result.bytes_read,
                 .outcome = result.outcome,
                 .limit_hit = result.limit_hit,
@@ -511,6 +604,192 @@ fn EventBridge(comptime S: type) type {
             } });
         }
     };
+}
+
+fn shouldSummarize(config: SearchConfig, result: Result) bool {
+    if (result.paused or !result.scanned_all) return false;
+    if (config.live and !liveIsClosed(config)) return false;
+    return true;
+}
+
+fn makeSummary(source_id: []const u8, result: Result) Summary {
+    return .{
+        .source_id = source_id,
+        .elapsed = result.elapsed_ns,
+        .searches = 1,
+        .searches_with_match = if (result.matched_lines > 0) 1 else 0,
+        .bytes_searched = result.bytes_searched,
+        .bytes_printed = result.output_bytes,
+        .matched_lines = result.matched_lines,
+        .matches = result.matches,
+        .bytes_read_raw = result.bytes_read,
+        .sources_failed = if (result.soft_error != null) 1 else 0,
+    };
+}
+
+fn emitSummary(comptime S: type, sink: *S, source_id: []const u8, config: SearchConfig, result: Result) void {
+    if (!shouldSummarize(config, result)) return;
+    _ = eventFlow(sink, .{ .summary = makeSummary(source_id, result) });
+}
+
+/// 拉式迭代器交出的一条事件。切片在 `SourcePull.deinit` 之前有效。
+pub const PullEvent = struct {
+    kind: enum { begin, match, context, context_break, progress, heartbeat, end, summary },
+    source_id: []u8,
+    line_number: u64 = 0,
+    column: ?u64 = null,
+    absolute_offset: u64 = 0,
+    bytes: []u8 = &.{},
+    spans: []Span = &.{},
+    matched_lines: u64 = 0,
+    matches: u64 = 0,
+    bytes_searched: u64 = 0,
+    elapsed: u64 = 0,
+    searches: u64 = 0,
+    searches_with_match: u64 = 0,
+    bytes_printed: u64 = 0,
+    bytes_read_raw: u64 = 0,
+    sources_failed: u64 = 0,
+
+    pub fn deinit(self: *PullEvent, allocator: std.mem.Allocator) void {
+        if (self.source_id.len != 0) allocator.free(self.source_id);
+        if (self.bytes.len != 0) allocator.free(self.bytes);
+        if (self.spans.len != 0) allocator.free(self.spans);
+    }
+};
+
+/// 能取出 begin、context、match、end 这一组事件的拉式接口。
+/// 单行的 `SliceIter` 没有上下文，也不带来源事件。
+pub fn SourcePull(comptime M: type) type {
+    return struct {
+        allocator: std.mem.Allocator,
+        matcher: M,
+        source_id: []const u8,
+        haystack: []const u8,
+        config: SearchConfig,
+        items: std.ArrayList(PullEvent) = .empty,
+        index: usize = 0,
+        loaded: bool = false,
+
+        const Self = @This();
+
+        pub fn deinit(self: *Self) void {
+            for (self.items.items) |*item| item.deinit(self.allocator);
+            self.items.deinit(self.allocator);
+        }
+
+        pub fn next(self: *Self) !?PullEvent {
+            if (!self.loaded) {
+                try self.load();
+                self.loaded = true;
+            }
+            if (self.index >= self.items.items.len) return null;
+            const ev = self.items.items[self.index];
+            self.index += 1;
+            return ev;
+        }
+
+        fn load(self: *Self) !void {
+            const Collect = struct {
+                pull: *Self,
+                failed: bool = false,
+
+                pub fn event(c: *@This(), ev: Event) bool {
+                    const copied = copyPull(c.pull.allocator, ev) catch {
+                        c.failed = true;
+                        return false;
+                    };
+                    c.pull.items.append(c.pull.allocator, copied) catch {
+                        var doomed = copied;
+                        doomed.deinit(c.pull.allocator);
+                        c.failed = true;
+                        return false;
+                    };
+                    return true;
+                }
+            };
+            var collect = Collect{ .pull = self };
+            _ = searchSourceSlice(Collect, &collect, self.source_id, self.haystack, self.matcher, self.config) catch |err| return err;
+            if (collect.failed) return error.OutOfMemory;
+        }
+    };
+}
+
+pub fn openSourcePull(
+    allocator: std.mem.Allocator,
+    matcher: anytype,
+    source_id: []const u8,
+    haystack: []const u8,
+    config: SearchConfig,
+) SourcePull(@TypeOf(matcher)) {
+    return .{
+        .allocator = allocator,
+        .matcher = matcher,
+        .source_id = source_id,
+        .haystack = haystack,
+        .config = config,
+    };
+}
+
+fn copyPull(allocator: std.mem.Allocator, ev: Event) !PullEvent {
+    switch (ev) {
+        .begin => |b| return .{ .kind = .begin, .source_id = try allocator.dupe(u8, b.source_id) },
+        .context_break => |b| return .{ .kind = .context_break, .source_id = try allocator.dupe(u8, b.source_id) },
+        .progress => |p| return .{
+            .kind = .progress,
+            .source_id = try allocator.dupe(u8, p.source_id),
+            .bytes_searched = p.bytes_searched,
+            .matches = p.matches,
+            .matched_lines = p.matched_lines,
+        },
+        .heartbeat => |h| return .{
+            .kind = .heartbeat,
+            .source_id = try allocator.dupe(u8, h.source_id),
+            .bytes_searched = h.bytes_searched,
+            .matches = h.matches,
+            .matched_lines = h.matched_lines,
+        },
+        .end => |e| return .{
+            .kind = .end,
+            .source_id = try allocator.dupe(u8, e.source_id),
+            .matched_lines = e.matched_lines,
+            .matches = e.matches,
+        },
+        .summary => |s| return .{
+            .kind = .summary,
+            .source_id = try allocator.dupe(u8, s.source_id),
+            .matched_lines = s.matched_lines,
+            .matches = s.matches,
+            .bytes_searched = s.bytes_searched,
+            .elapsed = s.elapsed,
+            .searches = s.searches,
+            .searches_with_match = s.searches_with_match,
+            .bytes_printed = s.bytes_printed,
+            .bytes_read_raw = s.bytes_read_raw,
+            .sources_failed = s.sources_failed,
+        },
+        .match, .context => |line| {
+            const id = try allocator.dupe(u8, line.source_id);
+            errdefer allocator.free(id);
+            var bytes: []u8 = &.{};
+            errdefer if (bytes.len != 0) allocator.free(bytes);
+            if (line.bytes.len != 0) bytes = try allocator.dupe(u8, line.bytes);
+            var spans: []Span = &.{};
+            errdefer if (spans.len != 0) allocator.free(spans);
+            if (line.matches.len != 0) spans = try allocator.dupe(Span, line.matches);
+            return .{
+                .kind = if (ev == .match) .match else .context,
+                .source_id = id,
+                .line_number = line.line_number,
+                .column = line.column,
+                .absolute_offset = line.absolute_offset,
+                .bytes = bytes,
+                .spans = spans,
+                .matched_lines = 0,
+                .matches = @intCast(line.matches.len),
+            };
+        },
+    }
 }
 
 fn lineEvent(source_id: []const u8, line: Line) sink_mod.LineEvent {
@@ -552,7 +831,8 @@ fn drive(
     var state = State{};
     state.label = name;
     state.decompressed_bytes = config.decompressed_bytes;
-    armDeadline(&state, config);
+    armClock(&state, config);
+    state.from_reader = true;
     state.text_alloc = allocator;
     defer if (state.text_buf.len != 0) allocator.free(state.text_buf);
     state.ring.cap = beforeCount(config);
@@ -568,8 +848,13 @@ fn drive(
     var seen: []bool = &.{};
     defer if (seen.len != 0) allocator.free(seen);
     if (config.line_numbers) state.line_number = 1;
+    restoreCounters(&state, config);
     if (!callOpt(S, "begin", sink, .{name})) {
-        state.stopped = true;
+        noteRejected(S, &state, sink);
+        if (state.paused) {
+            state.resume_at = state.abs_base;
+            state.resume_line = state.line_number orelse 1;
+        }
         return finishSink(S, sink, &state, config);
     }
     if (rejectEmptyResults(&state, config)) return finishSink(S, sink, &state, config);
@@ -595,6 +880,12 @@ fn drive(
     var decoder = encoding.Decoder.init(config.encoding);
     decoder.max_in = decodeCap(config);
     defer decoder.deinit(allocator);
+    var upstream = Upstream{
+        .inner = read_ctx,
+        .state = &state,
+        .config = config,
+        .sink = @ptrCast(sink),
+    };
 
     while (!state.stopped) {
         if (state.exceeded(config)) {
@@ -623,7 +914,11 @@ fn drive(
             }
             if (dest.len > left) dest = dest[0..left];
         }
-        const pulled = decoder.pull(allocator, readFn, read_ctx, bufferWindow(config), dest, &state.bytes_read) catch |err| {
+        const pulled = decoder.pull(allocator, struct {
+            fn read(ctx: *anyopaque, out: []u8) readRet(readFn) {
+                return readUpstream(S, readFn, ctx, out);
+            }
+        }.read, &upstream, bufferWindow(config), dest, &state.bytes_read) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             if (err == error.DecodeLimit) return error.DecodeLimit;
             state.soft_error = .read_failed;
@@ -774,10 +1069,95 @@ fn readClock(config: SearchConfig) i128 {
     return monotonicNs();
 }
 
-fn armDeadline(state: *State, config: SearchConfig) void {
-    if (config.time_budget_ns == null) return;
+fn armClock(state: *State, config: SearchConfig) void {
+    if (config.continuation) |saved| {
+        state.started_ns = saved.started_ns;
+        state.deadline_armed = saved.deadline_armed;
+        state.last_input_ns = saved.started_ns;
+        return;
+    }
     state.started_ns = readClock(config);
-    state.deadline_armed = true;
+    state.last_input_ns = state.started_ns;
+    if (config.time_budget_ns != null) state.deadline_armed = true;
+}
+
+fn restoreCounters(state: *State, config: SearchConfig) void {
+    const saved = config.continuation orelse return;
+    state.matched_lines = saved.matched_lines;
+    state.matches = saved.matches;
+    state.bytes_read = saved.bytes_read;
+    state.bytes_searched = saved.bytes_searched;
+    state.output_bytes = saved.output_bytes;
+    state.results_out = saved.results_out;
+    state.limit_count = saved.limit_count;
+    if (config.line_numbers) state.line_number = saved.line_number;
+}
+
+fn liveIsClosed(config: SearchConfig) bool {
+    if (!config.live) return true;
+    const flag = config.live_closed orelse return false;
+    return flag.load(.acquire);
+}
+
+const Upstream = struct {
+    inner: *anyopaque,
+    state: *State,
+    config: SearchConfig,
+    sink: *anyopaque,
+    spins: u8 = 0,
+    spin_at: i128 = 0,
+    have_spin: bool = false,
+};
+
+fn readRet(comptime readFn: anytype) type {
+    return @typeInfo(@TypeOf(readFn)).@"fn".return_type.?;
+}
+
+fn readUpstream(comptime S: type, comptime readFn: anytype, ctx: *anyopaque, dest: []u8) readRet(readFn) {
+    const box: *Upstream = @ptrCast(@alignCast(ctx));
+    if (!box.config.live) return readFn(box.inner, dest);
+    const sink: *S = @ptrCast(@alignCast(box.sink));
+    while (!box.state.stopped) {
+        const n = try readFn(box.inner, dest);
+        if (n != 0) {
+            box.state.last_input_ns = readClock(box.config);
+            box.state.idle_sent = false;
+            box.spins = 0;
+            box.have_spin = false;
+            return n;
+        }
+        if (liveIsClosed(box.config)) return 0;
+        const now = readClock(box.config);
+        if (box.have_spin and now == box.spin_at) {
+            box.spins += 1;
+            if (box.spins > 8) return 0;
+        } else {
+            box.spin_at = now;
+            box.have_spin = true;
+            box.spins = 0;
+        }
+        const timeout: i128 = @intCast(box.config.idle_timeout_ns orelse 0);
+        if (!box.state.idle_sent and now - box.state.last_input_ns >= timeout) {
+            const at = box.state.abs_base + @as(u64, box.state.pos);
+            const keep = callOpt(S, "heartbeat", sink, .{ at, box.state.matches, box.state.matched_lines });
+            box.state.idle_sent = true;
+            if (!keep) {
+                noteRejected(S, box.state, sink);
+                return 0;
+            }
+        }
+        if (stopForBudget(box.state, box.config)) return 0;
+    }
+    return 0;
+}
+
+fn noteRejected(comptime S: type, state: *State, sink: *S) void {
+    if (@hasDecl(S, "control") and sink.control() == .pause) state.paused = true;
+    state.stopped = true;
+}
+
+fn isPause(comptime S: type, sink: *S) bool {
+    return @hasDecl(S, "control") and sink.control() == .pause;
 }
 
 fn pastDeadline(state: *const State, config: SearchConfig) bool {
@@ -999,12 +1379,23 @@ fn matchBuffer(
     while (state.pos < buf.len) {
         if (state.stopped) return false;
         if (stopInMatch(state, config)) return false;
+        if (!maybeProgress(S, sink, state, config)) return false;
         if (config.invert) {
             if (!try matchInvert(S, sink, matcher, buf, state, config)) break;
         } else if (try findLine(matcher, buf, state, config)) |line| {
             if (state.abs_base + @as(u64, line.start) < config.resume_from) {
                 state.pos = line.end;
                 continue;
+            }
+            if (config.files_without_match) {
+                state.limit_count += 1;
+                state.matched_lines += 1;
+                state.matches += 1;
+                state.results_out += 1;
+                state.pos = line.end;
+                state.stopped = true;
+                state.need_close = true;
+                return false;
             }
             state.limit_count += 1;
             if (beforeCount(config) > 0 or afterCount(config) > 0) {
@@ -1017,6 +1408,7 @@ fn matchBuffer(
         } else break;
     }
     if (state.stopped) return false;
+    if (!maybeProgress(S, sink, state, config)) return false;
     if (!try afterContext(S, sink, matcher, buf, buf.len, state, config)) return false;
     // 上限已经达到时，缓冲里的 after 行刚才交过了，不能再为后面的行去读。
     if (state.exceeded(config)) return false;
@@ -1378,6 +1770,27 @@ fn lossyDest(state: *State, scratch: []u8, need: usize) ?[]u8 {
     return state.text_buf[0..need];
 }
 
+fn nextLineNumber(state: *const State, buf: []const u8, line: Range, config: SearchConfig) u64 {
+    var n = state.line_number orelse 1;
+    if (line.end > line.start and line.end <= buf.len and buf[line.end - 1] == recordSep(config)) n += 1;
+    return n;
+}
+
+fn maybeProgress(comptime S: type, sink: *S, state: *State, config: SearchConfig) bool {
+    const step = config.progress_interval orelse return true;
+    if (step == 0) return true;
+    const at = state.abs_base + @as(u64, state.pos);
+    if (state.next_progress == 0) state.next_progress = step;
+    if (at < state.next_progress) return true;
+    state.next_progress = at + step;
+    const keep = callOpt(S, "progress", sink, .{ at, state.matches, state.matched_lines });
+    if (!keep) {
+        noteRejected(S, state, sink);
+        return false;
+    }
+    return true;
+}
+
 fn sinkMatched(
     comptime S: type,
     sink: *S,
@@ -1430,10 +1843,19 @@ fn sinkMatched(
     state.after_left = afterCount(config);
     state.has_sunk = true;
     state.matched_lines += 1;
+    state.matches += if (matches.len > 0) @as(u64, @intCast(matches.len)) else 1;
     state.results_out += 1;
-    if (!keep) state.stopped = true;
+    if (!keep) {
+        if (isPause(S, sink)) {
+            state.resume_at = state.abs_base + @as(u64, line.end);
+            state.resume_line = nextLineNumber(state, buf, line, config);
+        }
+        noteRejected(S, state, sink);
+    }
+    if (state.paused) return false;
+    if (!maybeProgress(S, sink, state, config)) return false;
     if (!noteHitLimit(state, config, state.abs_base + line.end)) return false;
-    return keep;
+    return keep and !state.paused;
 }
 
 fn sinkContext(
@@ -1488,8 +1910,8 @@ fn sinkContext(
     state.remembered_until = @max(state.remembered_until, line.end);
     if (kind == .after and state.after_left > 0) state.after_left -= 1;
     state.has_sunk = true;
-    if (!keep) state.stopped = true;
-    return keep;
+    if (!keep) noteRejected(S, state, sink);
+    return keep and !state.paused;
 }
 
 fn sinkBreakAt(
@@ -1502,8 +1924,8 @@ fn sinkBreakAt(
     const any_context = beforeCount(config) > 0 or afterCount(config) > 0;
     if (!any_context or !state.has_sunk or line_abs <= state.last_abs_end) return true;
     const keep = callOpt(S, "contextBreak", sink, .{});
-    if (!keep) state.stopped = true;
-    return keep;
+    if (!keep) noteRejected(S, state, sink);
+    return keep and !state.paused;
 }
 
 fn lineIsReportedHit(matcher: anytype, buf: []const u8, line: Range, config: SearchConfig) bool {
@@ -1597,6 +2019,43 @@ fn preceding(bytes: []const u8, count: usize) usize {
 }
 
 fn finishSink(comptime S: type, sink: *S, state: *State, config: SearchConfig) Result {
+    const cursor = state.abs_base + @as(u64, state.pos);
+    if (cursor > state.bytes_searched) state.bytes_searched = cursor;
+    if (!state.from_reader) state.bytes_read = @max(state.bytes_read, state.bytes_searched);
+    const elapsed = elapsedOf(state, config);
+    const resume_state = ResumeState{
+        .matched_lines = state.matched_lines,
+        .matches = state.matches,
+        .bytes_read = state.bytes_read,
+        .bytes_searched = state.bytes_searched,
+        .output_bytes = state.output_bytes,
+        .results_out = state.results_out,
+        .limit_count = state.limit_count,
+        .line_number = state.resume_line,
+        .started_ns = state.started_ns,
+        .deadline_armed = state.deadline_armed,
+        .skip_begin = true,
+    };
+    if (state.paused) {
+        if (state.resume_at == null) state.resume_at = cursor;
+        return .{
+            .outcome = .stopped,
+            .paused = true,
+            .matched_lines = state.matched_lines,
+            .matches = state.matches,
+            .nul_offset = state.nul_offset,
+            .binary_offset = state.nul_offset,
+            .bytes_read = state.bytes_read,
+            .bytes_searched = state.bytes_searched,
+            .output_bytes = state.output_bytes,
+            .elapsed_ns = elapsed,
+            .resume_at = state.resume_at,
+            .resume_state = resume_state,
+            .limit_hit = .none,
+            .partial = false,
+            .scanned_all = false,
+        };
+    }
     if (state.exceeded(config)) state.need_close = true;
     closeOnce(state, config);
     var outcome: Outcome = if (state.stopped) .stopped else .complete;
@@ -1608,16 +2067,30 @@ fn finishSink(comptime S: type, sink: *S, state: *State, config: SearchConfig) R
     const result = Result{
         .outcome = outcome,
         .matched_lines = state.matched_lines,
+        .matches = state.matches,
         .nul_offset = state.nul_offset,
         .binary_offset = state.nul_offset,
         .bytes_read = state.bytes_read,
+        .bytes_searched = state.bytes_searched,
+        .output_bytes = state.output_bytes,
+        .elapsed_ns = elapsed,
         .limit_hit = state.limit_hit,
         .partial = partial,
         .resume_at = state.resume_at,
         .soft_error = state.soft_error,
+        .scanned_all = state.scanned_all,
+        .resume_state = resume_state,
     };
     _ = callOpt(S, "finish", sink, .{result});
     return result;
+}
+
+fn elapsedOf(state: *const State, config: SearchConfig) u64 {
+    const now = readClock(config);
+    const delta = now - state.started_ns;
+    if (delta <= 0) return 0;
+    if (delta > std.math.maxInt(u64)) return std.math.maxInt(u64);
+    return @intCast(delta);
 }
 
 fn resetStats(matcher: anytype) void {
@@ -1884,7 +2357,7 @@ fn emitRing(
         state.last_abs_end = slot.end_abs;
         state.has_sunk = true;
         if (!keep) {
-            state.stopped = true;
+            noteRejected(S, state, sink);
             state.ring.clear();
             return false;
         }
@@ -2068,11 +2541,12 @@ fn emitHold(
     releaseQueue(state);
     if (as_match) {
         state.matched_lines += 1;
+        state.matches += 1;
         state.results_out += 1;
     }
     state.last_abs_end = end_abs;
     state.has_sunk = true;
-    if (!keep) state.stopped = true;
+    if (!keep) noteRejected(S, state, sink);
     if (as_match and !noteHitLimit(state, config, end_abs)) return false;
     return keep;
 }
@@ -3737,7 +4211,7 @@ test "非法 UTF-8 同时给出有损文本和原始字节" {
     try testing.expectEqualStrings("a\u{FFFD}b", bad.text[0..bad.text_len]);
 }
 
-const EvKind = enum { begin, match, context, brk, end };
+const EvKind = enum { begin, match, context, brk, progress, heartbeat, end, summary };
 
 const Saved = struct {
     kind: EvKind,
@@ -3753,6 +4227,14 @@ const Saved = struct {
     window_start: u64 = 0,
     status: BinaryStatus = .none,
     matched_lines: u64 = 0,
+    match_count: u64 = 0,
+    bytes_searched: u64 = 0,
+    bytes_printed: u64 = 0,
+    bytes_read_raw: u64 = 0,
+    elapsed: u64 = 0,
+    searches: u64 = 0,
+    searches_with_match: u64 = 0,
+    sources_failed: u64 = 0,
 
     fn free(self: *Saved) void {
         const a = testing.allocator;
@@ -3779,10 +4261,38 @@ const Bag = struct {
         const saved: Saved = switch (ev) {
             .begin => |b| bare(.begin, b.source_id),
             .context_break => |b| bare(.brk, b.source_id),
+            .progress => |p| blk: {
+                var row = bare(.progress, p.source_id);
+                row.bytes_searched = p.bytes_searched;
+                row.match_count = p.matches;
+                row.matched_lines = p.matched_lines;
+                break :blk row;
+            },
+            .heartbeat => |h| blk: {
+                var row = bare(.heartbeat, h.source_id);
+                row.bytes_searched = h.bytes_searched;
+                row.match_count = h.matches;
+                row.matched_lines = h.matched_lines;
+                break :blk row;
+            },
             .end => |e| blk: {
                 var row = bare(.end, e.source_id);
                 row.status = e.binary_status;
                 row.matched_lines = e.matched_lines;
+                row.match_count = e.matches;
+                break :blk row;
+            },
+            .summary => |s| blk: {
+                var row = bare(.summary, s.source_id);
+                row.elapsed = s.elapsed;
+                row.searches = s.searches;
+                row.searches_with_match = s.searches_with_match;
+                row.bytes_searched = s.bytes_searched;
+                row.bytes_printed = s.bytes_printed;
+                row.matched_lines = s.matched_lines;
+                row.match_count = s.matches;
+                row.bytes_read_raw = s.bytes_read_raw;
+                row.sources_failed = s.sources_failed;
                 break :blk row;
             },
             .match => |line| fromLine(.match, line),
@@ -3806,6 +4316,15 @@ const Bag = struct {
             if (item.kind != .match) continue;
             if (seen == n) return item;
             seen += 1;
+        }
+        unreachable;
+    }
+
+    fn find(self: *const Bag, kind: EvKind) *const Saved {
+        var i = self.items.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.items.items[i].kind == kind) return &self.items.items[i];
         }
         unreachable;
     }
@@ -3859,7 +4378,8 @@ test "服务入口只接受来源 ID" {
     try testing.expect(bag.kindCount(.match) == 1);
     for (bag.items.items) |item| try testing.expectEqualStrings("sid-8", item.id);
     try testing.expect(bag.items.items[0].kind == .begin);
-    try testing.expect(bag.items.items[bag.items.items.len - 1].kind == .end);
+    try testing.expect(bag.find(.end).kind == .end);
+    try testing.expect(bag.items.items[bag.items.items.len - 1].kind == .summary);
 }
 
 test "事件带行号、字节列号和绝对偏移" {
@@ -3927,21 +4447,21 @@ test "二进制状态三种取值" {
     var bag = Bag{};
     defer bag.deinit();
     _ = try searchId(&bag, "plain", "MATCH\n", "MATCH", .{});
-    try testing.expectEqual(BinaryStatus.none, bag.items.items[bag.items.items.len - 1].status);
+    try testing.expectEqual(BinaryStatus.none, bag.find(.end).status);
 
     bag.reset();
     _ = try searchId(&bag, "text", "xxMATCH\x00yy\n", "MATCH", .{ .binary = .none });
-    try testing.expectEqual(BinaryStatus.none, bag.items.items[bag.items.items.len - 1].status);
+    try testing.expectEqual(BinaryStatus.none, bag.find(.end).status);
     try testing.expect(std.mem.indexOfScalar(u8, bag.matchAt(0).bytes, 0) != null);
 
     bag.reset();
     _ = try searchId(&bag, "seen", "xxMATCH\x00yy\n", "MATCH", .{ .binary = .report });
-    try testing.expectEqual(BinaryStatus.detected, bag.items.items[bag.items.items.len - 1].status);
+    try testing.expectEqual(BinaryStatus.detected, bag.find(.end).status);
 
     bag.reset();
     _ = try searchId(&bag, "skip", "ab\x00MATCH\n", "MATCH", .{ .binary = .quit });
-    try testing.expectEqual(BinaryStatus.suppressed, bag.items.items[bag.items.items.len - 1].status);
-    try testing.expectEqual(@as(u64, 0), bag.items.items[bag.items.items.len - 1].matched_lines);
+    try testing.expectEqual(BinaryStatus.suppressed, bag.find(.end).status);
+    try testing.expectEqual(@as(u64, 0), bag.find(.end).matched_lines);
     try testing.expectEqual(@as(usize, 0), bag.kindCount(.match));
 }
 
@@ -3969,12 +4489,12 @@ test "未命中来源也有 begin 和 end" {
     defer bag.deinit();
     const result = try searchId(&bag, "miss", "nope\n", "MATCH", .{});
     try testing.expectEqual(@as(u64, 0), result.matched_lines);
-    try testing.expectEqual(@as(usize, 2), bag.items.items.len);
     try testing.expect(bag.items.items[0].kind == .begin);
-    try testing.expect(bag.items.items[1].kind == .end);
+    try testing.expect(bag.find(.end).kind == .end);
     try testing.expectEqualStrings("miss", bag.items.items[0].id);
-    try testing.expectEqualStrings("miss", bag.items.items[1].id);
-    try testing.expectEqual(@as(u64, 0), bag.items.items[1].matched_lines);
+    try testing.expectEqualStrings("miss", bag.find(.end).id);
+    try testing.expectEqual(@as(u64, 0), bag.find(.end).matched_lines);
+    try testing.expectEqual(@as(u64, 0), bag.find(.end).match_count);
     try testing.expectEqual(@as(usize, 0), bag.kindCount(.match));
 }
 
@@ -4033,7 +4553,7 @@ test "事件逐条回调" {
     try testing.expectEqual(@as(usize, 0), watch.offset_at_begin);
     try testing.expectEqual(@as(usize, 2), watch.offset_at_first);
     try testing.expectEqual(@as(u32, 2), watch.matches);
-    try testing.expectEqual(@as(u32, 4), watch.n);
+    try testing.expectEqual(@as(u32, 5), watch.n);
     try testing.expect(!watch.end_before_second);
 }
 
@@ -4418,6 +4938,53 @@ test "预算来自调用方参数" {
     try testing.expectEqual(sink_mod.LimitHit.max_bytes, served.limit_hit);
 }
 
+test "直接传入的流也受来源大小上限约束" {
+    var finder = try Finder.init("MATCH", .{});
+    var sink = Quiet{};
+    var reader = std.Io.Reader.fixed("MATCH\nMORE MATCH\n");
+    const stopped = try searchSource(Quiet, testing.allocator, &sink, &reader, "direct", &finder, .{
+        .max_source_bytes = 6,
+        .max_request_bytes = SearchConfig.max_request_bytes_hard_cap,
+        .binary = .none,
+        .buffer_size = 8,
+        .max_line_len = 64,
+        .encoding = .none,
+    });
+    try testing.expectEqual(@as(u64, 6), stopped.bytes_read);
+    try testing.expectEqual(sink_mod.LimitHit.max_bytes, stopped.limit_hit);
+    try testing.expect(stopped.partial);
+    try testing.expect(stopped.bytes_read < "MATCH\nMORE MATCH\n".len);
+
+    const armed = serviceConfig(.{});
+    try testing.expectEqual(SearchConfig.default_max_source_bytes, armed.max_source_bytes.?);
+    try testing.expectEqual(SearchConfig.default_max_request_bytes, armed.max_request_bytes.?);
+    try testing.expect(armed.max_source_bytes.? <= SearchConfig.max_source_bytes_hard_cap);
+    try testing.expectEqual(SearchConfig.default_time_budget_ns, armed.time_budget_ns.?);
+    try testing.expectEqual(BinaryPolicy.quit, (SearchConfig{}).binary);
+
+    const total: usize = @intCast(SearchConfig.default_max_source_bytes + 32);
+    const big = try testing.allocator.alloc(u8, total);
+    defer testing.allocator.free(big);
+    @memset(big, 'a');
+    var at: usize = 15;
+    while (at < big.len) : (at += 16) big[at] = '\n';
+    @memcpy(big[0..5], "MATCH");
+    var wide = std.Io.Reader.fixed(big);
+    const capped = try searchSource(Quiet, testing.allocator, &sink, &wide, "direct-default", &finder, .{
+        .binary = .none,
+        .buffer_size = 64 * 1024,
+        .max_line_len = 64,
+        .encoding = .none,
+    });
+    try testing.expectEqual(SearchConfig.default_max_source_bytes, capped.bytes_read);
+    try testing.expectEqual(sink_mod.LimitHit.max_bytes, capped.limit_hit);
+    try testing.expect(capped.bytes_read < big.len);
+}
+
+test "默认构建不映射文件" {
+    try testing.expect(!build_options.window_map);
+}
+
 test "软错误与有无匹配可区分" {
     var finder = try Finder.init("MATCH", .{});
     var sink = Quiet{};
@@ -4539,10 +5106,10 @@ test "limit_hit 覆盖每种停止原因" {
     var sink = Quiet{};
 
     const plain = try searchSlice(Quiet, &sink, "MATCH\n", "", &finder, .{ .binary = .none });
-    seen[@intFromEnum(plain.limit_hit)] = true;
+    seen[@backingInt(plain.limit_hit)] = true;
 
     const bytes = try driveCapped(&finder, "MATCH\nMATCH\nMORE\n", 6, null);
-    seen[@intFromEnum(bytes.result.limit_hit)] = true;
+    seen[@backingInt(bytes.result.limit_hit)] = true;
 
     var deadline = DeadlineGate{ .rest = "MATCH\nMATCH\nTAIL\n" };
     const timed = try drive(DeadlineGate, testing.allocator, &deadline, &finder, .{
@@ -4553,7 +5120,7 @@ test "limit_hit 覆盖每种停止原因" {
         .clock = DeadlineGate.now,
         .clock_ctx = &deadline,
     }, "", DeadlineGate.read, &deadline);
-    seen[@intFromEnum(timed.limit_hit)] = true;
+    seen[@backingInt(timed.limit_hit)] = true;
 
     var cancel = CancelGate{ .rest = "MATCH\nMATCH\nTAIL\n" };
     const stopped = try drive(CancelGate, testing.allocator, &cancel, &finder, .{
@@ -4564,7 +5131,7 @@ test "limit_hit 覆盖每种停止原因" {
         .close_input = CancelGate.close,
         .close_ctx = &cancel,
     }, "", CancelGate.read, &cancel);
-    seen[@intFromEnum(stopped.limit_hit)] = true;
+    seen[@backingInt(stopped.limit_hit)] = true;
 
     var page = Page{};
     defer page.deinit();
@@ -4572,7 +5139,7 @@ test "limit_hit 覆盖每种停止原因" {
         .max_results = 1,
         .binary = .none,
     });
-    seen[@intFromEnum(capped.limit_hit)] = true;
+    seen[@backingInt(capped.limit_hit)] = true;
 
     var raw: u8 = 0;
     const inflated = try drive(Quiet, testing.allocator, &sink, &finder, .{
@@ -4582,10 +5149,10 @@ test "limit_hit 覆盖每种停止原因" {
         .decompressed_bytes = 8,
         .max_decompressed_bytes = 4,
     }, "", badRead, &raw);
-    seen[@intFromEnum(inflated.limit_hit)] = true;
+    seen[@backingInt(inflated.limit_hit)] = true;
 
     for (std.enums.values(sink_mod.LimitHit)) |reason| {
-        try testing.expect(seen[@intFromEnum(reason)]);
+        try testing.expect(seen[@backingInt(reason)]);
     }
 }
 
@@ -4618,4 +5185,399 @@ test "未扫完的计数带 partial" {
     try testing.expect(!done.partial);
     try testing.expect(!full_watch.partial);
     try testing.expectEqual(@as(u64, 2), done.matched_lines);
+}
+
+test "匹配次数和匹配行数不同" {
+    var bag = Bag{};
+    defer bag.deinit();
+    const result = try searchId(&bag, "g03", "MATCH MATCH\nMATCH\n", "MATCH", .{ .binary = .none });
+    try testing.expectEqual(@as(u64, 2), result.matched_lines);
+    try testing.expectEqual(@as(u64, 3), result.matches);
+    try testing.expectEqual(@as(u64, 2), bag.find(.end).matched_lines);
+    try testing.expectEqual(@as(u64, 3), bag.find(.end).match_count);
+}
+
+test "无匹配来源列表在第一条命中处停止" {
+    const Watch = struct {
+        matches: u32 = 0,
+        pub fn event(self: *@This(), ev: Event) bool {
+            if (ev == .match) self.matches += 1;
+            return true;
+        }
+    };
+    var scratch: [32]u8 = undefined;
+    const hay = "MATCH\nMORE\n";
+    var src = std.testing.Reader.init(&scratch, &.{.{ .buffer = hay }});
+    src.artificial_limit = .limited(6);
+    var watch = Watch{};
+    var finder = try Finder.init("MATCH", .{});
+    var closed = std.atomic.Value(bool).init(false);
+    const result = try searchSource(Watch, testing.allocator, &watch, &src.interface, "miss-list", &finder, .{
+        .files_without_match = true,
+        .buffer_size = 6,
+        .max_line_len = 64,
+        .binary = .none,
+        .encoding = .none,
+        .close_input = struct {
+            fn close(ctx: ?*anyopaque) void {
+                const flag: *std.atomic.Value(bool) = @ptrCast(@alignCast(ctx.?));
+                flag.store(true, .release);
+            }
+        }.close,
+        .close_ctx = &closed,
+    });
+    try testing.expectEqual(@as(u32, 0), watch.matches);
+    try testing.expectEqual(@as(u64, 1), result.matched_lines);
+    try testing.expect(closed.load(.acquire));
+    try testing.expect(src.next_offset < hay.len);
+
+    var bag = Bag{};
+    defer bag.deinit();
+    const missed = try searchId(&bag, "none", "nope\n", "ZZ", .{ .files_without_match = true, .binary = .none });
+    try testing.expectEqual(@as(u64, 0), missed.matched_lines);
+    try testing.expectEqual(@as(u64, 0), bag.find(.end).matched_lines);
+    try testing.expectEqual(@as(u64, 0), bag.find(.end).match_count);
+    try testing.expectEqual(@as(usize, 0), bag.kindCount(.match));
+}
+
+test "零命中来源的 end 仍有计数" {
+    var bag = Bag{};
+    defer bag.deinit();
+    const result = try searchId(&bag, "zero", "nothing\n", "MATCH", .{ .binary = .none });
+    try testing.expectEqual(@as(u64, 0), result.matched_lines);
+    try testing.expectEqual(@as(u64, 0), result.matches);
+    const end = bag.find(.end);
+    try testing.expectEqual(@as(u64, 0), end.matched_lines);
+    try testing.expectEqual(@as(u64, 0), end.match_count);
+    try testing.expectEqualStrings("zero", end.id);
+}
+
+test "计数：单文件、多文件、零次和二进制" {
+    var one = Bag{};
+    defer one.deinit();
+    const single = try searchId(&one, "one", "MATCH\nno\nMATCH MATCH\n", "MATCH", .{ .binary = .none });
+    try testing.expectEqual(@as(u64, 2), single.matched_lines);
+    try testing.expectEqual(@as(u64, 3), single.matches);
+    try testing.expectEqual(@as(u64, 2), one.find(.end).matched_lines);
+    try testing.expectEqual(@as(u64, 3), one.find(.end).match_count);
+
+    var multi = Bag{};
+    defer multi.deinit();
+    _ = try searchId(&multi, "a.txt", "MATCH\n", "MATCH", .{ .binary = .none });
+    const a_end = multi.find(.end);
+    try testing.expectEqual(@as(u64, 1), a_end.matched_lines);
+    try testing.expectEqualStrings("a.txt", a_end.id);
+    multi.reset();
+    _ = try searchId(&multi, "b.txt", "no\n", "MATCH", .{ .binary = .none });
+    try testing.expectEqual(@as(u64, 0), multi.find(.end).matched_lines);
+    try testing.expectEqualStrings("b.txt", multi.find(.end).id);
+
+    var zero = Bag{};
+    defer zero.deinit();
+    _ = try searchId(&zero, "t.txt", "no\n", "MATCH", .{ .binary = .none });
+    try testing.expectEqual(@as(u64, 0), zero.find(.end).match_count);
+
+    var bin = Bag{};
+    defer bin.deinit();
+    const binary = try searchId(&bin, "bin", "MATCH\na\x00\nMATCH2\n", "MATCH", .{ .binary = .report });
+    try testing.expectEqual(@as(u64, 2), binary.matched_lines);
+    try testing.expect(binary.matches >= 2);
+    try testing.expectEqual(@as(u64, 2), bin.find(.end).matched_lines);
+}
+
+test "计数：max_count 的 after 窗口里抬成匹配的行也算" {
+    const Nop = struct {
+        pub fn matched(_: *@This(), _: Line) bool {
+            return true;
+        }
+    };
+    var nop = Nop{};
+    var finder = try Finder.init("MATCH", .{});
+    const result = try searchSlice(Nop, &nop, "a\nb\nMATCH\nc\nd\ne\nMATCH2\nf\n", "", &finder, .{
+        .after = 4,
+        .max_count = 1,
+        .line_numbers = true,
+        .binary = .none,
+    });
+    try testing.expectEqual(@as(u64, 2), result.matched_lines);
+}
+
+test "汇总字段齐全且未结束时没有 summary" {
+    const Clock = struct {
+        now: i128 = 0,
+        fn tick(ctx: ?*anyopaque) i128 {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.now += 5;
+            return self.now;
+        }
+    };
+    var clock = Clock{};
+    var bag = Bag{};
+    defer bag.deinit();
+    const hay = "MATCH MATCH\nMATCH\n";
+    _ = try searchId(&bag, "sum", hay, "MATCH", .{
+        .binary = .none,
+        .clock = Clock.tick,
+        .clock_ctx = &clock,
+        .time_budget_ns = SearchConfig.max_time_budget_ns,
+    });
+    try testing.expectEqual(@as(usize, 1), bag.kindCount(.summary));
+    const sum = bag.find(.summary);
+    try testing.expect(sum.elapsed >= 5);
+    try testing.expectEqual(@as(u64, 1), sum.searches);
+    try testing.expectEqual(@as(u64, 1), sum.searches_with_match);
+    try testing.expectEqual(@as(u64, hay.len), sum.bytes_searched);
+    try testing.expect(sum.bytes_printed > 0);
+    try testing.expectEqual(@as(u64, 2), sum.matched_lines);
+    try testing.expectEqual(@as(u64, 3), sum.match_count);
+    try testing.expectEqual(@as(u64, hay.len), sum.bytes_read_raw);
+    try testing.expectEqual(@as(u64, 0), sum.sources_failed);
+    try testing.expect(bag.find(.end).kind == .end);
+
+    bag.reset();
+    _ = try searchId(&bag, "part", "MATCH\nMATCH\nMORE\n", "MATCH", .{
+        .max_source_bytes = 4,
+        .binary = .none,
+    });
+    try testing.expectEqual(@as(usize, 0), bag.kindCount(.summary));
+    try testing.expectEqual(@as(usize, 1), bag.kindCount(.end));
+}
+
+test "progress 含已扫描字节和匹配数" {
+    var bag = Bag{};
+    defer bag.deinit();
+    _ = try searchId(&bag, "prog", "MATCH\nabcd\nMATCH\n", "MATCH", .{
+        .progress_interval = 4,
+        .binary = .none,
+    });
+    try testing.expect(bag.kindCount(.progress) >= 1);
+    var saw_bytes = false;
+    var saw_matches = false;
+    for (bag.items.items) |item| {
+        if (item.kind != .progress) continue;
+        if (item.bytes_searched >= 4) saw_bytes = true;
+        if (item.match_count >= 1) saw_matches = true;
+    }
+    try testing.expect(saw_bytes);
+    try testing.expect(saw_matches);
+}
+
+test "回调可以暂停后继续" {
+    const Gate = struct {
+        hits: u32 = 0,
+        ends: u32 = 0,
+        begins: u32 = 0,
+        pub fn event(self: *@This(), ev: Event) Flow {
+            switch (ev) {
+                .begin => self.begins += 1,
+                .match => {
+                    self.hits += 1;
+                    if (self.hits == 1) return .pause;
+                },
+                .end => self.ends += 1,
+                else => {},
+            }
+            return .cont;
+        }
+    };
+    var gate = Gate{};
+    var finder = try Finder.init("MATCH", .{});
+    const hay = "MATCH\nno\nMATCH\n";
+    const first = try searchSourceSlice(Gate, &gate, "pause", hay, &finder, .{ .binary = .none });
+    try testing.expect(first.paused);
+    try testing.expectEqual(@as(u32, 1), gate.hits);
+    try testing.expectEqual(@as(u32, 1), gate.begins);
+    try testing.expectEqual(@as(u32, 0), gate.ends);
+
+    const second = try resumeSourceSlice(Gate, &gate, "pause", hay, &finder, .{ .binary = .none }, first);
+    try testing.expect(!second.paused);
+    try testing.expectEqual(@as(u32, 2), gate.hits);
+    try testing.expectEqual(@as(u32, 1), gate.begins);
+    try testing.expectEqual(@as(u32, 1), gate.ends);
+    try testing.expectEqual(@as(u64, 2), second.matched_lines);
+    try testing.expect(second.scanned_all);
+
+    const Stop = struct {
+        hits: u32 = 0,
+        ends: u32 = 0,
+        pub fn event(self: *@This(), ev: Event) Flow {
+            switch (ev) {
+                .match => {
+                    self.hits += 1;
+                    return .stop;
+                },
+                .end => self.ends += 1,
+                else => {},
+            }
+            return .cont;
+        }
+    };
+    var stop = Stop{};
+    const stopped = try searchSourceSlice(Stop, &stop, "stop", hay, &finder, .{ .binary = .none });
+    try testing.expect(!stopped.paused);
+    try testing.expectEqual(@as(u32, 1), stop.hits);
+    try testing.expectEqual(@as(u32, 1), stop.ends);
+    try testing.expect(!stopped.scanned_all);
+}
+
+test "拉式接口取出 begin 到 end" {
+    var finder = try Finder.init("MATCH", .{});
+    var pull = openSourcePull(testing.allocator, &finder, "pull-1", "a\nMATCH\nb\n", .{
+        .before = 1,
+        .after = 1,
+        .binary = .none,
+    });
+    defer pull.deinit();
+    var saw_begin = false;
+    var saw_context = false;
+    var saw_match = false;
+    var saw_end = false;
+    while (try pull.next()) |ev| {
+        switch (ev.kind) {
+            .begin => {
+                saw_begin = true;
+                try testing.expectEqualStrings("pull-1", ev.source_id);
+            },
+            .context => {
+                try testing.expect(saw_begin);
+                try testing.expect(!saw_end);
+                saw_context = true;
+            },
+            .match => {
+                try testing.expect(saw_begin);
+                try testing.expectEqualStrings("MATCH", ev.bytes);
+                saw_match = true;
+            },
+            .end => {
+                try testing.expect(saw_begin);
+                try testing.expect(saw_match);
+                saw_end = true;
+            },
+            else => {},
+        }
+    }
+    try testing.expect(saw_begin);
+    try testing.expect(saw_context);
+    try testing.expect(saw_match);
+    try testing.expect(saw_end);
+}
+
+test "实时流空闲时产生心跳" {
+    const Src = struct {
+        step: u8 = 0,
+        now: i128 = 0,
+        closed: std.atomic.Value(bool) = .init(false),
+        heartbeats: u32 = 0,
+        summary_before_heartbeat: bool = false,
+        saw_summary: bool = false,
+        saw_end: bool = false,
+
+        fn clock(ctx: ?*anyopaque) i128 {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            return self.now;
+        }
+
+        fn read(ctx: *anyopaque, dest: []u8) ReadError!usize {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.step += 1;
+            switch (self.step) {
+                1 => {
+                    const data = "idle\n";
+                    @memcpy(dest[0..data.len], data);
+                    return data.len;
+                },
+                2 => {
+                    self.now = 1_000;
+                    return 0;
+                },
+                3 => {
+                    const data = "MATCH\n";
+                    @memcpy(dest[0..data.len], data);
+                    return data.len;
+                },
+                else => {
+                    self.closed.store(true, .release);
+                    return 0;
+                },
+            }
+        }
+
+        pub fn event(self: *@This(), ev: Event) bool {
+            switch (ev) {
+                .heartbeat => {
+                    self.heartbeats += 1;
+                    self.summary_before_heartbeat = self.saw_summary;
+                },
+                .summary => self.saw_summary = true,
+                .end => self.saw_end = true,
+                else => {},
+            }
+            return true;
+        }
+    };
+    var src = Src{};
+    var finder = try Finder.init("MATCH", .{});
+    const cfg = SearchConfig{
+        .live = true,
+        .idle_timeout_ns = 1_000,
+        .live_closed = &src.closed,
+        .clock = Src.clock,
+        .clock_ctx = &src,
+        .time_budget_ns = SearchConfig.max_time_budget_ns,
+        .binary = .none,
+        .buffer_size = 64,
+        .max_line_len = 64,
+        .encoding = .none,
+        .line_numbers = true,
+    };
+    var bridge = EventBridge(Src){
+        .inner = &src,
+        .source_id = "live",
+        .config = cfg,
+    };
+    const result = try drive(EventBridge(Src), testing.allocator, &bridge, &finder, cfg, "live", Src.read, &src);
+    try testing.expect(src.heartbeats >= 1);
+    try testing.expect(!src.summary_before_heartbeat);
+    try testing.expect(src.saw_end);
+    try testing.expect(!src.saw_summary);
+    try testing.expectEqual(sink_mod.LimitHit.none, result.limit_hit);
+    try testing.expect(result.soft_error == null);
+    try testing.expectEqual(@as(u64, 1), result.matched_lines);
+    emitSummary(Src, &src, "live", cfg, result);
+    try testing.expect(src.saw_summary);
+}
+
+test "命中一次就写出路径并停止" {
+    const Stop = struct {
+        id: []const u8 = "",
+        hits: u32 = 0,
+        pub fn event(self: *@This(), ev: Event) bool {
+            switch (ev) {
+                .begin => |b| self.id = b.source_id,
+                .match => |line| {
+                    self.hits += 1;
+                    self.id = line.source_id;
+                    return false;
+                },
+                else => {},
+            }
+            return true;
+        }
+    };
+    var scratch: [32]u8 = undefined;
+    const hay = "no\nMATCH\nMATCH\n";
+    var src = std.testing.Reader.init(&scratch, &.{.{ .buffer = hay }});
+    src.artificial_limit = .limited(9);
+    var stop = Stop{};
+    var finder = try Finder.init("MATCH", .{});
+    const result = try searchSource(Stop, testing.allocator, &stop, &src.interface, "src-1", &finder, .{
+        .buffer_size = 9,
+        .max_line_len = 64,
+        .binary = .none,
+        .encoding = .none,
+    });
+    try testing.expectEqualStrings("src-1", stop.id);
+    try testing.expectEqual(@as(u32, 1), stop.hits);
+    try testing.expectEqual(@as(u64, 1), result.matched_lines);
+    try testing.expect(src.next_offset < hay.len);
 }

@@ -360,10 +360,20 @@ fn followLink(host: *Host, job: *Job, name: []const u8, rel: []const u8, scratch
 }
 
 fn duplicateDir(dir: std.Io.Dir) ?std.Io.Dir {
-    if (builtin.os.tag == .windows) return null;
-    const rc = std.c.fcntl(dir.handle, std.c.F.DUPFD_CLOEXEC, @as(std.c.fd_t, 0));
-    if (rc < 0) return null;
-    return .{ .handle = @intCast(rc) };
+    switch (comptime builtin.os.tag) {
+        .windows => return null,
+        .linux => {
+            // musl 目标不会自动链接 libc。DUPFD_CLOEXEC 走 fcntl 系统调用。
+            const rc = std.os.linux.fcntl(dir.handle, std.os.linux.F.DUPFD_CLOEXEC, 0);
+            if (std.os.linux.errno(rc) != .SUCCESS) return null;
+            return .{ .handle = @intCast(rc) };
+        },
+        else => {
+            const rc = std.c.fcntl(dir.handle, std.c.F.DUPFD_CLOEXEC, @as(std.c.fd_t, 0));
+            if (rc < 0) return null;
+            return .{ .handle = @intCast(rc) };
+        },
+    }
 }
 
 fn createFileJob(host: *Host, parent: *Job, names: []const []const u8) !*Job {

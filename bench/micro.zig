@@ -261,15 +261,12 @@ const WalkCtx = struct {
 fn walkRun(ctx: *WalkCtx) !usize {
     var saw = false;
     var out_buf: [64]u8 = undefined;
-    var err_buf: [64]u8 = undefined;
     var out: std.Io.Writer.Discarding = .init(&out_buf);
-    var err_w: std.Io.Writer.Discarding = .init(&err_buf);
     const stats = try libwebgrep.parallel.run(ctx.gpa, ctx.io, .{
         .pattern = "NEEDLE",
         .roots = &.{"bench/tmp/walk"},
         .emit = .count,
         .stdout = &out.writer,
-        .stderr = &err_w.writer,
         .saw_output = &saw,
         .walk = .{ .threads = ctx.threads, .read_ignore = false },
     });

@@ -107,20 +107,20 @@ libwebgrep 原名 zrg（webgrep core），是用纯 Zig 0.17 编写的服务端�
 ## 八、输出模式与统计
 - [ ] G01 [MVP][P0][core] 默认模式：逐条产出匹配行事件
 - [ ] G02 [MVP][P0][core] 统计匹配的行数（rg -c）
-- [ ] G03 [MVP][P0][core] 统计匹配的次数（rg --count-matches）
+- [x] G03 [MVP][P0][core] 统计匹配的次数（rg --count-matches）
 - [ ] G04 [MVP][P0][core] 输出有匹配的来源列表，每个来源找到第一个匹配就停止读取（rg -l）
-- [ ] G05 [MVP][P0][core] 输出没有匹配的来源列表（rg --files-without-match）
-- [ ] G06 [MVP][P0][core] 计数结果包含零命中的来源，结束事件里始终带计数（rg --include-zero）
-- [ ] G07 [MVP][P0][core] 统计字段：elapsed、searches、searches_with_match、bytes_searched、bytes_printed、matched_lines、matches，另外增加 bytes_read_raw、sources_failed（rg --stats / JSON 的 stats）
-- [ ] G08 [MVP][P0][core] 实时流定期产出 progress 事件（包含已扫描字节数和匹配数）；流没有结束时不发最终汇总
+- [x] G05 [MVP][P0][core] 输出没有匹配的来源列表（rg --files-without-match）
+- [x] G06 [MVP][P0][core] 计数结果包含零命中的来源，结束事件里始终带计数（rg --include-zero）
+- [x] G07 [MVP][P0][core] 统计字段：elapsed、searches、searches_with_match、bytes_searched、bytes_printed、matched_lines、matches，另外增加 bytes_read_raw、sources_failed（rg --stats / JSON 的 stats）
+- [x] G08 [MVP][P0][core] 实时流定期产出 progress 事件（包含已扫描字节数和匹配数）；流没有结束时不发最终汇总
 - [ ] G09 [MVP][P0][能力] "只显示命中片段"所需的数据完全由匹配区间提供，不单独实现这种输出模式（rg -o）
 
 ## 九、事件 API 与流控
-- [ ] H01 [MVP][P0][core] 事件类型齐全：begin、match、context、progress、end，以及最终的 summary（字段命名可以参照 rg --json）
+- [x] H01 [MVP][P0][core] 事件类型齐全：begin、match、context、progress、end，以及最终的 summary（字段命名可以参照 rg --json）
 - [ ] H02 [MVP][P0][core] 每产出一个事件就立即回调（相当于行缓冲），事件的聚合和 flush 交给传输层（rg --line-buffered）
-- [ ] H03 [MVP][P0][core] 背压：回调可以要求暂停或停止，或者提供拉取式接口
-- [ ] H04 [MVP][P0][core] 实时流（类似 tail -f）支持空闲超时和心跳事件
-- [ ] H05 [MVP][P0][能力] 事件结构可以无损地序列化为 NDJSON，供 SSE 或 WebSocket 推送；序列化由 API 层完成，不在 core 中（rg --json）
+- [x] H03 [MVP][P0][core] 背压：回调可以要求暂停或停止，或者提供拉取式接口
+- [x] H04 [MVP][P0][core] 实时流（类似 tail -f）支持空闲超时和心跳事件
+- [x] H05 [MVP][P0][能力] 事件结构可以无损地序列化为 NDJSON，供 SSE 或 WebSocket 推送；序列化由 API 层完成，不在 core 中（rg --json）
 
 ## 十、资源与安全（rg 没有这些，但公开服务必须具备）
 - [x] I01 [MVP][P0][core] 扫描字节上限，按来源和按请求分别设置（CWE-400；OWASP API4:2023）

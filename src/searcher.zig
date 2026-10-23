@@ -2,36 +2,52 @@
 //!
 //! 先在缓冲里找匹配，命中后再向两侧找 `\n`。没有命中的区域不逐行扫描。
 //! 模式里的换行由 Finder 拒绝；这里假定匹配器不会跨行。
-//! 行终止符仍是 LF。交给 Sink 的行内容去掉结尾的 `\n`，再去掉紧挨着的一个 `\r`。
+//! 默认行终止符是 LF。交给 Sink 的行内容去掉结尾的 `\n`，再去掉紧挨着的一个 `\r`。
+//! `null_data` 改用 NUL 分隔记录，记录里的 LF 不断行，NUL 也不当成二进制。
 //!
-//! 切片搜索不分配内存。Reader 和文件搜索使用调用方传入的分配器，缓冲从
-//! `buffer_size` 倍增到 `max_line_len`，超过则返回 `error.LineTooLong`。
+//! `encoding = .auto` 只在流开头嗅探 BOM。UTF-16 先转成 UTF-8 再搜索，非法序列换成
+//! U+FFFD。没有 BOM 就不猜测。`.none` 不嗅探、不转码。
+//!
+//! 没有 BOM 时切片搜索不分配。需要转码的切片用 `decode_allocator`。Reader 和文件搜索
+//! 使用调用方传入的分配器。读缓冲从 `buffer_size` 涨到单行上限，不再为了装下整行继续涨。
+//! 超过上限的行仍按流查找，交出去的是匹配附近的窗口。前置上下文放在环形缓冲里，不回退读取。
 
 const std = @import("std");
 const build_options = @import("build_options");
+const encoding = @import("encoding.zig");
 const matcher_mod = @import("matcher.zig");
 const memchr = @import("finder/memchr.zig");
 const sink_mod = @import("sink.zig");
 
+pub const Encoding = encoding.Encoding;
+
 pub const BinaryPolicy = enum {
-    /// 遇到 NUL 就停止这个输入，不再搜索当前这次读入。遍历发现的文件用这个。
+    /// 跳过。遇到 NUL 就停止读取。这是默认。
     quit,
-    /// 显式给出的文件用这个。看到 NUL 后继续找，直到知道有没有匹配。
+    /// 继续搜索，直到知道有没有匹配，但是不返回行内容。
     report,
-    /// 不检测。
+    /// 按文本处理，不把 NUL 当成二进制。
     none,
 };
 
 pub const SearchConfig = struct {
     /// 起始块大小。128 MiB 文件上四档里 1 MiB 最快，见 `BENCHMARKS.md`。默认 1 MiB。
     pub const default_buffer_size: usize = 1024 * 1024;
-    /// 单行字节上限。缓冲倍增到这里仍放不下一整行时返回 `error.LineTooLong`。
+    /// 单行字节上限。读缓冲不超过这个值加一个换行字节。更长的行改走窗口。
     pub const default_max_line_len: usize = 2 * 1024 * 1024;
+    /// 上下文行数硬顶。调用方可以把实际上限调低，不能超过这里。
+    pub const context_lines_hard_cap: u32 = 10;
 
     line_numbers: bool = false,
     invert: bool = false,
-    before: u32 = 0,
-    after: u32 = 0,
+    /// 对称上下文。`before` 或 `after` 不是 null 时，对应的一侧改用那个值。
+    context: u32 = 0,
+    /// null 表示跟 `context` 走。
+    before: ?u32 = null,
+    /// null 表示跟 `context` 走。
+    after: ?u32 = null,
+    /// 服务层可以把上下文行数上限调得比硬顶更低。比硬顶大时仍按硬顶。
+    max_context_lines: ?u32 = null,
     /// 这个输入上最多报告多少条匹配行。null 表示不限。
     /// 计入上限的是主循环找到的命中。`-A` 窗口里额外抬成匹配的行不占用额度，
     /// 但仍然调用 `matched`，因此计数打印器会把它们算进去。这和 ripgrep 15 一致。
@@ -50,7 +66,13 @@ pub const SearchConfig = struct {
     /// 匹配行数达到 `max_count` 时调用，用来关闭上游。没提供就不调用。
     close_input: ?*const fn (?*anyopaque) void = null,
     close_ctx: ?*anyopaque = null,
-    binary: BinaryPolicy = .report,
+    binary: BinaryPolicy = .quit,
+    /// 用 NUL 分隔记录。记录内部的 LF 不断行，NUL 也不当成二进制信号。
+    null_data: bool = false,
+    /// 默认只在流开头嗅探 BOM。`.none` 关掉嗅探和转码。
+    encoding: Encoding = .auto,
+    /// 切片上需要转码，或有损文本放不进栈缓冲时使用。流式搜索用函数上的分配器。
+    decode_allocator: ?std.mem.Allocator = null,
     buffer_size: usize = default_buffer_size,
     max_line_len: usize = default_max_line_len,
     match_mode: matcher_mod.MatchMode = .earliest,
@@ -65,8 +87,8 @@ pub const Result = sink_mod.Result;
 pub const Line = sink_mod.Line;
 pub const Span = sink_mod.Span;
 
-pub const SliceError = error{LineTooLong};
-pub const ReadError = error{ LineTooLong, OutOfMemory, ReadFailed } || std.Io.File.ReadPositionalError;
+pub const SliceError = error{ ContextLinesExceeded, OutOfMemory };
+pub const ReadError = error{ OutOfMemory, ReadFailed, ContextLinesExceeded } || std.Io.File.ReadPositionalError;
 
 const width = memchr.native_width;
 
@@ -95,8 +117,29 @@ const State = struct {
     bytes_read: u64 = 0,
     nul_offset: ?u64 = null,
     stopped: bool = false,
+    /// 已经交给 Sink 的最后一行的终点绝对偏移（含换行）。断点用它判断，不看缓冲下标。
+    last_abs_end: u64 = 0,
+    /// 这一位之前的完整行，要么已经交过，要么已经放进前置环。
+    remembered_until: usize = 0,
+    ring: BeforeRing = .{},
+    long_active: bool = false,
+    long_origin: u64 = 0,
+    long_dropped: u64 = 0,
+    long_number: ?u64 = null,
+    long_has_match: bool = false,
+    long_excluded: bool = false,
+    long_hold_len: usize = 0,
+    long_window_start: u64 = 0,
+    long_line_len: u64 = 0,
+    long_match_start: usize = 0,
+    long_match_end: usize = 0,
+    /// 0 没有留窗口，1 行首窗口，2 匹配窗口。
+    long_hold_kind: u2 = 0,
     /// 这一块里很早就有匹配。后面的块改回先扫 NUL，避免每个密集块搜两遍。
     prefer_prepass: bool = false,
+    /// 有损文本放不进栈缓冲时用。只在回调返回前有效。
+    text_alloc: ?std.mem.Allocator = null,
+    text_buf: []u8 = &.{},
 
     fn exceeded(self: *const State, config: SearchConfig) bool {
         const limit = config.max_count orelse return false;
@@ -104,7 +147,37 @@ const State = struct {
     }
 };
 
-/// 在 `haystack` 上搜索。行切片直接指向 `haystack`。`name` 传给 `begin`，可以是空串。
+const Prepared = struct {
+    bytes: []const u8,
+    owned: []u8 = &.{},
+    alloc: ?std.mem.Allocator = null,
+
+    fn deinit(self: *const Prepared) void {
+        if (self.owned.len != 0) if (self.alloc) |alloc| alloc.free(self.owned);
+    }
+};
+
+fn materialize(haystack: []const u8, config: SearchConfig) SliceError!Prepared {
+    if (config.encoding != .auto) return .{ .bytes = haystack };
+    switch (encoding.sniff(haystack, true)) {
+        .raw, .need_more => return .{ .bytes = haystack },
+        .utf8 => {
+            const rest = if (haystack.len >= 3) haystack[3..] else haystack[0..0];
+            if (encoding.validUtf8(rest)) return .{ .bytes = rest };
+            const alloc = config.decode_allocator orelse return error.OutOfMemory;
+            const owned = try encoding.convertAlloc(alloc, .utf8, rest);
+            return .{ .bytes = owned, .owned = owned, .alloc = alloc };
+        },
+        .utf16le, .utf16be => |kind| {
+            const alloc = config.decode_allocator orelse return error.OutOfMemory;
+            const payload = if (haystack.len >= 2) haystack[2..] else haystack[0..0];
+            const owned = try encoding.convertAlloc(alloc, kind, payload);
+            return .{ .bytes = owned, .owned = owned, .alloc = alloc };
+        },
+    }
+}
+
+/// 在 `haystack` 上搜索。没有 BOM 时行切片直接指向 `haystack`。`name` 传给 `begin`，可以是空串。
 pub fn searchSlice(
     comptime S: type,
     sink: *S,
@@ -113,15 +186,33 @@ pub fn searchSlice(
     matcher: anytype,
     config: SearchConfig,
 ) SliceError!Result {
+    const view = try materialize(haystack, config);
+    defer view.deinit();
+    return searchPrepared(S, sink, view.bytes, name, matcher, config);
+}
+
+fn searchPrepared(
+    comptime S: type,
+    sink: *S,
+    haystack: []const u8,
+    name: []const u8,
+    matcher: anytype,
+    config: SearchConfig,
+) SliceError!Result {
+    try rejectWideContext(config);
     resetStats(matcher);
     var state = State{};
+    state.text_alloc = config.decode_allocator;
+    defer if (state.text_buf.len != 0) if (state.text_alloc) |alloc| alloc.free(state.text_buf);
+    state.ring.cap = beforeCount(config);
+    state.ring.stride = config.max_line_len;
     if (config.line_numbers) state.line_number = 1;
     if (!callOpt(S, "begin", sink, .{name})) {
         state.stopped = true;
         return finishSink(S, sink, &state, config);
     }
 
-    if (config.binary != .none) {
+    if (watchesBinary(config)) {
         if (memchr.find(width, haystack, 0, 0)) |nul| {
             state.nul_offset = nul;
             const cont = callOpt(S, "binary", sink, .{nul});
@@ -210,7 +301,22 @@ fn drive(
     comptime readFn: anytype,
     read_ctx: *anyopaque,
 ) ReadError!Result {
+    try rejectWideContext(config);
     var state = State{};
+    state.text_alloc = allocator;
+    defer if (state.text_buf.len != 0) allocator.free(state.text_buf);
+    state.ring.cap = beforeCount(config);
+    state.ring.stride = config.max_line_len;
+    if (state.ring.cap > 0) {
+        const bytes = beforeContextCapacity(config);
+        if (bytes > 0) state.ring.storage = try allocator.alloc(u8, bytes);
+        state.ring.owned = true;
+    }
+    defer if (state.ring.storage.len != 0) allocator.free(state.ring.storage);
+    var hold: []u8 = &.{};
+    defer if (hold.len != 0) allocator.free(hold);
+    var seen: []bool = &.{};
+    defer if (seen.len != 0) allocator.free(seen);
     if (config.line_numbers) state.line_number = 1;
     if (!callOpt(S, "begin", sink, .{name})) {
         state.stopped = true;
@@ -235,6 +341,8 @@ fn drive(
     }
     defer if (!borrowed) allocator.free(buf);
     var filled: usize = 0;
+    var decoder = encoding.Decoder.init(config.encoding);
+    defer decoder.deinit(allocator);
 
     while (!state.stopped) {
         if (state.exceeded(config)) {
@@ -246,20 +354,48 @@ fn drive(
             break;
         }
         if (filled == buf.len) {
-            buf = try grow(allocator, buf, config);
-            if (config.scratch) |slot| slot.* = buf;
+            if (try grow(allocator, buf, config)) |next| {
+                buf = next;
+                if (config.scratch) |slot| slot.* = buf;
+            } else if (!try makeRoom(S, allocator, sink, matcher, &buf, &filled, &hold, &seen, &state, config)) {
+                state.stopped = true;
+                break;
+            } else if (config.scratch) |slot| slot.* = buf;
         }
-        const n = try readFn(read_ctx, buf[filled..]);
-        state.bytes_read += n;
-        const eof = n == 0;
-        const new_at = filled;
-        if (!eof) filled += n;
+        const pulled = try decoder.pull(allocator, readFn, read_ctx, bufferWindow(config), buf[filled..], &state.bytes_read);
+        const eof = pulled.eof;
+        if (pulled.n == 0 and !eof and filled == 0) continue;
+        var chunk_at = filled;
+        if (pulled.n != 0) filled += pulled.n;
 
-        const search_end = if (eof) filled else lastComplete(buf[0..filled]);
-        // 换行符本身不计入单行上限，所以缓冲可以比上限多一个字节。
-        const pending = filled - search_end;
-        if (pending > config.max_line_len) return error.LineTooLong;
+        if (state.long_active or longTail(buf[0..filled], eof, config)) {
+            const cont = try pumpLong(
+                S,
+                allocator,
+                sink,
+                matcher,
+                &buf,
+                &filled,
+                &hold,
+                &seen,
+                chunk_at,
+                eof,
+                &state,
+                config,
+            );
+            if (config.scratch) |slot| slot.* = buf;
+            if (!cont) {
+                state.stopped = true;
+                break;
+            }
+            if (state.long_active) {
+                if (eof) break;
+                continue;
+            }
+            chunk_at = 0;
+        }
 
+        const search_end = if (eof) filled else lastComplete(buf[0..filled], config);
         const view_end = if (eof) filled else search_end;
         // 文本快路径把 NUL 检查并进查找。单独再扫一遍 NUL，1 GiB 热文件大约要 19 ms，
         // 单字节模式会因此慢过 rg。上下文和密集匹配仍走原来的先扫 NUL。
@@ -287,18 +423,18 @@ fn drive(
                 state.nul_offset = state.abs_base + rel;
                 const cont = callOpt(S, "binary", sink, .{state.nul_offset.?});
                 if (config.binary == .quit or !cont) {
-                    filled = new_at;
+                    filled = chunk_at;
                     state.stopped = true;
                     break;
                 }
                 skip_match = false;
             }
-        } else if (!eof and config.binary != .none and state.nul_offset == null) {
-            if (memchr.find(width, buf[new_at..filled], 0, 0)) |rel| {
-                state.nul_offset = state.abs_base + new_at + rel;
+        } else if (!eof and watchesBinary(config) and state.nul_offset == null) {
+            if (memchr.find(width, buf[chunk_at..filled], 0, 0)) |rel| {
+                state.nul_offset = state.abs_base + chunk_at + rel;
                 const cont = callOpt(S, "binary", sink, .{state.nul_offset.?});
                 if (config.binary == .quit or !cont) {
-                    filled = new_at;
+                    filled = chunk_at;
                     state.stopped = true;
                     break;
                 }
@@ -315,8 +451,9 @@ fn drive(
         if (eof) break;
         if (state.stopped) break;
 
-        const consumed = rollConsumed(buf[0..search_end], &state, config);
-        countLines(buf, consumed, &state);
+        const consumed = search_end;
+        rememberBefore(matcher, buf, &state, config, consumed);
+        countLines(buf, consumed, &state, config);
         const remain = filled - consumed;
         if (consumed > 0 and remain > 0) {
             std.mem.copyForwards(u8, buf[0..remain], buf[consumed..filled]);
@@ -336,18 +473,19 @@ fn flagIsSet(config: SearchConfig) bool {
     return flag.load(.acquire);
 }
 
-fn grow(allocator: std.mem.Allocator, buf: []u8, config: SearchConfig) error{ LineTooLong, OutOfMemory }![]u8 {
-    const limit = config.max_line_len + 1;
-    if (buf.len >= limit) return error.LineTooLong;
+fn grow(allocator: std.mem.Allocator, buf: []u8, config: SearchConfig) error{OutOfMemory}!?[]u8 {
+    const limit = lineHoldLimit(config);
+    if (buf.len >= limit) return null;
     const doubled = if (buf.len > limit / 2) limit else buf.len * 2;
-    const next = @min(limit, doubled);
-    if (next <= buf.len) return error.LineTooLong;
-    return allocator.realloc(buf, next);
+    const next = @min(limit, @max(doubled, buf.len + 1));
+    if (next <= buf.len) return null;
+    return try allocator.realloc(buf, next);
 }
 
 fn canFuse(matcher: anytype, config: SearchConfig, state: *const State) bool {
+    if (config.null_data) return false;
     if (state.prefer_prepass or state.nul_offset != null) return false;
-    if (config.binary == .none or config.invert or config.before != 0 or config.after != 0) return false;
+    if (config.binary == .none or config.invert or beforeCount(config) != 0 or afterCount(config) != 0) return false;
     if (config.whole_word or config.whole_line or config.contains.len != 0 or config.excludes.len != 0) return false;
     return @hasDecl(@TypeOf(matcher.*), "findWatched");
 }
@@ -357,8 +495,17 @@ fn bufferWindow(config: SearchConfig) usize {
     return config.buffer_size;
 }
 
-fn lastComplete(buf: []const u8) usize {
-    if (memchr.findLast(width, buf, 0, buf.len, '\n')) |i| return i + 1;
+fn recordSep(config: SearchConfig) u8 {
+    return if (config.null_data) 0 else '\n';
+}
+
+/// NUL 只在 LF 分行、并且不是 NUL 记录模式时当成二进制信号。
+fn watchesBinary(config: SearchConfig) bool {
+    return config.binary != .none and !config.null_data;
+}
+
+fn lastComplete(buf: []const u8, config: SearchConfig) usize {
+    if (memchr.findLast(width, buf, 0, buf.len, recordSep(config))) |i| return i + 1;
     return 0;
 }
 
@@ -377,7 +524,7 @@ fn matchBuffer(
             if (!try matchInvert(S, sink, matcher, buf, state, config)) break;
         } else if (try findLine(matcher, buf, state, config)) |line| {
             state.limit_count += 1;
-            if (config.before > 0 or config.after > 0) {
+            if (beforeCount(config) > 0 or afterCount(config) > 0) {
                 if (!try afterContext(S, sink, matcher, buf, line.start, state, config)) return false;
                 if (!try beforeContext(S, sink, matcher, buf, line.start, state, config)) return false;
             }
@@ -415,17 +562,17 @@ fn findLine(matcher: anytype, buf: []const u8, state: *State, config: SearchConf
             nextMatch(matcher, buf, pos, config);
         const hit = found orelse return null;
         if (hit.start > buf.len or hit.start < pos) return null;
-        const start = lineStart(buf, hit.start);
+        const start = lineStart(buf, hit.start, config);
         if (start == buf.len) {
             pos = buf.len;
             continue;
         }
-        const end = lineEnd(buf, @max(hit.end, start));
+        const end = lineEnd(buf, @max(hit.end, start), config);
         if (end == start) {
             pos = @min(buf.len, start + 1);
             continue;
         }
-        const content_end = contentEnd(buf, .{ .start = start, .end = end });
+        const content_end = contentEnd(buf, .{ .start = start, .end = end }, config);
         if (config.whole_line and !acceptsWholeLine(matcher, buf, start, content_end)) {
             pos = end;
             continue;
@@ -506,14 +653,14 @@ fn matchInvert(
     };
     if (gap.start == gap.end) return true;
 
-    if (config.before > 0 or config.after > 0) {
+    if (beforeCount(config) > 0 or afterCount(config) > 0) {
         if (!try afterContext(S, sink, matcher, buf, gap.start, state, config)) return false;
         if (!try beforeContext(S, sink, matcher, buf, gap.start, state, config)) return false;
     }
     var cursor = gap.start;
-    while (nextLine(buf, cursor, gap.end)) |line| {
+    while (nextLine(buf, cursor, gap.end, config)) |line| {
         cursor = line.end;
-        const content_end = contentEnd(buf, line);
+        const content_end = contentEnd(buf, line, config);
         if (!linePassesFilters(buf, line.start, content_end, config)) continue;
         state.limit_count += 1;
         if (!try sinkMatched(S, sink, matcher, buf, line, null, state, config)) return false;
@@ -535,7 +682,7 @@ fn afterContext(
     const exceeded = state.exceeded(config);
     var cursor = state.last_line_visited;
     if (cursor > upto) return true;
-    while (nextLine(buf, cursor, upto)) |line| {
+    while (nextLine(buf, cursor, upto, config)) |line| {
         cursor = line.end;
         if (exceeded and lineIsReportedHit(matcher, buf, line, config)) {
             const saved = state.after_left;
@@ -558,20 +705,95 @@ fn beforeContext(
     state: *State,
     config: SearchConfig,
 ) SliceError!bool {
-    if (config.before == 0) return true;
-    if (state.last_line_visited >= upto) return true;
-    const slice = buf[state.last_line_visited..upto];
-    const rel = preceding(slice, config.before - 1);
-    var cursor = state.last_line_visited + rel;
-    while (nextLine(buf, cursor, upto)) |line| {
-        cursor = line.end;
-        if (!try sinkBreak(S, sink, buf, line.start, state, config)) return false;
-        if (!try sinkContext(S, sink, matcher, buf, line, .before, state, config)) return false;
+    if (beforeCount(config) == 0) return true;
+    // 匹配可能落在本块开头，前置行已经在上一块推进环里。
+    // 那种情况下 last_line_visited == upto，仍然要把环交出去。
+    if (state.last_line_visited < upto) {
+        rememberBefore(matcher, buf, state, config, upto);
     }
-    return true;
+    return emitRing(S, sink, buf, state, config);
 }
 
 const ContextKind = enum { before, after };
+
+fn sinkLine(
+    comptime S: type,
+    comptime name: []const u8,
+    sink: *S,
+    state: *State,
+    bytes: []const u8,
+    span: ?Span,
+    offset: u64,
+    number: ?u64,
+    truncated: bool,
+    line_len: u64,
+    window_start: u64,
+) bool {
+    var scratch: [1024]u8 = undefined;
+    const line = buildLine(state, &scratch, bytes, span, offset, number, truncated, line_len, window_start);
+    return callOpt(S, name, sink, .{line});
+}
+
+fn buildLine(
+    state: *State,
+    scratch: []u8,
+    bytes: []const u8,
+    span: ?Span,
+    offset: u64,
+    number: ?u64,
+    truncated: bool,
+    line_len: u64,
+    window_start: u64,
+) Line {
+    const text = lossyText(state, scratch, bytes);
+    var match = span;
+    var column: ?u64 = null;
+    if (span) |found| {
+        const from = @min(found.start, bytes.len);
+        const to = @min(@max(found.end, from), bytes.len);
+        const units = encoding.utf16Span(bytes, from, to);
+        match = .{
+            .start = found.start,
+            .end = found.end,
+            .u16_start = units.start,
+            .u16_end = units.end,
+        };
+        column = units.start + 1;
+    }
+    return .{
+        .bytes = bytes,
+        .text = text,
+        .raw = bytes,
+        .offset = offset,
+        .number = number,
+        .match = match,
+        .u16_column = column,
+        .truncated = truncated,
+        .line_len = line_len,
+        .window_start = window_start,
+    };
+}
+
+fn lossyText(state: *State, scratch: []u8, bytes: []const u8) []const u8 {
+    if (encoding.validUtf8(bytes)) return bytes;
+    const need = encoding.lossyLen(bytes);
+    const dest = lossyDest(state, scratch, need) orelse return bytes;
+    return dest[0..encoding.writeLossy(bytes, dest)];
+}
+
+fn lossyDest(state: *State, scratch: []u8, need: usize) ?[]u8 {
+    if (need <= scratch.len) return scratch[0..need];
+    const alloc = state.text_alloc orelse return null;
+    if (state.text_buf.len < need) {
+        if (state.text_buf.len == 0) {
+            state.text_buf = alloc.alloc(u8, need) catch return null;
+        } else {
+            state.text_buf = alloc.realloc(state.text_buf, need) catch return null;
+        }
+    }
+    if (state.text_buf.len < need) return null;
+    return state.text_buf[0..need];
+}
 
 fn sinkMatched(
     comptime S: type,
@@ -583,19 +805,29 @@ fn sinkMatched(
     state: *State,
     config: SearchConfig,
 ) SliceError!bool {
-    const content_end = contentEnd(buf, line);
-    if (content_end - line.start > config.max_line_len) return error.LineTooLong;
-    if (!try sinkBreak(S, sink, buf, line.start, state, config)) return false;
-    countLines(buf, line.start, state);
-    const span = spanFrom(buf, line, content_end, known);
-    const keep = callOpt(S, "matched", sink, .{Line{
-        .bytes = buf[line.start..content_end],
-        .offset = state.abs_base + line.start,
-        .number = state.line_number,
-        .match = span,
-    }});
+    const preview = previewLine(buf, line, known, config);
+    const line_abs = state.abs_base + line.start;
+    if (!try sinkBreakAt(S, sink, line_abs, state, config)) return false;
+    countLines(buf, line.start, state, config);
+    const withheld = config.binary == .report and state.nul_offset != null;
+    const bytes = if (withheld) buf[line.start..line.start] else buf[preview.start..preview.end];
+    const keep = sinkLine(
+        S,
+        "matched",
+        sink,
+        state,
+        bytes,
+        if (withheld) null else preview.span,
+        line_abs,
+        state.line_number,
+        preview.truncated and !withheld,
+        preview.line_len,
+        if (withheld) 0 else preview.window_start,
+    );
     state.last_line_visited = line.end;
-    state.after_left = config.after;
+    state.last_abs_end = state.abs_base + line.end;
+    state.remembered_until = @max(state.remembered_until, line.end);
+    state.after_left = afterCount(config);
     state.has_sunk = true;
     state.matched_lines += 1;
     if (!keep) state.stopped = true;
@@ -613,48 +845,58 @@ fn sinkContext(
     state: *State,
     config: SearchConfig,
 ) SliceError!bool {
-    const content_end = contentEnd(buf, line);
-    if (content_end - line.start > config.max_line_len) return error.LineTooLong;
-    countLines(buf, line.start, state);
-    const span = if (config.invert) spanFrom(buf, line, content_end, matchInLine(matcher, buf, line, config)) else null;
-    const keep = callOpt(S, "context", sink, .{Line{
-        .bytes = buf[line.start..content_end],
-        .offset = state.abs_base + line.start,
-        .number = state.line_number,
-        .match = span,
-    }});
+    const known = if (config.invert) matchInLine(matcher, buf, line, config) else null;
+    const preview = previewLine(buf, line, known, config);
+    const line_abs = state.abs_base + line.start;
+    if (!try sinkBreakAt(S, sink, line_abs, state, config)) return false;
+    countLines(buf, line.start, state, config);
+    const withheld = config.binary == .report and state.nul_offset != null;
+    const bytes = if (withheld) buf[line.start..line.start] else buf[preview.start..preview.end];
+    const keep = sinkLine(
+        S,
+        "context",
+        sink,
+        state,
+        bytes,
+        if (withheld) null else preview.span,
+        line_abs,
+        state.line_number,
+        preview.truncated and !withheld,
+        preview.line_len,
+        if (withheld) 0 else preview.window_start,
+    );
     state.last_line_visited = line.end;
+    state.last_abs_end = state.abs_base + line.end;
+    state.remembered_until = @max(state.remembered_until, line.end);
     if (kind == .after and state.after_left > 0) state.after_left -= 1;
     state.has_sunk = true;
     if (!keep) state.stopped = true;
     return keep;
 }
 
-fn sinkBreak(
+fn sinkBreakAt(
     comptime S: type,
     sink: *S,
-    buf: []const u8,
-    start: usize,
+    line_abs: u64,
     state: *State,
     config: SearchConfig,
 ) SliceError!bool {
-    _ = buf;
-    const any_context = config.before > 0 or config.after > 0;
-    if (!any_context or !state.has_sunk or state.last_line_visited >= start) return true;
+    const any_context = beforeCount(config) > 0 or afterCount(config) > 0;
+    if (!any_context or !state.has_sunk or line_abs <= state.last_abs_end) return true;
     const keep = callOpt(S, "contextBreak", sink, .{});
     if (!keep) state.stopped = true;
     return keep;
 }
 
 fn lineIsReportedHit(matcher: anytype, buf: []const u8, line: Range, config: SearchConfig) bool {
-    const content_end = contentEnd(buf, line);
+    const content_end = contentEnd(buf, line, config);
     if (!linePassesFilters(buf, line.start, content_end, config)) return false;
     const hit = matchInLine(matcher, buf, line, config) != null;
     return if (config.invert) !hit else hit;
 }
 
 fn matchInLine(matcher: anytype, buf: []const u8, line: Range, config: SearchConfig) ?BufMatch {
-    const end = contentEnd(buf, line);
+    const end = contentEnd(buf, line, config);
     if (config.whole_line) {
         if (!acceptsWholeLine(matcher, buf, line.start, end)) return null;
         return .{ .start = line.start, .end = end };
@@ -677,43 +919,44 @@ fn spanFrom(buf: []const u8, line: Range, content_end: usize, known: ?BufMatch) 
     };
 }
 
-fn contentEnd(buf: []const u8, line: Range) usize {
+fn contentEnd(buf: []const u8, line: Range, config: SearchConfig) usize {
     var end = line.end;
-    if (end > line.start and end <= buf.len and buf[end - 1] == '\n') end -= 1;
-    if (end > line.start and end <= buf.len and buf[end - 1] == '\r') end -= 1;
+    const sep = recordSep(config);
+    if (end > line.start and end <= buf.len and buf[end - 1] == sep) end -= 1;
+    if (!config.null_data and end > line.start and end <= buf.len and buf[end - 1] == '\r') end -= 1;
     return end;
 }
 
-fn countLines(buf: []const u8, upto: usize, state: *State) void {
+fn countLines(buf: []const u8, upto: usize, state: *State, config: SearchConfig) void {
     if (state.line_number == null) return;
     if (state.last_line_counted >= upto) return;
-    const n = memchr.count(width, buf, state.last_line_counted, upto, '\n');
+    const n = memchr.count(width, buf, state.last_line_counted, upto, recordSep(config));
     state.line_number = (state.line_number orelse return) + n;
     state.last_line_counted = upto;
 }
 
 fn rollConsumed(buf: []const u8, state: *const State, config: SearchConfig) usize {
-    if (config.before == 0 and config.after == 0) return buf.len;
-    const context_start = preceding(buf, config.before);
-    return @max(context_start, state.last_line_visited);
-}
-
-fn lineStart(buf: []const u8, pos: usize) usize {
-    const upto = @min(pos, buf.len);
-    if (memchr.findLast(width, buf, 0, upto, '\n')) |i| return i + 1;
-    return 0;
-}
-
-fn lineEnd(buf: []const u8, from: usize) usize {
-    if (from >= buf.len) return buf.len;
-    if (memchr.find(width, buf, from, '\n')) |i| return i + 1;
+    _ = state;
+    _ = config;
     return buf.len;
 }
 
-fn nextLine(buf: []const u8, pos: usize, end: usize) ?Range {
+fn lineStart(buf: []const u8, pos: usize, config: SearchConfig) usize {
+    const upto = @min(pos, buf.len);
+    if (memchr.findLast(width, buf, 0, upto, recordSep(config))) |i| return i + 1;
+    return 0;
+}
+
+fn lineEnd(buf: []const u8, from: usize, config: SearchConfig) usize {
+    if (from >= buf.len) return buf.len;
+    if (memchr.find(width, buf, from, recordSep(config))) |i| return i + 1;
+    return buf.len;
+}
+
+fn nextLine(buf: []const u8, pos: usize, end: usize, config: SearchConfig) ?Range {
     if (pos >= end or pos >= buf.len) return null;
     const limit = @min(end, buf.len);
-    if (memchr.find(width, buf, pos, '\n')) |i| {
+    if (memchr.find(width, buf, pos, recordSep(config))) |i| {
         if (i >= limit) return .{ .start = pos, .end = limit };
         return .{ .start = pos, .end = i + 1 };
     }
@@ -748,6 +991,7 @@ fn finishSink(comptime S: type, sink: *S, state: *State, config: SearchConfig) R
         .outcome = outcome,
         .matched_lines = state.matched_lines,
         .nul_offset = state.nul_offset,
+        .binary_offset = state.nul_offset,
         .bytes_read = state.bytes_read,
     };
     _ = callOpt(S, "finish", sink, .{result});
@@ -766,6 +1010,600 @@ fn resetStats(matcher: anytype) void {
 fn callOpt(comptime S: type, comptime name: []const u8, sink: *S, args: anytype) bool {
     if (!@hasDecl(S, name)) return true;
     return @call(.auto, @field(S, name), .{sink} ++ args);
+}
+
+fn contextLineLimit(config: SearchConfig) u32 {
+    const hard = SearchConfig.context_lines_hard_cap;
+    return @min(config.max_context_lines orelse hard, hard);
+}
+
+fn rejectWideContext(config: SearchConfig) error{ContextLinesExceeded}!void {
+    const limit = contextLineLimit(config);
+    if (config.context > limit) return error.ContextLinesExceeded;
+    if (config.before) |n| if (n > limit) return error.ContextLinesExceeded;
+    if (config.after) |n| if (n > limit) return error.ContextLinesExceeded;
+}
+
+fn beforeCount(config: SearchConfig) u32 {
+    return config.before orelse config.context;
+}
+
+fn afterCount(config: SearchConfig) u32 {
+    return config.after orelse config.context;
+}
+
+fn beforeContextCapacity(config: SearchConfig) usize {
+    return std.math.mul(usize, @as(usize, beforeCount(config)), config.max_line_len) catch std.math.maxInt(usize);
+}
+
+fn lineHoldLimit(config: SearchConfig) usize {
+    return config.max_line_len + 1;
+}
+
+fn longTail(buf: []const u8, eof: bool, config: SearchConfig) bool {
+    if (eof or buf.len == 0) return false;
+    const end = lastComplete(buf, config);
+    return buf.len - end > config.max_line_len;
+}
+
+const Preview = struct {
+    start: usize,
+    end: usize,
+    truncated: bool,
+    line_len: u64,
+    window_start: u64,
+    span: ?Span,
+};
+
+/// 窗口尽量包住整个匹配。匹配比上限长时，从匹配起点开始。
+fn windowOrigin(raw: usize, limit: usize, match_at: usize, match_end: usize) usize {
+    if (limit == 0 or raw <= limit) return 0;
+    const mend = @min(match_end, raw);
+    const mstart = @min(match_at, mend);
+    const mlen = mend - mstart;
+    if (mlen >= limit) {
+        if (mstart + limit > raw) return raw - limit;
+        return mstart;
+    }
+    const mid = mstart + mlen / 2;
+    var rel: usize = if (mid > limit / 2) mid - limit / 2 else 0;
+    if (rel + limit > raw) rel = raw - limit;
+    if (mstart < rel) rel = mstart;
+    const tail = mstart + mlen;
+    if (tail > rel + limit) rel = tail - limit;
+    if (rel + limit > raw) rel = raw - limit;
+    return rel;
+}
+
+fn previewLine(buf: []const u8, line: Range, known: ?BufMatch, config: SearchConfig) Preview {
+    const content_end = contentEnd(buf, line, config);
+    const raw = content_end - line.start;
+    const limit = config.max_line_len;
+    if (limit == 0 or raw <= limit) {
+        return .{
+            .start = line.start,
+            .end = content_end,
+            .truncated = false,
+            .line_len = raw,
+            .window_start = 0,
+            .span = spanFrom(buf, line, content_end, known),
+        };
+    }
+    var rel: usize = 0;
+    if (known) |m| {
+        const at = if (m.start > line.start) m.start - line.start else 0;
+        const mend = if (m.end > line.start) @min(m.end - line.start, raw) else at;
+        rel = windowOrigin(raw, limit, at, mend);
+    }
+    const win_end = rel + limit;
+    var span: ?Span = null;
+    if (known) |m| {
+        const abs_s = line.start + rel;
+        const abs_e = line.start + win_end;
+        if (m.start >= abs_s and m.start < abs_e) {
+            span = .{
+                .start = m.start - abs_s,
+                .end = @min(m.end, abs_e) - abs_s,
+            };
+        }
+    }
+    return .{
+        .start = line.start + rel,
+        .end = line.start + win_end,
+        .truncated = true,
+        .line_len = raw,
+        .window_start = rel,
+        .span = span,
+    };
+}
+
+const RingSlot = struct {
+    len: u32 = 0,
+    abs: u64 = 0,
+    end_abs: u64 = 0,
+    number: ?u64 = null,
+    truncated: bool = false,
+    line_len: u64 = 0,
+    window_start: u64 = 0,
+    mstart: u32 = 0,
+    mend: u32 = 0,
+    has_match: bool = false,
+    src_start: usize = 0,
+    src_end: usize = 0,
+};
+
+const BeforeRing = struct {
+    slots: [SearchConfig.context_lines_hard_cap]RingSlot = undefined,
+    storage: []u8 = &.{},
+    stride: usize = 0,
+    cap: u32 = 0,
+    count: u32 = 0,
+    head: u32 = 0,
+    owned: bool = false,
+
+    fn clear(self: *BeforeRing) void {
+        self.count = 0;
+        self.head = 0;
+    }
+
+    fn index(self: *const BeforeRing, oldest_i: u32) u32 {
+        return (self.head + self.cap - self.count + oldest_i) % self.cap;
+    }
+
+    fn push(self: *BeforeRing, buf: []const u8, preview: Preview, abs: u64, end_abs: u64, number: ?u64) void {
+        const slice = if (preview.end >= preview.start) buf[preview.start..preview.end] else buf[0..0];
+        self.pushBytes(slice, preview, abs, end_abs, number);
+    }
+
+    fn pushBytes(self: *BeforeRing, slice: []const u8, preview: Preview, abs: u64, end_abs: u64, number: ?u64) void {
+        if (self.cap == 0) return;
+        const idx = self.head;
+        if (self.count < self.cap) self.count += 1;
+        const len = slice.len;
+        self.slots[idx] = .{
+            .len = std.math.cast(u32, len) orelse std.math.maxInt(u32),
+            .abs = abs,
+            .end_abs = end_abs,
+            .number = number,
+            .truncated = preview.truncated,
+            .line_len = preview.line_len,
+            .window_start = preview.window_start,
+            .has_match = preview.span != null,
+            .mstart = if (preview.span) |s| std.math.cast(u32, s.start) orelse 0 else 0,
+            .mend = if (preview.span) |s| std.math.cast(u32, s.end) orelse 0 else 0,
+            .src_start = preview.start,
+            .src_end = preview.end,
+        };
+        if (self.owned and self.stride > 0 and len > 0) {
+            const at = @as(usize, idx) * self.stride;
+            const n = @min(len, self.stride);
+            @memcpy(self.storage[at..][0..n], slice[0..n]);
+            self.slots[idx].len = std.math.cast(u32, n) orelse 0;
+        }
+        self.head = (self.head + 1) % self.cap;
+    }
+
+    fn bytes(self: *const BeforeRing, idx: u32, buf: []const u8) []const u8 {
+        const slot = self.slots[idx];
+        if (self.owned) {
+            if (self.stride == 0 or slot.len == 0) return &.{};
+            const at = @as(usize, idx) * self.stride;
+            return self.storage[at..][0..slot.len];
+        }
+        if (slot.src_end < slot.src_start or slot.src_end > buf.len) return &.{};
+        return buf[slot.src_start..slot.src_end];
+    }
+};
+
+fn rememberBefore(matcher: anytype, buf: []const u8, state: *State, config: SearchConfig, upto: usize) void {
+    const limit_end = @min(upto, buf.len);
+    if (state.ring.cap == 0) {
+        state.remembered_until = @max(state.remembered_until, limit_end);
+        return;
+    }
+    var cursor = @max(state.remembered_until, state.last_line_visited);
+    if (cursor > limit_end) cursor = limit_end;
+    while (nextLine(buf, cursor, limit_end, config)) |line| {
+        if (line.end <= state.last_line_visited) {
+            cursor = line.end;
+            continue;
+        }
+        const known = if (config.invert) matchInLine(matcher, buf, line, config) else null;
+        const preview = previewLine(buf, line, known, config);
+        countLines(buf, line.start, state, config);
+        state.ring.push(buf, preview, state.abs_base + line.start, state.abs_base + line.end, state.line_number);
+        cursor = line.end;
+    }
+    state.remembered_until = limit_end;
+}
+
+fn emitRing(
+    comptime S: type,
+    sink: *S,
+    buf: []const u8,
+    state: *State,
+    config: SearchConfig,
+) SliceError!bool {
+    var i: u32 = 0;
+    while (i < state.ring.count) : (i += 1) {
+        const idx = state.ring.index(i);
+        const slot = state.ring.slots[idx];
+        if (!try sinkBreakAt(S, sink, slot.abs, state, config)) {
+            state.ring.clear();
+            return false;
+        }
+        const raw = state.ring.bytes(idx, buf);
+        const withheld = config.binary == .report and state.nul_offset != null;
+        const span: ?Span = if (withheld or !slot.has_match) null else .{
+            .start = slot.mstart,
+            .end = slot.mend,
+        };
+        const keep = sinkLine(
+            S,
+            "context",
+            sink,
+            state,
+            if (withheld) raw[0..0] else raw,
+            span,
+            slot.abs,
+            slot.number,
+            slot.truncated and !withheld,
+            slot.line_len,
+            if (withheld) 0 else slot.window_start,
+        );
+        state.last_abs_end = slot.end_abs;
+        state.has_sunk = true;
+        if (!keep) {
+            state.stopped = true;
+            state.ring.clear();
+            return false;
+        }
+    }
+    state.ring.clear();
+    return true;
+}
+
+fn needleLen(matcher: anytype) usize {
+    const T = @TypeOf(matcher.*);
+    if (@hasField(T, "pattern")) return matcher.pattern.len;
+    if (@hasField(T, "patterns")) {
+        var max: usize = 0;
+        for (matcher.patterns) |pat| max = @max(max, pat.len);
+        return max;
+    }
+    return 1;
+}
+
+fn overlapKeep(matcher: anytype, config: SearchConfig) usize {
+    var n = needleLen(matcher);
+    for (config.contains) |pat| n = @max(n, pat.len);
+    for (config.excludes) |pat| n = @max(n, pat.len);
+    if (config.whole_word) n += 1;
+    if (n == 0) n = 1;
+    const cap = if (config.max_line_len == 0) 1 else config.max_line_len;
+    return @min(n, cap);
+}
+
+fn containsDone(seen: []const bool, config: SearchConfig) bool {
+    if (config.contains.len == 0) return true;
+    if (seen.len < config.contains.len) return false;
+    for (seen[0..config.contains.len]) |ok| if (!ok) return false;
+    return true;
+}
+
+fn ensureHold(allocator: std.mem.Allocator, hold: *[]u8, n: usize) error{OutOfMemory}!void {
+    if (n == 0 or hold.len >= n) return;
+    if (hold.len == 0) {
+        hold.* = try allocator.alloc(u8, n);
+    } else {
+        hold.* = try allocator.realloc(hold.*, n);
+    }
+}
+
+fn compactBuf(buf: []u8, filled: *usize, drop: usize, state: *State) void {
+    if (drop == 0 or drop > filled.*) return;
+    const remain = filled.* - drop;
+    if (remain > 0) std.mem.copyForwards(u8, buf[0..remain], buf[drop..filled.*]);
+    filled.* = remain;
+    state.pos = if (state.pos >= drop) state.pos - drop else 0;
+    state.last_line_visited = if (state.last_line_visited >= drop) state.last_line_visited - drop else 0;
+    state.last_line_counted = if (state.last_line_counted >= drop) state.last_line_counted - drop else 0;
+    state.remembered_until = if (state.remembered_until >= drop) state.remembered_until - drop else 0;
+    state.abs_base += drop;
+}
+
+fn noteLong(
+    allocator: std.mem.Allocator,
+    matcher: anytype,
+    bytes: []const u8,
+    hold: *[]u8,
+    seen: *[]bool,
+    state: *State,
+    config: SearchConfig,
+    commit: bool,
+) error{OutOfMemory}!void {
+    if (!state.long_excluded) {
+        for (config.excludes) |pat| {
+            if (std.mem.indexOf(u8, bytes, pat) != null) {
+                state.long_excluded = true;
+                break;
+            }
+        }
+    }
+    if (seen.len >= config.contains.len) {
+        for (config.contains, 0..) |pat, i| {
+            if (!seen.*[i] and std.mem.indexOf(u8, bytes, pat) != null) seen.*[i] = true;
+        }
+    }
+    if (state.long_has_match or config.whole_line) return;
+    const keep = if (commit) 0 else overlapKeep(matcher, config);
+    const stable = if (bytes.len > keep) bytes.len - keep else 0;
+    var pos: usize = 0;
+    while (pos < stable) {
+        const hit = nextMatch(matcher, bytes, pos, config) orelse break;
+        if (hit.start >= stable) break;
+        if (config.whole_word and hit.end >= bytes.len and !commit) {
+            pos = @min(bytes.len, hit.start + 1);
+            continue;
+        }
+        if (config.whole_word and state.long_dropped > 0 and hit.start == 0 and !commit) {
+            pos = @min(bytes.len, hit.start + 1);
+            continue;
+        }
+        try saveMatchWindow(allocator, bytes, hit, hold, state, config);
+        state.long_has_match = true;
+        break;
+    }
+}
+
+fn saveMatchWindow(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    hit: matcher_mod.Match,
+    hold: *[]u8,
+    state: *State,
+    config: SearchConfig,
+) error{OutOfMemory}!void {
+    const limit = config.max_line_len;
+    if (limit == 0) return;
+    try ensureHold(allocator, hold, limit);
+    const avail = bytes.len;
+    const local = windowOrigin(avail, limit, hit.start, @min(hit.end, avail));
+    const end = @min(avail, local + limit);
+    if (end < local) return;
+    if (hit.start >= end) return;
+    const n = end - local;
+    @memcpy(hold.*[0..n], bytes[local..end]);
+    state.long_hold_len = n;
+    state.long_window_start = state.long_dropped + local;
+    state.long_match_start = hit.start - local;
+    state.long_match_end = @min(hit.end, end) - local;
+    state.long_hold_kind = 2;
+}
+
+fn savePrefix(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    hold: *[]u8,
+    state: *State,
+    config: SearchConfig,
+) error{OutOfMemory}!void {
+    const limit = config.max_line_len;
+    if (limit == 0 or state.long_hold_kind == 2) return;
+    const n = @min(limit, bytes.len);
+    if (n == 0) return;
+    try ensureHold(allocator, hold, limit);
+    @memcpy(hold.*[0..n], bytes[0..n]);
+    state.long_hold_len = n;
+    state.long_window_start = state.long_dropped;
+    state.long_hold_kind = 1;
+}
+
+fn slideLong(buf: *[]u8, filled: *usize, matcher: anytype, state: *State, config: SearchConfig) void {
+    const keep = overlapKeep(matcher, config);
+    if (filled.* <= keep) return;
+    const drop = filled.* - keep;
+    std.mem.copyForwards(u8, buf.*[0..keep], buf.*[drop..filled.*]);
+    filled.* = keep;
+    state.long_dropped += drop;
+    state.abs_base += drop;
+}
+
+fn emitHold(
+    comptime S: type,
+    sink: *S,
+    hold: []const u8,
+    state: *State,
+    config: SearchConfig,
+    as_match: bool,
+    end_abs: u64,
+) SliceError!bool {
+    const withheld = config.binary == .report and state.nul_offset != null;
+    const n = @min(state.long_hold_len, hold.len);
+    const raw = hold[0..n];
+    const span: ?Span = if (withheld or state.long_hold_kind != 2) null else .{
+        .start = state.long_match_start,
+        .end = state.long_match_end,
+    };
+    if (!try sinkBreakAt(S, sink, state.long_origin, state, config)) return false;
+    const bytes = if (withheld) raw[0..0] else raw;
+    const truncated = state.long_line_len > config.max_line_len and !withheld;
+    const window = if (withheld) 0 else state.long_window_start;
+    const keep = if (as_match)
+        sinkLine(S, "matched", sink, state, bytes, span, state.long_origin, state.long_number, truncated, state.long_line_len, window)
+    else
+        sinkLine(S, "context", sink, state, bytes, span, state.long_origin, state.long_number, truncated, state.long_line_len, window);
+    if (as_match) state.matched_lines += 1;
+    state.last_abs_end = end_abs;
+    state.has_sunk = true;
+    if (!keep) state.stopped = true;
+    return keep;
+}
+
+fn finishLong(
+    comptime S: type,
+    sink: *S,
+    buf: *[]u8,
+    filled: *usize,
+    hold: []const u8,
+    seen: []const bool,
+    state: *State,
+    config: SearchConfig,
+    content_in_buf: usize,
+    drop_buf: usize,
+) SliceError!bool {
+    state.long_line_len = state.long_dropped + content_in_buf;
+    const filters_ok = !state.long_excluded and containsDone(seen, config);
+    const matched_pat = state.long_has_match and !config.whole_line;
+    var is_hit = if (config.invert) !matched_pat else matched_pat;
+    if (!filters_ok) is_hit = false;
+    const end_abs = state.abs_base + drop_buf;
+    if (is_hit and !state.exceeded(config)) {
+        if (!try emitRing(S, sink, buf.*, state, config)) return false;
+        state.limit_count += 1;
+        if (!try emitHold(S, sink, hold, state, config, true, end_abs)) return false;
+        state.after_left = afterCount(config);
+    } else if (state.after_left > 0) {
+        if (!try emitHold(S, sink, hold, state, config, is_hit, end_abs)) return false;
+        if (state.after_left > 0) state.after_left -= 1;
+    } else if (beforeCount(config) > 0) {
+        const raw = hold[0..@min(state.long_hold_len, hold.len)];
+        const preview = Preview{
+            .start = 0,
+            .end = raw.len,
+            .truncated = state.long_line_len > config.max_line_len,
+            .line_len = state.long_line_len,
+            .window_start = state.long_window_start,
+            .span = if (state.long_hold_kind == 2) .{
+                .start = state.long_match_start,
+                .end = state.long_match_end,
+            } else null,
+        };
+        state.ring.pushBytes(raw, preview, state.long_origin, end_abs, state.long_number);
+    }
+    countLines(buf.*, @min(drop_buf, filled.*), state, config);
+    compactBuf(buf.*, filled, @min(drop_buf, filled.*), state);
+    state.pos = 0;
+    state.last_line_visited = 0;
+    state.remembered_until = 0;
+    state.long_active = false;
+    state.long_hold_kind = 0;
+    state.long_has_match = false;
+    return !state.stopped;
+}
+
+fn beginLong(
+    allocator: std.mem.Allocator,
+    matcher: anytype,
+    buf: *[]u8,
+    filled: *usize,
+    hold: *[]u8,
+    seen: *[]bool,
+    state: *State,
+    config: SearchConfig,
+) error{OutOfMemory}!void {
+    state.long_active = true;
+    state.long_origin = state.abs_base;
+    state.long_dropped = 0;
+    state.long_has_match = false;
+    state.long_excluded = false;
+    state.long_hold_kind = 0;
+    state.long_hold_len = 0;
+    state.long_window_start = 0;
+    state.long_number = state.line_number;
+    if (config.contains.len > seen.len) {
+        if (seen.len != 0) allocator.free(seen.*);
+        seen.* = try allocator.alloc(bool, config.contains.len);
+    }
+    if (seen.len > 0) @memset(seen.*, false);
+    const bytes = buf.*[0..filled.*];
+    if (config.invert or beforeCount(config) > 0 or state.after_left > 0) {
+        try savePrefix(allocator, bytes, hold, state, config);
+    }
+    try noteLong(allocator, matcher, bytes, hold, seen, state, config, false);
+    slideLong(buf, filled, matcher, state, config);
+}
+
+fn makeRoom(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    sink: *S,
+    matcher: anytype,
+    buf: *[]u8,
+    filled: *usize,
+    hold: *[]u8,
+    seen: *[]bool,
+    state: *State,
+    config: SearchConfig,
+) ReadError!bool {
+    if (state.long_active) {
+        const before = filled.*;
+        slideLong(buf, filled, matcher, state, config);
+        return filled.* < buf.len and filled.* < before;
+    }
+    const end = lastComplete(buf.*[0..filled.*], config);
+    if (end > 0) {
+        if (!try matchBuffer(S, sink, matcher, buf.*[0..end], state, config)) return false;
+        rememberBefore(matcher, buf.*, state, config, end);
+        countLines(buf.*, end, state, config);
+        compactBuf(buf.*, filled, end, state);
+        return filled.* < buf.len;
+    }
+    if (filled.* > config.max_line_len) {
+        try beginLong(allocator, matcher, buf, filled, hold, seen, state, config);
+        return filled.* < buf.len;
+    }
+    return false;
+}
+
+fn pumpLong(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    sink: *S,
+    matcher: anytype,
+    buf: *[]u8,
+    filled: *usize,
+    hold: *[]u8,
+    seen: *[]bool,
+    new_at: usize,
+    eof: bool,
+    state: *State,
+    config: SearchConfig,
+) ReadError!bool {
+    if (watchesBinary(config) and state.nul_offset == null and new_at < filled.*) {
+        if (memchr.find(width, buf.*[new_at..filled.*], 0, 0)) |rel| {
+            state.nul_offset = state.abs_base + new_at + rel;
+            const cont = callOpt(S, "binary", sink, .{state.nul_offset.?});
+            if (config.binary == .quit or !cont) return false;
+        }
+    }
+    if (!state.long_active) {
+        if (eof) return true;
+        const search_end = lastComplete(buf.*[0..filled.*], config);
+        if (filled.* - search_end <= config.max_line_len) return true;
+        if (search_end > 0) {
+            if (!try matchBuffer(S, sink, matcher, buf.*[0..search_end], state, config)) return false;
+            rememberBefore(matcher, buf.*, state, config, search_end);
+            countLines(buf.*, search_end, state, config);
+            compactBuf(buf.*, filled, search_end, state);
+        }
+        try beginLong(allocator, matcher, buf, filled, hold, seen, state, config);
+        return !state.stopped;
+    }
+    const sep = recordSep(config);
+    if (memchr.find(width, buf.*, 0, sep)) |nl| {
+        var content_len = nl;
+        if (!config.null_data and nl > 0 and buf.*[nl - 1] == '\r') content_len = nl - 1;
+        try noteLong(allocator, matcher, buf.*[0..content_len], hold, seen, state, config, true);
+        return finishLong(S, sink, buf, filled, hold.*, seen.*, state, config, content_len, nl + 1);
+    }
+    if (eof) {
+        try noteLong(allocator, matcher, buf.*[0..filled.*], hold, seen, state, config, true);
+        return finishLong(S, sink, buf, filled, hold.*, seen.*, state, config, filled.*, filled.*);
+    }
+    try noteLong(allocator, matcher, buf.*[0..filled.*], hold, seen, state, config, false);
+    if (filled.* > config.max_line_len) slideLong(buf, filled, matcher, state, config);
+    return !state.stopped;
 }
 
 const testing = std.testing;
@@ -805,7 +1643,6 @@ const Rec = struct {
     pub fn contextBreak(self: *Rec) bool {
         if (self.suppress_lines) return true;
         self.breaks += 1;
-        self.text.appendSlice(testing.allocator, "--\n") catch unreachable;
         return true;
     }
 
@@ -859,13 +1696,13 @@ test "切片：行号、上下文和分隔" {
         \\2-b
         \\3:MATCH
         \\4-c
-        \\--
         \\6-e
         \\7:MATCH2
         \\8-f
         \\
     , rec.text.items);
     try testing.expectEqual(@as(u64, 2), rec.matches);
+    try testing.expectEqual(@as(u32, 1), rec.breaks);
 }
 
 test "切片：max_count 仍吐出 after，窗口内的命中保持匹配格式" {
@@ -978,16 +1815,41 @@ fn finishOf(hay: []const u8, pattern: []const u8, policy: BinaryPolicy) !Result 
     return searchSlice(Rec, &rec, hay, "", &finder, .{ .binary = policy, .buffer_size = 64 });
 }
 
-test "切片：超长匹配行报错" {
+test "切片：超长匹配行交出窗口" {
+    const Cap = struct {
+        truncated: bool = false,
+        line_len: u64 = 0,
+        window_start: u64 = 0,
+        offset: u64 = 0,
+        bytes: [8]u8 = undefined,
+        len: usize = 0,
+        mstart: usize = 0,
+        pub fn matched(self: *@This(), line: Line) bool {
+            self.truncated = line.truncated;
+            self.line_len = line.line_len;
+            self.window_start = line.window_start;
+            self.offset = line.offset;
+            self.len = @min(line.bytes.len, self.bytes.len);
+            @memcpy(self.bytes[0..self.len], line.bytes[0..self.len]);
+            self.mstart = line.match.?.start;
+            return true;
+        }
+    };
     var finder = try Finder.init("MATCH", .{});
-    var rec = Rec{};
-    defer rec.deinit(testing.allocator);
+    var cap = Cap{};
     const hay = "MATCHxxxxxxxxxxxxxxxxxxxx";
-    const result = searchSlice(Rec, &rec, hay, "", &finder, .{ .max_line_len = 8, .binary = .none });
-    try testing.expectError(error.LineTooLong, result);
+    const result = try searchSlice(Cap, &cap, hay, "", &finder, .{ .max_line_len = 8, .binary = .none });
+    try testing.expectEqual(Outcome.complete, result.outcome);
+    try testing.expect(cap.truncated);
+    try testing.expectEqual(@as(u64, hay.len), cap.line_len);
+    try testing.expectEqual(@as(u64, 0), cap.offset);
+    try testing.expectEqual(@as(usize, 8), cap.len);
+    try testing.expectEqualStrings(hay[cap.window_start..][0..cap.len], cap.bytes[0..cap.len]);
+    try testing.expectEqual(@as(u64, 0), cap.window_start + cap.mstart);
 }
 
 test "分块读把 NUL 并进查找" {
+    // 按 LF 分行，且不是 NUL 记录模式，所以 NUL 仍是二进制信号。
     var reader = std.Io.Reader.fixed("ab\ncd\nMATCH\n");
     var finder = try Finder.init("MATCH", .{});
     var rec = Rec{};
@@ -1008,6 +1870,7 @@ test "分块读把 NUL 并进查找" {
     const bin_result = try searchReader(Rec, testing.allocator, &bin, &bin_reader, "", &bin_finder, .{
         .buffer_size = 64,
         .max_line_len = 64,
+        .binary = .report,
     });
     try testing.expectEqual(Outcome.binary_matched, bin_result.outcome);
     try testing.expectEqual(@as(?u64, 7), bin_result.nul_offset);
@@ -1141,17 +2004,33 @@ test "Reader 上刚好达到单行上限的行可以读完" {
     try testing.expectEqualStrings("2:zzz\n", rec.text.items);
 }
 
-test "Reader 超过单行上限" {
+test "Reader 超过单行上限仍返回窗口" {
     var reader = std.Io.Reader.fixed("abcdef\n");
     var finder = try Finder.init("a", .{});
-    var rec = Rec{};
-    defer rec.deinit(testing.allocator);
-    const result = searchReader(Rec, testing.allocator, &rec, &reader, "", &finder, .{
+    const Cap = struct {
+        truncated: bool = false,
+        line_len: u64 = 0,
+        text: [8]u8 = undefined,
+        len: usize = 0,
+        pub fn matched(self: *@This(), line: Line) bool {
+            self.truncated = line.truncated;
+            self.line_len = line.line_len;
+            self.len = @min(line.bytes.len, self.text.len);
+            @memcpy(self.text[0..self.len], line.bytes[0..self.len]);
+            return true;
+        }
+    };
+    var cap = Cap{};
+    const result = try searchReader(Cap, testing.allocator, &cap, &reader, "", &finder, .{
         .buffer_size = 4,
         .max_line_len = 4,
         .binary = .none,
     });
-    try testing.expectError(error.LineTooLong, result);
+    try testing.expectEqual(Outcome.complete, result.outcome);
+    try testing.expect(cap.truncated);
+    try testing.expectEqual(@as(u64, 6), cap.line_len);
+    try testing.expectEqual(@as(usize, 4), cap.len);
+    try testing.expectEqualStrings("abcd", cap.text[0..cap.len]);
 }
 
 test "拉式迭代器" {
@@ -1557,4 +2436,665 @@ test "AND 与 NOT 同时过滤，且与反选不同" {
     try testing.expect(!std.mem.eql(u8, both.text.items, inverted.text.items));
     try testing.expect(!std.mem.eql(u8, together.text.items, inverted.text.items));
     try testing.expect(!std.mem.eql(u8, together.text.items, both.text.items));
+}
+
+const Win = struct {
+    calls: u32 = 0,
+    truncated: bool = false,
+    line_len: u64 = 0,
+    window_start: u64 = 0,
+    offset: u64 = 0,
+    mstart: usize = 0,
+    bytes: []u8 = &.{},
+
+    fn deinit(self: *Win) void {
+        if (self.bytes.len != 0) testing.allocator.free(self.bytes);
+    }
+
+    pub fn matched(self: *Win, line: Line) bool {
+        self.calls += 1;
+        self.truncated = line.truncated;
+        self.line_len = line.line_len;
+        self.window_start = line.window_start;
+        self.offset = line.offset;
+        self.mstart = if (line.match) |span| span.start else 0;
+        if (self.bytes.len != 0) testing.allocator.free(self.bytes);
+        self.bytes = testing.allocator.dupe(u8, line.bytes) catch unreachable;
+        return true;
+    }
+};
+
+test "超长行只保留匹配窗口并且偏移精确" {
+    const max_line: usize = 16;
+    var hay = try testing.allocator.alloc(u8, 4001);
+    defer testing.allocator.free(hay);
+    @memset(hay, 'z');
+    const match_at: usize = 2500;
+    @memcpy(hay[match_at..][0..5], "MATCH");
+    hay[4000] = '\n';
+
+    var slice_finder = try Finder.init("MATCH", .{});
+    var slice_win = Win{};
+    defer slice_win.deinit();
+    const slice_result = try searchSlice(Win, &slice_win, hay, "", &slice_finder, .{
+        .max_line_len = max_line,
+        .binary = .none,
+    });
+    try testing.expectEqual(Outcome.complete, slice_result.outcome);
+    try testing.expectEqual(@as(u32, 1), slice_win.calls);
+    try testing.expect(slice_win.truncated);
+    try testing.expectEqual(@as(u64, 4000), slice_win.line_len);
+    try testing.expectEqual(@as(u64, 0), slice_win.offset);
+    try testing.expect(slice_win.bytes.len <= max_line);
+    try testing.expect(slice_win.bytes.len > 0);
+    try testing.expectEqualStrings(hay[slice_win.window_start..][0..slice_win.bytes.len], slice_win.bytes);
+    try testing.expect(std.mem.indexOf(u8, slice_win.bytes, "MATCH") != null);
+    try testing.expectEqual(@as(u64, match_at), slice_win.window_start + slice_win.mstart);
+
+    var reader = std.Io.Reader.fixed(hay);
+    var read_finder = try Finder.init("MATCH", .{});
+    var read_win = Win{};
+    defer read_win.deinit();
+    const read_result = try searchReader(Win, testing.allocator, &read_win, &reader, "", &read_finder, .{
+        .max_line_len = max_line,
+        .buffer_size = 8,
+        .binary = .none,
+    });
+    try testing.expectEqual(Outcome.complete, read_result.outcome);
+    try testing.expectEqual(@as(u32, 1), read_win.calls);
+    try testing.expect(read_win.truncated);
+    try testing.expectEqual(@as(u64, 4000), read_win.line_len);
+    try testing.expectEqual(@as(u64, 0), read_win.offset);
+    try testing.expect(read_win.bytes.len <= max_line);
+    try testing.expectEqualStrings(hay[read_win.window_start..][0..read_win.bytes.len], read_win.bytes);
+    try testing.expect(std.mem.indexOf(u8, read_win.bytes, "MATCH") != null);
+    try testing.expectEqual(@as(u64, match_at), read_win.window_start + read_win.mstart);
+}
+
+test "不匹配的超长行也不把缓冲涨过上限" {
+    const max_line: usize = 32;
+    const line_len: usize = 3000;
+    var hay = try testing.allocator.alloc(u8, line_len + 1 + 6);
+    defer testing.allocator.free(hay);
+    @memset(hay[0..line_len], 'z');
+    hay[line_len] = '\n';
+    @memcpy(hay[line_len + 1 ..][0..6], "MATCH\n");
+
+    var scratch: []u8 = &.{};
+    defer testing.allocator.free(scratch);
+    var finder = try Finder.init("MATCH", .{});
+    var win = Win{};
+    defer win.deinit();
+    var reader = std.Io.Reader.fixed(hay);
+    const result = try searchReader(Win, testing.allocator, &win, &reader, "", &finder, .{
+        .scratch = &scratch,
+        .buffer_size = 16,
+        .max_line_len = max_line,
+        .binary = .none,
+        .line_numbers = true,
+    });
+    try testing.expectEqual(Outcome.complete, result.outcome);
+    try testing.expect(scratch.len <= max_line + 1);
+    try testing.expect(scratch.len < line_len);
+    try testing.expectEqual(@as(u32, 1), win.calls);
+    try testing.expect(!win.truncated);
+    try testing.expectEqual(@as(u64, line_len + 1), win.offset);
+    try testing.expectEqualStrings("MATCH", win.bytes);
+}
+
+test "二进制默认跳过并带 binary_offset" {
+    var ctx = CountedRead{ .rest = "abc\x00MATCH\nMORE\n" };
+    var finder = try Finder.init("MATCH", .{});
+    var rec = Rec{};
+    defer rec.deinit(testing.allocator);
+    const result = try drive(Rec, testing.allocator, &rec, &finder, .{
+        .buffer_size = 8,
+        .max_line_len = 64,
+    }, "", CountedRead.read, &ctx);
+    try testing.expectEqual(@as(?u64, 3), result.binary_offset);
+    try testing.expectEqual(result.binary_offset, result.nul_offset);
+    try testing.expectEqual(Outcome.binary_quit, result.outcome);
+    try testing.expectEqual(@as(u64, 0), result.matched_lines);
+    try testing.expectEqual(@as(usize, 1), ctx.reads);
+    try testing.expect(ctx.rest.len > 0);
+    try testing.expectEqualStrings("", rec.text.items);
+}
+
+test "搜索二进制但不返回行内容" {
+    const Sink = struct {
+        calls: u32 = 0,
+        bytes: usize = 0,
+        pub fn matched(self: *@This(), line: Line) bool {
+            self.calls += 1;
+            self.bytes += line.bytes.len;
+            return true;
+        }
+    };
+    var sink = Sink{};
+    var finder = try Finder.init("MATCH", .{});
+    const result = try searchSlice(Sink, &sink, "xxMATCH\x00yy\nMATCH2\n", "", &finder, .{
+        .binary = .report,
+    });
+    try testing.expect(result.binary_offset != null);
+    try testing.expectEqual(@as(?u64, 7), result.binary_offset);
+    try testing.expect(result.matched_lines > 0);
+    try testing.expect(sink.calls > 0);
+    try testing.expectEqual(@as(usize, 0), sink.bytes);
+    try testing.expectEqual(Outcome.binary_matched, result.outcome);
+}
+
+test "按文本处理的二进制仍走超长行窗口" {
+    var hay = try testing.allocator.alloc(u8, 64);
+    defer testing.allocator.free(hay);
+    @memset(hay, 'q');
+    @memcpy(hay[4..9], "MATCH");
+    hay[20] = 0;
+    hay[63] = '\n';
+    var finder = try Finder.init("MATCH", .{});
+    var win = Win{};
+    defer win.deinit();
+    const result = try searchSlice(Win, &win, hay, "", &finder, .{
+        .max_line_len = 8,
+        .binary = .none,
+    });
+    try testing.expectEqual(Outcome.complete, result.outcome);
+    try testing.expect(win.truncated);
+    try testing.expectEqual(@as(u64, 63), win.line_len);
+    try testing.expect(std.mem.indexOf(u8, win.bytes, "MATCH") != null);
+    try testing.expect(win.bytes.len <= 8);
+}
+
+test "前置上下文容量不超过行数上限乘单行上限" {
+    const max_line: usize = 16;
+    const before: u32 = 3;
+    const cfg = SearchConfig{
+        .before = before,
+        .max_line_len = max_line,
+        .max_context_lines = 4,
+        .buffer_size = 32,
+        .binary = .none,
+        .line_numbers = true,
+    };
+    try testing.expectEqual(@as(usize, 48), beforeContextCapacity(cfg));
+    try testing.expect(beforeContextCapacity(cfg) <= @as(usize, SearchConfig.context_lines_hard_cap) * max_line);
+
+    const Sink = struct {
+        text: [64]u8 = undefined,
+        len: usize = 0,
+        fn add(self: *@This(), line: Line, mark: u8) void {
+            if (line.number) |n| {
+                if (self.len < self.text.len) {
+                    self.text[self.len] = '0' + @as(u8, @intCast(n));
+                    self.len += 1;
+                }
+            }
+            if (self.len < self.text.len) {
+                self.text[self.len] = mark;
+                self.len += 1;
+            }
+            const n = @min(line.bytes.len, self.text.len - self.len);
+            @memcpy(self.text[self.len..][0..n], line.bytes[0..n]);
+            self.len += n;
+            if (self.len < self.text.len) {
+                self.text[self.len] = '\n';
+                self.len += 1;
+            }
+        }
+        pub fn context(self: *@This(), line: Line) bool {
+            self.add(line, '-');
+            return true;
+        }
+        pub fn matched(self: *@This(), line: Line) bool {
+            self.add(line, ':');
+            return true;
+        }
+    };
+    var sink = Sink{};
+    var finder = try Finder.init("M", .{});
+    var reader = std.Io.Reader.fixed("a\nb\nc\nd\ne\nM\n");
+    var scratch: []u8 = &.{};
+    defer testing.allocator.free(scratch);
+    var counted = CountAlloc{ .parent = testing.allocator };
+    const result = try searchReader(Sink, counted.allocator(), &sink, &reader, "", &finder, .{
+        .before = before,
+        .max_line_len = max_line,
+        .max_context_lines = 4,
+        .buffer_size = 32,
+        .binary = .none,
+        .line_numbers = true,
+        .scratch = &scratch,
+    });
+    try testing.expectEqual(Outcome.complete, result.outcome);
+    try testing.expectEqualStrings("3-c\n4-d\n5-e\n6:M\n", sink.text[0..sink.len]);
+    try testing.expect(counted.peak <= scratch.len + beforeContextCapacity(cfg) + 64);
+    try testing.expect(counted.peak <= @as(usize, SearchConfig.context_lines_hard_cap) * max_line + scratch.len + 64);
+}
+
+const CountAlloc = struct {
+    parent: std.mem.Allocator,
+    peak: usize = 0,
+    live: usize = 0,
+
+    fn allocator(self: *CountAlloc) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *CountAlloc = @ptrCast(@alignCast(ctx));
+        const ptr = self.parent.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.live += len;
+        self.peak = @max(self.peak, self.live);
+        return ptr;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *CountAlloc = @ptrCast(@alignCast(ctx));
+        if (!self.parent.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        self.live = self.live - memory.len + new_len;
+        self.peak = @max(self.peak, self.live);
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *CountAlloc = @ptrCast(@alignCast(ctx));
+        const ptr = self.parent.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+        self.live = self.live - memory.len + new_len;
+        self.peak = @max(self.peak, self.live);
+        return ptr;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *CountAlloc = @ptrCast(@alignCast(ctx));
+        self.parent.rawFree(memory, alignment, ret_addr);
+        self.live -= memory.len;
+    }
+};
+
+test "对称上下文可被单侧覆盖" {
+    var both = try run("a\nb\nM\nc\n", "M", .{
+        .line_numbers = true,
+        .context = 1,
+        .binary = .none,
+    });
+    defer both.deinit(testing.allocator);
+    try testing.expectEqualStrings("2-b\n3:M\n4-c\n", both.text.items);
+
+    var only_after = try run("a\nb\nM\nc\n", "M", .{
+        .line_numbers = true,
+        .context = 1,
+        .before = 0,
+        .binary = .none,
+    });
+    defer only_after.deinit(testing.allocator);
+    try testing.expectEqualStrings("3:M\n4-c\n", only_after.text.items);
+
+    var only_before = try run("a\nb\nM\nc\n", "M", .{
+        .line_numbers = true,
+        .context = 1,
+        .after = 0,
+        .binary = .none,
+    });
+    defer only_before.deinit(testing.allocator);
+    try testing.expectEqualStrings("2-b\n3:M\n", only_before.text.items);
+
+    var mixed = try run("a\nb\nM\nc\nd\n", "M", .{
+        .line_numbers = true,
+        .context = 2,
+        .after = 1,
+        .binary = .none,
+    });
+    defer mixed.deinit(testing.allocator);
+    try testing.expectEqualStrings("1-a\n2-b\n3:M\n4-c\n", mixed.text.items);
+}
+
+test "断点是标记而不是两个减号" {
+    var rec = try run("a\nb\nMATCH\nc\nd\ne\nMATCH2\nf\n", "MATCH", .{
+        .line_numbers = true,
+        .before = 1,
+        .after = 1,
+        .binary = .none,
+    });
+    defer rec.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 1), rec.breaks);
+    try testing.expect(std.mem.indexOf(u8, rec.text.items, "--") == null);
+    try testing.expectEqualStrings("2-b\n3:MATCH\n4-c\n6-e\n7:MATCH2\n8-f\n", rec.text.items);
+}
+
+test "上下文行数不能超过硬顶" {
+    var finder = try Finder.init("M", .{});
+    var rec = Rec{};
+    defer rec.deinit(testing.allocator);
+    const over = SearchConfig.context_lines_hard_cap + 1;
+    try testing.expectError(error.ContextLinesExceeded, searchSlice(Rec, &rec, "M\n", "", &finder, .{
+        .context = over,
+    }));
+    try testing.expectError(error.ContextLinesExceeded, searchSlice(Rec, &rec, "M\n", "", &finder, .{
+        .before = over,
+    }));
+    try testing.expectError(error.ContextLinesExceeded, searchSlice(Rec, &rec, "M\n", "", &finder, .{
+        .after = over,
+    }));
+    try testing.expectError(error.ContextLinesExceeded, searchSlice(Rec, &rec, "M\n", "", &finder, .{
+        .before = over,
+        .max_context_lines = over + 5,
+    }));
+    try testing.expectError(error.ContextLinesExceeded, searchSlice(Rec, &rec, "M\n", "", &finder, .{
+        .context = 3,
+        .max_context_lines = 2,
+    }));
+    const ok = try searchSlice(Rec, &rec, "M\n", "", &finder, .{
+        .context = 2,
+        .max_context_lines = 4,
+        .binary = .none,
+    });
+    try testing.expectEqual(@as(u64, 1), ok.matched_lines);
+}
+
+fn writeUtf16(dst: []u8, little: bool, ascii: []const u8) []const u8 {
+    dst[0] = if (little) 0xff else 0xfe;
+    dst[1] = if (little) 0xfe else 0xff;
+    var i: usize = 2;
+    for (ascii) |b| {
+        if (little) {
+            dst[i] = b;
+            dst[i + 1] = 0;
+        } else {
+            dst[i] = 0;
+            dst[i + 1] = b;
+        }
+        i += 2;
+    }
+    return dst[0..i];
+}
+
+const Mark = struct {
+    bytes: [32]u8 = undefined,
+    len: usize = 0,
+    raw: [32]u8 = undefined,
+    raw_len: usize = 0,
+    text: [32]u8 = undefined,
+    text_len: usize = 0,
+    b0: usize = 0,
+    b1: usize = 0,
+    u0: usize = 0,
+    u1: usize = 0,
+    column: ?u64 = null,
+    number: ?u64 = null,
+    offset: u64 = 0,
+
+    pub fn matched(self: *Mark, line: Line) bool {
+        self.len = @min(line.bytes.len, self.bytes.len);
+        @memcpy(self.bytes[0..self.len], line.bytes[0..self.len]);
+        self.raw_len = @min(line.raw.len, self.raw.len);
+        @memcpy(self.raw[0..self.raw_len], line.raw[0..self.raw_len]);
+        self.text_len = @min(line.text.len, self.text.len);
+        @memcpy(self.text[0..self.text_len], line.text[0..self.text_len]);
+        const span = line.match.?;
+        self.b0 = span.start;
+        self.b1 = span.end;
+        self.u0 = span.u16_start;
+        self.u1 = span.u16_end;
+        self.column = line.u16_column;
+        self.number = line.number;
+        self.offset = line.offset;
+        return true;
+    }
+};
+
+test "NUL 分隔符按记录计数" {
+    // 默认 binary 是 quit。NUL 记录模式里它只是分隔符，LF 不再断行。
+    // NUL 作为二进制信号只在 LF 分行、且不是这种原始记录模式时生效。
+    const hay = "a\nb\x00c\x00d\ne";
+    var first = try run(hay, "b", .{ .line_numbers = true, .null_data = true });
+    defer first.deinit(testing.allocator);
+    try testing.expectEqualStrings("1:a\nb\n", first.text.items);
+
+    var second = try run(hay, "c", .{ .line_numbers = true, .null_data = true });
+    defer second.deinit(testing.allocator);
+    try testing.expectEqualStrings("2:c\n", second.text.items);
+
+    var third = try run(hay, "e", .{ .line_numbers = true, .null_data = true });
+    defer third.deinit(testing.allocator);
+    try testing.expectEqualStrings("3:d\ne\n", third.text.items);
+
+    var finder = try Finder.init("e", .{});
+    var rec = Rec{};
+    defer rec.deinit(testing.allocator);
+    const result = try searchSlice(Rec, &rec, hay, "", &finder, .{
+        .null_data = true,
+        .line_numbers = true,
+    });
+    try testing.expectEqual(Outcome.complete, result.outcome);
+    try testing.expectEqual(@as(?u64, null), result.binary_offset);
+    try testing.expectEqual(@as(?u64, null), result.nul_offset);
+    try testing.expectEqual(@as(u64, 1), result.matched_lines);
+
+    var reader = std.Io.Reader.fixed(hay);
+    var streamed = Rec{};
+    defer streamed.deinit(testing.allocator);
+    var stream_finder = try Finder.init("e", .{});
+    const streamed_result = try searchReader(Rec, testing.allocator, &streamed, &reader, "", &stream_finder, .{
+        .null_data = true,
+        .line_numbers = true,
+        .buffer_size = 3,
+        .max_line_len = 64,
+    });
+    try testing.expectEqual(Outcome.complete, streamed_result.outcome);
+    try testing.expectEqual(@as(?u64, null), streamed_result.binary_offset);
+    try testing.expectEqualStrings("3:d\ne\n", streamed.text.items);
+}
+
+test "UTF-8 BOM 被跳过且不参与匹配" {
+    const hay = "\xEF\xBB\xBFfoo\nbar\n";
+    var hit = try run(hay, "foo", .{ .line_numbers = true, .binary = .none });
+    defer hit.deinit(testing.allocator);
+    try testing.expectEqualStrings("1:foo\n", hit.text.items);
+
+    var bom = try run(hay, "\xEF\xBB\xBF", .{ .binary = .none });
+    defer bom.deinit(testing.allocator);
+    try testing.expectEqual(@as(u64, 0), bom.matches);
+
+    var byte = try run(hay, "\xEF", .{ .binary = .none });
+    defer byte.deinit(testing.allocator);
+    try testing.expectEqual(@as(u64, 0), byte.matches);
+
+    const bad = "\xEF\xBB\xBFa\xffb\n";
+    var replaced = Mark{};
+    var rep_finder = try Finder.init("\u{FFFD}", .{});
+    const rep = try searchSlice(Mark, &replaced, bad, "", &rep_finder, .{
+        .binary = .none,
+        .decode_allocator = testing.allocator,
+    });
+    try testing.expectEqual(@as(u64, 1), rep.matched_lines);
+    try testing.expectEqualStrings("a\u{FFFD}b", replaced.bytes[0..replaced.len]);
+
+    var raw_bad = try run(bad, "\xff", .{
+        .binary = .none,
+        .decode_allocator = testing.allocator,
+    });
+    defer raw_bad.deinit(testing.allocator);
+    try testing.expectEqual(@as(u64, 0), raw_bad.matches);
+
+    var reader = std.Io.Reader.fixed(hay);
+    var finder = try Finder.init("foo", .{});
+    var rec = Rec{};
+    defer rec.deinit(testing.allocator);
+    const split = try searchReader(Rec, testing.allocator, &rec, &reader, "", &finder, .{
+        .line_numbers = true,
+        .binary = .none,
+        .buffer_size = 2,
+        .max_line_len = 64,
+    });
+    try testing.expectEqual(Outcome.complete, split.outcome);
+    try testing.expectEqualStrings("1:foo\n", rec.text.items);
+}
+
+test "UTF-16LE 与 UTF-16BE 转成 UTF-8 后命中" {
+    // 读缓冲比 BOM（2 字节）加一个 UTF-16 码元（2 字节）还小，码元会拆在两块里。
+    const cap: usize = 3;
+    try testing.expect(cap < 4);
+
+    var le_buf: [10]u8 = undefined;
+    const le = writeUtf16(&le_buf, true, "foo\n");
+    var le_reader = std.Io.Reader.fixed(le);
+    var le_finder = try Finder.init("foo", .{});
+    var le_rec = Rec{};
+    defer le_rec.deinit(testing.allocator);
+    const le_result = try searchReader(Rec, testing.allocator, &le_rec, &le_reader, "", &le_finder, .{
+        .line_numbers = true,
+        .buffer_size = cap,
+        .max_line_len = 64,
+    });
+    try testing.expectEqual(Outcome.complete, le_result.outcome);
+    try testing.expectEqual(@as(?u64, null), le_result.binary_offset);
+    try testing.expectEqualStrings("1:foo\n", le_rec.text.items);
+
+    var be_buf: [10]u8 = undefined;
+    const be = writeUtf16(&be_buf, false, "foo\n");
+    var be_reader = std.Io.Reader.fixed(be);
+    var be_finder = try Finder.init("foo", .{});
+    var be_rec = Rec{};
+    defer be_rec.deinit(testing.allocator);
+    const be_result = try searchReader(Rec, testing.allocator, &be_rec, &be_reader, "", &be_finder, .{
+        .line_numbers = true,
+        .buffer_size = cap,
+        .max_line_len = 64,
+    });
+    try testing.expectEqual(Outcome.complete, be_result.outcome);
+    try testing.expectEqualStrings("1:foo\n", be_rec.text.items);
+
+    var slice_mark = Mark{};
+    var slice_finder = try Finder.init("foo", .{});
+    const slice_result = try searchSlice(Mark, &slice_mark, le, "", &slice_finder, .{
+        .decode_allocator = testing.allocator,
+        .line_numbers = true,
+    });
+    try testing.expectEqual(Outcome.complete, slice_result.outcome);
+    try testing.expectEqualStrings("foo", slice_mark.bytes[0..slice_mark.len]);
+    try testing.expectEqual(@as(u64, 0), slice_mark.offset);
+    try testing.expectEqual(@as(?u64, 1), slice_mark.number);
+}
+
+test "非法 UTF-16 变成 U+FFFD" {
+    const lone = [_]u8{ 0xFF, 0xFE, 0x61, 0x00, 0x00, 0xD8, 0x62, 0x00, 0x0A, 0x00 };
+    var mark = Mark{};
+    var finder = try Finder.init("\u{FFFD}", .{});
+    var reader = std.Io.Reader.fixed(&lone);
+    const result = try searchReader(Mark, testing.allocator, &mark, &reader, "", &finder, .{
+        .buffer_size = 3,
+        .max_line_len = 64,
+        .binary = .none,
+    });
+    try testing.expectEqual(Outcome.complete, result.outcome);
+    try testing.expectEqualStrings("a\u{FFFD}b", mark.bytes[0..mark.len]);
+
+    const odd = [_]u8{ 0xFF, 0xFE, 0x61, 0x00, 0xFF };
+    var odd_mark = Mark{};
+    var odd_finder = try Finder.init("\u{FFFD}", .{});
+    const odd_result = try searchSlice(Mark, &odd_mark, &odd, "", &odd_finder, .{
+        .decode_allocator = testing.allocator,
+        .binary = .none,
+    });
+    try testing.expectEqual(@as(u64, 1), odd_result.matched_lines);
+    try testing.expectEqualStrings("a\u{FFFD}", odd_mark.bytes[0..odd_mark.len]);
+
+    const be = [_]u8{ 0xFE, 0xFF, 0x00, 0x61, 0xD8, 0x00, 0x00, 0x0A };
+    var be_mark = Mark{};
+    var be_finder = try Finder.init("a", .{});
+    const be_result = try searchSlice(Mark, &be_mark, &be, "", &be_finder, .{
+        .decode_allocator = testing.allocator,
+        .binary = .none,
+    });
+    try testing.expectEqual(@as(u64, 1), be_result.matched_lines);
+    try testing.expectEqualStrings("a\u{FFFD}", be_mark.bytes[0..be_mark.len]);
+}
+
+test "原始字节模式不嗅探 BOM" {
+    const hay = "\xEF\xBB\xBFfoo\n";
+    var kept = try run(hay, "\xEF\xBB\xBF", .{
+        .encoding = .none,
+        .line_numbers = true,
+        .binary = .none,
+    });
+    defer kept.deinit(testing.allocator);
+    try testing.expectEqualStrings("1:\xEF\xBB\xBFfoo\n", kept.text.items);
+
+    var text = try run(hay, "foo", .{
+        .encoding = .none,
+        .line_numbers = true,
+        .binary = .none,
+    });
+    defer text.deinit(testing.allocator);
+    try testing.expectEqualStrings("1:\xEF\xBB\xBFfoo\n", text.text.items);
+
+    var le_buf: [10]u8 = undefined;
+    const le = writeUtf16(&le_buf, true, "foo\n");
+    var miss = try run(le, "foo", .{ .encoding = .none, .binary = .none });
+    defer miss.deinit(testing.allocator);
+    try testing.expectEqual(@as(u64, 0), miss.matches);
+
+    var bom = try run(le, "\xFF\xFE", .{ .encoding = .none, .binary = .none });
+    defer bom.deinit(testing.allocator);
+    try testing.expectEqual(@as(u64, 1), bom.matches);
+}
+
+test "匹配的 UTF-16 偏移按码元计数" {
+    const hay = "aé你😀x\n";
+    var ex = Mark{};
+    var ex_finder = try Finder.init("é", .{});
+    _ = try searchSlice(Mark, &ex, hay, "", &ex_finder, .{ .binary = .none });
+    try testing.expectEqual(@as(usize, 1), ex.b0);
+    try testing.expectEqual(@as(usize, 3), ex.b1);
+    try testing.expectEqual(@as(usize, 1), ex.u0);
+    try testing.expectEqual(@as(usize, 2), ex.u1);
+    try testing.expectEqual(@as(?u64, 2), ex.column);
+
+    var face = Mark{};
+    var face_finder = try Finder.init("😀", .{});
+    _ = try searchSlice(Mark, &face, hay, "", &face_finder, .{ .binary = .none });
+    try testing.expectEqual(@as(usize, 6), face.b0);
+    try testing.expectEqual(@as(usize, 10), face.b1);
+    try testing.expectEqual(@as(usize, 3), face.u0);
+    try testing.expectEqual(@as(usize, 5), face.u1);
+    try testing.expectEqual(@as(?u64, 4), face.column);
+
+    var ex_x = Mark{};
+    var x_finder = try Finder.init("x", .{});
+    _ = try searchSlice(Mark, &ex_x, hay, "", &x_finder, .{ .binary = .none });
+    try testing.expectEqual(@as(usize, 10), ex_x.b0);
+    try testing.expectEqual(@as(usize, 11), ex_x.b1);
+    try testing.expectEqual(@as(usize, 5), ex_x.u0);
+    try testing.expectEqual(@as(usize, 6), ex_x.u1);
+    try testing.expectEqual(@as(?u64, 6), ex_x.column);
+}
+
+test "非法 UTF-8 同时给出有损文本和原始字节" {
+    const hay = "a\xffb\n";
+    var letter = Mark{};
+    var letter_finder = try Finder.init("b", .{});
+    const found = try searchSlice(Mark, &letter, hay, "", &letter_finder, .{ .binary = .none });
+    try testing.expectEqual(@as(u64, 1), found.matched_lines);
+    try testing.expectEqualStrings("a\xffb", letter.bytes[0..letter.len]);
+    try testing.expectEqualStrings("a\xffb", letter.raw[0..letter.raw_len]);
+    try testing.expectEqualStrings("a\u{FFFD}b", letter.text[0..letter.text_len]);
+    try testing.expectEqual(@as(usize, 2), letter.b0);
+    try testing.expectEqual(@as(usize, 3), letter.b1);
+    try testing.expectEqual(@as(usize, 2), letter.u0);
+    try testing.expectEqual(@as(usize, 3), letter.u1);
+    try testing.expectEqual(@as(?u64, 3), letter.column);
+
+    var bad = Mark{};
+    var bad_finder = try Finder.init("\xff", .{});
+    _ = try searchSlice(Mark, &bad, hay, "", &bad_finder, .{ .binary = .none });
+    try testing.expectEqual(@as(usize, 1), bad.b0);
+    try testing.expectEqual(@as(usize, 2), bad.b1);
+    try testing.expectEqual(@as(usize, 1), bad.u0);
+    try testing.expectEqual(@as(usize, 2), bad.u1);
+    try testing.expectEqualStrings("a\xffb", bad.raw[0..bad.raw_len]);
+    try testing.expectEqualStrings("a\u{FFFD}b", bad.text[0..bad.text_len]);
 }

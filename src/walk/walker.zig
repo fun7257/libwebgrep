@@ -3,6 +3,7 @@
 //!
 //! 默认跳过隐藏文件和 `.git`。不跟随符号链接。路径按字节拼接，不假定 UTF-8。
 
+const builtin = @import("builtin");
 const std = @import("std");
 const file_id = @import("file_id.zig");
 const glob = @import("glob.zig");
@@ -19,7 +20,7 @@ pub const Config = struct {
     max_filesize: ?u64 = null,
     globs: []const []const u8 = &.{},
     types: []const []const u8 = &.{},
-    /// 0 表示由调度层选择 CPU 数。
+    /// 0 表示由调度层选择。Darwin 上性能核更少时用性能核数，否则用逻辑 CPU 数。
     threads: u32 = 0,
     skip_git: bool = true,
 };
@@ -57,8 +58,14 @@ pub const Job = struct {
     depth: u32,
     ancestors: []file_id.Id,
     allocator: std.mem.Allocator,
+    /// 非 null 时这个任务只搜这些文件名，不再列目录。名字由本任务释放。
+    files: ?[][]u8 = null,
 
     pub fn destroy(self: *Job, io: std.Io) void {
+        if (self.files) |names| {
+            for (names) |name| self.allocator.free(name);
+            self.allocator.free(names);
+        }
         self.dir.close(io);
         self.allocator.free(self.rel);
         if (self.ancestors.len != 0) self.allocator.free(self.ancestors);
@@ -121,6 +128,22 @@ pub fn createRoot(host: *Host, root_path: []const u8) !*Job {
 }
 
 pub fn process(host: *Host, job: *Job) void {
+    if (job.files) |names| {
+        defer job.destroy(host.io);
+        if (host.stop.load(.acquire)) return;
+        var scratch: [4096]u8 = undefined;
+        for (names) |name| {
+            if (host.stop.load(.acquire)) return;
+            var rel_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const rel = joinRel(&rel_buf, job.rel, name) catch {
+                report(host, job, name, error.NameTooLong);
+                continue;
+            };
+            visitFile(host, job, name, rel, &scratch, null);
+        }
+        return;
+    }
+
     defer job.destroy(host.io);
     if (host.stop.load(.acquire)) return;
     if (host.config.max_depth) |max| {
@@ -139,20 +162,55 @@ pub fn process(host: *Host, job: *Job) void {
 
     var lister = list_dir.Lister.init(job.dir, scratch);
     var entries: [64]std.Io.Dir.Entry = undefined;
+    var batch: FileBatch = .{};
     while (!host.stop.load(.acquire)) {
         const n = lister.fill(host.io, &entries) catch |err| {
             report(host, job, "", err);
             return;
         };
-        if (n == 0) return;
+        if (n == 0) break;
         for (entries[0..n]) |entry| {
-            if (host.stop.load(.acquire)) return;
-            handleEntry(host, job, entry);
+            if (host.stop.load(.acquire)) break;
+            handleEntry(host, job, entry, &batch);
+            if (batch.len == file_batch) flushFiles(host, job, &batch);
         }
     }
+    flushFiles(host, job, &batch);
 }
 
-fn handleEntry(host: *Host, job: *Job, entry: std.Io.Dir.Entry) void {
+const file_batch = 16;
+
+const FileBatch = struct {
+    names: [file_batch][]const u8 = undefined,
+    len: usize = 0,
+};
+
+fn flushFiles(host: *Host, job: *Job, batch: *FileBatch) void {
+    if (batch.len == 0) return;
+    const names = batch.names[0..batch.len];
+    batch.len = 0;
+    const child = createFileJob(host, job, names) catch {
+        var scratch: [4096]u8 = undefined;
+        for (names) |name| {
+            var rel_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const rel = joinRel(&rel_buf, job.rel, name) catch continue;
+            visitFile(host, job, name, rel, &scratch, null);
+        }
+        return;
+    };
+    host.push(host.push_ctx, child) catch |err| {
+        child.destroy(host.io);
+        report(host, job, "", err);
+        var scratch: [4096]u8 = undefined;
+        for (names) |name| {
+            var rel_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const rel = joinRel(&rel_buf, job.rel, name) catch continue;
+            visitFile(host, job, name, rel, &scratch, null);
+        }
+    };
+}
+
+fn handleEntry(host: *Host, job: *Job, entry: std.Io.Dir.Entry, batch: *FileBatch) void {
     const name = entry.name;
     if (name.len == 0) return;
     if (host.config.skip_git and std.mem.eql(u8, name, ".git")) return;
@@ -176,7 +234,14 @@ fn handleEntry(host: *Host, job: *Job, entry: std.Io.Dir.Entry) void {
             };
             descend(host, job, name, rel, &scratch, child_dir, null);
         },
-        .file => visitFile(host, job, name, rel, &scratch, null),
+        .file => {
+            if (host.config.threads > 1 and !ignore.isIgnored(job.ignore, rel, false, &scratch) and allowFile(host, rel) and types.matches(host.config.types, name)) {
+                batch.names[batch.len] = name;
+                batch.len += 1;
+            } else {
+                visitFile(host, job, name, rel, &scratch, null);
+            }
+        },
         .sym_link => if (host.config.follow_symlinks) followLink(host, job, name, rel, &scratch),
         else => {},
     }
@@ -292,6 +357,41 @@ fn followLink(host: *Host, job: *Job, name: []const u8, rel: []const u8, scratch
         .file => visitFile(host, job, name, rel, scratch, stat.size),
         else => {},
     }
+}
+
+fn duplicateDir(dir: std.Io.Dir) ?std.Io.Dir {
+    if (builtin.os.tag == .windows) return null;
+    const rc = std.c.fcntl(dir.handle, std.c.F.DUPFD_CLOEXEC, @as(std.c.fd_t, 0));
+    if (rc < 0) return null;
+    return .{ .handle = @intCast(rc) };
+}
+
+fn createFileJob(host: *Host, parent: *Job, names: []const []const u8) !*Job {
+    const dir = duplicateDir(parent.dir) orelse return error.SystemResources;
+    errdefer dir.close(host.io);
+    const job = try host.allocator.create(Job);
+    errdefer host.allocator.destroy(job);
+    const rel_copy = try host.allocator.dupe(u8, parent.rel);
+    errdefer host.allocator.free(rel_copy);
+    const owned = try host.allocator.alloc([]u8, names.len);
+    errdefer host.allocator.free(owned);
+    var filled: usize = 0;
+    errdefer for (owned[0..filled]) |item| host.allocator.free(item);
+    for (names) |name| {
+        owned[filled] = try host.allocator.dupe(u8, name);
+        filled += 1;
+    }
+    job.* = .{
+        .dir = dir,
+        .root = parent.root,
+        .rel = rel_copy,
+        .ignore = parent.ignore,
+        .depth = parent.depth,
+        .ancestors = &.{},
+        .allocator = host.allocator,
+        .files = owned,
+    };
+    return job;
 }
 
 fn createJob(

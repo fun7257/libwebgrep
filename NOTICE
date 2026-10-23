@@ -1,6 +1,6 @@
 # NOTICE
 
-zrg 的代码是原作。
+libwebgrep 的代码是原作。
 
 字节频率秩在 `src/finder/frequency.zig`。它是按英文散文和源码的常见程度手写的，不是从 memchr crate、ripgrep 或其他项目抄来的表。调用方可以换成自己的 `[256]u8`。
 

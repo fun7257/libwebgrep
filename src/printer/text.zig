@@ -18,7 +18,7 @@ pub const Text = struct {
     /// 多文件或 `-H` 时为真。路径为空时不打印路径。
     show_path: bool = false,
     /// 为真时，在有匹配区间的行上打印列号。行号本身来自 `Line.number`。
-    /// rg 的 `--column` 会同时打开行号，示例 CLI 也这么做。
+    /// 列号和行号分开设置。rg 的 `--column` 会同时打开行号，调用方要对齐时自己打开。
     column: bool = false,
 
     path: []const u8 = "",

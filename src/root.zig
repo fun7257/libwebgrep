@@ -1,4 +1,4 @@
-//! zrg：可嵌入的字面量行搜索库。
+//! libwebgrep：可嵌入的字面量行搜索库。
 //!
 //! 会分配或做 I/O 的公共函数显式接收分配器和 `std.Io`。
 //! 纯切片上的查找不需要这两者。库代码没有全局可变状态。
@@ -63,6 +63,7 @@ test {
     _ = @import("finder/finder.zig");
     _ = @import("finder/byteset.zig");
     _ = @import("finder/aho.zig");
+    _ = @import("finder/pairs.zig");
     _ = @import("finder/multi.zig");
     if (@import("build_options").teddy != .off) {
         _ = @import("finder/teddy.zig");

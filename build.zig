@@ -46,7 +46,7 @@ pub fn build(b: *std.Build) void {
     options.addOption(TeddyIsa, "teddy", teddy);
     const test_filters: []const []const u8 = if (fuzz_filter) |filter| &.{filter} else &.{};
 
-    const mod = b.addModule("zrg", .{
+    const mod = b.addModule("libwebgrep", .{
         .root_source_file = b.path("src/root.zig"),
         .target = compile_target,
         .optimize = optimize,
@@ -54,53 +54,21 @@ pub fn build(b: *std.Build) void {
     });
     mod.addOptions("build_options", options);
 
-    const exe = b.addExecutable(.{
-        .name = "zrg",
-        .use_llvm = use_llvm,
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/cli.zig"),
-            .target = compile_target,
-            .optimize = optimize,
-            .sanitize_thread = sanitize_thread,
-            .imports = &.{
-                .{ .name = "zrg", .module = mod },
-            },
-        }),
-    });
-    b.installArtifact(exe);
-
-    const run_step = b.step("run", "运行示例 CLI");
-    const run_cmd = b.addRunArtifact(exe);
-    run_step.dependOn(&run_cmd.step);
-    run_cmd.step.dependOn(b.getInstallStep());
-    run_cmd.addPassthruArgs();
-
     const lib_tests = b.addTest(.{
-        .name = "zrg-test",
+        .name = "libwebgrep-test",
         .root_module = mod,
         .filters = test_filters,
         .use_llvm = use_llvm,
     });
     const run_lib_tests = b.addRunArtifact(lib_tests);
 
-    const exe_tests = b.addTest(.{
-        .name = "zrg-cli-test",
-        .root_module = exe.root_module,
-        .filters = test_filters,
-        .use_llvm = use_llvm,
-    });
-    const run_exe_tests = b.addRunArtifact(exe_tests);
-
     const test_step = b.step("test", "运行单元测试");
     test_step.dependOn(&run_lib_tests.step);
-    test_step.dependOn(&run_exe_tests.step);
 
     // 交叉编译时只编译，不运行。例如：
     // zig build check -Dtarget=x86_64-linux-musl
-    const check_step = b.step("check", "编译库、示例和测试，不运行");
+    const check_step = b.step("check", "编译库和测试，不运行");
     check_step.dependOn(&lib_tests.step);
-    check_step.dependOn(&exe_tests.step);
-    check_step.dependOn(&exe.step);
     if (want_linux_getdents and target.result.os.tag != .linux) {
         const fail = b.addFail("-Dlinux-getdents 只适用于 os 为 linux 的目标");
         test_step.dependOn(&fail.step);
@@ -120,28 +88,24 @@ pub fn build(b: *std.Build) void {
         b.getInstallStep().dependOn(&fail.step);
     }
 
-    const bench_step = b.step("bench", "ReleaseFast 基准（内核微基准，随后是端到端脚本）");
+    const bench_step = b.step("bench", "ReleaseFast 内核微基准，直接调用库");
     if (optimize != .fast) {
         const fail = b.addFail("基准只在 ReleaseFast 下运行：zig build bench -Doptimize=ReleaseFast");
         bench_step.dependOn(&fail.step);
     } else {
         const micro = b.addExecutable(.{
-            .name = "zrg-bench",
+            .name = "libwebgrep-bench",
             .use_llvm = use_llvm,
             .root_module = b.createModule(.{
                 .root_source_file = b.path("bench/micro.zig"),
                 .target = compile_target,
                 .optimize = optimize,
                 .imports = &.{
-                    .{ .name = "zrg", .module = mod },
+                    .{ .name = "libwebgrep", .module = mod },
                 },
             }),
         });
         const run_micro = b.addRunArtifact(micro);
-        const e2e = b.addSystemCommand(&.{ "bash", "bench/e2e.sh" });
-        e2e.setCwd(b.path("."));
-        e2e.step.dependOn(b.getInstallStep());
-        e2e.step.dependOn(&run_micro.step);
-        bench_step.dependOn(&e2e.step);
+        bench_step.dependOn(&run_micro.step);
     }
 }

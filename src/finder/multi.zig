@@ -1,8 +1,9 @@
 //! 多模式字面量。
 //!
-//! 全部是单字节时走字节集。其余走 Aho-Corasick 稠密 DFA。
+//! 全部是单字节时走字节集。邻接对不超过 16 种时走向量过滤，不建自动机。
+//! 否则在 Teddy 打得开、不超过 32 个且没有空模式时走 Teddy。剩下走 Aho-Corasick，
+//! 锚点字节不超过 16 种时自动机仍先做单字节向量预过滤。
 //! Teddy 由 `-Dteddy` 选择。aarch64 默认是 neon，其他架构默认关闭。
-//! 打开时，不超过 32 个、并且都非空的模式走 Teddy。空模式和更长的集合仍走自动机。
 //!
 //! 模式字节由调用方持有，并且不能含有换行。复制本结构只复制指针，表在
 //! `deinit` 之前只读，工人可以共享。只有创建者调用 `deinit`。
@@ -14,6 +15,7 @@ const build_options = @import("build_options");
 const byteset = @import("byteset.zig");
 const matcher = @import("../matcher.zig");
 const memchr = @import("memchr.zig");
+const pairs = @import("pairs.zig");
 
 const teddy_on = build_options.teddy != .off;
 const teddy_mod = if (teddy_on) @import("teddy.zig") else struct {
@@ -27,6 +29,7 @@ pub const Multi = struct {
 
     const Kind = union(enum) {
         bytes: byteset.Set,
+        pairs: pairs.Engine,
         ac: aho.Ac,
         teddy: if (teddy_on) teddy_mod.Engine else void,
     };
@@ -43,6 +46,13 @@ pub const Multi = struct {
         if (allSingleByte(patterns)) {
             return .{
                 .kind = .{ .bytes = byteset.Set.init(patterns, ignore) },
+                .ignore_case = ignore,
+                .empty_only = false,
+            };
+        }
+        if (try pairs.Engine.create(allocator, patterns, ignore)) |engine| {
+            return .{
+                .kind = .{ .pairs = engine },
                 .ignore_case = ignore,
                 .empty_only = false,
             };
@@ -66,6 +76,7 @@ pub const Multi = struct {
     pub fn deinit(self: *Multi) void {
         switch (self.kind) {
             .bytes => {},
+            .pairs => |*engine| engine.deinit(),
             .ac => |*ac| ac.deinit(),
             .teddy => |*engine| {
                 if (comptime teddy_on) engine.deinit();
@@ -78,6 +89,16 @@ pub const Multi = struct {
         return self.empty_only;
     }
 
+    /// 微基准用来核对这次落到哪条引擎。改分派时基准场景测试会失败。
+    pub fn engineName(self: *const Multi) []const u8 {
+        return switch (self.kind) {
+            .bytes => "bytes",
+            .pairs => "pairs",
+            .ac => "ac",
+            .teddy => "teddy",
+        };
+    }
+
     pub fn resetStats(self: *Multi) void {
         _ = self;
     }
@@ -88,6 +109,7 @@ pub const Multi = struct {
                 const at = set.find(haystack, start) orelse return null;
                 return .{ .start = at, .end = at + 1 };
             },
+            .pairs => |*engine| return engine.find(haystack, start, mode),
             .ac => |*ac| return ac.find(haystack, start, mode),
             .teddy => |*engine| {
                 if (comptime teddy_on) return engine.find(haystack, start, mode);
@@ -128,6 +150,41 @@ fn allSingleByte(patterns: []const []const u8) bool {
     if (patterns.len == 0) return false;
     for (patterns) |pat| if (pat.len != 1) return false;
     return true;
+}
+
+const digram_store = blk: {
+    const n = 33;
+    var storage: [n][2]u8 = undefined;
+    for (0..n) |i| {
+        storage[i] = .{ 0x80 + @as(u8, @intCast(i)), 0xC0 + @as(u8, @intCast(i)) };
+    }
+    break :blk storage;
+};
+
+const digram_pats = blk: {
+    var pats: [digram_store.len][]const u8 = undefined;
+    for (0..digram_store.len) |i| pats[i] = &digram_store[i];
+    break :blk pats;
+};
+
+/// 微基准和场景测试共用这些模式。文本形状见 `fillScenarioText`。
+/// 字节集是两个不会出现的单字节。邻接对里有末尾那个 `NEEDLE`。
+/// 17 条双字节超过邻接对的 16 条上限，Teddy 开着时走 Teddy，否则走自动机。
+/// 33 条超过 Teddy 的 32 条上限，只能走自动机。这些字节都不在样例文本里。
+pub const scenario_bytes: []const []const u8 = &.{ "Q", "Z" };
+pub const scenario_pairs: []const []const u8 = &.{ "NEEDLE", "ZXZQ" };
+pub const scenario_teddy: []const []const u8 = digram_pats[0..17];
+pub const scenario_ac: []const []const u8 = &digram_pats;
+
+/// 基准文本：全是 `a`，每 64 字节一个换行，末尾盖上 `NEEDLE\n`。
+/// `bench/micro.zig` 和场景测试用同一形状。缓冲至少要容得下末尾那 7 个字节。
+pub fn fillScenarioText(buf: []u8) void {
+    const needle = "NEEDLE\n";
+    std.debug.assert(buf.len >= needle.len);
+    @memset(buf, 'a');
+    var i: usize = 63;
+    while (i < buf.len) : (i += 64) buf[i] = '\n';
+    @memcpy(buf[buf.len - needle.len ..], needle);
 }
 
 fn teddyEligible(patterns: []const []const u8) bool {
@@ -300,10 +357,14 @@ test "经典失败链和随机对照" {
     }
 }
 
-test "窗口边界、两组桶，以及更晚但更早结束" {
-    const pats = [_][]const u8{
-        "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota",
-    };
+test "邻接对放不下时走 Teddy 或自动机" {
+    var buf: [17][2]u8 = undefined;
+    var pats: [17][]const u8 = undefined;
+    for (&buf, 0..) |*slot, i| {
+        slot[0] = @intCast(32 + i);
+        slot[1] = @intCast(160 + i);
+        pats[i] = slot;
+    }
     var multi = try Multi.init(std.testing.allocator, &pats, .{});
     defer multi.deinit();
     if (teddy_on) {
@@ -311,6 +372,20 @@ test "窗口边界、两组桶，以及更晚但更早结束" {
     } else {
         try std.testing.expect(multi.kind == .ac);
     }
+    var hay: [4]u8 = .{ 0, 0, 0, 0 };
+    @memcpy(hay[1..3], pats[3]);
+    const got = multi.find(&hay, 0, .leftmost_first).?;
+    try std.testing.expectEqual(@as(usize, 1), got.start);
+    try std.testing.expectEqual(@as(usize, 3), got.end);
+}
+
+test "窗口边界、邻接对，以及更晚但更早结束" {
+    const pats = [_][]const u8{
+        "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota",
+    };
+    var multi = try Multi.init(std.testing.allocator, &pats, .{});
+    defer multi.deinit();
+    try std.testing.expect(multi.kind == .pairs);
 
     var hay: [48]u8 = @splat('x');
     @memcpy(hay[0..4], "iota");
@@ -335,6 +410,146 @@ test "窗口边界、两组桶，以及更晚但更早结束" {
     const early = ends.find("abcdef", 0, .earliest).?;
     try std.testing.expectEqual(@as(usize, 3), early.start);
     try std.testing.expectEqual(@as(usize, 5), early.end);
+}
+
+const vec_width = memchr.native_width;
+
+fn expectNaive(multi: *Multi, hay: []const u8, pats: []const []const u8) !void {
+    inline for (.{ .earliest, .leftmost_first }) |mode| {
+        var pos: usize = 0;
+        while (pos <= hay.len) {
+            const got = multi.find(hay, pos, mode);
+            const want = naive(hay, pos, pats, false, mode);
+            if (want) |match| {
+                const have = got orelse return error.TestExpectedEqual;
+                try std.testing.expectEqual(match.start, have.start);
+                try std.testing.expectEqual(match.end, have.end);
+                pos = have.end;
+            } else {
+                try std.testing.expect(got == null);
+                break;
+            }
+        }
+    }
+}
+
+test "第二跨：邻接对先整窗未命中，再命中" {
+    const stride = vec_width * 8;
+    const pats = [_][]const u8{ "lp", "be" };
+    var multi = try Multi.init(std.testing.allocator, &pats, .{});
+    defer multi.deinit();
+    try std.testing.expect(multi.kind == .pairs);
+
+    var missed: [stride * 2 + vec_width]u8 = @splat('x');
+    const deep = stride + 4;
+    missed[deep] = 'l';
+    missed[deep + 1] = 'p';
+    try std.testing.expectEqual(deep, multi.find(&missed, 0, .leftmost_first).?.start);
+    try expectNaive(&multi, &missed, &pats);
+
+    var edge: [stride * 2 + vec_width]u8 = @splat('x');
+    edge[stride - 1] = 'l';
+    edge[stride] = 'p';
+    edge[stride + vec_width] = 'b';
+    edge[stride + vec_width + 1] = 'e';
+    try std.testing.expectEqual(stride - 1, multi.find(&edge, 0, .leftmost_first).?.start);
+    try expectNaive(&multi, &edge, &pats);
+}
+
+test "第二跨：Teddy 四窗或自动机，和朴素查找一致" {
+    var buf: [17][2]u8 = undefined;
+    var pats: [17][]const u8 = undefined;
+    for (&buf, 0..) |*slot, i| {
+        slot[0] = @intCast(32 + i);
+        slot[1] = @intCast(160 + i);
+        pats[i] = slot;
+    }
+    var multi = try Multi.init(std.testing.allocator, &pats, .{});
+    defer multi.deinit();
+    if (teddy_on) {
+        try std.testing.expect(multi.kind == .teddy);
+    } else {
+        try std.testing.expect(multi.kind == .ac);
+    }
+
+    var inside: [96]u8 = @splat('x');
+    @memcpy(inside[50..][0..2], pats[3]);
+    try std.testing.expectEqual(@as(usize, 50), multi.find(&inside, 0, .leftmost_first).?.start);
+    try expectNaive(&multi, &inside, &pats);
+
+    var skipped: [160]u8 = @splat('x');
+    @memcpy(skipped[96..][0..2], pats[5]);
+    try std.testing.expectEqual(@as(usize, 96), multi.find(&skipped, 0, .leftmost_first).?.start);
+    try expectNaive(&multi, &skipped, &pats);
+}
+
+test "全是单字节时走字节集，第二跨和朴素查找一致" {
+    const stride = vec_width * 4;
+    var one_buf: [1]u8 = .{'q'};
+    const one_pats = [_][]const u8{&one_buf};
+    var one = try Multi.init(std.testing.allocator, &one_pats, .{});
+    defer one.deinit();
+    try std.testing.expect(one.kind == .bytes);
+
+    var many_buf: [17][1]u8 = undefined;
+    var many_pats: [17][]const u8 = undefined;
+    for (&many_buf, 0..) |*slot, i| {
+        slot[0] = @intCast(32 + i);
+        many_pats[i] = slot;
+    }
+    var many = try Multi.init(std.testing.allocator, &many_pats, .{});
+    defer many.deinit();
+    try std.testing.expect(many.kind == .bytes);
+
+    var hay: [stride * 2 + 4]u8 = @splat(0);
+    hay[stride + 1] = 48;
+    try std.testing.expectEqual(stride + 1, many.find(&hay, 0, .leftmost_first).?.start);
+    try expectNaive(&many, &hay, &many_pats);
+    try std.testing.expect(many.find(&hay, stride + 2, .leftmost_first) == null);
+}
+
+test "基准场景的模式落到各自的引擎" {
+    try std.testing.expectEqual(@as(usize, 17), scenario_teddy.len);
+    try std.testing.expectEqual(@as(usize, 33), scenario_ac.len);
+
+    var bytes = try Multi.init(std.testing.allocator, scenario_bytes, .{});
+    defer bytes.deinit();
+    try std.testing.expectEqualStrings("bytes", bytes.engineName());
+
+    var pairs_engine = try Multi.init(std.testing.allocator, scenario_pairs, .{});
+    defer pairs_engine.deinit();
+    try std.testing.expectEqualStrings("pairs", pairs_engine.engineName());
+
+    var teddy = try Multi.init(std.testing.allocator, scenario_teddy, .{});
+    defer teddy.deinit();
+    const teddy_name = if (teddy_on) "teddy" else "ac";
+    try std.testing.expectEqualStrings(teddy_name, teddy.engineName());
+
+    var ac = try Multi.init(std.testing.allocator, scenario_ac, .{});
+    defer ac.deinit();
+    try std.testing.expectEqualStrings("ac", ac.engineName());
+
+    var hay: [256]u8 = undefined;
+    fillScenarioText(&hay);
+    const needle_at = hay.len - "NEEDLE\n".len;
+    try std.testing.expect(bytes.find(&hay, 0, .earliest) == null);
+    const pair_hit = pairs_engine.find(&hay, 0, .earliest).?;
+    try std.testing.expectEqual(needle_at, pair_hit.start);
+    try std.testing.expectEqual(needle_at + "NEEDLE".len, pair_hit.end);
+    try std.testing.expect(teddy.find(&hay, 0, .earliest) == null);
+    try std.testing.expect(ac.find(&hay, 0, .earliest) == null);
+
+    // 样例文本本身命中不了这三组。种进一个模式字节，确认不是空转。
+    hay[80] = scenario_bytes[0][0];
+    try std.testing.expectEqual(@as(usize, 80), bytes.find(&hay, 0, .earliest).?.start);
+
+    hay[80] = 'a';
+    @memcpy(hay[90..][0..2], scenario_teddy[0]);
+    try std.testing.expectEqual(@as(usize, 90), teddy.find(&hay, 0, .earliest).?.start);
+
+    @memset(hay[90..][0..2], 'a');
+    @memcpy(hay[120..][0..2], scenario_ac[32]);
+    try std.testing.expectEqual(@as(usize, 120), ac.find(&hay, 0, .earliest).?.start);
 }
 
 test "多模式模糊对照" {

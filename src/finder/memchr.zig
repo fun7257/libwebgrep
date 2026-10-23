@@ -1,7 +1,7 @@
 //! 单字节查找。
 //!
-//! `find` 直接调用 `std.mem.findScalarPos`。在 Apple M2 的 ReleaseFast 下，
-//! 手写版 55.8 GB/s，std 54.6 GB/s，差距约 2%，按设计改用 std。
+//! `find` 直接调用 `std.mem.findScalarPos`。决定改用 std 的那次是手写
+//! 55.8 GB/s、std 54.6 GB/s，差距约 2%。后来的微基准记在 `BENCHMARKS.md`。
 //! 两个不同字节的 `findEither`、反向查找和计数仍用手写 `@Vector`：
 //! std 的 `findScalarLast` 是标量循环，计数也没有对应的向量实现。
 //!
@@ -242,10 +242,33 @@ fn mask16(block: @Vector(16, u8), a: u8, b: u8) u64 {
     else
         (block == @as(@Vector(16, u8), @splat(a))) | (block == @as(@Vector(16, u8), @splat(b)));
     const bytes: @Vector(16, u8) = @select(u8, cmp, @as(@Vector(16, u8), @splat(@as(u8, 0xFF))), @as(@Vector(16, u8), @splat(@as(u8, 0))));
-    const lanes: @Vector(8, u16) = @bitCast(bytes);
+    return nibbleMask(bytes);
+}
+
+/// 命中字节是 `0xFF` 时，每字节收成 4 个 1。NEON 没有 movemask，用这个代替。
+pub inline fn nibbleMask(flags: @Vector(16, u8)) u64 {
+    const lanes: @Vector(8, u16) = @bitCast(flags);
     const shifted = lanes >> @as(@Vector(8, u16), @splat(@as(u16, 4)));
     const narrowed: @Vector(8, u8) = @truncate(shifted);
     return @bitCast(narrowed);
+}
+
+/// 半字节掩码里第一个命中的字节下标。没有命中时返回 null。
+pub inline fn index16(flags: @Vector(16, u8)) ?usize {
+    const mask = nibbleMask(flags);
+    if (mask == 0) return null;
+    return @as(usize, @ctz(mask)) / 4;
+}
+
+/// `native_width` 个 `0xFF` 标志里第一个字节下标。32 宽先拆成两段 16。
+pub inline fn indexWidth(flags: @Vector(native_width, u8)) ?usize {
+    if (comptime native_width == 32) {
+        const halves: [2]@Vector(16, u8) = @bitCast(flags);
+        if (index16(halves[0])) |rel| return rel;
+        if (index16(halves[1])) |rel| return 16 + rel;
+        return null;
+    }
+    return index16(flags);
 }
 
 fn scalarFind(haystack: []const u8, start: usize, needle: u8) ?usize {

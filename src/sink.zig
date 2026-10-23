@@ -20,6 +20,8 @@ pub const Result = struct {
     /// `matched` 被调用的次数。计数打印器和退出码用它。
     matched_lines: u64 = 0,
     nul_offset: ?u64 = null,
+    /// 实际读过的字节。目录搜索用它记账，不再为了这个数对每个文件 `fstat`。
+    bytes_read: u64 = 0,
 };
 
 /// 一个输入的结束原因。
@@ -86,12 +88,12 @@ pub const AnySink = struct {
 /// 为类型 `S` 生成虚表。缺的方法保持继续搜索。
 pub fn anyVtable(comptime S: type) AnySink.VTable {
     return .{
-        .begin = if (@hasDecl(S, "begin")) &adaptBegin(S) else &noopPath,
-        .matched = if (@hasDecl(S, "matched")) &adaptMatched(S) else &noopLine,
-        .context = if (@hasDecl(S, "context")) &adaptContext(S) else &noopLine,
-        .context_break = if (@hasDecl(S, "contextBreak")) &adaptBreak(S) else &noopCtx,
-        .binary = if (@hasDecl(S, "binary")) &adaptBinary(S) else &noopBinary,
-        .finish = if (@hasDecl(S, "finish")) &adaptFinish(S) else &noopFinish,
+        .begin = if (@hasDecl(S, "begin")) &adapt(S, "begin") else &noopPath,
+        .matched = if (@hasDecl(S, "matched")) &adapt(S, "matched") else &noopLine,
+        .context = if (@hasDecl(S, "context")) &adapt(S, "context") else &noopLine,
+        .context_break = if (@hasDecl(S, "contextBreak")) &adapt(S, "contextBreak") else &noopCtx,
+        .binary = if (@hasDecl(S, "binary")) &adapt(S, "binary") else &noopBinary,
+        .finish = if (@hasDecl(S, "finish")) &adapt(S, "finish") else &noopFinish,
     };
 }
 
@@ -99,52 +101,28 @@ fn castSink(comptime S: type, ctx: *anyopaque) *S {
     return @ptrCast(@alignCast(ctx));
 }
 
-fn adaptBegin(comptime S: type) fn (*anyopaque, []const u8) bool {
+/// 把 `S` 的方法收成虚表函数。方法本身是 comptime 名字，参数个数在这里定死。
+fn adapt(comptime S: type, comptime name: []const u8) AdaptFn(S, name) {
+    const types = @typeInfo(@TypeOf(@field(S, name))).@"fn".param_types;
+    if (types.len == 1) {
+        return struct {
+            fn f(ctx: *anyopaque) bool {
+                return @call(.auto, @field(S, name), .{castSink(S, ctx)});
+            }
+        }.f;
+    }
+    const Arg = types[1].?;
     return struct {
-        fn f(ctx: *anyopaque, path: []const u8) bool {
-            return castSink(S, ctx).begin(path);
+        fn f(ctx: *anyopaque, arg: Arg) bool {
+            return @call(.auto, @field(S, name), .{ castSink(S, ctx), arg });
         }
     }.f;
 }
 
-fn adaptMatched(comptime S: type) fn (*anyopaque, Line) bool {
-    return struct {
-        fn f(ctx: *anyopaque, line: Line) bool {
-            return castSink(S, ctx).matched(line);
-        }
-    }.f;
-}
-
-fn adaptContext(comptime S: type) fn (*anyopaque, Line) bool {
-    return struct {
-        fn f(ctx: *anyopaque, line: Line) bool {
-            return castSink(S, ctx).context(line);
-        }
-    }.f;
-}
-
-fn adaptBreak(comptime S: type) fn (*anyopaque) bool {
-    return struct {
-        fn f(ctx: *anyopaque) bool {
-            return castSink(S, ctx).contextBreak();
-        }
-    }.f;
-}
-
-fn adaptBinary(comptime S: type) fn (*anyopaque, u64) bool {
-    return struct {
-        fn f(ctx: *anyopaque, offset: u64) bool {
-            return castSink(S, ctx).binary(offset);
-        }
-    }.f;
-}
-
-fn adaptFinish(comptime S: type) fn (*anyopaque, Result) bool {
-    return struct {
-        fn f(ctx: *anyopaque, result: Result) bool {
-            return castSink(S, ctx).finish(result);
-        }
-    }.f;
+fn AdaptFn(comptime S: type, comptime name: []const u8) type {
+    const types = @typeInfo(@TypeOf(@field(S, name))).@"fn".param_types;
+    if (types.len == 1) return fn (*anyopaque) bool;
+    return fn (*anyopaque, types[1].?) bool;
 }
 
 fn noopPath(_: *anyopaque, _: []const u8) bool {

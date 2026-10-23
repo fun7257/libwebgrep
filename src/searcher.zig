@@ -22,8 +22,7 @@ pub const BinaryPolicy = enum {
 };
 
 pub const SearchConfig = struct {
-    /// 起始块大小。1 GiB 热文件上 1 MiB 中位 109.7 ms，256 KiB 是 111.9 ms，
-    /// 8 MiB 回落到 124 ms。默认取 1 MiB。
+    /// 起始块大小。128 MiB 文件上四档里 1 MiB 最快，见 `BENCHMARKS.md`。默认 1 MiB。
     pub const default_buffer_size: usize = 1024 * 1024;
     /// 单行字节上限。缓冲倍增到这里仍放不下一整行时返回 `error.LineTooLong`。
     pub const default_max_line_len: usize = 2 * 1024 * 1024;
@@ -78,6 +77,7 @@ const State = struct {
     /// 占用 max_count 的命中数。上下文里被抬成匹配的行不加。
     limit_count: u64 = 0,
     matched_lines: u64 = 0,
+    bytes_read: u64 = 0,
     nul_offset: ?u64 = null,
     stopped: bool = false,
     /// 这一块里很早就有匹配。后面的块改回先扫 NUL，避免每个密集块搜两遍。
@@ -101,7 +101,7 @@ pub fn searchSlice(
     resetStats(matcher);
     var state = State{};
     if (config.line_numbers) state.line_number = 1;
-    if (!callBegin(S, sink, name)) {
+    if (!callOpt(S, "begin", sink, .{name})) {
         state.stopped = true;
         return finishSink(S, sink, &state, config);
     }
@@ -109,7 +109,7 @@ pub fn searchSlice(
     if (config.binary != .none) {
         if (memchr.find(width, haystack, 0, 0)) |nul| {
             state.nul_offset = nul;
-            const cont = callBinary(S, sink, nul);
+            const cont = callOpt(S, "binary", sink, .{nul});
             if (config.binary == .quit) {
                 const window = bufferWindow(config);
                 if (nul < @min(haystack.len, window)) {
@@ -197,7 +197,7 @@ fn drive(
 ) ReadError!Result {
     var state = State{};
     if (config.line_numbers) state.line_number = 1;
-    if (!callBegin(S, sink, name)) {
+    if (!callOpt(S, "begin", sink, .{name})) {
         state.stopped = true;
         return finishSink(S, sink, &state, config);
     }
@@ -231,6 +231,7 @@ fn drive(
             if (config.scratch) |slot| slot.* = buf;
         }
         const n = try readFn(read_ctx, buf[filled..]);
+        state.bytes_read += n;
         const eof = n == 0;
         const new_at = filled;
         if (!eof) filled += n;
@@ -238,8 +239,7 @@ fn drive(
         const search_end = if (eof) filled else lastComplete(buf[0..filled]);
         // 换行符本身不计入单行上限，所以缓冲可以比上限多一个字节。
         const pending = filled - search_end;
-        if (!eof and pending > config.max_line_len) return error.LineTooLong;
-        if (eof and pending > config.max_line_len) return error.LineTooLong;
+        if (pending > config.max_line_len) return error.LineTooLong;
 
         const view_end = if (eof) filled else search_end;
         // 文本快路径把 NUL 检查并进查找。单独再扫一遍 NUL，1 GiB 热文件大约要 19 ms，
@@ -266,7 +266,7 @@ fn drive(
             }
             if (nul_rel) |rel| {
                 state.nul_offset = state.abs_base + rel;
-                const cont = callBinary(S, sink, state.nul_offset.?);
+                const cont = callOpt(S, "binary", sink, .{state.nul_offset.?});
                 if (config.binary == .quit or !cont) {
                     filled = new_at;
                     state.stopped = true;
@@ -277,7 +277,7 @@ fn drive(
         } else if (!eof and config.binary != .none and state.nul_offset == null) {
             if (memchr.find(width, buf[new_at..filled], 0, 0)) |rel| {
                 state.nul_offset = state.abs_base + new_at + rel;
-                const cont = callBinary(S, sink, state.nul_offset.?);
+                const cont = callOpt(S, "binary", sink, .{state.nul_offset.?});
                 if (config.binary == .quit or !cont) {
                     filled = new_at;
                     state.stopped = true;
@@ -509,12 +509,12 @@ fn sinkMatched(
     if (!try sinkBreak(S, sink, buf, line.start, state, config)) return false;
     countLines(buf, line.start, state);
     const span = spanFrom(buf, line, content_end, known);
-    const keep = callMatched(S, sink, .{
+    const keep = callOpt(S, "matched", sink, .{Line{
         .bytes = buf[line.start..content_end],
         .offset = state.abs_base + line.start,
         .number = state.line_number,
         .match = span,
-    });
+    }});
     state.last_line_visited = line.end;
     state.after_left = config.after;
     state.has_sunk = true;
@@ -538,12 +538,12 @@ fn sinkContext(
     if (content_end - line.start > config.max_line_len) return error.LineTooLong;
     countLines(buf, line.start, state);
     const span = if (config.invert) spanFrom(buf, line, content_end, matchInLine(matcher, buf, line, config)) else null;
-    const keep = callContext(S, sink, .{
+    const keep = callOpt(S, "context", sink, .{Line{
         .bytes = buf[line.start..content_end],
         .offset = state.abs_base + line.start,
         .number = state.line_number,
         .match = span,
-    });
+    }});
     state.last_line_visited = line.end;
     if (kind == .after and state.after_left > 0) state.after_left -= 1;
     state.has_sunk = true;
@@ -562,7 +562,7 @@ fn sinkBreak(
     _ = buf;
     const any_context = config.before > 0 or config.after > 0;
     if (!any_context or !state.has_sunk or state.last_line_visited >= start) return true;
-    const keep = callBreak(S, sink);
+    const keep = callOpt(S, "contextBreak", sink, .{});
     if (!keep) state.stopped = true;
     return keep;
 }
@@ -655,8 +655,9 @@ fn finishSink(comptime S: type, sink: *S, state: *State, config: SearchConfig) R
         .outcome = outcome,
         .matched_lines = state.matched_lines,
         .nul_offset = state.nul_offset,
+        .bytes_read = state.bytes_read,
     };
-    _ = callFinish(S, sink, result);
+    _ = callOpt(S, "finish", sink, .{result});
     return result;
 }
 
@@ -669,29 +670,9 @@ fn resetStats(matcher: anytype) void {
     if (@hasDecl(Child, "resetStats")) matcher.resetStats();
 }
 
-fn callBegin(comptime S: type, sink: *S, name: []const u8) bool {
-    if (@hasDecl(S, "begin")) return sink.begin(name);
-    return true;
-}
-fn callMatched(comptime S: type, sink: *S, line: Line) bool {
-    if (@hasDecl(S, "matched")) return sink.matched(line);
-    return true;
-}
-fn callContext(comptime S: type, sink: *S, line: Line) bool {
-    if (@hasDecl(S, "context")) return sink.context(line);
-    return true;
-}
-fn callBreak(comptime S: type, sink: *S) bool {
-    if (@hasDecl(S, "contextBreak")) return sink.contextBreak();
-    return true;
-}
-fn callBinary(comptime S: type, sink: *S, offset: u64) bool {
-    if (@hasDecl(S, "binary")) return sink.binary(offset);
-    return true;
-}
-fn callFinish(comptime S: type, sink: *S, result: Result) bool {
-    if (@hasDecl(S, "finish")) return sink.finish(result);
-    return true;
+fn callOpt(comptime S: type, comptime name: []const u8, sink: *S, args: anytype) bool {
+    if (!@hasDecl(S, name)) return true;
+    return @call(.auto, @field(S, name), .{sink} ++ args);
 }
 
 const testing = std.testing;
@@ -1129,4 +1110,104 @@ test "scratch 在两次搜索之间复用" {
     var second = std.Io.Reader.fixed("MATCH\n");
     _ = try searchReader(Sink, testing.allocator, &sink, &second, "", &finder, cfg);
     try testing.expectEqual(ptr, scratch.ptr);
+}
+
+test "多模式分块读和切片一致，NUL 在命中前会停" {
+    const Multi = @import("finder/multi.zig").Multi;
+    const pats = [_][]const u8{ "pq", "rs" };
+    var multi = try Multi.init(testing.allocator, &pats, .{});
+    defer multi.deinit();
+    try testing.expect(multi.kind == .pairs);
+
+    var hay: [103]u8 = @splat('x');
+    hay[31] = '\n';
+    @memset(hay[32..64], 'y');
+    hay[64] = 'p';
+    hay[65] = 'q';
+    hay[66] = '\n';
+    @memset(hay[67..99], 'z');
+    hay[99] = '\n';
+    hay[100] = 'r';
+    hay[101] = 's';
+    hay[102] = '\n';
+
+    const cfg = SearchConfig{
+        .line_numbers = true,
+        .buffer_size = 32,
+        .max_line_len = 128,
+        .binary = .none,
+        .match_mode = .leftmost_first,
+    };
+    var slice_rec = Rec{};
+    defer slice_rec.deinit(testing.allocator);
+    const slice_result = try searchSlice(Rec, &slice_rec, &hay, "f", &multi, cfg);
+
+    var reader = std.Io.Reader.fixed(&hay);
+    var read_rec = Rec{};
+    defer read_rec.deinit(testing.allocator);
+    const read_result = try searchReader(Rec, testing.allocator, &read_rec, &reader, "f", &multi, cfg);
+
+    var expect: [42]u8 = undefined;
+    @memcpy(expect[0..2], "2:");
+    @memset(expect[2..34], 'y');
+    @memcpy(expect[34..37], "pq\n");
+    @memcpy(expect[37..42], "4:rs\n");
+    try testing.expectEqualStrings(&expect, slice_rec.text.items);
+    try testing.expectEqualStrings(&expect, read_rec.text.items);
+    try testing.expectEqual(slice_result.matched_lines, read_result.matched_lines);
+    try testing.expectEqual(@as(u64, 2), read_result.matched_lines);
+
+    var raw: [32]u8 = @splat('x');
+    raw[8] = 0;
+    raw[16] = 'p';
+    raw[17] = 'q';
+    raw[18] = '\n';
+    var nul_reader = std.Io.Reader.fixed(&raw);
+    var nul_rec = Rec{};
+    defer nul_rec.deinit(testing.allocator);
+    const nul_result = try searchReader(Rec, testing.allocator, &nul_rec, &nul_reader, "f", &multi, .{
+        .buffer_size = 32,
+        .max_line_len = 64,
+        .binary = .quit,
+        .match_mode = .leftmost_first,
+    });
+    try testing.expectEqual(Outcome.binary_quit, nul_result.outcome);
+    try testing.expectEqual(@as(?u64, 8), nul_result.nul_offset);
+    try testing.expectEqual(@as(u64, 0), nul_result.matched_lines);
+    try testing.expectEqualStrings("", nul_rec.text.items);
+}
+
+test "基准场景的切片命中和基准同一配置" {
+    const multi = @import("finder/multi.zig");
+    var hay: [256]u8 = undefined;
+    multi.fillScenarioText(&hay);
+    const Sink = struct {
+        pub fn matched(_: *@This(), _: Line) bool {
+            return true;
+        }
+    };
+    var sink = Sink{};
+
+    var sensitive = try Finder.init("NEEDLE", .{ .case = .sensitive });
+    try testing.expectEqual(@as(u64, 1), (try searchSlice(Sink, &sink, &hay, "", &sensitive, .{})).matched_lines);
+
+    var ignore = try Finder.init("needle", .{ .case = .insensitive });
+    try testing.expectEqual(@as(u64, 1), (try searchSlice(Sink, &sink, &hay, "", &ignore, .{})).matched_lines);
+
+    var smart = try Finder.init("needle", .{ .case = .smart });
+    try testing.expectEqual(@as(u64, 1), (try searchSlice(Sink, &sink, &hay, "", &smart, .{})).matched_lines);
+
+    const Group = struct { pats: []const []const u8, lines: u64 };
+    const groups = [_]Group{
+        .{ .pats = multi.scenario_bytes, .lines = 0 },
+        .{ .pats = multi.scenario_pairs, .lines = 1 },
+        .{ .pats = multi.scenario_teddy, .lines = 0 },
+        .{ .pats = multi.scenario_ac, .lines = 0 },
+    };
+    for (groups) |group| {
+        var many = try multi.Multi.init(testing.allocator, group.pats, .{});
+        defer many.deinit();
+        const result = try searchSlice(Sink, &sink, &hay, "", &many, .{});
+        try testing.expectEqual(group.lines, result.matched_lines);
+    }
 }

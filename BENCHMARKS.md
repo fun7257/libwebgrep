@@ -1,119 +1,118 @@
 # 基准
 
-只记录 ReleaseFast。Debug 在 x86_64 上会走 Zig 自研后端，这里的宿主虽然是 aarch64，基准仍然只用 ReleaseFast。
+只记录 ReleaseFast 下 `bench/micro.zig` 的进程内计时。命令是 `zig build bench -Doptimize=ReleaseFast`。不启动命令行，也不和 ripgrep 比。
+
+每一行是 `scenario 名字 bytes 字节数 gbs 吞吐 iters 次数 sink 累计结果`。吞吐是 `字节 / 秒 / 1e9`。先空跑一次，不计入。之后至少再跑 300 ms，并且至少两次。每次调用前有内存屏障。会改写缓冲的查找还会翻转第一个字节，避免被当成死代码删掉。`sink` 是各次返回值的和。返回值和下面写的预期不一致时，这次基准失败，不会把空结果记成吞吐。
+
+单模式 `Finder` 在计时外建好，循环里只清统计再查找。多模式在计时外建好。模式表是 `src/finder/multi.zig` 里的 `scenario_bytes`、`scenario_pairs`、`scenario_teddy`、`scenario_ac`，和库测试共用。目录场景每次都走完整的 `parallel.run`，包含建工人和拆工人。
+
+没有 x86_64 的计时。
 
 ## 环境
 
 | 项 | 值 |
 | --- | --- |
+| 日期 | 2026-10-23 |
 | 机器 | Apple M2，8 核，8 GiB |
 | 系统 | Darwin arm64 |
 | Zig | 0.17.0 |
-| ripgrep | 15.2.0（本机是 NEON 构建） |
-| hyperfine | 2.0.0，`--shell=bash --warmup 2 --runs 5` |
+| 优化 | ReleaseFast |
 | 向量宽度 | 16 |
+| Teddy | 默认 neon。这次 `multi_teddy` 落到 `teddy` |
+| 目录默认线程 | `resolveThreads(0)` = 4，本机性能核数 |
 
-吞吐的 GB/s 是 `字节 / 秒 / 1e9`。没有 x86_64 的计时。1 GiB 那几组是 P0 最终二进制同一次 `bench/e2e.sh`。这台机器当时已经跑过好几轮，绝对时间比冷机时高，rg 和 zrg 是同一轮比的。源码树是 P1 另一次运行，写在那张表后面。
+## 测试怎么锁住这些场景
 
-## 内核微基准
+`zig build test` 不跑计时。它锁契约：
 
-64 MiB 文本，每 64 字节一个换行，末尾放一个 `NEEDLE`。单字节查找的是不存在的 `0xff`，避免命中后提前返回。每次调用前有编译器内存屏障，并翻转 `buf[0]`，避免被当成死代码删掉。
+- `基准场景的模式落到各自的引擎`：四组模式分别落到字节集、邻接对、Teddy（关掉 Teddy 时这组改走自动机）、自动机。样例文本上，字节集、Teddy、自动机没有命中，邻接对命中末尾的 `NEEDLE`。再种进一个模式字节，确认没命中不是空转。
+- `基准场景的切片命中和基准同一配置`：同一形状的文本，用默认 `searchSlice` 配置。`NEEDLE` 区分大小写、`needle` 忽略大小写、`needle` 的 smart case 都是 1 行。四组多模式的行数是 0、1、0、0。
 
-决定 `find` 走 std 的那次对比：手写 55.769 GB/s，`std.mem.findScalar` 54.631 GB/s，比值 1.021。后来同一次运行里转调 std 的 `find` 是 53.423 GB/s，std 是 55.595 GB/s，比值 0.961。两次都在 5% 以内，所以单字节 `find` 保持调用 std。
+文本形状是 `fillScenarioText`：全是 `a`，每 64 字节一个换行，末尾盖上 `NEEDLE\n`。大基准用 64 MiB。文件基准是同一形状的 128 MiB 正文再加末尾那 7 个字节。
 
-当前代码同一次运行：
+## 2026-10-23 这一次
 
-| 项 | GB/s |
-| --- | ---: |
-| `memchr.find`（std） | 52.110 |
-| 手写 `findEither` | 56.456 |
-| `std.mem.findScalar` | 52.114 |
-| find / std | 1.000 |
-| findEither / std | 1.083 |
-| Finder，`NEEDLE`，区分大小写 | 38.874 |
-| Finder，`needle`，ASCII 忽略大小写 | 13.864 |
-| Finder，`needle`，smart case | 13.996 |
-| `searchSlice`，同一块缓冲，含 NUL 预扫 | 21.844 |
-| Finder，字母表填充上的 `zrgneedle` | 39.477 |
+```
+libwebgrep bench width 16 walk_default_threads 4
+scenario memchr_find bytes 67108864 gbs 48.260 iters 216 sink 0
+scenario memchr_either bytes 67108864 gbs 26.494 iters 119 sink 0
+scenario std_find_scalar bytes 67108864 gbs 50.595 iters 227 sink 0
+scenario finder_sensitive bytes 67108864 gbs 35.747 iters 160 sink 10737417120
+scenario finder_ignore bytes 67108864 gbs 13.510 iters 61 sink 4093640277
+scenario finder_smart bytes 67108864 gbs 13.514 iters 61 sink 4093640277
+scenario search_slice bytes 67108864 gbs 21.007 iters 94 sink 94
+engine multi_bytes bytes
+scenario multi_bytes bytes 67108864 gbs 22.906 iters 103 sink 0
+engine multi_pairs pairs
+scenario multi_pairs bytes 67108864 gbs 19.423 iters 87 sink 87
+engine multi_teddy teddy
+scenario multi_teddy bytes 67108864 gbs 2.789 iters 13 sink 0
+engine multi_ac ac
+scenario multi_ac bytes 67108864 gbs 1.044 iters 5 sink 0
+scenario finder_alphabet bytes 67108864 gbs 35.896 iters 161 sink 10804525333
+scenario file_64KiB bytes 134217735 gbs 9.584 iters 22 sink 22
+scenario file_128KiB bytes 134217735 gbs 9.781 iters 22 sink 22
+scenario file_256KiB bytes 134217735 gbs 10.063 iters 23 sink 23
+scenario file_1MiB bytes 134217735 gbs 10.242 iters 23 sink 23
+scenario file_readall bytes 134217735 gbs 5.041 iters 12 sink 12
+scenario walk_1 bytes 786432 gbs 0.157 iters 60 sink 540
+scenario walk_default bytes 786432 gbs 0.371 iters 142 sink 1278
+```
 
-128 MiB 文件、热缓存、`searchFile`、每种缓冲三次取中位数：
+`find / std` = 48.260 / 50.595 = 0.954。`memchr.find` 就是 `std.mem.findScalarPos`。`memchr_either` 同时找 `0xff` 和 `0xfe`，两个都不在文本里，工作量和单字节查找不同。
 
-| 缓冲 | GB/s |
-| --- | ---: |
-| 64 KiB | 9.521 |
-| 128 KiB | 9.737 |
-| 256 KiB | 10.010 |
-| 1 MiB | 10.178 |
-| 一次读完整文件再搜 | 4.965 |
+### 64 MiB 文本
 
-## 端到端
+缓冲 67108864 字节。单字节查找的是不存在的字节，每次返回 0。`Finder` 每次返回 `NEEDLE` 的起点，也就是 `67108864 - 7`。`search_slice` 和多模式每次返回命中行数。
 
-`hyperfine` 对比 `rg --no-config --color=never -F` 和 `zig-out/bin/zrg -F`。输出丢到 `/dev/null`。必须加 `--shell=bash`，否则 hyperfine 2.0 会把重定向当成文件名。
+| 场景 | 每次结果 | GB/s |
+| --- | --- | ---: |
+| `memchr_find` | 未命中 | 48.260 |
+| `memchr_either` | 两个字节都未命中 | 26.494 |
+| `std_find_scalar` | 未命中 | 50.595 |
+| `finder_sensitive`，`NEEDLE` | 命中末尾 | 35.747 |
+| `finder_ignore`，`needle`，忽略大小写 | 命中末尾 | 13.510 |
+| `finder_smart`，`needle`，smart case | 命中末尾 | 13.514 |
+| `search_slice`，`NEEDLE`，默认配置 | 1 行 | 21.007 |
+| `multi_bytes`，`Q` 和 `Z`，字节集 | 0 行 | 22.906 |
+| `multi_pairs`，`NEEDLE` 和 `ZXZQ`，邻接对 | 1 行 | 19.423 |
+| `multi_teddy`，17 条双字节，Teddy | 0 行 | 2.789 |
+| `multi_ac`，33 条双字节，自动机 | 0 行 | 1.044 |
+| `finder_alphabet`，`libwebgrep` | 命中末尾 | 35.896 |
 
-验收文件 `corpus/large/1g.txt` 是 1073741824 字节。填充行是 `the quick brown fox jumps over a dog 0123456789`，文件末尾一行 `ZXZQNEEDLE`。填充里没有 `Z`、`X`、`Q`。`corpus/large/adv.txt` 同样是 1 GiB，每行是 `abcdefghijklmnopqrstuvwxyz`，末尾一行 `zrgneedle`。
+`needle` 全是小写，smart case 会折叠，所以和忽略大小写同一条路径，两次分别是 13.510 和 13.514。
 
-| 组 | rg | zrg | zrg 相对 rg | 内存 rg / zrg |
-| --- | ---: | ---: | ---: | ---: |
-| 1. 1 GiB 热缓存，`ZXZQNEEDLE` | 131.7 ms ± 3.4 | 116.9 ms ± 3.2 | −11.2% | 4.9 / 2.8 MiB |
-| 1b. 1 GiB 字母表填充，`zrgneedle` | 127.9 ms ± 4.7 | 116.1 ms ± 3.5 | −9.2% | 4.9 / 2.8 MiB |
-| 5. 密集匹配，40 万行 `match` | 17.7 ms ± 0.4 | 13.8 ms ± 0.5 | −22.1% | 4.9 / 2.8 MiB |
-| 6. `-i zxzqneedle`，同一 1 GiB 文件 | 208.9 ms ± 1.5 | 169.2 ms ± 3.4 | −19.0% | 5.1 / 2.8 MiB |
-| 6b. `-S zxzqneedle` | 211.8 ms ± 2.3 | 168.1 ms ± 4.5 | −20.6% | 5.1 / 2.8 MiB |
+`search_slice` 用默认配置。默认 `binary` 是 `report`，切片路径会先把整段扫一遍 NUL。这是嵌入时调用的入口，吞吐低于单独的 `Finder.find`。
 
-按 1e9 字节/秒，第 1 组 rg 约 8.15 GB/s，zrg 约 9.19 GB/s。zrg 这组最慢的一次是 121.1 ms，仍快于 rg 最快的 129.1 ms。
+四组多模式的模式不同，数字是这一类查询在这份文本上的代价。字节集是两个缺失单字节。邻接对带一个末尾命中。Teddy 和自动机是整段未命中。17 条超过邻接对的 16 条上限，33 条超过 Teddy 的 32 条上限。能收成邻接对的查询不会走到后面两档。
 
-第 6 组 zrg 更快，是因为只做 ASCII 折叠。rg 的 `-i` 在这个全 ASCII 文件上仍比它自己的区分大小写慢。
+字母表场景把同一块缓冲改成重复的 `abcdefghijklmnopqrstuvwxyz`。`libwebgrep` 只出现在末尾。35.896 和区分大小写的 `NEEDLE` 同一档，预过滤没有掉进标量确认。
 
-同一最终二进制上另测的两项，不在 `e2e.sh` 里：
+### 128 MiB 文件
 
-| 组 | rg | zrg | zrg 相对 rg |
+`bench/tmp/sweep.txt`，正文 128 MiB，再加末尾 `NEEDLE\n`，共 134217735 字节。同一次进程里写完再反复读，是热缓存。`searchFile` 加空 sink，模式 `NEEDLE`。每次 1 行，并且 `bytes_read` 必须等于文件长度。缓冲按调用传入。`file_readall` 的缓冲等于文件长度，一次读完再搜。
+
+由 GB/s 折回的单次时间是 `134217735 / gbs / 1e9`。
+
+| 缓冲 | GB/s | 单次 |
+| --- | ---: | ---: |
+| 64 KiB | 9.584 | 14.0 ms |
+| 128 KiB | 9.781 | 13.7 ms |
+| 256 KiB | 10.063 | 13.3 ms |
+| 1 MiB | 10.242 | 13.1 ms |
+| 一次读完再搜 | 5.041 | 26.6 ms |
+
+四档里 1 MiB 最快。一次读完再搜大约用掉两倍时间。默认缓冲保持 1 MiB。
+
+### 目录
+
+`bench/tmp/walk`。`flat/` 里 128 个文件，另外 8 个目录各 32 个，一共 384 个文件。每个文件 2048 字节，合计 786432 字节。每个目录的 `f000.txt` 末尾有一个 `NEEDLE`，一共 9 个命中。`read_ignore` 关闭，输出是计数，写进丢弃 writer。
+
+`walk_1` 指定 1 个线程。`walk_default` 传入 0，由调度层选成这次的 4。每次迭代都是一次完整的 `parallel.run`。单次时间是 `786432 / gbs / 1e9`。
+
+| 场景 | GB/s | 单次 | 命中文件 |
 | --- | ---: | ---: | ---: |
-| 单字节 `Z`，1 GiB | 104.9 ms ± 1.3 | 94.5 ms ± 0.5 | −9.9% |
-| `-c e`，1 GiB，几乎每行都命中 | 469.0 ms ± 48.8 | 397.4 ms ± 3.6 | −15.3% |
+| `walk_1` | 0.157 | 5.0 ms | 9 |
+| `walk_default` | 0.371 | 2.1 ms | 9 |
 
-`-c e` 的 rg 有一次明显偏慢的首跑，中位数仍高于 zrg。
-
-源码树是另一次运行，没有重测上面的 1 GiB 文件。树是 `/Users/fun/zig-source/zig-aarch64-macos-0.17.0/lib`，19501 个文件，约 228 MiB。模式是 `OutOfMemory`。跑之前先对照过：`zrg --files` 和 `rg --files` 排序后都是 19501 行，完全一致；`-F -j 1 OutOfMemory` 排序后都是 629 行，完全一致。hyperfine 仍是 `--shell=bash --warmup 2 --runs 5`。缓存已经被这次对照走热。
-
-| 组 | rg | zrg | zrg 相对 rg | 内存 rg / zrg |
-| --- | ---: | ---: | ---: | ---: |
-| 2. 源码树，`-j 1` | 397.5 ms ± 2.0 | 374.6 ms ± 0.8 | −5.8% | 5.3 / 3.1 MiB |
-| 3. 源码树，默认线程 | 168.4 ms ± 2.9 | 179.2 ms ± 4.3 | +6.4% | 11.2 / 8.2 MiB |
-
-这台机器是 8 核，默认线程就是 8。第 3 组 zrg 比 rg 慢 6.4%，179.2 / 168.4 = 1.064，落在 rg 的 110% 以内。zrg 这次最慢的一次是 185.1 ms。
-
-## 多模式
-
-另一次运行，没有重测上面的 1 GiB 文件，也没有重测源码树。文件是 `corpus/large/multi.txt`，33554432 字节。填充行和 1 GiB 那组相同，每 64 行在前面加上轮换的 `alpha`、`beta`、`gamma`、`delta`。模式文件先写这四个词，其余是 `zq` 加四位编号再加 `miss`，长度至少 2，都不含换行。`rg -F -c -f` 和 zrg 的命中行数都是 10902，10、100、1000 三个集合一样。hyperfine 仍是 `--shell=bash --warmup 2 --runs 5`。命令是 `rg -f` 对 `zrg -f`，两边都带原来的 `-F`。
-
-下面三行用的二进制是当时的 `zig-out/bin/zrg`，Teddy 关闭，三条都走 Aho-Corasick。相对差是 hyperfine 打印的。
-
-| 组 | rg | zrg | zrg 相对 rg | 内存 rg / zrg |
-| --- | ---: | ---: | ---: | ---: |
-| 7. 10 个模式 | 10.4 ms ± 0.2 | 93.9 ms ± 0.3 | +804.4% | 5.0 / 3.1 MiB |
-| 8. 100 个模式 | 13.0 ms ± 0.2 | 94.4 ms ± 0.4 | +626.5% | 5.9 / 3.7 MiB |
-| 9. 1000 个模式 | 12.7 ms ± 0.2 | 98.7 ms ± 0.3 | +678.6% | 6.7 / 9.5 MiB |
-
-内存相对差分别是 −38.4%、−37.1%、+43.1%。10 个模式大约是 rg 的 9.0 倍，100 个大约 7.3 倍，1000 个大约 7.8 倍。
-
-同一文件上又单独跑了一轮 10 个模式，用来比较自动机和 NEON。NEON 二进制是 `zig build -Doptimize=ReleaseFast -Dteddy=neon`。这一轮的 rg 和自动机也重新计了时。命中行数仍是 10902。
-
-| 实现 | 时间 | 相对这一轮 rg | 内存 |
-| --- | ---: | ---: | ---: |
-| rg 15.2.0 | 10.6 ms ± 0.3 | — | 5.0 MiB |
-| zrg，Aho-Corasick | 93.4 ms ± 0.1 | +783.7% | 3.1 MiB |
-| zrg，`-Dteddy=neon` | 57.6 ms ± 0.3 | +445.0% | 3.0 MiB |
-
-NEON 相对自动机是 57.6 / 93.4，大约快 38%。相对 rg 仍是大约 5.5 倍，内存 −40.5%。100 和 1000 个模式超过 32 条，Teddy 用不上，上面那两行就是它们的数字。因为 NEON 比自动机快，并且超出噪声，aarch64 的默认改成 `neon`。它没有超过 rg。x86 的 SSSE3 和 AVX2 没有计时，默认仍是 `off`。
-
-跳过的组：
-
-- 4：`sudo -n true` 失败，不能 drop caches，也没有跑 `purge`。多模式这次也没有清缓存。
-- 窗口映射和裸 `getdents64` 仍是默认关闭的构建选项，没有放进这张表。
-- 1 GiB 和源码树没有为多模式重跑。
-
-## 试过并放弃的读法
-
-整文件 `mmap` 在新鲜进程的 1 GiB 热缓存上是 zrg 192.4 ms、驻留 1026 MiB，同一轮 rg 是 125.4 ms、4.9 MiB。进程内的 128 MiB 微基准曾经觉得映射更快，端到端对不上。文件路径保持 `readPositional` 滚动缓冲。
-
-把 NUL 和模式分成两遍扫，`searchSlice` 停在大约 22 GB/s，接近单字节 memchr 和配对扫描的调和平均。窗口再扫一遍也没有提高。切片路径仍是两遍。流式路径在没有上下文、没有反选时，把 NUL 检查并进已经加载的向量，文本文件只扫一遍。
+这 768 KiB 里大部分时间花在打开文件和建立工人，不花在匹配。这个 GB/s 不和上面的内存扫描放在一起比。4 个线程这次大约是单线程的 2.4 倍。

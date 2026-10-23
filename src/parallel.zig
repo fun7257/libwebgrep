@@ -1,7 +1,9 @@
 //! 目录搜索的调度。每个工人有自己的 Chase-Lev 队列、Finder 和搜索缓冲。
 //!
 //! 工人从自己的队列尾部取任务（后进先出），从别人的队列头部偷（先进先出）。
-//! 结束条件：空闲人数达到工人数，再偷一整轮仍然没有任务，然后置停止标志。
+//! 忙的时候不加锁。这一轮取不到，就在 `std.Io.Condition` 上等待。
+//! 子目录入队时若已有空闲工人，就 `signal` 一个。全部空闲且锁里再偷一轮仍空，
+//! 或者搜索要提前停，就在同一把锁下置停止标志并 `broadcast`。
 //! 一个人时不建 `Io.Group`，调用线程自己跑同一套循环。
 //!
 //! 显式文件不进这里。调用方按参数顺序处理路径，目录才走这套调度。
@@ -55,7 +57,7 @@ pub const Run = struct {
     /// 文本上下文分组之间写 `--`。
     use_separator: bool = false,
     saw_output: *bool,
-    /// 为真时在结束时写一条 JSON summary。命令行自己汇总多次调用，所以默认不写。
+    /// 为真时在结束时写一条 JSON summary。调用方要自己汇总多次调用时保持默认，不写。
     write_summary: bool = false,
 };
 
@@ -78,6 +80,9 @@ const Shared = struct {
     use_separator: bool,
     saw: *bool,
     lock: std.Io.Mutex = .init,
+    /// 只保护空闲等待。队列本身仍是 Chase-Lev，搜索热路径不拿这把锁。
+    idle_mu: std.Io.Mutex = .init,
+    idle_cv: std.Io.Condition = .init,
     stop: std.atomic.Value(bool) = .init(false),
     idle: std.atomic.Value(u32) = .init(0),
     workers: u32,
@@ -95,7 +100,7 @@ const Shared = struct {
         _ = self.errors.fetchAdd(1, .monotonic);
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
-        self.stderr.print("zrg: {s}: {t}\n", .{ path, err }) catch {};
+        self.stderr.print("libwebgrep: {s}: {t}\n", .{ path, err }) catch {};
     }
 
     fn addSearch(self: *Shared, result: searcher.Result, matches: u64, bytes: u64, printed: usize) void {
@@ -156,6 +161,8 @@ const Slot = struct {
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, req: Run) !Stats {
     const workers = resolveThreads(req.walk.threads);
+    var walk_cfg = req.walk;
+    walk_cfg.threads = workers;
     const deques = try allocator.alloc(Queue, workers);
     var ready: usize = 0;
     var session = walker.Session.init(allocator);
@@ -188,7 +195,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, req: Run) !Stats {
         .io = io,
         .deques = deques,
         .session = &session,
-        .walk = req.walk,
+        .walk = walk_cfg,
         .search = req.search,
         .emit = req.emit,
         .finder = finder,
@@ -297,36 +304,71 @@ fn workerLoop(worker: *Worker) !void {
             runJob(worker, job);
             continue;
         }
-        const idle_now = shared.idle.fetchAdd(1, .acq_rel) + 1;
-        if (idle_now == shared.workers) {
-            if (stealJob(shared, index)) |job| {
-                _ = shared.idle.fetchSub(1, .acq_rel);
-                runJob(worker, job);
-                continue;
-            }
-            if (shared.deques[index].pop()) |job| {
-                _ = shared.idle.fetchSub(1, .acq_rel);
-                runJob(worker, job);
-                continue;
-            }
-            shared.stop.store(true, .release);
-            return;
+        if (try park(worker)) |job| {
+            runJob(worker, job);
+            continue;
         }
-        while (!shared.stop.load(.acquire)) {
-            try shared.io.checkCancel();
-            if (shared.deques[index].pop()) |job| {
-                _ = shared.idle.fetchSub(1, .acq_rel);
-                runJob(worker, job);
-                break;
-            }
-            if (stealJob(shared, index)) |job| {
-                _ = shared.idle.fetchSub(1, .acq_rel);
-                runJob(worker, job);
-                break;
-            }
-            std.Thread.yield() catch {};
-        } else return;
+        return;
     }
+}
+
+/// 锁里复查队列，没有活就睡。返回 `null` 表示已经停止。
+///
+/// `Condition.signal` 在没有等待者时会丢掉。入队一侧看见空闲人数是 0 就不再加锁，
+/// 所以先公布空闲，再在这把锁里复查；两边用同一把锁接上。
+fn park(worker: *Worker) !?*walker.Job {
+    const shared = worker.shared;
+    const index = worker.index;
+    try shared.idle_mu.lock(shared.io);
+    defer shared.idle_mu.unlock(shared.io);
+
+    if (shared.deques[index].pop()) |job| return job;
+    if (stealJob(shared, index)) |job| return job;
+
+    var announced = false;
+    errdefer if (announced) {
+        _ = shared.idle.fetchSub(1, .acq_rel);
+    };
+    const idle_now = shared.idle.fetchAdd(1, .acq_rel) + 1;
+    announced = true;
+
+    if (idle_now == shared.workers) {
+        if (shared.deques[index].pop()) |job| {
+            _ = shared.idle.fetchSub(1, .acq_rel);
+            announced = false;
+            return job;
+        }
+        if (stealJob(shared, index)) |job| {
+            _ = shared.idle.fetchSub(1, .acq_rel);
+            announced = false;
+            return job;
+        }
+        shared.stop.store(true, .release);
+        shared.idle_cv.broadcast(shared.io);
+        return null;
+    }
+
+    while (!shared.stop.load(.acquire)) {
+        if (shared.deques[index].pop()) |job| {
+            _ = shared.idle.fetchSub(1, .acq_rel);
+            announced = false;
+            return job;
+        }
+        if (stealJob(shared, index)) |job| {
+            _ = shared.idle.fetchSub(1, .acq_rel);
+            announced = false;
+            return job;
+        }
+        try shared.idle_cv.wait(shared.io, &shared.idle_mu);
+    }
+    return null;
+}
+
+fn requestStop(shared: *Shared) void {
+    shared.idle_mu.lockUncancelable(shared.io);
+    defer shared.idle_mu.unlock(shared.io);
+    shared.stop.store(true, .release);
+    shared.idle_cv.broadcast(shared.io);
 }
 
 fn stealJob(shared: *Shared, index: u32) ?*walker.Job {
@@ -362,7 +404,12 @@ fn makeHost(worker: *Worker, slot: *Slot) walker.Host {
 
 fn pushJob(ctx: *anyopaque, job: *walker.Job) anyerror!void {
     const slot: *Slot = @ptrCast(@alignCast(ctx));
-    try slot.worker.shared.deques[slot.worker.index].push(job);
+    const shared = slot.worker.shared;
+    try shared.deques[slot.worker.index].push(job);
+    if (shared.idle.load(.acquire) == 0) return;
+    shared.idle_mu.lockUncancelable(shared.io);
+    defer shared.idle_mu.unlock(shared.io);
+    shared.idle_cv.signal(shared.io);
 }
 
 fn onError(ctx: *anyopaque, path: []const u8, err: anyerror) void {
@@ -375,13 +422,13 @@ fn onFile(ctx: *anyopaque, visit: walker.Visit) anyerror!walker.Control {
     const worker = slot.worker;
     const shared = worker.shared;
     shared.io.checkCancel() catch {
-        shared.stop.store(true, .release);
+        requestStop(shared);
         return .stop;
     };
     if (shared.stop.load(.acquire)) return .stop;
     if (shared.emit == .files_only) {
         printPath(worker, visit.path) catch |err| {
-            shared.stop.store(true, .release);
+            requestStop(shared);
             shared.note(visit.path, err);
             return .stop;
         };
@@ -395,12 +442,8 @@ fn onFile(ctx: *anyopaque, visit: walker.Visit) anyerror!walker.Control {
         return .cont;
     };
     defer file.close(shared.io);
-    var size = visit.size;
-    if (size == 0) {
-        if (file.stat(shared.io)) |stat| size = stat.size else |_| {}
-    }
-    searchOpen(worker, file, visit.path, size) catch |err| {
-        shared.stop.store(true, .release);
+    searchOpen(worker, file, visit.path) catch |err| {
+        requestStop(shared);
         shared.note(visit.path, err);
         return .stop;
     };
@@ -416,12 +459,12 @@ fn printPath(worker: *Worker, path: []const u8) !void {
     _ = worker.shared.bytes_printed.fetchAdd(bytes.len, .monotonic);
 }
 
-fn searchOpen(worker: *Worker, file: std.Io.File, path: []const u8, size: u64) !void {
-    if (worker.shared.many) |many| return searchWith(worker, many, file, path, size);
-    return searchWith(worker, &worker.finder, file, path, size);
+fn searchOpen(worker: *Worker, file: std.Io.File, path: []const u8) !void {
+    if (worker.shared.many) |many| return searchWith(worker, many, file, path);
+    return searchWith(worker, &worker.finder, file, path);
 }
 
-fn searchWith(worker: *Worker, engine: anytype, file: std.Io.File, path: []const u8, size: u64) !void {
+fn searchWith(worker: *Worker, engine: anytype, file: std.Io.File, path: []const u8) !void {
     worker.buf.clearRetainingCapacity();
     const cfg = worker.config();
     const started = std.Io.Timestamp.now(worker.shared.io, .awake);
@@ -437,7 +480,7 @@ fn searchWith(worker: *Worker, engine: anytype, file: std.Io.File, path: []const
             if (sink.write_error) |err| return err;
             const bytes = worker.buf.written();
             try worker.flush(bytes);
-            worker.shared.addSearch(result, result.matched_lines, size, bytes.len);
+            worker.shared.addSearch(result, result.matched_lines, result.bytes_read, bytes.len);
         },
         .count => {
             var sink = count_printer.Count{ .writer = &worker.buf.writer, .show_path = true };
@@ -445,7 +488,7 @@ fn searchWith(worker: *Worker, engine: anytype, file: std.Io.File, path: []const
             if (sink.write_error) |err| return err;
             const bytes = worker.buf.written();
             try worker.flush(bytes);
-            worker.shared.addSearch(result, result.matched_lines, size, bytes.len);
+            worker.shared.addSearch(result, result.matched_lines, result.bytes_read, bytes.len);
         },
         .files_with_matches => {
             var sink = files_printer.Files{ .writer = &worker.buf.writer };
@@ -453,39 +496,40 @@ fn searchWith(worker: *Worker, engine: anytype, file: std.Io.File, path: []const
             if (sink.write_error) |err| return err;
             const bytes = worker.buf.written();
             try worker.flush(bytes);
-            worker.shared.addSearch(result, result.matched_lines, size, bytes.len);
+            worker.shared.addSearch(result, result.matched_lines, result.bytes_read, bytes.len);
         },
         .quiet => {
-            var sink = Quiet{ .stop = &worker.shared.stop };
+            var sink = Quiet{ .shared = worker.shared };
             const result = try searcher.searchFile(Quiet, worker.shared.allocator, worker.shared.io, &sink, file, path, engine, cfg);
-            worker.shared.addSearch(result, result.matched_lines, size, 0);
+            worker.shared.addSearch(result, result.matched_lines, result.bytes_read, 0);
         },
         .json => {
             const JsonSink = json_printer.Printer(@TypeOf(engine.*));
             var sink = JsonSink{
                 .writer = &worker.buf.writer,
                 .finder = engine,
-                .bytes_searched = size,
+                .bytes_searched = 0,
             };
             const result = try searcher.searchFile(JsonSink, worker.shared.allocator, worker.shared.io, &sink, file, path, engine, cfg);
             if (sink.write_error) |err| return err;
+            sink.bytes_searched = result.bytes_read;
             const elapsed = elapsedNanos(started.durationTo(std.Io.Timestamp.now(worker.shared.io, .awake)));
             if (sink.started and !sink.writeEnd(elapsed)) {
                 if (sink.write_error) |err| return err;
             }
             const bytes = worker.buf.written();
             if (sink.started) try worker.flush(bytes);
-            worker.shared.addSearch(result, sink.matches, size, bytes.len);
+            worker.shared.addSearch(result, sink.matches, result.bytes_read, bytes.len);
         },
     }
 }
 
 const Quiet = struct {
-    stop: *std.atomic.Value(bool),
+    shared: *Shared,
 
     pub fn matched(self: *Quiet, line: searcher.Line) bool {
         _ = line;
-        self.stop.store(true, .release);
+        requestStop(self.shared);
         return false;
     }
 };
@@ -493,9 +537,42 @@ const Quiet = struct {
 pub fn resolveThreads(requested: u32) u32 {
     if (builtin.single_threaded) return 1;
     if (requested != 0) return requested;
-    const count = std.Thread.getCpuCount() catch 1;
+    const logical = std.Thread.getCpuCount() catch 1;
+    var count = logical;
+    // 大小核上，逻辑 CPU 数会把一半工人放到能效核。目录搜索要等最慢的工人，
+    // 8 线程的合计 system 时间大约是 4 个性能核的两倍，墙钟更慢。显式 -j 不走这里。
+    if (performanceCoreCount()) |perf| {
+        if (perf > 0 and perf < logical) count = perf;
+    }
     if (count == 0) return 1;
     return @intCast(@min(count, std.math.maxInt(u32)));
+}
+
+fn performanceCoreCount() ?usize {
+    if (comptime !builtin.os.tag.isDarwin()) return null;
+    var count: c_int = 0;
+    var len: usize = @sizeOf(c_int);
+    const rc = std.posix.system.sysctlbyname("hw.perflevel0.physicalcpu", &count, &len, null, 0);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        else => return null,
+    }
+    if (count <= 0) return null;
+    return @intCast(count);
+}
+
+test "默认工人数在性能核更少时用性能核" {
+    if (builtin.single_threaded) return;
+    const logical = std.Thread.getCpuCount() catch 1;
+    const n = resolveThreads(0);
+    if (performanceCoreCount()) |perf| {
+        if (perf > 0 and perf < logical) {
+            try testing.expectEqual(@as(u32, @intCast(perf)), n);
+            return;
+        }
+    }
+    const expect: u32 = @intCast(@min(@max(logical, 1), std.math.maxInt(u32)));
+    try testing.expectEqual(expect, n);
 }
 
 fn elapsedNanos(duration: std.Io.Duration) u64 {
@@ -610,5 +687,103 @@ test "目录搜索共享只读的多模式自动机" {
     try testing.expectEqual(@as(u64, 2), stats.matched_lines);
     try testing.expectEqual(@as(u64, 2), stats.searches_with_match);
     try testing.expectEqual(@as(u64, 3), stats.searches);
+    try testing.expectEqual(@as(u32, 0), stats.errors);
+}
+
+test "空闲工人被子目录叫醒后不会丢匹配" {
+    if (builtin.single_threaded) return;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const names = [_][]const u8{ "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7" };
+    for (names) |name| {
+        try tmp.dir.createDir(io, name, .default_dir);
+        var path_buf: [16]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "{s}/a.txt", .{name});
+        try tmp.dir.writeFile(io, .{ .sub_path = path, .data = "needle\n" });
+    }
+
+    const root = try tempRoot(tmp.dir);
+    defer testing.allocator.free(root);
+    var out: std.Io.Writer.Allocating = .init(std.heap.smp_allocator);
+    defer out.deinit();
+    var err_w: std.Io.Writer.Allocating = .init(std.heap.smp_allocator);
+    defer err_w.deinit();
+    var saw = false;
+    const stats = try run(std.heap.smp_allocator, io, .{
+        .pattern = "needle",
+        .roots = &.{root},
+        .walk = .{ .threads = 4 },
+        .emit = .count,
+        .stdout = &out.writer,
+        .stderr = &err_w.writer,
+        .saw_output = &saw,
+    });
+    try testing.expectEqual(@as(u64, 8), stats.matched_lines);
+    try testing.expectEqual(@as(u64, 8), stats.searches_with_match);
+    try testing.expectEqual(@as(u32, 0), stats.errors);
+}
+
+test "同一个大目录里的文件不会被多工人丢掉" {
+    if (builtin.single_threaded) return;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    var i: usize = 0;
+    while (i < 40) : (i += 1) {
+        var path_buf: [16]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "f{d:0>2}.txt", .{i});
+        try tmp.dir.writeFile(io, .{ .sub_path = path, .data = "needle\n" });
+    }
+
+    const root = try tempRoot(tmp.dir);
+    defer testing.allocator.free(root);
+    var out: std.Io.Writer.Allocating = .init(std.heap.smp_allocator);
+    defer out.deinit();
+    var err_w: std.Io.Writer.Allocating = .init(std.heap.smp_allocator);
+    defer err_w.deinit();
+    var saw = false;
+    const stats = try run(std.heap.smp_allocator, io, .{
+        .pattern = "needle",
+        .roots = &.{root},
+        .walk = .{ .threads = 4 },
+        .emit = .count,
+        .stdout = &out.writer,
+        .stderr = &err_w.writer,
+        .saw_output = &saw,
+    });
+    try testing.expectEqual(@as(u64, 40), stats.matched_lines);
+    try testing.expectEqual(@as(u64, 40), stats.searches);
+    try testing.expectEqual(@as(u32, 0), stats.errors);
+    try testing.expect(stats.bytes_searched >= 40);
+}
+
+test "quiet 命中会叫醒已经睡着的工人" {
+    if (builtin.single_threaded) return;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "hit.txt", .data = "needle\n" });
+    try tmp.dir.createDir(io, "sub", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "sub/a.txt", .data = "needle\n" });
+
+    const root = try tempRoot(tmp.dir);
+    defer testing.allocator.free(root);
+    var out: std.Io.Writer.Allocating = .init(std.heap.smp_allocator);
+    defer out.deinit();
+    var err_w: std.Io.Writer.Allocating = .init(std.heap.smp_allocator);
+    defer err_w.deinit();
+    var saw = false;
+    const stats = try run(std.heap.smp_allocator, io, .{
+        .pattern = "needle",
+        .roots = &.{root},
+        .walk = .{ .threads = 4 },
+        .emit = .quiet,
+        .stdout = &out.writer,
+        .stderr = &err_w.writer,
+        .saw_output = &saw,
+    });
+    try testing.expect(stats.matched);
+    try testing.expect(stats.matched_lines >= 1);
     try testing.expectEqual(@as(u32, 0), stats.errors);
 }

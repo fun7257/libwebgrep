@@ -11,6 +11,7 @@ const std = @import("std");
 const ascii = @import("ascii.zig");
 const build_options = @import("build_options");
 const matcher = @import("../matcher.zig");
+const memchr = @import("memchr.zig");
 
 const isa = switch (build_options.teddy) {
     .neon => @import("teddy_neon.zig"),
@@ -85,6 +86,18 @@ pub const Engine = struct {
         var pos = start;
         while (pos < haystack.len) {
             if (mode == .earliest and done(best, pos, self.min_len)) break;
+            if (haystack.len - pos >= lanes * 4) {
+                if (self.leadingEmpty(haystack, pos, mode, &best)) |skip| {
+                    if (skip == 4) {
+                        pos += lanes * 4;
+                        continue;
+                    }
+                    pos += skip * lanes;
+                    if (self.scan(haystack, pos, mode, &best)) break;
+                    pos += lanes;
+                    continue;
+                } else break;
+            }
             if (haystack.len - pos >= lanes) {
                 if (self.scan(haystack, pos, mode, &best)) break;
                 pos += lanes;
@@ -97,33 +110,82 @@ pub const Engine = struct {
         return .{ .start = chosen.start, .end = chosen.end };
     }
 
+    /// 连续空窗口的个数。`null` 表示 earliest 已经不可能再有更早的结束。
+    fn leadingEmpty(self: *const Engine, haystack: []const u8, pos: usize, mode: matcher.MatchMode, best: *const ?Cand) ?usize {
+        var n: usize = 0;
+        while (n < 4) : (n += 1) {
+            const at = pos + n * lanes;
+            if (mode == .earliest and done(best.*, at, self.min_len)) return null;
+            if (self.windowHot(haystack, at)) return n;
+        }
+        return 4;
+    }
+
+    fn windowHot(self: *const Engine, haystack: []const u8, pos: usize) bool {
+        const base = loadAt(haystack, pos);
+        const next = if (self.fingerprint > 1) loadAt(haystack, pos + lanes) else base;
+        var combined: Vec = @splat(0);
+        var g: usize = 0;
+        while (g < self.ngroups) : (g += 1) combined |= self.maskVec(g, base, next);
+        return vectorHot(combined);
+    }
+
     fn scan(self: *const Engine, haystack: []const u8, pos: usize, mode: matcher.MatchMode, best: *?Cand) bool {
         const base = loadAt(haystack, pos);
         const next = if (self.fingerprint > 1) loadAt(haystack, pos + lanes) else base;
-        var masks: [max_groups][lanes]u8 = undefined;
+        var accs: [max_groups]Vec = undefined;
+        var combined: Vec = @splat(0);
         var g: usize = 0;
         while (g < self.ngroups) : (g += 1) {
-            masks[g] = self.maskOf(g, base, next);
+            accs[g] = self.maskVec(g, base, next);
+            combined |= accs[g];
         }
-        var lane: usize = 0;
-        while (lane < lanes) : (lane += 1) {
-            const at = pos + lane;
-            if (at >= haystack.len) return false;
-            if (mode == .earliest and done(best.*, at, self.min_len)) return true;
-            var row: [max_groups]u8 = @splat(0);
-            var any = false;
-            g = 0;
-            while (g < self.ngroups) : (g += 1) {
-                row[g] = masks[g][lane];
-                if (row[g] != 0) any = true;
+        if (comptime lanes == 16) {
+            var bits = nonzero16(combined);
+            while (bits != 0) {
+                @branchHint(.unlikely);
+                const lane = @ctz(bits) / 4;
+                const shift: u6 = @intCast(lane * 4);
+                bits &= ~(@as(u64, 0xF) << shift);
+                if (self.confirmLane(haystack, pos, lane, mode, best, &accs)) return true;
             }
-            if (!any) continue;
-            if (self.confirm(haystack, at, mode, best, row)) return true;
+            return false;
+        } else {
+            const halves: [2]@Vector(16, u8) = @bitCast(combined);
+            var half: usize = 0;
+            while (half < 2) : (half += 1) {
+                var bits = nonzero16(halves[half]);
+                while (bits != 0) {
+                    @branchHint(.unlikely);
+                    const lane = half * 16 + @ctz(bits) / 4;
+                    const shift: u6 = @intCast((@ctz(bits) / 4) * 4);
+                    bits &= ~(@as(u64, 0xF) << shift);
+                    if (self.confirmLane(haystack, pos, lane, mode, best, &accs)) return true;
+                }
+            }
+            return false;
         }
-        return false;
     }
 
-    fn maskOf(self: *const Engine, group: usize, base: Vec, next: Vec) [lanes]u8 {
+    fn confirmLane(
+        self: *const Engine,
+        haystack: []const u8,
+        pos: usize,
+        lane: usize,
+        mode: matcher.MatchMode,
+        best: *?Cand,
+        accs: *const [max_groups]Vec,
+    ) bool {
+        const at = pos + lane;
+        if (at >= haystack.len) return false;
+        if (mode == .earliest and done(best.*, at, self.min_len)) return true;
+        var row: [max_groups]u8 = @splat(0);
+        var g: usize = 0;
+        while (g < self.ngroups) : (g += 1) row[g] = laneByte(accs[g], lane);
+        return self.confirm(haystack, at, mode, best, row);
+    }
+
+    fn maskVec(self: *const Engine, group: usize, base: Vec, next: Vec) Vec {
         var acc = nibble(&self.groups[group].lo[0], &self.groups[group].hi[0], base);
         if (self.fingerprint > 1) {
             acc &= nibble(&self.groups[group].lo[1], &self.groups[group].hi[1], isa.shift(base, next, 1));
@@ -181,6 +243,23 @@ pub const Engine = struct {
         return false;
     }
 };
+
+fn vectorHot(acc: Vec) bool {
+    if (comptime lanes == 16) return nonzero16(acc) != 0;
+    const halves: [2]@Vector(16, u8) = @bitCast(acc);
+    return nonzero16(halves[0]) != 0 or nonzero16(halves[1]) != 0;
+}
+
+fn nonzero16(block: @Vector(16, u8)) u64 {
+    const hits = block != @as(@Vector(16, u8), @splat(0));
+    const flags: @Vector(16, u8) = @select(u8, hits, @as(@Vector(16, u8), @splat(@as(u8, 0xFF))), @as(@Vector(16, u8), @splat(@as(u8, 0))));
+    return memchr.nibbleMask(flags);
+}
+
+fn laneByte(acc: Vec, lane: usize) u8 {
+    const bytes: [lanes]u8 = acc;
+    return bytes[lane];
+}
 
 fn nibble(lo: *const [16]u8, hi: *const [16]u8, bytes: Vec) Vec {
     const lo_idx = bytes & @as(Vec, @splat(0x0f));

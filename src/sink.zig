@@ -17,6 +17,28 @@ pub const Span = struct {
     u16_end: usize = 0,
 };
 
+/// 回调对搜索的控制。`bool` 仍然表示继续或停止；服务入口也可以返回这个枚举。
+pub const Flow = enum {
+    cont,
+    pause,
+    stop,
+};
+
+/// 暂停后接着搜需要的计数。`resumeSourceSlice` 会带上它。
+pub const ResumeState = struct {
+    matched_lines: u64 = 0,
+    matches: u64 = 0,
+    bytes_read: u64 = 0,
+    bytes_searched: u64 = 0,
+    output_bytes: u64 = 0,
+    results_out: u64 = 0,
+    limit_count: u64 = 0,
+    line_number: u64 = 1,
+    started_ns: i128 = 0,
+    deadline_armed: bool = false,
+    skip_begin: bool = false,
+};
+
 /// 这次搜索为什么停下。`decompressed_bytes` 先留在这里，解压实现之前不会由扫描自己累计。
 pub const LimitHit = enum {
     none,
@@ -36,8 +58,10 @@ pub const SoftError = enum {
 /// 致命错误走函数的 error。软错误、有匹配、无匹配都是成功返回的结果，靠下面的字段区分。
 pub const Result = struct {
     outcome: Outcome = .complete,
-    /// `matched` 被调用的次数。计数打印器和退出码用它。
+    /// 匹配行数。和 `matches` 不是同一个数。
     matched_lines: u64 = 0,
+    /// 匹配次数。一行里可以有多次。
+    matches: u64 = 0,
     /// 检测到 NUL 时的绝对偏移。没有 NUL 就是 null。
     binary_offset: ?u64 = null,
     /// 与 `binary_offset` 相同。
@@ -52,6 +76,18 @@ pub const Result = struct {
     resume_at: ?u64 = null,
     /// 这个来源读失败。搜索调用本身仍然成功返回。
     soft_error: ?SoftError = null,
+    /// 回调要求暂停。还没有 end，也没有 summary。
+    paused: bool = false,
+    /// 输入已经扫完。没扫完时不把 summary 当成最终结果。
+    scanned_all: bool = false,
+    /// 从开始到这次返回的纳秒。测试时钟也可以驱动它。
+    elapsed_ns: u64 = 0,
+    /// 已经交给调用方的行字节。
+    output_bytes: u64 = 0,
+    /// 已经扫过的可搜索字节。
+    bytes_searched: u64 = 0,
+    /// 暂停后续搜用的计数。没暂停时也是这次结束时的快照。
+    resume_state: ResumeState = .{},
 };
 
 /// 一个输入的结束原因。
@@ -100,12 +136,46 @@ pub const LineEvent = struct {
     binary_status: BinaryStatus = .none,
 };
 
+/// 扫描过程中的进度。按调用方给的间隔产生。
+pub const Progress = struct {
+    source_id: []const u8,
+    bytes_searched: u64 = 0,
+    /// 到目前为止的匹配次数。
+    matches: u64 = 0,
+    matched_lines: u64 = 0,
+};
+
+/// 实时流空闲超时。不是错误，也不是结束。
+pub const Heartbeat = struct {
+    source_id: []const u8,
+    bytes_searched: u64 = 0,
+    matches: u64 = 0,
+    matched_lines: u64 = 0,
+};
+
+/// 一次请求的汇总。流没结束时不会作为最终结果发出。
+pub const Summary = struct {
+    source_id: []const u8 = "",
+    /// 纳秒。名字与清单字段一致。
+    elapsed: u64 = 0,
+    searches: u64 = 0,
+    searches_with_match: u64 = 0,
+    bytes_searched: u64 = 0,
+    bytes_printed: u64 = 0,
+    matched_lines: u64 = 0,
+    matches: u64 = 0,
+    bytes_read_raw: u64 = 0,
+    sources_failed: u64 = 0,
+};
+
 /// 一个来源结束。没有命中时也会产生。
 pub const EndEvent = struct {
     source_id: []const u8,
     binary_status: BinaryStatus = .none,
     binary_offset: ?u64 = null,
     matched_lines: u64 = 0,
+    /// 匹配次数。零命中也是 0，不会省掉这个字段。
+    matches: u64 = 0,
     bytes_read: u64 = 0,
     outcome: Outcome = .complete,
     limit_hit: LimitHit = .none,
@@ -115,14 +185,18 @@ pub const EndEvent = struct {
 };
 
 /// 服务入口的事件。每产生一个就回调一次，不把多行攒起来再交。
-/// begin、match、context、end 都只带来源标识。
+/// begin、match、context、progress、end、summary 都只带来源标识。
+/// 断点仍然是 `context_break`。实时流的空闲是 `heartbeat`。
 pub const Event = union(enum) {
     begin: struct { source_id: []const u8 },
     match: LineEvent,
     context: LineEvent,
     /// 上下文不连续。不是一段分隔文本。
     context_break: struct { source_id: []const u8 },
+    progress: Progress,
+    heartbeat: Heartbeat,
     end: EndEvent,
+    summary: Summary,
 };
 
 /// 交给 Sink 的一行。

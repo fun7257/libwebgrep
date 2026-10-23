@@ -22,7 +22,7 @@ libwebgrep 原名 zrg（webgrep core），是用纯 Zig 0.17 编写的服务端�
 6. 文中出现的数值（如上下文 ≤10 行、单行 ≤64 KiB）只是建议的数量级。审查只检查"有上限，且可以由服务层配置"，不检查具体数值。
 
 ## 二、输入与来源
-- [ ] A01 [MVP][P0][core] 输入抽象为"来源"（reader + 来源 ID）；公共 API 不接受用户提供的文件系统路径（rg PATH；CWE-22）
+- [x] A01 [MVP][P0][core] 输入抽象为"来源"（reader + 来源 ID）；公共 API 不接受用户提供的文件系统路径（rg PATH；CWE-22）
 - [ ] A02 [MVP][P0][core] 支持不可回退的流式输入，不依赖 seek 或 mmap
 - [ ] A03 [后续][P1][core] 模式列表输入：每行一个模式，空行匹配所有行；只接受文本，不读服务器上的文件（rg -f）
 - [ ] A04 [后续][P1][core] gzip 在进程内流式解压，按 Content-Encoding 或文件魔数检测：
@@ -134,7 +134,7 @@ libwebgrep 原名 zrg（webgrep core），是用纯 Zig 0.17 编写的服务端�
 - [x] I09 [MVP][P0][core] 类型化错误：致命错误、每个来源的软错误、"有匹配/无匹配"三者分开表达。不照搬 rg 把软错误也归入退出码 2 的做法
 - [x] I10 [MVP][P0][core] 返回给调用方的错误不包含内部路径等细节，细节只通过服务端日志钩子输出（OWASP Error Handling）
 - [x] I11 [MVP][core] core 不读取任何环境变量或配置文件（rg RIPGREP_CONFIG_PATH / --no-config）
-- [ ] I12 [MVP][core] 安全默认值，并且都可以由服务层覆盖：
+- [x] I12 [MVP][core] 安全默认值，并且都可以由服务层覆盖：
   - 二进制内容默认跳过
   - 不跟随符号链接
   - 不读取全局和父目录的忽略规则
@@ -154,11 +154,11 @@ libwebgrep 原名 zrg（webgrep core），是用纯 Zig 0.17 编写的服务端�
   - 有总开关
   - 没有 git 仓库时同样生效
 - [ ] J05 [后续][P1][core] 接受用户以文本形式提供的忽略规则，不接受路径（替代 rg --ignore-file）
-- [ ] J06 [MVP][P1][core] 强制不读取全局 excludes 配置（rg --no-ignore-global）
-- [ ] J07 [MVP][P1][core] 强制不读取搜索根目录之上的忽略规则（rg --no-ignore-parent）
+- [x] J06 [MVP][P1][core] 强制不读取全局 excludes 配置（rg --no-ignore-global）
+- [x] J07 [MVP][P1][core] 强制不读取搜索根目录之上的忽略规则（rg --no-ignore-parent）
 - [ ] J08 [后续][P1][core] 细分的忽略开关（rg --no-ignore-dot / --no-ignore-exclude / --no-ignore-vcs / --ignore-file-case-insensitive）
 - [ ] J09 [后续][P1][core] 最大遍历深度，由服务端固定（rg -d）
-- [ ] J10 [MVP][core] 每个文件或来源的大小上限，与 I01 统一处理（rg --max-filesize）
+- [x] J10 [MVP][core] 每个文件或来源的大小上限，与 I01 统一处理（rg --max-filesize）
 - [ ] J11 [后续][P1][core] 不跨越文件系统边界，默认开启（rg --one-file-system）
 - [ ] J12 [后续][P1][能力] 提供"文件类型 → glob"的展开接口，类型表由配置层提供（rg -t / -T / --type-add）
 - [ ] J13 [后续][P1][core] 可以列出将被搜索的来源，这一操作计入遍历预算（rg --files）

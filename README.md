@@ -126,54 +126,28 @@ var any = libwebgrep.AnySink{ .ctx = @ptrCast(&sink), .vtable = &vtable };
 _ = try libwebgrep.searchSlice(libwebgrep.AnySink, &any, haystack, "", &finder, .{});
 ```
 
-## 搜索一个文件
+## 搜索一个来源
 
-服务入口是 `searchSource`（reader）和 `searchSourceSlice`（内存切片），再加上调用方分配的来源标识。`searchFile` 和 `parallel.run` 不是服务入口，N7 会从公共 API 去掉。
+公共入口是 `searchSource`（调用方打开的 reader）和 `searchSourceSlice`（内存切片）。来源标识由调用方分配，库不解释，事件里也不带服务器路径。要搜多个来源，调用方自己打开每一路流，分别传入来源标识。库不接收文件系统路径。
 
-会分配或做 I/O 的函数显式接收分配器和 `std.Io`。热路径上的逐块查找不再分配，也不加锁。
+会分配或做 I/O 的函数显式接收分配器和 `std.Io`。热路径上的逐块查找不再分配，也不加锁。默认缓冲 1 MiB，单行上限 2 MiB，并且不超过硬顶。
 
 ```zig
-pub fn searchPath(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    path: []const u8,
-    pattern: []const u8,
-    writer: *std.Io.Writer,
-) !libwebgrep.Result {
-    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
-    defer file.close(io);
-
-    var finder = try libwebgrep.Finder.init(pattern, .{ .case = .insensitive });
-    var printer = libwebgrep.TextPrinter{ .writer = writer, .show_path = true };
-    return libwebgrep.searchFile(
-        libwebgrep.TextPrinter,
-        allocator,
-        io,
-        &printer,
-        file,
-        path,
-        &finder,
-        .{ .line_numbers = true, .before = 1, .after = 1 },
-    );
-}
+const Collect = struct {
+    pub fn event(self: *@This(), ev: libwebgrep.Event) bool {
+        _ = self;
+        _ = ev;
+        return true;
+    }
+};
+var found = Collect{};
+var reader = std.Io.Reader.fixed("alpha\nbeta\n");
+var one = try libwebgrep.Finder.init("alpha", .{});
+_ = try libwebgrep.searchSource(Collect, allocator, &found, &reader, "src-1", &one, .{});
+_ = try libwebgrep.searchSourceSlice(Collect, &found, "src-2", "beta\n", &one, .{});
 ```
 
-`searchReader` 的形状相同，只是把文件换成 `*std.Io.Reader`。默认缓冲 1 MiB，单行上限 2 MiB。超长行返回 `error.LineTooLong`，缓冲不会一直涨。
-
-内置打印器：
-
-- `TextPrinter`：`路径:行号:列号:文本`，上下文用 `-`，组之间用 `--`。
-- `CountPrinter`：单输入写 `N`，多输入写 `路径:N`。
-- `Json`：对齐 `rg --json` 的 JSON Lines。没有命中的文件不写事件。
-- `Files`：命中一次就写路径，对应 `-l`。
-
-二进制策略：
-
-- `.quit`：读到 NUL 就停。`parallel.run` 在策略不是 `.none` 时改成这个。
-- `.report`：确认有匹配后只报告二进制说明。`searchFile` 的默认由调用方传入。
-- `.none`：不检测。
-
-目录搜索在 `libwebgrep.parallel.run`。单个模式时每个工人有自己的查找器。多个模式共享同一个只读的 `Multi`，工人不释放它。搜索缓冲和 Chase-Lev 队列仍是每个工人一份。忽略规则在发布之后只读。热路径上的逐块查找仍然不分配、不加锁；锁只包住一个文件的输出。
+二进制策略默认是 `.quit`：读到 NUL 就停。`.report` 继续确认有没有匹配，但是不返回行内容。`.none` 按文本处理。调用方可以在硬顶之内改上下文、单行、扫描字节和时间上限。跟随符号链接、读取全局忽略和父目录忽略都不能打开。
 
 ## 范围
 

@@ -29,20 +29,38 @@ pub fn find(comptime width: comptime_int, haystack: []const u8, start: usize, ne
 pub fn findEither(comptime width: comptime_int, haystack: []const u8, start: usize, a: u8, b: u8) ?usize {
     comptime checkWidth(width);
     if (start >= haystack.len) return null;
+    if (a == b) return std.mem.findScalarPos(u8, haystack, start, a);
 
+    const V = @Vector(width, u8);
+    const va: V = @splat(a);
+    const vb: V = @splat(b);
     var i: usize = start;
     const n = haystack.len;
     if (n - i >= width) {
         const stride = width * 4;
         while (n - i >= stride) {
+            var hits: [4]@Vector(width, bool) = undefined;
             inline for (0..4) |k| {
-                const at = i + k * width;
-                if (firstIn(width, haystack[at..][0..width].*, a, b)) |rel| return at + rel;
+                const block: V = haystack[i + k * width ..][0..width].*;
+                hits[k] = (block == va) | (block == vb);
+            }
+            if (@reduce(.Or, (hits[0] | hits[1]) | (hits[2] | hits[3]))) {
+                @branchHint(.unlikely);
+                inline for (0..4) |k| {
+                    if (@reduce(.Or, hits[k])) {
+                        return i + k * width + @as(usize, std.simd.firstTrue(hits[k]).?);
+                    }
+                }
             }
             i += stride;
         }
         while (n - i >= width) {
-            if (firstIn(width, haystack[i..][0..width].*, a, b)) |rel| return i + rel;
+            const block: V = haystack[i..][0..width].*;
+            const hit = (block == va) | (block == vb);
+            if (@reduce(.Or, hit)) {
+                @branchHint(.unlikely);
+                return i + @as(usize, std.simd.firstTrue(hit).?);
+            }
             i += width;
         }
     }
@@ -74,20 +92,31 @@ pub fn count(comptime width: comptime_int, haystack: []const u8, start: usize, e
     const limit = @min(end, haystack.len);
     if (start >= limit) return 0;
 
+    const V = @Vector(width, u8);
+    const vn: V = @splat(needle);
     var i: usize = start;
     var total: usize = 0;
     if (limit - i >= width) {
         const stride = width * 4;
         while (limit - i >= stride) {
-            inline for (0..4) |k| {
-                total += countIn(width, haystack[i + k * width ..][0..width].*, needle);
+            var acc: V = @splat(0);
+            var batches: usize = 0;
+            while (limit - i >= stride and batches < 63) : (batches += 1) {
+                inline for (0..4) |k| {
+                    const block: V = haystack[i + k * width ..][0..width].*;
+                    acc +%= @intFromBool(block == vn);
+                }
+                i += stride;
             }
-            i += stride;
+            total += @reduce(.Add, @as(@Vector(width, u16), acc));
         }
+        var tail_acc: V = @splat(0);
         while (limit - i >= width) {
-            total += countIn(width, haystack[i..][0..width].*, needle);
+            const block: V = haystack[i..][0..width].*;
+            tail_acc +%= @intFromBool(block == vn);
             i += width;
         }
+        total += @reduce(.Add, @as(@Vector(width, u16), tail_acc));
     }
     while (i < limit) : (i += 1) {
         if (haystack[i] == needle) total += 1;

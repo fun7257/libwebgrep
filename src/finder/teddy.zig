@@ -21,8 +21,8 @@ const isa = switch (build_options.teddy) {
 };
 
 const lanes = isa.lanes;
-const max_groups = 4;
-const max_patterns = max_groups * 8;
+const num_buckets = 8;
+const max_patterns = 32;
 const max_fp = 3;
 
 const Vec = @Vector(lanes, u8);
@@ -43,8 +43,8 @@ pub const Engine = struct {
     ignore_case: bool,
     min_len: usize,
     fingerprint: u8,
-    ngroups: u8,
-    groups: [max_groups]Group,
+    group: Group,
+    bucket_pats: [num_buckets]u32,
 
     pub fn init(patterns: []const []const u8, ignore_case: bool) Engine {
         std.debug.assert(patterns.len > 0 and patterns.len <= max_patterns);
@@ -54,15 +54,17 @@ pub const Engine = struct {
             min_len = @min(min_len, pat.len);
         }
         const fingerprint: u8 = @intCast(@min(min_len, max_fp));
-        var groups: [max_groups]Group = std.mem.zeroes([max_groups]Group);
+        var group: Group = std.mem.zeroes(Group);
+        var bucket_pats: [num_buckets]u32 = @splat(0);
         for (patterns, 0..) |pat, id| {
-            const group = id / 8;
-            const bit: u8 = @as(u8, 1) << @intCast(id % 8);
+            const bucket: u3 = @intCast(id % num_buckets);
+            const bit: u8 = @as(u8, 1) << bucket;
+            bucket_pats[bucket] |= @as(u32, 1) << @intCast(id);
             for (0..fingerprint) |k| {
                 const forms = if (ignore_case) ascii.caseVariants(pat[k]) else [2]u8{ pat[k], pat[k] };
                 for (forms) |byte| {
-                    groups[group].lo[k][byte & 0x0f] |= bit;
-                    groups[group].hi[k][byte >> 4] |= bit;
+                    group.lo[k][byte & 0x0f] |= bit;
+                    group.hi[k][byte >> 4] |= bit;
                 }
             }
         }
@@ -71,8 +73,8 @@ pub const Engine = struct {
             .ignore_case = ignore_case,
             .min_len = min_len,
             .fingerprint = fingerprint,
-            .ngroups = @intCast((patterns.len + 7) / 8),
-            .groups = groups,
+            .group = group,
+            .bucket_pats = bucket_pats,
         };
     }
 
@@ -81,77 +83,177 @@ pub const Engine = struct {
     }
 
     pub fn find(self: *const Engine, haystack: []const u8, start: usize, mode: matcher.MatchMode) ?matcher.Match {
+        var unused: ?usize = null;
         if (start > haystack.len) return null;
+        return switch (self.fingerprint) {
+            inline 1...max_fp => |fp| self.findFp(fp, haystack, start, mode, false, &unused),
+            else => unreachable,
+        };
+    }
+
+    pub fn findWatchingNul(
+        self: *const Engine,
+        haystack: []const u8,
+        start: usize,
+        mode: matcher.MatchMode,
+        nul_out: *?usize,
+    ) ?matcher.Match {
+        if (start > haystack.len) return null;
+        return switch (self.fingerprint) {
+            inline 1...max_fp => |fp| self.findFp(fp, haystack, start, mode, true, nul_out),
+            else => unreachable,
+        };
+    }
+
+    noinline fn findFp(
+        self: *const Engine,
+        comptime fp: u8,
+        haystack: []const u8,
+        start: usize,
+        mode: matcher.MatchMode,
+        comptime watch_nul: bool,
+        nul_out: *?usize,
+    ) ?matcher.Match {
+        var lo_tab: [fp]Vec = undefined;
+        var hi_tab: [fp]Vec = undefined;
+        inline for (0..fp) |k| {
+            lo_tab[k] = expandTable(&self.group.lo[k]);
+            hi_tab[k] = expandTable(&self.group.hi[k]);
+        }
+
         var best: ?Cand = null;
         var pos = start;
+        var nul_checked = start;
+        const fast_extra: usize = fp - 1;
+        const stride = lanes * 4;
+        const zero: Vec = @splat(0);
+
+        outer: while (pos + stride + fast_extra <= haystack.len) {
+            if (mode == .earliest and best != null and done(best, pos, self.min_len)) break;
+            var accs: [4]Vec = undefined;
+            var nul_hit: @Vector(lanes, bool) = @splat(false);
+            inline for (0..4) |w| {
+                const at = pos + w * lanes;
+                const b0: Vec = haystack[at..][0..lanes].*;
+                accs[w] = nibbleVec(lo_tab[0], hi_tab[0], b0);
+                if (watch_nul) nul_hit = nul_hit | (b0 == zero);
+            }
+            const combined = (accs[0] | accs[1]) | (accs[2] | accs[3]);
+            const check_v = if (watch_nul) combined | @as(Vec, @intFromBool(nul_hit)) else combined;
+            if (@reduce(.Or, check_v) == 0) {
+                pos += stride;
+                if (watch_nul and best == null) nul_checked = pos;
+                continue;
+            }
+            inline for (0..4) |w| {
+                const at = pos + w * lanes;
+                if (mode == .earliest and done(best, at, self.min_len)) break :outer;
+                if (@reduce(.Or, accs[w]) != 0) {
+                    const acc = evalRefine(fp, accs[w], haystack, at, &lo_tab, &hi_tab);
+                    if (@reduce(.Or, acc) != 0) {
+                        if (self.scanVec(haystack, at, mode, &best, acc)) break :outer;
+                    }
+                }
+            }
+            if (watch_nul and best == null and @reduce(.Or, nul_hit)) {
+                if (memchr.find(lanes, haystack[0 .. pos + stride], nul_checked, 0)) |nul_at| {
+                    nul_out.* = nul_at;
+                    return null;
+                }
+                nul_checked = pos + stride;
+            }
+            pos += stride;
+        }
+
         while (pos < haystack.len) {
             if (mode == .earliest and done(best, pos, self.min_len)) break;
-            if (haystack.len - pos >= lanes * 4) {
-                if (self.leadingEmpty(haystack, pos, mode, &best)) |skip| {
-                    if (skip == 4) {
-                        pos += lanes * 4;
-                        continue;
-                    }
-                    pos += skip * lanes;
-                    if (self.scan(haystack, pos, mode, &best)) break;
-                    pos += lanes;
-                    continue;
-                } else break;
-            }
             if (haystack.len - pos >= lanes) {
-                if (self.scan(haystack, pos, mode, &best)) break;
+                const acc = self.maskTail(fp, haystack, pos, &lo_tab, &hi_tab);
+                if (@reduce(.Or, acc) != 0) {
+                    if (self.scanVec(haystack, pos, mode, &best, acc)) break;
+                }
                 pos += lanes;
             } else {
                 if (self.confirm(haystack, pos, mode, &best, null)) break;
                 pos += 1;
             }
         }
-        const chosen = best orelse return null;
+        const chosen = best orelse {
+            if (watch_nul and nul_checked < haystack.len) {
+                if (memchr.find(lanes, haystack, nul_checked, 0)) |nul_at| nul_out.* = nul_at;
+            }
+            return null;
+        };
+        if (watch_nul and nul_checked < chosen.start) {
+            if (memchr.find(lanes, haystack[0..chosen.start], nul_checked, 0)) |nul_at| {
+                nul_out.* = nul_at;
+                return null;
+            }
+        }
         return .{ .start = chosen.start, .end = chosen.end };
     }
 
-    /// 连续空窗口的个数。`null` 表示 earliest 已经不可能再有更早的结束。
-    fn leadingEmpty(self: *const Engine, haystack: []const u8, pos: usize, mode: matcher.MatchMode, best: *const ?Cand) ?usize {
-        var n: usize = 0;
-        while (n < 4) : (n += 1) {
-            const at = pos + n * lanes;
-            if (mode == .earliest and done(best.*, at, self.min_len)) return null;
-            if (self.windowHot(haystack, at)) return n;
+    inline fn evalRefine(
+        comptime fp: u8,
+        acc0: Vec,
+        haystack: []const u8,
+        at: usize,
+        lo_tab: *const [fp]Vec,
+        hi_tab: *const [fp]Vec,
+    ) Vec {
+        var acc = acc0;
+        if (comptime fp > 1) {
+            const b1: Vec = haystack[at + 1 ..][0..lanes].*;
+            acc &= nibbleVec(lo_tab[1], hi_tab[1], b1);
         }
-        return 4;
+        if (comptime fp > 2) {
+            const b2: Vec = haystack[at + 2 ..][0..lanes].*;
+            acc &= nibbleVec(lo_tab[2], hi_tab[2], b2);
+        }
+        return acc;
     }
 
-    fn windowHot(self: *const Engine, haystack: []const u8, pos: usize) bool {
+    fn maskTail(
+        self: *const Engine,
+        comptime fp: u8,
+        haystack: []const u8,
+        pos: usize,
+        lo_tab: *const [fp]Vec,
+        hi_tab: *const [fp]Vec,
+    ) Vec {
+        _ = self;
         const base = loadAt(haystack, pos);
-        const next = if (self.fingerprint > 1) loadAt(haystack, pos + lanes) else base;
-        var combined: Vec = @splat(0);
-        var g: usize = 0;
-        while (g < self.ngroups) : (g += 1) combined |= self.maskVec(g, base, next);
-        return vectorHot(combined);
+        const next = if (comptime fp > 1) loadAt(haystack, pos + lanes) else base;
+        var acc = nibbleVec(lo_tab[0], hi_tab[0], base);
+        if (comptime fp > 1) {
+            acc &= nibbleVec(lo_tab[1], hi_tab[1], isa.shift(base, next, 1));
+        }
+        if (comptime fp > 2) {
+            acc &= nibbleVec(lo_tab[2], hi_tab[2], isa.shift(base, next, 2));
+        }
+        return acc;
     }
 
-    fn scan(self: *const Engine, haystack: []const u8, pos: usize, mode: matcher.MatchMode, best: *?Cand) bool {
-        const base = loadAt(haystack, pos);
-        const next = if (self.fingerprint > 1) loadAt(haystack, pos + lanes) else base;
-        var accs: [max_groups]Vec = undefined;
-        var combined: Vec = @splat(0);
-        var g: usize = 0;
-        while (g < self.ngroups) : (g += 1) {
-            accs[g] = self.maskVec(g, base, next);
-            combined |= accs[g];
-        }
+    fn scanVec(
+        self: *const Engine,
+        haystack: []const u8,
+        pos: usize,
+        mode: matcher.MatchMode,
+        best: *?Cand,
+        acc: Vec,
+    ) bool {
         if (comptime lanes == 16) {
-            var bits = nonzero16(combined);
+            var bits = nonzero16(acc);
             while (bits != 0) {
                 @branchHint(.unlikely);
                 const lane = @ctz(bits) / 4;
                 const shift: u6 = @intCast(lane * 4);
                 bits &= ~(@as(u64, 0xF) << shift);
-                if (self.confirmLane(haystack, pos, lane, mode, best, &accs)) return true;
+                if (self.confirmLane(haystack, pos, lane, mode, best, laneByte(acc, lane))) return true;
             }
             return false;
         } else {
-            const halves: [2]@Vector(16, u8) = @bitCast(combined);
+            const halves: [2]@Vector(16, u8) = @bitCast(acc);
             var half: usize = 0;
             while (half < 2) : (half += 1) {
                 var bits = nonzero16(halves[half]);
@@ -160,7 +262,7 @@ pub const Engine = struct {
                     const lane = half * 16 + @ctz(bits) / 4;
                     const shift: u6 = @intCast((@ctz(bits) / 4) * 4);
                     bits &= ~(@as(u64, 0xF) << shift);
-                    if (self.confirmLane(haystack, pos, lane, mode, best, &accs)) return true;
+                    if (self.confirmLane(haystack, pos, lane, mode, best, laneByte(acc, lane))) return true;
                 }
             }
             return false;
@@ -174,65 +276,56 @@ pub const Engine = struct {
         lane: usize,
         mode: matcher.MatchMode,
         best: *?Cand,
-        accs: *const [max_groups]Vec,
+        bucket_mask: u8,
     ) bool {
         const at = pos + lane;
         if (at >= haystack.len) return false;
         if (mode == .earliest and done(best.*, at, self.min_len)) return true;
-        var row: [max_groups]u8 = @splat(0);
-        var g: usize = 0;
-        while (g < self.ngroups) : (g += 1) row[g] = laneByte(accs[g], lane);
-        return self.confirm(haystack, at, mode, best, row);
+        return self.confirm(haystack, at, mode, best, bucket_mask);
     }
 
-    fn maskVec(self: *const Engine, group: usize, base: Vec, next: Vec) Vec {
-        var acc = nibble(&self.groups[group].lo[0], &self.groups[group].hi[0], base);
-        if (self.fingerprint > 1) {
-            acc &= nibble(&self.groups[group].lo[1], &self.groups[group].hi[1], isa.shift(base, next, 1));
-        }
-        if (self.fingerprint > 2) {
-            acc &= nibble(&self.groups[group].lo[2], &self.groups[group].hi[2], isa.shift(base, next, 2));
-        }
-        return acc;
-    }
-
-    /// `lane_bits` 为空时检查全部模式，供窗口尾巴使用。否则只确认这一路上置位的模式。
+    /// `bucket_mask` 为空时检查全部模式，供窗口尾巴使用。否则只确认置位桶里的模式。
     fn confirm(
         self: *const Engine,
         haystack: []const u8,
         at: usize,
         mode: matcher.MatchMode,
         best: *?Cand,
-        lane_bits: ?[max_groups]u8,
+        bucket_mask: ?u8,
     ) bool {
+        var pat_bits: u32 = 0;
+        if (bucket_mask) |bmask| {
+            var b = bmask;
+            while (b != 0) {
+                const bucket = @ctz(b);
+                b &= b - 1;
+                pat_bits |= self.bucket_pats[bucket];
+            }
+        } else {
+            pat_bits = if (self.patterns.len == 32)
+                std.math.maxInt(u32)
+            else
+                (@as(u32, 1) << @intCast(self.patterns.len)) - 1;
+        }
+
         var found = false;
-        var g: usize = 0;
-        while (g < self.ngroups) : (g += 1) {
-            const bits: u8 = if (lane_bits) |row| row[g] else 0xff;
-            if (bits == 0) continue;
-            var local: u32 = 0;
-            var rest = bits;
-            while (rest != 0) : (local += 1) {
-                const on: u8 = @intCast(rest & 1);
-                rest >>= 1;
-                if (on == 0) continue;
-                const id: u32 = @intCast(g * 8 + local);
-                if (id >= self.patterns.len) continue;
-                const pat = self.patterns[id];
-                if (!matchesAt(pat, haystack, at, self.ignore_case)) continue;
-                const cand = Cand{ .start = at, .end = at + pat.len, .id = id };
-                found = true;
-                switch (mode) {
-                    .leftmost_first => {
-                        best.* = cand;
-                        return true;
-                    },
-                    .earliest => {
-                        if (best.*) |cur| {
-                            if (prefer(cand, cur)) best.* = cand;
-                        } else best.* = cand;
-                    },
-                }
+        while (pat_bits != 0) {
+            const id: u32 = @ctz(pat_bits);
+            pat_bits &= pat_bits - 1;
+            const pat = self.patterns[id];
+            if (!matchesAt(pat, haystack, at, self.ignore_case)) continue;
+            const cand = Cand{ .start = at, .end = at + pat.len, .id = id };
+            found = true;
+            switch (mode) {
+                .leftmost_first => {
+                    best.* = cand;
+                    return true;
+                },
+                .earliest => {
+                    if (best.*) |cur| {
+                        if (prefer(cand, cur)) best.* = cand;
+                    } else best.* = cand;
+                },
             }
         }
         if (mode == .earliest and found) {
@@ -244,10 +337,17 @@ pub const Engine = struct {
     }
 };
 
-fn vectorHot(acc: Vec) bool {
-    if (comptime lanes == 16) return nonzero16(acc) != 0;
-    const halves: [2]@Vector(16, u8) = @bitCast(acc);
-    return nonzero16(halves[0]) != 0 or nonzero16(halves[1]) != 0;
+fn toMatch(best: ?Cand) ?matcher.Match {
+    const chosen = best orelse return null;
+    return .{ .start = chosen.start, .end = chosen.end };
+}
+
+fn expandTable(table: *const [16]u8) Vec {
+    if (comptime lanes == 16) return table.*;
+    var wide: [32]u8 = undefined;
+    wide[0..16].* = table.*;
+    wide[16..32].* = table.*;
+    return wide;
 }
 
 fn nonzero16(block: @Vector(16, u8)) u64 {
@@ -261,10 +361,10 @@ fn laneByte(acc: Vec, lane: usize) u8 {
     return bytes[lane];
 }
 
-fn nibble(lo: *const [16]u8, hi: *const [16]u8, bytes: Vec) Vec {
+inline fn nibbleVec(lo_v: Vec, hi_v: Vec, bytes: Vec) Vec {
     const lo_idx = bytes & @as(Vec, @splat(0x0f));
     const hi_idx = bytes >> @as(Vec, @splat(@as(u8, 4)));
-    return isa.lookup(lo, lo_idx) & isa.lookup(hi, hi_idx);
+    return isa.lookup(lo_v, lo_idx) & isa.lookup(hi_v, hi_idx);
 }
 
 fn loadAt(haystack: []const u8, at: usize) Vec {

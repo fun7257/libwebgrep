@@ -148,7 +148,6 @@ pub fn process(host: *Host, job: *Job) void {
     if (job.files) |names| {
         defer job.destroy(host.io);
         if (host.stop.load(.acquire)) return;
-        var scratch: [4096]u8 = undefined;
         for (names) |name| {
             if (host.stop.load(.acquire)) return;
             var rel_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -156,7 +155,7 @@ pub fn process(host: *Host, job: *Job) void {
                 report(host, job, name, error.NameTooLong);
                 continue;
             };
-            visitFile(host, job, name, rel, &scratch);
+            visitCheckedFile(host, job, name, rel);
         }
         return;
     }
@@ -199,30 +198,51 @@ const file_batch = 16;
 
 const FileBatch = struct {
     names: [file_batch][]const u8 = undefined,
+    storage: [4096]u8 = undefined,
+    used: usize = 0,
     len: usize = 0,
+
+    fn push(self: *FileBatch, host: *Host, job: *Job, name: []const u8) void {
+        if (name.len > self.storage.len) {
+            var rel_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const rel = joinRel(&rel_buf, job.rel, name) catch {
+                report(host, job, name, error.NameTooLong);
+                return;
+            };
+            visitCheckedFile(host, job, name, rel);
+            return;
+        }
+        if (self.used + name.len > self.storage.len or self.len == file_batch) {
+            flushFiles(host, job, self);
+        }
+        const slice = self.storage[self.used..][0..name.len];
+        @memcpy(slice, name);
+        self.used += name.len;
+        self.names[self.len] = slice;
+        self.len += 1;
+    }
 };
 
 fn flushFiles(host: *Host, job: *Job, batch: *FileBatch) void {
     if (batch.len == 0) return;
     const names = batch.names[0..batch.len];
     batch.len = 0;
+    batch.used = 0;
     const child = createFileJob(host, job, names) catch {
-        var scratch: [4096]u8 = undefined;
         for (names) |name| {
             var rel_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
             const rel = joinRel(&rel_buf, job.rel, name) catch continue;
-            visitFile(host, job, name, rel, &scratch);
+            visitCheckedFile(host, job, name, rel);
         }
         return;
     };
     host.push(host.push_ctx, child) catch |err| {
         child.destroy(host.io);
         report(host, job, "", err);
-        var scratch: [4096]u8 = undefined;
         for (names) |name| {
             var rel_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
             const rel = joinRel(&rel_buf, job.rel, name) catch continue;
-            visitFile(host, job, name, rel, &scratch);
+            visitCheckedFile(host, job, name, rel);
         }
     };
 }
@@ -253,11 +273,13 @@ fn handleEntry(host: *Host, job: *Job, entry: std.Io.Dir.Entry, batch: *FileBatc
             descend(host, job, name, rel, &scratch, child_dir);
         },
         .file => {
-            if (host.config.threads > 1 and !ignore.isIgnored(job.ignore, rel, false, &scratch) and allowFile(host, rel) and types.matches(host.config.types, name)) {
-                batch.names[batch.len] = name;
-                batch.len += 1;
+            if (ignore.isIgnored(job.ignore, rel, false, &scratch)) return;
+            if (!allowFile(host, rel)) return;
+            if (!types.matches(host.config.types, name)) return;
+            if (host.config.threads > 1) {
+                batch.push(host, job, name);
             } else {
-                visitFile(host, job, name, rel, &scratch);
+                visitCheckedFile(host, job, name, rel);
             }
         },
         // 链接本身不进入。目标即使在搜索根内也不读，遍历也不能顺着链接越出根。
@@ -309,17 +331,12 @@ fn descend(
     };
 }
 
-fn visitFile(
+fn visitCheckedFile(
     host: *Host,
     job: *Job,
     name: []const u8,
     rel: []const u8,
-    scratch: []u8,
 ) void {
-    if (ignore.isIgnored(job.ignore, rel, false, scratch)) return;
-    if (!allowFile(host, rel)) return;
-    if (!types.matches(host.config.types, name)) return;
-
     var size: u64 = 0;
     if (host.config.max_filesize) |limit| {
         const stat = job.dir.statFile(
@@ -334,11 +351,25 @@ fn visitFile(
         if (size > limit) return;
     }
 
-    const path = displayPath(host.allocator, job.root, rel) catch |err| {
-        report(host, job, name, err);
-        return;
+    var stack_path: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var heap_path: []u8 = &.{};
+    defer if (heap_path.len != 0) host.allocator.free(heap_path);
+    const path: []const u8 = if (rel.len == 0)
+        job.root
+    else if (job.root.len == 0)
+        rel
+    else if (job.root.len + 1 + rel.len <= stack_path.len) blk: {
+        @memcpy(stack_path[0..job.root.len], job.root);
+        stack_path[job.root.len] = '/';
+        @memcpy(stack_path[job.root.len + 1 ..][0..rel.len], rel);
+        break :blk stack_path[0 .. job.root.len + 1 + rel.len];
+    } else blk: {
+        heap_path = displayPath(host.allocator, job.root, rel) catch |err| {
+            report(host, job, name, err);
+            return;
+        };
+        break :blk heap_path;
     };
-    defer host.allocator.free(path);
     const control = host.on_file(host.file_ctx, .{
         .path = path,
         .dir = job.dir,
@@ -757,7 +788,10 @@ test "默认不跨文件系统" {
     try std.testing.expect(sawBase(same.items, "inside.txt"));
 
     const marker = "n7-cross.txt";
-    var shm = try std.Io.Dir.openDirAbsolute(io, "/dev/shm", .{});
+    var shm = std.Io.Dir.openDirAbsolute(io, "/dev/shm", .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
     defer shm.close(io);
     try shm.writeFile(io, .{ .sub_path = marker, .data = "secret\n" });
     defer shm.deleteFile(io, marker) catch {};

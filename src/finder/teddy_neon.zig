@@ -7,8 +7,7 @@ const std = @import("std");
 
 pub const lanes: usize = 16;
 
-pub fn lookup(table: *const [16]u8, idx: @Vector(16, u8)) @Vector(16, u8) {
-    const table_v: @Vector(16, u8) = table.*;
+pub inline fn lookup(table_v: @Vector(16, u8), idx: @Vector(16, u8)) @Vector(16, u8) {
     return asm (
         \\ tbl %[out].16b, {%[table].16b}, %[idx].16b
         : [out] "=w" (-> @Vector(16, u8)),
@@ -17,22 +16,15 @@ pub fn lookup(table: *const [16]u8, idx: @Vector(16, u8)) @Vector(16, u8) {
     );
 }
 
-pub fn shift(a: @Vector(16, u8), b: @Vector(16, u8), comptime n: u8) @Vector(16, u8) {
-    return switch (n) {
-        1 => asm (
-            \\ ext %[out].16b, %[a].16b, %[b].16b, #1
-            : [out] "=w" (-> @Vector(16, u8)),
-            : [a] "w" (a),
-              [b] "w" (b),
-        ),
-        2 => asm (
-            \\ ext %[out].16b, %[a].16b, %[b].16b, #2
-            : [out] "=w" (-> @Vector(16, u8)),
-            : [a] "w" (a),
-              [b] "w" (b),
-        ),
-        else => unreachable,
+pub inline fn shift(a: @Vector(16, u8), b: @Vector(16, u8), comptime n: u8) @Vector(16, u8) {
+    const mask = comptime blk: {
+        var m: [lanes]i32 = undefined;
+        for (0..lanes) |i| {
+            m[i] = if (i + n < lanes) @intCast(i + n) else -@as(i32, @intCast(i + n - lanes)) - 1;
+        }
+        break :blk m;
     };
+    return @shuffle(u8, a, b, mask);
 }
 
 test "NEON 移位让第 i 路对应起点 i" {

@@ -157,27 +157,33 @@ pub const PackedPair = struct {
             if (watched and guard.gave_up) return null;
             origin = bound + 1;
         }
-        // 一次推进 4 个向量，摊掉循环开销。命中处理不内联，避免把确认代码编进快循环。
+        // 一次推进 4 个向量，把 4 个窗口的掩码并起来做单次归约，减少 75% 的归约与分支指令。
         const stride = width * 4;
         while (origin <= last and origin + max_index + stride <= haystack.len) {
+            var masks: [4]@Vector(width, bool) = undefined;
             inline for (0..4) |k| {
-                const at = origin + k * width;
-                if (hotHit(self, width, haystack, at, fold, watch_nul)) {
-                    @branchHint(.unlikely);
-                    const rel = @call(
-                        .never_inline,
-                        takeHit,
-                        .{ self, width, haystack, at, last, &previous, fold, watched, watch_nul, guard, nul_out },
-                    );
-                    if (watch_nul and nul_out.* != null) return null;
-                    if (rel) |found| return at + found;
-                    if (watched and guard.gave_up) return null;
+                masks[k] = hotMask(self, width, haystack, origin + k * width, fold, watch_nul);
+            }
+            if (@reduce(.Or, (masks[0] | masks[1]) | (masks[2] | masks[3]))) {
+                @branchHint(.unlikely);
+                inline for (0..4) |k| {
+                    if (@reduce(.Or, masks[k])) {
+                        const at = origin + k * width;
+                        const rel = @call(
+                            .never_inline,
+                            takeHit,
+                            .{ self, width, haystack, at, last, &previous, fold, watched, watch_nul, guard, nul_out },
+                        );
+                        if (watch_nul and nul_out.* != null) return null;
+                        if (rel) |found| return at + found;
+                        if (watched and guard.gave_up) return null;
+                    }
                 }
             }
             origin += stride;
         }
         while (origin <= last and origin + max_index + width <= haystack.len) {
-            if (hotHit(self, width, haystack, origin, fold, watch_nul)) {
+            if (@reduce(.Or, hotMask(self, width, haystack, origin, fold, watch_nul))) {
                 @branchHint(.unlikely);
                 const rel = @call(
                     .never_inline,
@@ -213,26 +219,26 @@ inline fn byteMask(comptime width: comptime_int, block: @Vector(width, u8), byte
     if (!fold) return block == @as(@Vector(width, u8), @splat(byte));
     const forms = ascii.caseVariants(byte);
     if (forms[0] == forms[1]) return block == @as(@Vector(width, u8), @splat(forms[0]));
-    return (block == @as(@Vector(width, u8), @splat(forms[0]))) |
-        (block == @as(@Vector(width, u8), @splat(forms[1])));
+    // ASCII 字母的大写与小写只差 0x20 位，置位后等于小写形式，无假阳性且省掉一次比较与或运算。
+    return (block | @as(@Vector(width, u8), @splat(0x20))) == @as(@Vector(width, u8), @splat(forms[0]));
 }
 
-/// 这一窗里两个锚点字节有没有同时命中。`watch_nul` 时顺带看覆盖向量里有没有 NUL。
+/// 这一窗里两个锚点字节的命中掩码。`watch_nul` 时顺带并入覆盖向量里的 NUL 掩码。
 /// 覆盖向量是下标更小的那个锚点，已经在寄存器里，不再多加载一次。
-inline fn hotHit(
+inline fn hotMask(
     self: PackedPair,
     comptime width: comptime_int,
     haystack: []const u8,
     origin: usize,
     comptime fold: bool,
     comptime watch_nul: bool,
-) bool {
+) @Vector(width, bool) {
     const left: @Vector(width, u8) = haystack[origin + self.anchor_index ..][0..width].*;
     const right: @Vector(width, u8) = haystack[origin + self.other_index ..][0..width].*;
     const hits = byteMask(width, left, self.anchor, fold) & byteMask(width, right, self.other, fold);
-    if (!watch_nul) return @reduce(.Or, hits);
+    if (!watch_nul) return hits;
     const cover = if (self.anchor_index <= self.other_index) left else right;
-    return @reduce(.Or, hits | (cover == @as(@Vector(width, u8), @splat(0))));
+    return hits | (cover == @as(@Vector(width, u8), @splat(0)));
 }
 
 fn noteNul(haystack: []const u8, base: usize, nul_out: *?usize) bool {

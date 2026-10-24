@@ -5,11 +5,7 @@
 
 pub const lanes: usize = 32;
 
-pub fn lookup(table: *const [16]u8, idx: @Vector(32, u8)) @Vector(32, u8) {
-    var wide: [32]u8 = undefined;
-    wide[0..16].* = table.*;
-    wide[16..32].* = table.*;
-    const table_v: @Vector(32, u8) = wide;
+pub inline fn lookup(table_v: @Vector(32, u8), idx: @Vector(32, u8)) @Vector(32, u8) {
     return asm (
         \\ vpshufb %[idx], %[table], %[out]
         : [out] "=v" (-> @Vector(32, u8)),
@@ -18,25 +14,13 @@ pub fn lookup(table: *const [16]u8, idx: @Vector(32, u8)) @Vector(32, u8) {
     );
 }
 
-pub fn shift(a: @Vector(32, u8), b: @Vector(32, u8), comptime n: u8) @Vector(32, u8) {
-    var tmp: @Vector(32, u8) = @splat(0);
-    return switch (n) {
-        1 => asm (
-            \\ vperm2i128 $0x21, %[b], %[a], %[tmp]
-            \\ vpalignr $1, %[a], %[tmp], %[out]
-            : [out] "=&v" (-> @Vector(32, u8)),
-              [tmp] "=&v" (tmp),
-            : [a] "v" (a),
-              [b] "v" (b),
-        ),
-        2 => asm (
-            \\ vperm2i128 $0x21, %[b], %[a], %[tmp]
-            \\ vpalignr $2, %[a], %[tmp], %[out]
-            : [out] "=&v" (-> @Vector(32, u8)),
-              [tmp] "=&v" (tmp),
-            : [a] "v" (a),
-              [b] "v" (b),
-        ),
-        else => unreachable,
+pub inline fn shift(a: @Vector(32, u8), b: @Vector(32, u8), comptime n: u8) @Vector(32, u8) {
+    const mask = comptime blk: {
+        var m: [lanes]i32 = undefined;
+        for (0..lanes) |i| {
+            m[i] = if (i + n < lanes) @intCast(i + n) else -@as(i32, @intCast(i + n - lanes)) - 1;
+        }
+        break :blk m;
     };
+    return @shuffle(u8, a, b, mask);
 }

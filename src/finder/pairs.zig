@@ -122,17 +122,62 @@ pub const Engine = struct {
     }
 
     pub fn find(self: *const Engine, haystack: []const u8, start: usize, mode: matcher.MatchMode) ?matcher.Match {
+        return self.findInner(haystack, start, mode, false, undefined);
+    }
+
+    pub fn findWatchingNul(
+        self: *const Engine,
+        haystack: []const u8,
+        start: usize,
+        mode: matcher.MatchMode,
+        nul_out: *?usize,
+    ) ?matcher.Match {
+        return self.findInner(haystack, start, mode, true, nul_out);
+    }
+
+    fn findInner(
+        self: *const Engine,
+        haystack: []const u8,
+        start: usize,
+        mode: matcher.MatchMode,
+        comptime watch_nul: bool,
+        nul_out: *?usize,
+    ) ?matcher.Match {
         if (start > haystack.len) return null;
         var best: ?Cand = null;
         var pos = start;
+        var nul_checked: usize = start;
         while (pos < haystack.len) {
             // 邻接对很稀。确认一处之后若再扫到下一处，调用方每行找一次时会把文本读两遍。
             const limit = anchorLimit(haystack.len, pos, start, self.max_off, self.min_len, mode, best) orelse break;
-            const at = self.findCandidate(haystack, pos, limit) orelse break;
+            const at = self.findCandidate(haystack, pos, limit, watch_nul, &nul_checked, nul_out) orelse break;
+            if (watch_nul and nul_out.* != null) break;
             self.note(haystack, at, start, mode, &best);
             pos = at + 1;
         }
-        const chosen = best orelse return null;
+        if (watch_nul) {
+            if (nul_out.*) |nul_at| {
+                if (best) |chosen| {
+                    if (chosen.start <= nul_at) {
+                        nul_out.* = null;
+                        return .{ .start = chosen.start, .end = chosen.end };
+                    }
+                }
+                return null;
+            }
+        }
+        const chosen = best orelse {
+            if (watch_nul and nul_checked < haystack.len) {
+                if (memchr.find(width, haystack, nul_checked, 0)) |at| nul_out.* = at;
+            }
+            return null;
+        };
+        if (watch_nul and nul_checked < chosen.start) {
+            if (memchr.find(width, haystack[0..chosen.start], nul_checked, 0)) |at| {
+                nul_out.* = at;
+                return null;
+            }
+        }
         return .{ .start = chosen.start, .end = chosen.end };
     }
 
@@ -164,28 +209,67 @@ pub const Engine = struct {
         }
     }
 
-    fn findCandidate(self: *const Engine, hay: []const u8, pos: usize, limit: usize) ?usize {
+    fn findCandidate(
+        self: *const Engine,
+        hay: []const u8,
+        pos: usize,
+        limit: usize,
+        comptime watch_nul: bool,
+        nul_checked: *usize,
+        nul_out: *?usize,
+    ) ?usize {
         const end = @min(limit, hay.len);
         if (pos >= end) return null;
         const back: usize = if (self.nneg != 0) 1 else 0;
         const fwd: usize = if (self.npos != 0) 1 else 0;
         var i = pos;
         while (i < back and i < end) : (i += 1) {
-            if (self.hitScalar(hay, i)) return i;
+            if (watch_nul and hay[i] == 0) {
+                nul_out.* = i;
+                return null;
+            }
+            if (self.hitScalar(hay, i)) {
+                if (watch_nul and i + 1 > nul_checked.*) nul_checked.* = i + 1;
+                return i;
+            }
         }
-        if (self.scan(hay, &i, end, fwd)) |at| return at;
+        if (self.scan(hay, &i, end, fwd, watch_nul, nul_checked, nul_out)) |at| return at;
+        if (watch_nul and nul_out.* != null) return null;
         while (i < end) : (i += 1) {
-            if (self.hitScalar(hay, i)) return i;
+            if (watch_nul and hay[i] == 0) {
+                nul_out.* = i;
+                return null;
+            }
+            if (self.hitScalar(hay, i)) {
+                if (watch_nul and i + 1 > nul_checked.*) nul_checked.* = i + 1;
+                return i;
+            }
         }
+        if (watch_nul and end > nul_checked.*) nul_checked.* = end;
         return null;
     }
 
-    /// 桶不超过 8 个时先走哈希。再多就退回逐对比较。
-    /// 条数在进循环前定死。运行时逐条跳转时比较无法重叠。
-    noinline fn scan(self: *const Engine, hay: []const u8, i: *usize, end: usize, fwd: usize) ?usize {
+    /// 正向字节对不超过 2 个时直接做向量比较，省掉移位加哈希；
+    /// 桶不超过 8 个时走哈希；再多就退回逐对比较。
+    noinline fn scan(
+        self: *const Engine,
+        hay: []const u8,
+        i: *usize,
+        end: usize,
+        fwd: usize,
+        comptime watch_nul: bool,
+        nul_checked: *usize,
+        nul_out: *?usize,
+    ) ?usize {
+        if (self.collectDirect()) |direct| {
+            switch (direct.n) {
+                inline 1...2 => |n| return self.scanDirect(hay, i, end, &direct.rules, n, watch_nul, nul_checked, nul_out),
+                else => {},
+            }
+        }
         if (self.collectBuckets()) |pack| {
             switch (pack.n) {
-                inline 1...8 => |n| return self.scanBuckets(hay, i, end, &pack.bytes, n),
+                inline 1...8 => |n| return self.scanBuckets(hay, i, end, &pack.bytes, n, watch_nul, nul_checked, nul_out),
                 else => {},
             }
         }
@@ -199,6 +283,104 @@ pub const Engine = struct {
         }
     }
 
+    noinline fn scanDirect(
+        self: *const Engine,
+        hay: []const u8,
+        i: *usize,
+        end: usize,
+        rules: *const [2]Rule,
+        comptime n: u8,
+        comptime watch_nul: bool,
+        nul_checked: *usize,
+        nul_out: *?usize,
+    ) ?usize {
+        const V = @Vector(width, u8);
+        const zero: V = @splat(0);
+        var f_splat: [n]V = undefined;
+        var s_splat: [n]V = undefined;
+        inline for (0..n) |k| {
+            f_splat[k] = @splat(rules[k].anchor);
+            s_splat[k] = @splat(rules[k].partner);
+        }
+        var at = i.*;
+        const stride = width * fp_windows;
+        while (at + stride + 1 <= hay.len and at + stride <= end) {
+            var m0: [fp_windows]@Vector(width, bool) = undefined;
+            inline for (0..fp_windows) |w| {
+                const base = at + w * width;
+                const v0: V = hay[base..][0..width].*;
+                var m: @Vector(width, bool) = (v0 == f_splat[0]);
+                if (comptime n > 1) m = m | (v0 == f_splat[1]);
+                if (watch_nul) m = m | (v0 == zero);
+                m0[w] = m;
+            }
+            const lo4 = (m0[0] | m0[1]) | (m0[2] | m0[3]);
+            const hi4 = (m0[4] | m0[5]) | (m0[6] | m0[7]);
+            if (!@reduce(.Or, lo4 | hi4)) {
+                at += stride;
+                if (watch_nul and at > nul_checked.*) nul_checked.* = at;
+                continue;
+            }
+            inline for (0..fp_windows) |w| {
+                if (@reduce(.Or, m0[w])) {
+                    const base = at + w * width;
+                    const v0: V = hay[base..][0..width].*;
+                    const v1: V = hay[base + 1 ..][0..width].*;
+                    var m: @Vector(width, bool) = (v0 == f_splat[0]) & (v1 == s_splat[0]);
+                    if (comptime n > 1) m = m | ((v0 == f_splat[1]) & (v1 == s_splat[1]));
+                    const z = if (watch_nul) (v0 == zero) else @as(@Vector(width, bool), @splat(false));
+                    if (@reduce(.Or, m | z)) {
+                        if (self.verifySpan(hay, base, end)) |found| {
+                            if (watch_nul) {
+                                if (memchr.find(width, hay[0 .. found + 1], nul_checked.*, 0)) |nul_at| {
+                                    nul_out.* = nul_at;
+                                    return null;
+                                }
+                                if (found + 1 > nul_checked.*) nul_checked.* = found + 1;
+                            }
+                            i.* = found;
+                            return found;
+                        }
+                        if (watch_nul and @reduce(.Or, z)) {
+                            nul_out.* = base + @as(usize, std.simd.firstTrue(z).?);
+                            return null;
+                        }
+                    }
+                }
+                if (watch_nul and at + (w + 1) * width > nul_checked.*) nul_checked.* = at + (w + 1) * width;
+            }
+            at += stride;
+        }
+        while (at + width + 1 <= hay.len and at + width <= end) {
+            const v0: V = hay[at..][0..width].*;
+            const v1: V = hay[at + 1 ..][0..width].*;
+            var m: @Vector(width, bool) = @splat(false);
+            inline for (0..n) |k| m = m | ((v0 == f_splat[k]) & (v1 == s_splat[k]));
+            const z = if (watch_nul) (v0 == zero) else @as(@Vector(width, bool), @splat(false));
+            if (@reduce(.Or, m | z)) {
+                if (self.verifySpan(hay, at, end)) |found| {
+                    if (watch_nul) {
+                        if (memchr.find(width, hay[0 .. found + 1], nul_checked.*, 0)) |nul_at| {
+                            nul_out.* = nul_at;
+                            return null;
+                        }
+                        if (found + 1 > nul_checked.*) nul_checked.* = found + 1;
+                    }
+                    i.* = found;
+                    return found;
+                }
+                if (watch_nul and @reduce(.Or, z)) {
+                    nul_out.* = at + @as(usize, std.simd.firstTrue(z).?);
+                    return null;
+                }
+            }
+            at += width;
+            if (watch_nul and at > nul_checked.*) nul_checked.* = at;
+        }
+        i.* = at;
+        return null;
+    }
+
     /// `h = first + (second << 7)`。每个规则的哈希都放进桶里，所以不会漏。
     /// 负偏移的规则看的是前一个字节和锚点组成的正向字节对。
     noinline fn scanBuckets(
@@ -208,6 +390,9 @@ pub const Engine = struct {
         end: usize,
         buckets: *const [8]u8,
         comptime n: u8,
+        comptime watch_nul: bool,
+        nul_checked: *usize,
+        nul_out: *?usize,
     ) ?usize {
         const V = @Vector(width, u8);
         var splats: [n]V = undefined;
@@ -217,31 +402,64 @@ pub const Engine = struct {
         while (at + stride + 1 <= hay.len and at + stride <= end) {
             var acc: @Vector(width, bool) = @splat(false);
             inline for (0..fp_windows) |w| {
-                acc = acc | fpWindow(n, hay, at + w * width, &splats);
+                acc = acc | fpWindow(n, hay, at + w * width, &splats, watch_nul);
             }
             if (!@reduce(.Or, acc)) {
                 at += stride;
+                if (watch_nul and at > nul_checked.*) nul_checked.* = at;
                 continue;
             }
             inline for (0..fp_windows) |w| {
                 const base = at + w * width;
-                if (@reduce(.Or, fpWindow(n, hay, base, &splats))) {
+                if (@reduce(.Or, fpWindow(n, hay, base, &splats, watch_nul))) {
                     if (self.verifySpan(hay, base, end)) |found| {
+                        if (watch_nul) {
+                            if (memchr.find(width, hay[0 .. found + 1], nul_checked.*, 0)) |nul_at| {
+                                nul_out.* = nul_at;
+                                return null;
+                            }
+                            if (found + 1 > nul_checked.*) nul_checked.* = found + 1;
+                        }
                         i.* = found;
                         return found;
                     }
+                    if (watch_nul) {
+                        const v0: V = hay[base..][0..width].*;
+                        const z = v0 == @as(V, @splat(0));
+                        if (@reduce(.Or, z)) {
+                            nul_out.* = base + @as(usize, std.simd.firstTrue(z).?);
+                            return null;
+                        }
+                    }
                 }
+                if (watch_nul and base + width > nul_checked.*) nul_checked.* = base + width;
             }
             at += stride;
         }
         while (at + width + 1 <= hay.len and at + width <= end) {
-            if (@reduce(.Or, fpWindow(n, hay, at, &splats))) {
+            if (@reduce(.Or, fpWindow(n, hay, at, &splats, watch_nul))) {
                 if (self.verifySpan(hay, at, end)) |found| {
+                    if (watch_nul) {
+                        if (memchr.find(width, hay[0 .. found + 1], nul_checked.*, 0)) |nul_at| {
+                            nul_out.* = nul_at;
+                            return null;
+                        }
+                        if (found + 1 > nul_checked.*) nul_checked.* = found + 1;
+                    }
                     i.* = found;
                     return found;
                 }
+                if (watch_nul) {
+                    const v0: V = hay[at..][0..width].*;
+                    const z = v0 == @as(V, @splat(0));
+                    if (@reduce(.Or, z)) {
+                        nul_out.* = at + @as(usize, std.simd.firstTrue(z).?);
+                        return null;
+                    }
+                }
             }
             at += width;
+            if (watch_nul and at > nul_checked.*) nul_checked.* = at;
         }
         i.* = at;
         return null;
@@ -259,6 +477,19 @@ pub const Engine = struct {
             if (edge < end and edge < hay.len and self.hitScalar(hay, edge)) return edge;
         }
         return null;
+    }
+
+    fn collectDirect(self: *const Engine) ?struct { n: u8, rules: [2]Rule } {
+        var rules: [2]Rule = undefined;
+        var n: u8 = 0;
+        for (self.pos_rules[0..self.npos]) |rule| {
+            if (!noteDirect(&rules, &n, rule.anchor, rule.partner)) return null;
+        }
+        for (self.neg_rules[0..self.nneg]) |rule| {
+            if (!noteDirect(&rules, &n, rule.partner, rule.anchor)) return null;
+        }
+        if (n == 0) return null;
+        return .{ .n = n, .rules = rules };
     }
 
     fn collectBuckets(self: *const Engine) ?struct { n: u8, bytes: [8]u8 } {
@@ -436,13 +667,22 @@ fn noteBucket(bytes: *[8]u8, n: *u8, hash: u8) bool {
     return true;
 }
 
-fn fpWindow(comptime n: u8, hay: []const u8, at: usize, splats: *const [n]@Vector(width, u8)) @Vector(width, bool) {
+fn noteDirect(rules: *[2]Rule, n: *u8, first: u8, second: u8) bool {
+    for (rules[0..n.*]) |have| if (have.anchor == first and have.partner == second) return true;
+    if (n.* == 2) return false;
+    rules[n.*] = .{ .anchor = first, .partner = second };
+    n.* += 1;
+    return true;
+}
+
+fn fpWindow(comptime n: u8, hay: []const u8, at: usize, splats: *const [n]@Vector(width, u8), comptime watch_nul: bool) @Vector(width, bool) {
     const V = @Vector(width, u8);
     const v0: V = hay[at..][0..width].*;
     const v1: V = hay[at + 1 ..][0..width].*;
     const h = v0 +% (v1 << @as(V, @splat(@as(u8, 7))));
     var hits: @Vector(width, bool) = @splat(false);
     inline for (0..n) |k| hits = hits | (h == splats[k]);
+    if (watch_nul) hits = hits | (v0 == @as(V, @splat(@as(u8, 0))));
     return hits;
 }
 

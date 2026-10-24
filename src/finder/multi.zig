@@ -219,17 +219,31 @@ pub const Multi = struct {
     }
 
     pub fn findWatched(self: *Multi, haystack: []const u8, start: usize, nul: *?usize) ?matcher.Match {
-        const hit = self.find(haystack, start, .earliest);
-        const limit = if (hit) |item| item.start else haystack.len;
-        if (start < limit) {
-            if (memchr.find(memchr.native_width, haystack, start, 0)) |at| {
-                if (at < limit) {
-                    nul.* = at;
-                    return null;
+        switch (self.kind) {
+            .bytes => |*set| {
+                const at = set.findWatchingNul(haystack, start, nul) orelse return null;
+                return .{ .start = at, .end = at + 1 };
+            },
+            .pairs => |*engine| return engine.findWatchingNul(haystack, start, .earliest, nul),
+            .ac => |*ac| return ac.findWatchingNul(haystack, start, .earliest, nul),
+            .teddy => |*engine| {
+                if (comptime teddy_on) return engine.findWatchingNul(haystack, start, .earliest, nul);
+                unreachable;
+            },
+            .mixed => {
+                const hit = self.scan(haystack, start, .earliest, allowAll);
+                const limit = if (hit) |item| item.start else haystack.len;
+                if (start < limit) {
+                    if (memchr.find(memchr.native_width, haystack, start, 0)) |at| {
+                        if (at < limit) {
+                            nul.* = at;
+                            return null;
+                        }
+                    }
                 }
-            }
+                return hit;
+            },
         }
-        return hit;
     }
 };
 

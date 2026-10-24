@@ -350,8 +350,27 @@ fn searchPrepared(
     if (rejectEmptyResults(&state, config)) return finishSink(S, sink, &state, config);
     if (stopForBudget(&state, config)) return finishSink(S, sink, &state, config);
 
+    var skip_match = false;
     if (watchesBinary(config)) {
-        if (memchr.find(width, view, 0, 0)) |nul| {
+        var nul_at: ?usize = null;
+        if (view.len > 0 and canFuse(matcher, config, &state)) {
+            const found = matcher.findWatched(view, 0, &nul_at);
+            if (nul_at == null) {
+                if (found) |hit| {
+                    if (memchr.find(width, view[hit.start..], 0, 0)) |rel| {
+                        nul_at = hit.start + rel;
+                    } else if (config.progress_interval == null or config.progress_interval.? == 0) {
+                        state.pos = lineStart(view, hit.start, config);
+                    }
+                } else {
+                    skip_match = true;
+                    state.pos = view.len;
+                }
+            }
+        } else {
+            nul_at = memchr.find(width, view, 0, 0);
+        }
+        if (nul_at) |nul| {
             noteBinary(&state, config, state.abs_base + nul);
             const cont = callOpt(S, "binary", sink, .{state.nul_offset.?});
             if (config.binary == .quit) {
@@ -372,7 +391,11 @@ fn searchPrepared(
     }
 
     if (!state.stopped) {
-        if (!try matchBuffer(S, sink, matcher, view, &state, config)) state.stopped = true;
+        if (skip_match) {
+            if (stopInMatch(&state, config) or !maybeProgress(S, sink, &state, config)) state.stopped = true;
+        } else {
+            if (!try matchBuffer(S, sink, matcher, view, &state, config)) state.stopped = true;
+        }
     }
     const consumed = (!state.stopped or state.pos >= view.len) and !state.output_blocked;
     if (consumed and !state.hit_byte_cap and state.soft_error == null) state.scanned_all = true;
@@ -974,8 +997,13 @@ fn drive(
                 if (found) |hit| {
                     if (memchr.find(width, buf[hit.start..filled], 0, 0)) |rel| {
                         nul_rel = hit.start + rel;
-                    } else if (hit.start < state.pos + 4096) {
-                        state.prefer_prepass = true;
+                    } else {
+                        if (hit.start < state.pos + 4096) {
+                            state.prefer_prepass = true;
+                        }
+                        if (config.progress_interval == null or config.progress_interval.? == 0) {
+                            state.pos = lineStart(buf[0..view_end], hit.start, config);
+                        }
                     }
                 } else {
                     skip_match = true;

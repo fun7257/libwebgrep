@@ -1,7 +1,9 @@
-//! x86_64 AVX2 的 Teddy 查表。只在 `-Dteddy=avx2` 且目标是 x86_64 时编入。
+//! x86_64 AVX2 Teddy lookup. Compiled only when `-Dteddy=avx2` and targeting x86_64.
 //!
-//! `vpshufb` 是三操作数，两条 16 字节通道各自查自己的表，所以 16 字节的半字节表要复制到高半。
-//! `vpalignr` 不会跨过 16 字节边界。先用 `vperm2i128` 拼出「上一段的高 16 字节接上下一段的低 16 字节」，再在通道内右移。
+//! `vpshufb` is three-operand and performs independent lookups in each 16-byte lane,
+//! so the 16-byte nibble table must be duplicated into the high half.
+//! `vpalignr` does not cross the 16-byte lane boundary; `vperm2i128` first combines the high
+//! 16 bytes of the previous vector with the low 16 bytes of the next vector before shifting within lanes.
 
 pub const lanes: usize = 32;
 

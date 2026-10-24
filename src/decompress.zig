@@ -1,24 +1,24 @@
-//! 进程内流式解压与防爆配额保护（Gzip / Zstd / XZ — A04, A05, F12）。
+//! In-process streaming decompression and decompression bomb protection (Gzip / Zstd / XZ).
 //!
-//! 设计铁律：
-//! 1. 绝不调用外部解压进程（`gzip`/`zstd`/`xz` 子进程全部禁止），100% 进程内流式完成。
-//! 2. 实时统计解压后字节数（`decompressed_bytes`）与压缩比（`decompressed_bytes / raw_bytes`），
-//!    一旦超过 `max_decompressed_bytes` 或 `max_compression_ratio` 立即拦截并返回 `error.DecompressLimit`
-//!    （由 Searcher 记为 `LimitHit.decompressed_bytes`）。
-//! 3. 损坏的压缩流不崩溃、不抛致命异常，归入 `error.CorruptStream`（由 Searcher 记为 `SoftError.read_failed`）。
+//! Design invariants:
+//! 1. Never spawn external decompression processes (`gzip`/`zstd`/`xz` subprocesses are strictly forbidden); 100% in-process streaming.
+//! 2. Track decompressed byte count (`decompressed_bytes`) and compression ratio (`decompressed_bytes / raw_bytes`) in real time;
+//!    immediately abort and return `error.DecompressLimit` once `max_decompressed_bytes` or `max_compression_ratio` is exceeded
+//!    (recorded by Searcher as `LimitHit.decompressed_bytes`).
+//! 3. Corrupt compressed streams never panic or raise fatal errors; they map to `error.CorruptStream` (recorded by Searcher as `SoftError.read_failed`).
 
 const std = @import("std");
 
 pub const Compression = enum {
-    /// 默认不解压，按原始字节流处理。
+    /// Do not decompress by default; process as a raw byte stream.
     none,
-    /// 在流开头按魔数自动识别 Gzip (`1F 8B`)、Zstd (`28 B5 2F FD`)、XZ (`FD 37 7A 58 5A 00`)。
+    /// Auto-detect Gzip (`1F 8B`), Zstd (`28 B5 2F FD`), or XZ (`FD 37 7A 58 5A 00`) by magic bytes at the start of the stream.
     auto,
-    /// 强制按 Gzip (RFC 1952) 解压。
+    /// Force Gzip (RFC 1952) decompression.
     gzip,
-    /// 强制按 Zstandard (RFC 8878) 解压。
+    /// Force Zstandard (RFC 8878) decompression.
     zstd,
-    /// 强制按 XZ 容器解压。
+    /// Force XZ container decompression.
     xz,
 };
 
@@ -32,7 +32,7 @@ pub const Detected = enum {
 
 pub const default_max_compression_ratio: u64 = 100;
 pub const max_compression_ratio_hard_cap: u64 = 1000;
-/// 至少解压出这么多字节后才开始检查压缩比，避免极短文本因头部开销误判。
+/// Minimum decompressed bytes before enforcing the compression ratio check, avoiding false positives on tiny inputs due to header overhead.
 pub const ratio_check_min_bytes: u64 = 64;
 
 pub const Error = error{
@@ -41,7 +41,7 @@ pub const Error = error{
     CorruptStream,
 };
 
-/// 块级偏移映射表（F12）：将解压/转码后的可搜索流偏移映射回原始输入流字节偏移。
+/// Block-level offset map: maps searchable stream offsets after decompression or transcoding back to raw input byte offsets.
 pub const OffsetMap = struct {
     pub const Anchor = struct {
         out_offset: u64,
@@ -49,7 +49,7 @@ pub const OffsetMap = struct {
     };
 
     anchors: std.ArrayList(Anchor) = .empty,
-    /// 固定前导偏移（例如剥离 3 字节 UTF-8 BOM 后 `base_raw_offset = 3`）。
+    /// Fixed leading offset (e.g., `base_raw_offset = 3` after stripping a 3-byte UTF-8 BOM).
     base_raw_offset: u64 = 0,
     active: bool = false,
 
@@ -74,13 +74,13 @@ pub const OffsetMap = struct {
         });
     }
 
-    /// 给定可搜索流上的绝对偏移 `out_offset`，返回对应的原始字节流偏移。
+    /// Given an absolute offset `out_offset` in the searchable stream, returns the corresponding raw byte stream offset.
     pub fn map(self: *const OffsetMap, out_offset: u64) u64 {
         if (!self.active) return out_offset + self.base_raw_offset;
         const items = self.anchors.items;
         if (items.len == 0) return out_offset + self.base_raw_offset;
 
-        // 二分查找最后一个 `anchor.out_offset <= out_offset`
+        // Binary search for the last `anchor.out_offset <= out_offset`
         var lo: usize = 0;
         var hi: usize = items.len;
         while (lo < hi) {
@@ -97,7 +97,7 @@ pub const OffsetMap = struct {
         if (idx + 1 < items.len) {
             const next = items[idx + 1];
             if (next.out_offset > cur.out_offset and next.raw_offset == cur.raw_offset) {
-                // 同一压缩块内产出的字节，映射回该压缩块的起始原始偏移
+                // Bytes produced within the same compressed block map back to the starting raw offset of that block
                 return cur.raw_offset;
             }
             if (next.out_offset > cur.out_offset and next.raw_offset > cur.raw_offset) {
@@ -112,7 +112,7 @@ pub const OffsetMap = struct {
     }
 };
 
-/// 嗅探流开头的压缩魔数。
+/// Sniff compression magic bytes at the beginning of a stream.
 pub fn sniff(bytes: []const u8, eof: bool) Detected {
     if (bytes.len >= 2 and bytes[0] == 0x1F and bytes[1] == 0x8B) return .gzip;
     if (bytes.len >= 4 and std.mem.eql(u8, bytes[0..4], &.{ 0x28, 0xB5, 0x2F, 0xFD })) return .zstd;
@@ -123,8 +123,8 @@ pub fn sniff(bytes: []const u8, eof: bool) Detected {
     return .raw;
 }
 
-/// 在内存中流式解压切片，实时强制执行 `max_decompressed_bytes` 与 `max_compression_ratio` 防爆检查，
-/// 同时把块级偏移锚点写入 `offset_map`。
+/// Decompress a slice in memory in a streaming fashion, enforcing `max_decompressed_bytes` and `max_compression_ratio` bomb checks in real time,
+/// while recording block-level offset anchors into `offset_map`.
 pub fn decompressSlice(
     allocator: std.mem.Allocator,
     compressed: []const u8,
@@ -243,7 +243,7 @@ fn pumpDecompress(
     }
 }
 
-/// 辅助生成合法 Gzip 字节流（使用 Stored Deflate 块 + CRC32 + ISIZE），供单元测试构造正常压缩流与高压缩比炸弹使用。
+/// Helper to generate a valid Gzip byte stream (using Stored Deflate blocks + CRC32 + ISIZE) for unit tests constructing normal compressed streams and high-ratio bombs.
 pub fn compressGzipStoredAlloc(allocator: std.mem.Allocator, payload: []const u8) error{OutOfMemory}![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
@@ -276,7 +276,7 @@ pub fn compressGzipStoredAlloc(allocator: std.mem.Allocator, payload: []const u8
     return out.toOwnedSlice(allocator);
 }
 
-/// 辅助生成合法 Zstd 帧（未压缩 Raw Block），供单元测试使用。
+/// Helper to generate a valid Zstd frame (uncompressed Raw Block) for unit tests.
 pub fn compressZstdRawAlloc(allocator: std.mem.Allocator, payload: []const u8) error{OutOfMemory}![]u8 {
     std.debug.assert(payload.len <= (1 << 17) - 1);
     var out = std.ArrayList(u8).empty;
@@ -304,7 +304,7 @@ pub fn compressZstdRawAlloc(allocator: std.mem.Allocator, payload: []const u8) e
     return out.toOwnedSlice(allocator);
 }
 
-test "A04 Gzip 解压与防爆上限拦截" {
+test "Gzip decompression and bomb limit enforcement" {
     const text = "line1\nMATCH_GZIP\nline3\n";
     const gz = try compressGzipStoredAlloc(std.testing.allocator, text);
     defer std.testing.allocator.free(gz);
@@ -327,7 +327,7 @@ test "A04 Gzip 解压与防爆上限拦截" {
     try std.testing.expectEqualStrings(text, out);
     try std.testing.expectEqual(@as(u64, text.len), dec_bytes);
 
-    // 模拟高压缩比 Gzip 炸弹（仅 43 字节压缩流解压出 1032 字节全 'A'，当压缩比上限设为 10 时立即拦截）
+    // Simulate a high-compression-ratio Gzip bomb (a short compressed stream inflating to 1032 'A' bytes, immediately blocked when the ratio cap is low)
     const bomb_gz = [_]u8{
         0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03,
         0x73, 0x74, 0xa4, 0x3d, 0x00, 0x00, 0x8d, 0xef, 0x72, 0x2f,
@@ -342,7 +342,7 @@ test "A04 Gzip 解压与防爆上限拦截" {
     );
 }
 
-test "A05 Zstd 解压与损坏流拦截" {
+test "Zstd decompression and corrupt stream handling" {
     const text = "hello zstd\nMATCH_ZSTD\n";
     const zst = try compressZstdRawAlloc(std.testing.allocator, text);
     defer std.testing.allocator.free(zst);
@@ -364,7 +364,7 @@ test "A05 Zstd 解压与损坏流拦截" {
     defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings(text, out);
 
-    // 损坏的 Zstd 帧应返回 error.CorruptStream
+    // A corrupt Zstd frame must return error.CorruptStream
     const corrupt_zst = [_]u8{ 0x28, 0xB5, 0x2F, 0xFD, 0xFF, 0xFF, 0xFF };
     try std.testing.expectError(
         error.CorruptStream,

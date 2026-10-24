@@ -1,90 +1,90 @@
-//! libwebgrep：可嵌入的字面量行搜索库。
+//! libwebgrep: Embeddable high-performance SIMD text and regex search engine library.
 //!
-//! 会分配或做 I/O 的公共函数显式接收分配器和 `std.Io`。
-//! 纯切片上的查找不需要这两者。库代码没有全局可变状态。
-//! 调用方文档是 `docs/API.md`。
+//! Public functions that allocate or perform I/O accept an explicit allocator and `std.Io`.
+//! Pure slice search requires neither. The library holds no mutable global state.
+//! Complete caller documentation is in `docs/API.md`.
 
 const std = @import("std");
 
-/// 字面量约定：模式条数、总长度、大小写。大小写折叠只支持 ASCII。
+/// Literal matching conventions: pattern count caps, byte caps, and case folding modes.
 pub const matcher = @import("matcher.zig");
-/// 事件、行和结果。切片只在回调返回前有效。
+/// Events, lines, and result types. Borrowed slices are valid only until the callback returns.
 pub const sink_mod = @import("sink.zig");
-/// 搜索配置和服务入口的定义。根上再导出的函数才是调用入口。
+/// Search configuration and service entry points. Re-exported functions at the root are the primary API.
 pub const searcher = @import("searcher.zig");
 
-/// `earliest` 取最早结束的匹配，`leftmost_first` 取最靠左的起点。
+/// `earliest` selects the match that ends earliest; `leftmost_first` selects the leftmost start offset.
 pub const MatchMode = matcher.MatchMode;
-/// 一次 `find` 的半开区间，相对这次传入的 haystack。
+/// Half-open byte range `[start, end)` relative to the haystack passed to `find`.
 pub const Match = matcher.Match;
-/// 预留的必需字面量。正则尚未提供。字面量查找器返回模式本身。
+/// Required literal extracted from a matcher (`bytes` and `offset_in_match`) for SIMD prefiltering.
 pub const RequiredLiteral = matcher.RequiredLiteral;
-/// `sensitive`、`insensitive`、`smart`。智能大小写按模式分别判断，这和 rg 整组判断不同。
+/// `sensitive`, `insensitive`, or `smart`. Smart case is evaluated per pattern independently.
 pub const CaseMode = matcher.CaseMode;
-/// 构造 `Finder` 或 `Multi` 的选项。条数和总长度只能往下调。
+/// Options for constructing `Finder` or `Multi`. Pattern count and byte limits can only be lowered below hard caps.
 pub const FindOptions = matcher.FindOptions;
 
-/// 半开区间。事件里相对行字节，并带扫描时算好的 UTF-16 端点。
+/// Half-open byte span within a line, carrying precomputed UTF-16 code-unit endpoints.
 pub const Span = sink_mod.Span;
-/// 旧回调上的一行。`bytes`、`text`、`raw`、`matches` 只在回调返回前有效。
+/// A matched or context line on legacy callbacks. `bytes`, `text`, `raw`, and `matches` are valid only until the callback returns.
 pub const Line = sink_mod.Line;
-/// 二进制状态：`none`、`detected`、`suppressed`。
+/// Binary detection status: `none`, `detected`, or `suppressed`.
 pub const BinaryStatus = sink_mod.BinaryStatus;
-/// 服务入口的事件：begin、match、context、context_break、progress、heartbeat、end、summary。
+/// Service entry event union: `begin`, `match`, `context`, `context_break`, `progress`, `heartbeat`, `end`, `summary`.
 pub const Event = sink_mod.Event;
-/// 服务入口上的一行，带来源 ID、行号、字节列、绝对偏移和半开区间。
+/// A line delivered on service entry points with `source_id`, line number, byte/UTF-16 columns, offsets, and spans.
 pub const LineEvent = sink_mod.LineEvent;
-/// 来源结束。未命中的来源也有 begin 和 end，计数可以为 0。
+/// Source completion event. Sources with zero matches still emit `begin` and `end`.
 pub const EndEvent = sink_mod.EndEvent;
-/// 运行时多态的旧回调。虚表必须活得比它久。不实现 `event`。
+/// Runtime-polymorphic legacy sink wrapper. Its vtable must outlive `AnySink`.
 pub const AnySink = sink_mod.AnySink;
-/// 为旧回调生成虚表。缺的方法保持继续搜索。不分配。
+/// Builds a vtable for a legacy sink type `S` without heap allocation.
 pub const anyVtable = sink_mod.anyVtable;
-/// 无上下文的拉式迭代。`Line.bytes` 指向调用方的 haystack，直到那份字节失效。
+/// Context-free pull iterator over a slice. `Line.bytes` borrows directly from `haystack`.
 pub const SliceIter = sink_mod.SliceIter;
-/// 成功返回的结果。软错误、有匹配、无匹配都在这里，致命错误走函数的错误。
+/// Search result returned on completion. Distinguishes matches, no matches, and per-source soft errors from fatal errors.
 pub const Result = sink_mod.Result;
-/// `complete`、`stopped`、`binary_quit`、`binary_matched`。
+/// Search termination outcome: `complete`, `stopped`, `binary_quit`, or `binary_matched`.
 pub const Outcome = sink_mod.Outcome;
-/// 预算耗尽时看这个字段：`none`、`max_results`、`max_bytes`、`deadline`、`decompressed_bytes`、`cancelled`。
+/// Budget limit reached during search: `none`, `max_results`, `max_bytes`, `deadline`, `decompressed_bytes`, or `cancelled`.
 pub const LimitHit = sink_mod.LimitHit;
-/// 来源软错误，只有 `read_failed`。没有内部路径。没有匹配时这个字段是 null。
+/// Per-source soft error (`read_failed`), sanitized of any internal server paths.
 pub const SoftError = sink_mod.SoftError;
-/// 服务回调的控制：继续、暂停、停止。暂停没有 end，也没有 summary。
+/// Flow control returned by service event callbacks: `cont`, `pause`, or `stop`.
 pub const Flow = sink_mod.Flow;
-/// 扫完后的汇总。没扫完、暂停、或实时流还开着时不发。
+/// Final request summary emitted when the input finishes without pause or open live stream.
 pub const Summary = sink_mod.Summary;
-/// 按调用方间隔发出的进度，不是最终汇总。
+/// Periodic progress snapshot emitted at `progress_interval`.
 pub const Progress = sink_mod.Progress;
-/// 实时流空闲。不是错误，也不是结束。
+/// Idle heartbeat emitted on a live stream when a read produces zero bytes.
 pub const Heartbeat = sink_mod.Heartbeat;
-/// 暂停后续搜的计数。`resumeSourceSlice` 会把它带回去。
+/// Saved counters used by `resumeSourceSlice` to continue after `Flow.pause`.
 pub const ResumeState = sink_mod.ResumeState;
 
-/// 二进制处理。默认 `quit`，也就是二进制默认跳过。
+/// Binary handling policy. Defaults to `quit` (binary inputs are skipped by default).
 pub const BinaryPolicy = searcher.BinaryPolicy;
-/// `auto` 在流开头嗅探 BOM（或使用 `charset` 提示），支持 UTF-8、UTF-16LE/BE、GBK 与 Latin-1。
+/// Input character encoding (`auto` sniffs UTF-8/UTF-16 BOM or uses `charset` hint; also `utf8`, `utf16le`, `utf16be`, `gbk`, `latin1`, `none`).
 pub const Encoding = searcher.Encoding;
-/// 进程内流式解压模式：`none`、`auto`、`gzip`、`zstd`、`xz`。
+/// In-process streaming decompression mode: `none`, `auto`, `gzip`, `zstd`, or `xz`.
 pub const Compression = searcher.Compression;
-/// 进程内流式解压与原始偏移映射模块。
+/// In-process bomb-safe streaming decompression and raw offset mapping module.
 pub const decompress = @import("decompress.zig");
-/// 搜索配置。服务入口会给留空的预算填默认值，旧入口留空表示不另加上限。
+/// Search configuration. Service entry points populate default multi-tenant budgets when left null.
 pub const SearchConfig = searcher.SearchConfig;
-/// 旧回调入口，搜索一块内存。不填服务默认预算。`name` 只传给 `begin`。
+/// Legacy callback entry point for searching an in-memory slice without default service budgets.
 pub const searchSlice = searcher.searchSlice;
-/// 旧回调入口，从 reader 搜索。短读视为结束。服务入口是 `searchSource`。
+/// Legacy callback entry point for searching a `std.Io.Reader`. Prefer `searchSource` for service workloads.
 pub const searchReader = searcher.searchReader;
-/// 服务入口：从 reader 搜索。来源 ID 由调用方分配。上游读失败是 `soft_error`，不是致命错误。
+/// Service entry point: searches a `std.Io.Reader` with caller-assigned `source_id` and multi-tenant budgets.
 pub const searchSource = searcher.searchSource;
-/// 服务入口：搜索一块内存。行字节只在 `event` 返回前有效。没有 BOM 时不分配。
+/// Service entry point: searches an in-memory slice with zero heap allocation when no transcoding is needed.
 pub const searchSourceSlice = searcher.searchSourceSlice;
-/// 从上次暂停继续搜同一块内存。不再发 begin。
+/// Resumes searching the same slice from a previous `Flow.pause` state without re-emitting `begin`.
 pub const resumeSourceSlice = searcher.resumeSourceSlice;
-/// 拉式入口。复制出来的事件活到 `deinit`，并且只保留一部分字段。
+/// Pull-based iterator over service events for an in-memory slice.
 pub const openSourcePull = searcher.openSourcePull;
 
-test "默认搜索配置" {
+test "default search configuration" {
     const cfg: SearchConfig = .{};
     try std.testing.expectEqual(SearchConfig.default_buffer_size, cfg.buffer_size);
     try std.testing.expectEqual(SearchConfig.default_max_line_len, cfg.max_line_len);
@@ -113,7 +113,7 @@ fn checkSearchFn(comptime F: type) !void {
     }
 }
 
-test "公共搜索入口没有路径参数" {
+test "public search entry points accept no filesystem handles or paths" {
     try std.testing.expect(!@hasDecl(@This(), "searchFile"));
     try std.testing.expect(!@hasDecl(@This(), "parallel"));
     try std.testing.expect(!@hasDecl(@This(), "walker"));
@@ -152,21 +152,21 @@ test "公共搜索入口没有路径参数" {
     try std.testing.expectEqual(@as(u32, 2), found.matches);
 }
 
-/// 单字节查找。不分配。宽度只接受 16 或 32。
+/// Vectorized single-byte search (`find`, `findEither`, `findAny`, `findLast`, `count`). Zero allocation; width is 16 or 32.
 pub const memchr = @import("finder/memchr.zig");
-/// `Finder` 的定义模块。单条字面量，不分配，模式不能含有换行。
+/// `Finder` definition module for single-literal SIMD search.
 pub const finder = @import("finder/finder.zig");
-/// 单条字面量查找器。模式字节由调用方持有。空模式是零宽匹配。
+/// Single-literal SIMD finder. Pattern bytes are borrowed from the caller; empty pattern matches zero-width.
 pub const Finder = finder.Finder;
-/// `Multi` 的定义模块。多条字面量是 OR，智能大小写按模式分别判断。
+/// `Multi` definition module for multi-literal OR search.
 pub const multi = @import("finder/multi.zig");
-/// 多条字面量。调用方持有模式字节，`deinit` 只释放内部表。
+/// Multi-literal OR search engine (`ByteSet`, `RarePair`, `Teddy`, `AhoCorasick`).
 pub const Multi = multi.Multi;
-/// `Regex` 的定义模块。线性时间 Thompson NFA 与必需字面量 SIMD 预过滤。
+/// `Regex` definition module for linear-time Thompson NFA search with SIMD literal prefiltering.
 pub const regex = @import("regex.zig");
-/// 线性时间正则表达式匹配器，支持编译大小硬顶与有界跨行窗口。
+/// Linear-time regular expression matcher with compile size hard caps and bounded multiline windows.
 pub const Regex = regex.Regex;
-/// 构造 `Regex` 的选项：大小写、有界跨行、`.` 是否匹配换行与指令数硬顶。
+/// Options for constructing `Regex`: case mode, bounded multiline, `dot_all`, and instruction caps.
 pub const RegexOptions = regex.RegexOptions;
 
 test {
@@ -199,22 +199,22 @@ test {
     }
 }
 
-/// 最坏线性的字面量查找。不分配。大小写折叠只支持 ASCII。
+/// Worst-case linear-time Two-Way substring finder without heap allocation.
 pub const two_way = @import("finder/two_way.zig");
 
-/// 内存树接口。搜索入口不接收它，也不打开它。
+/// Abstract in-memory tree source interface for archive or virtual tree inputs.
 pub const source = @import("source.zig");
-/// 字节 glob 辅助（支持嵌套花括号、上限保护与忽略大小写）。搜索入口不按它选择来源。
+/// Byte-oriented glob matcher supporting nested brace expansion, rule caps, and ASCII case insensitivity.
 pub const walk_glob = @import("walk/glob.zig");
-/// 解析调用方已有的忽略文本（支持纯文本注入与细分开关）。不读环境，也不读父目录。搜索入口不应用它。
+/// In-memory gitignore/ignore rule parser and hierarchical matcher with fine-grained switches.
 pub const walk_ignore = @import("walk/ignore.zig");
-/// 指针的工作窃取队列。搜索入口不创建它，也不起线程。
+/// Chase-Lev lock-free work-stealing deque for pointer elements.
 pub const walk_deque = @import("walk/deque.zig");
-/// 已打开目录或文件的设备号和 inode。搜索入口不调用它。
+/// Device and inode identifier helper for opened `std.Io.Dir` and `std.Io.File` handles.
 pub const walk_file_id = @import("walk/file_id.zig");
-/// 类型名到文件名的辅助（支持调用方注入自定义类型表并展开为 glob）。搜索入口不按类型过滤。
+/// File-type table filter supporting custom caller-injected type tables and glob expansion.
 pub const walk_types = @import("walk/types.zig");
-/// 枚举已打开的目录。搜索入口不列举目录。
+/// Batched directory entry reader over an already opened `std.Io.Dir`.
 pub const walk_list = @import("walk/list_dir.zig");
 
 test {

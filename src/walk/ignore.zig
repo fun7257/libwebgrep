@@ -1,10 +1,12 @@
-//! gitignore 子集。
+//! Subset of gitignore rule matching.
 //!
-//! 支持注释、行首转义、`!`、尾部 `/`、锚定 `/`、不跨 `/` 的 `*` 和 `?`、
-//! `**/`、字符类。同一份规则里后写的胜出。调用方把更深层的集合链在父集合后面，
-//! 所以深层覆盖浅层。父目录一旦被忽略，里面的文件不再被重新包含。
+//! Supports comments, leading-character escaping, `!` negation, trailing `/`, anchored `/`,
+//! non-slash-crossing `*` and `?`, `**/`, and character classes. Within the same rule set,
+//! later rules win. Callers chain deeper sets behind parent sets so child directories override
+//! ancestor rules. Once a parent directory is ignored, files inside it cannot be re-included.
 //!
-//! 规则文本由调用方放进集合。不读进程环境，也不沿父目录寻找忽略文件。
+//! Rule text is supplied directly by the caller; neither the process environment nor parent
+//! directories above the root are consulted for ignore files.
 
 const std = @import("std");
 const glob = @import("glob.zig");
@@ -14,12 +16,12 @@ pub const Affix = struct {
     index: u32,
 };
 
-/// 某一层目录的规则。建好之后只读，worker 可以共享。
+/// Rules for a single directory level. Read-only once built and safe to share across workers.
 pub const Set = struct {
     parent: ?*const Set = null,
-    /// 这一层目录在搜索根相对路径里的字节长度。根目录是 0。
+    /// Byte length of this directory's path relative to the search root (0 for the root itself).
     prefix: usize = 0,
-    /// 规则要先接上的路径前缀。空表示相对这一层目录。
+    /// Path prefix prepended before matching rules. Empty means relative to this directory level.
     repo_prefix: []const u8 = &.{},
     globs: []const glob.Glob = &.{},
     exact: std.StringHashMapUnmanaged([]const u32) = .empty,
@@ -42,24 +44,24 @@ pub const LayerFiles = struct {
 };
 
 pub const LayerSwitch = struct {
-    /// 是否启用 `.ignore` 与 `.rgignore`。
+    /// Whether to enable `.ignore` and `.rgignore`.
     dot: bool = true,
-    /// 是否启用 `.gitignore`。
+    /// Whether to enable `.gitignore`.
     vcs: bool = true,
-    /// 是否启用仓库内的 `.git/info/exclude`。
+    /// Whether to enable repository-local `.git/info/exclude`.
     exclude: bool = true,
-    /// 忽略规则是否忽略 ASCII 大小写。
+    /// Whether ignore rules match ASCII case-insensitively.
     case_insensitive: bool = false,
-    /// 单次解析规则条数上限（不超过硬顶）。
+    /// Maximum number of rules parsed per call (bounded by the hard cap).
     max_rules: ?usize = null,
 };
 
-/// 把一份忽略文件追加成 glob。`text` 会复制进 `allocator`。
+/// Parses an ignore file and appends its globs. `text` is duplicated into `allocator`.
 pub fn parseInto(allocator: std.mem.Allocator, text: []const u8, out: *std.ArrayList(glob.Glob)) !void {
     return parseIntoWithOptions(allocator, text, out, .{});
 }
 
-/// 按选项解析一份忽略规则文本并追加至 `out`，受条数上限保护。
+/// Parses ignore rule text with options and appends to `out`, enforcing the rule count cap.
 pub fn parseIntoWithOptions(
     allocator: std.mem.Allocator,
     text: []const u8,
@@ -81,7 +83,7 @@ pub fn parseIntoWithOptions(
     }
 }
 
-/// 解析调用方注入的多段纯文本忽略规则（不接受路径）。
+/// Parses multiple caller-supplied plain-text ignore rule blocks (does not accept file paths).
 pub fn parseTextsInto(
     allocator: std.mem.Allocator,
     texts: []const []const u8,
@@ -93,7 +95,7 @@ pub fn parseTextsInto(
     }
 }
 
-/// 按优先级（`git_exclude` < `.gitignore` < `.ignore` < `.rgignore`）与细分开关解析同一层目录的忽略文本。
+/// Parses ignore texts for a single directory level in priority order (`git_exclude` < `.gitignore` < `.ignore` < `.rgignore`) according to `switches`.
 pub fn parseLayerInto(
     allocator: std.mem.Allocator,
     files: LayerFiles,
@@ -116,12 +118,12 @@ pub fn parseLayerInto(
     }
 }
 
-/// 解析一行。空行和注释返回 null。
+/// Parses a single line. Empty lines and comments return null.
 pub fn parseLine(allocator: std.mem.Allocator, line: []const u8) !?glob.Glob {
     return parseLineWithOptions(allocator, line, false);
 }
 
-/// 解析一行，支持指定 ASCII 忽略大小写。
+/// Parses a single line with optional ASCII case-insensitivity.
 pub fn parseLineWithOptions(
     allocator: std.mem.Allocator,
     line: []const u8,
@@ -205,7 +207,7 @@ fn unescape(allocator: std.mem.Allocator, out: *std.ArrayList(u8), body: []const
     }
 }
 
-/// 用 arena 分配索引。`globs` 的文本必须活得和集合一样久。
+/// Allocates the rule index in `arena`. The pattern strings in `globs` must outlive the returned `Set`.
 pub fn build(
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
@@ -287,7 +289,7 @@ fn freeze(
     return out;
 }
 
-/// 父目录被忽略时，里面的路径也算忽略，后写的 `!` 不能把它救回来。
+/// If any parent directory is ignored, paths inside it are also ignored and cannot be re-included by a later `!` rule.
 pub fn isIgnored(set: *const Set, rel: []const u8, is_dir: bool, scratch: []u8) bool {
     if (!is_dir) {
         var end = rel.len;
@@ -367,7 +369,7 @@ fn parseAll(allocator: std.mem.Allocator, text: []const u8) ![]glob.Glob {
     return list.toOwnedSlice(allocator);
 }
 
-test "解析注释、转义、否定和目录" {
+test "parse comments, escapes, negation, and directory-only rules" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -393,7 +395,7 @@ test "解析注释、转义、否定和目录" {
     try std.testing.expectEqual(glob.Class.ext, globs[5].class);
 }
 
-test "后写优先，父目录被忽略后不能重新包含" {
+test "later rules win and ignored parent directories cannot be re-included" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -414,7 +416,7 @@ test "后写优先，父目录被忽略后不能重新包含" {
     try std.testing.expect(isIgnored(&set, "sub/other.txt", false, &scratch));
 }
 
-test "深层集合覆盖浅层" {
+test "deeper rule sets override shallower ones" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -428,12 +430,12 @@ test "深层集合覆盖浅层" {
     try std.testing.expect(isIgnored(&parent, "dir/keep.log", false, &scratch));
 }
 
-test "J05 纯文本忽略规则与 J08 细分开关" {
+test "plain-text ignore rules and per-layer switches" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // 1. J05：多段纯文本忽略规则注入（后段覆盖前段，支持大小写忽略）
+    // 1. Injected plain-text ignore rules (later blocks override earlier ones, supporting case-insensitive matching)
     var injected: std.ArrayList(glob.Glob) = .empty;
     try parseTextsInto(
         arena,
@@ -447,7 +449,7 @@ test "J05 纯文本忽略规则与 J08 细分开关" {
     try std.testing.expect(!isIgnored(&injected_set, "KEEP.TMP", false, &scratch));
     try std.testing.expect(isIgnored(&injected_set, "SECRET.TXT", false, &scratch));
 
-    // 2. J03 / J08：层级文件优先级（git_exclude < .gitignore < .ignore < .rgignore）与细分开关
+    // 2. Layer file precedence (git_exclude < .gitignore < .ignore < .rgignore) and fine-grained switches
     const files = LayerFiles{
         .git_exclude = "*.bak\n",
         .gitignore = "*.log\n",
@@ -464,7 +466,7 @@ test "J05 纯文本忽略规则与 J08 细分开关" {
     try std.testing.expect(isIgnored(&full_set, "temp.out", false, &scratch));
     try std.testing.expect(!isIgnored(&full_set, "final.out", false, &scratch));
 
-    // 关闭 vcs 与 exclude，仅保留 dot（.ignore / .rgignore）
+    // Disable vcs and exclude, keeping only dot (.ignore / .rgignore)
     var dot_only_globs: std.ArrayList(glob.Glob) = .empty;
     try parseLayerInto(arena, files, .{ .vcs = false, .exclude = false, .dot = true }, &dot_only_globs);
     const dot_set = try build(arena, std.testing.allocator, null, 0, &.{}, dot_only_globs.items);

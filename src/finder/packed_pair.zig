@@ -1,25 +1,26 @@
-//! 用两个稀有字节做预过滤，再对候选做整段确认。
-//! 模式至少两个字节。单字节走 memchr，本模块不处理。
+//! Prefilters using two rare bytes, then verifies candidate spans in full.
+//! Patterns must be at least two bytes; single-byte patterns use memchr and are not handled here.
 //!
-//! 热路径是通用 SIMD（Wojciech Muła 的 generic SIMD，memchr 的 packed pair
-//! 也是这个算法）：每个向量同时比较两个偏移上的字节，掩码取与。
-//! 只有两个字节一起命中才离开向量循环。单字节很常见、但两个字节的
-//! 相对位置对不上时，循环仍然整段留在向量指令里。
+//! The hot path uses generic SIMD (Wojciech Muła's generic SIMD algorithm, also used by
+//! memchr's packed pair): each vector compares bytes at two offsets simultaneously and ANDs their masks.
+//! The loop exits SIMD only when both bytes hit together. Even if individual bytes are common,
+//! as long as their relative offset does not match, execution stays entirely within vector instructions.
 
 const std = @import("std");
 const ascii = @import("ascii.zig");
 
-/// 不超过这个长度时，packed pair 自己完成查找，不把剩余输入交给 Two-Way。
-/// 假阳性再乘一次最长 32 字节的比较，总时间仍是线性的常数倍。
-/// 这个上界和 memchr 的 `do_packed_search` 一致。
+/// Up to this length, packed pair completes the search itself without handing the remaining input to Two-Way.
+/// False positives multiplied by at most a 32-byte comparison still run in constant-factor linear time.
+/// Matches memchr's `do_packed_search` upper bound.
 pub const owns_search_max_len: usize = 32;
 
-/// 长模式上的预过滤记账。平均每次确认失败跳过的字节太少时，调用方应改走 Two-Way。
-/// 数字和 memchr 的 PrefilterState 一致：至少 50 个候选，且平均每次跳过少于 8 字节。
+/// Prefilter accounting for long patterns. When failed verifications skip too few bytes on average,
+/// the caller should switch to Two-Way.
+/// Thresholds match memchr's PrefilterState: at least 50 candidates and fewer than 8 bytes skipped per candidate on average.
 pub const Guard = struct {
     candidates: u32 = 0,
     skipped: u64 = 0,
-    /// 预过滤放弃之后，Two-Way 从这里继续。不能叫 resume，那是关键字。
+    /// Offset where Two-Way should resume after the prefilter gives up (`resume` is a reserved keyword).
     restart: usize = 0,
     gave_up: bool = false,
 
@@ -45,7 +46,7 @@ pub const PackedPair = struct {
     other: u8,
     ignore_case: bool,
 
-    /// `rank` 的值越小越稀有。`pattern` 由调用方持有。
+    /// Smaller `rank` values indicate rarer bytes. `pattern` is owned by the caller.
     pub fn init(pattern: []const u8, rank: *const [256]u8, ignore_case: bool) PackedPair {
         std.debug.assert(pattern.len >= 2);
         var best: usize = 0;
@@ -74,9 +75,9 @@ pub const PackedPair = struct {
         };
     }
 
-    /// 在 `haystack[start..]` 中查找下一次完整匹配的起点。
-    /// `guard` 非空且模式长于 `owns_search_max_len` 时，预过滤跳得太近就停，
-    /// 并在 `guard` 里写下 Two-Way 应该接上的位置。
+    /// Finds the start of the next full match in `haystack[start..]`.
+    /// When `guard` is non-null and the pattern is longer than `owns_search_max_len`, stops if the prefilter
+    /// advances too slowly and records the resume offset for Two-Way in `guard`.
     pub fn find(
         self: PackedPair,
         comptime width: comptime_int,
@@ -87,9 +88,9 @@ pub const PackedPair = struct {
         return self.findInner(width, haystack, start, guard, false, undefined);
     }
 
-    /// 和 `find` 一样，但顺手在已经加载的向量上找 NUL。
-    /// 看到 NUL 时写入 `nul_out` 并返回 null，调用方按二进制策略处理这一块。
-    /// 返回匹配时，只保证匹配起点之前没有 NUL；匹配之后的字节由调用方再看。
+    /// Same as `find`, while also checking already-loaded vectors for NUL bytes.
+    /// If a NUL is seen, writes its offset to `nul_out` and returns null so the caller can apply its binary policy.
+    /// When returning a match, only guarantees no NUL precedes the match start; bytes after the match are checked by the caller.
     pub fn findWatchingNul(
         self: PackedPair,
         comptime width: comptime_int,
@@ -110,7 +111,7 @@ pub const PackedPair = struct {
         comptime watch_nul: bool,
         nul_out: *?usize,
     ) ?usize {
-        comptime if (width != 16 and width != 32) @compileError("packed pair 宽度只支持 16 和 32");
+        comptime if (width != 16 and width != 32) @compileError("packed pair width must be 16 or 32");
         const m = self.pattern.len;
         if (m > haystack.len or start > haystack.len - m) {
             if (watch_nul and start <= haystack.len) {
@@ -119,7 +120,7 @@ pub const PackedPair = struct {
             return null;
         }
         const last = haystack.len - m;
-        // 大小写、记账和 NUL 都在循环外定死，没命中的循环里只剩加载、比较和归约。
+        // Case folding, guard accounting, and NUL watching are specialized outside the loop so the miss loop contains only loads, comparisons, and reductions.
         if (self.ignore_case) {
             if (guard) |g| return self.findLoop(width, haystack, start, last, true, true, watch_nul, g, nul_out);
             return self.findLoop(width, haystack, start, last, true, false, watch_nul, undefined, nul_out);
@@ -142,22 +143,22 @@ pub const PackedPair = struct {
     ) ?usize {
         const max_index = @max(self.anchor_index, self.other_index);
         const cover_index = @min(self.anchor_index, self.other_index);
-        // 锚点不是 0 时，向量覆盖不到起点前面这几字节。
+        // When the minimum anchor offset is non-zero, SIMD loads do not cover the leading bytes after `start`.
         if (watch_nul and cover_index > 0) {
             const prefix_end = @min(haystack.len, start + cover_index);
             if (noteNul(haystack[start..prefix_end], start, nul_out)) return null;
         }
         var origin = start;
         var previous = start;
-        // 密集匹配时下一次命中通常就在几十字节内。先标量看完这一小段，
-        // 避免为了一次确认走进向量循环。稀有字面量上这只是每块多看几十个字节。
+        // During dense matches, the next hit is often within a few dozen bytes. Scan this short prefix
+        // scalarly to avoid entering the SIMD loop for a single confirmation; on rare literals this adds only a few dozen byte checks per block.
         if (!watch_nul) {
             const bound = @min(last, start + 47);
             if (scalarFrom(self, haystack, origin, bound, &previous, fold, watched, guard)) |hit| return hit;
             if (watched and guard.gave_up) return null;
             origin = bound + 1;
         }
-        // 一次推进 4 个向量，把 4 个窗口的掩码并起来做单次归约，减少 75% 的归约与分支指令。
+        // Advance 4 vectors per iteration and OR their masks into a single reduction, cutting reduction and branch instructions by 75%.
         const stride = width * 4;
         while (origin <= last and origin + max_index + stride <= haystack.len) {
             var masks: [4]@Vector(width, bool) = undefined;
@@ -207,7 +208,7 @@ pub const PackedPair = struct {
 fn confirm(self: PackedPair, haystack: []const u8, origin: usize) bool {
     const pat = self.pattern;
     const window = haystack[origin..][0..pat.len];
-    // 敏感比较交给 std。它会在第一个不相等的字节返回，假阳性不用看完整个模式。
+    // Case-sensitive comparison delegates to std, which returns on the first mismatch without scanning the full pattern on false positives.
     if (!self.ignore_case) return std.mem.eql(u8, pat, window);
     for (pat, window) |p, h| {
         if (!ascii.eq(p, h, true)) return false;
@@ -219,12 +220,12 @@ inline fn byteMask(comptime width: comptime_int, block: @Vector(width, u8), byte
     if (!fold) return block == @as(@Vector(width, u8), @splat(byte));
     const forms = ascii.caseVariants(byte);
     if (forms[0] == forms[1]) return block == @as(@Vector(width, u8), @splat(forms[0]));
-    // ASCII 字母的大写与小写只差 0x20 位，置位后等于小写形式，无假阳性且省掉一次比较与或运算。
+    // Uppercase and lowercase ASCII letters differ only by bit 0x20; setting that bit matches the lowercase form without false positives and saves a comparison and OR.
     return (block | @as(@Vector(width, u8), @splat(0x20))) == @as(@Vector(width, u8), @splat(forms[0]));
 }
 
-/// 这一窗里两个锚点字节的命中掩码。`watch_nul` 时顺带并入覆盖向量里的 NUL 掩码。
-/// 覆盖向量是下标更小的那个锚点，已经在寄存器里，不再多加载一次。
+/// Hit mask for both anchor bytes in this window. When `watch_nul` is enabled, ORs in the NUL mask from the covering vector.
+/// The covering vector is the anchor at the smaller offset, which is already in a register and requires no extra load.
 inline fn hotMask(
     self: PackedPair,
     comptime width: comptime_int,
@@ -247,7 +248,7 @@ fn noteNul(haystack: []const u8, base: usize, nul_out: *?usize) bool {
     return true;
 }
 
-/// 返回相对 `origin` 的匹配起点。单独成函数，确认逻辑不要嵌进快循环。
+/// Returns the match start relative to `origin`. Outlined so verification logic stays out of the hot loop.
 fn takeHit(
     self: PackedPair,
     comptime width: comptime_int,
@@ -339,7 +340,7 @@ fn findAll(pair: PackedPair, comptime width: comptime_int, haystack: []const u8,
     return pair.find(width, haystack, start, null);
 }
 
-test "按秩选择最稀有的两个字节" {
+test "selects the two rarest bytes by rank" {
     var rank: [256]u8 = @splat(200);
     rank['z'] = 0;
     rank['q'] = 1;
@@ -351,7 +352,7 @@ test "按秩选择最稀有的两个字节" {
     try std.testing.expectEqual(@as(u8, 'q'), pair.other);
 }
 
-test "扫描时发现 NUL，锚点覆盖不到的前缀也算" {
+test "detects NUL during scan, including prefix before minimum anchor offset" {
     const mid = PackedPair.init("QX", &frequency.default_rank, false);
     var buf: [200]u8 = undefined;
     @memset(&buf, 'a');
@@ -384,7 +385,7 @@ test "扫描时发现 NUL，锚点覆盖不到的前缀也算" {
     }
 }
 
-test "确认候选，假阳性继续往后" {
+test "verifies candidates and continues past false positives" {
     const pair = PackedPair.init("qx", &frequency.default_rank, false);
     inline for (.{ 16, 32 }) |w| {
         try std.testing.expectEqual(@as(?usize, 3), findAll(pair, w, "qqqqxqx", 0));
@@ -393,7 +394,7 @@ test "确认候选，假阳性继续往后" {
     }
 }
 
-test "忽略大小写" {
+test "case-insensitive matching" {
     const pair = PackedPair.init("Ab", &frequency.default_rank, true);
     inline for (.{ 16, 32 }) |w| {
         try std.testing.expectEqual(@as(?usize, 1), findAll(pair, w, "xabXAB", 0));
@@ -404,7 +405,7 @@ test "忽略大小写" {
 
 const frequency = @import("frequency.zig");
 
-test "随机对照朴素查找" {
+test "random differential against naive search" {
     var prng = std.Random.DefaultPrng.init(0x9A11);
     const random = prng.random();
     var hay: [100]u8 = undefined;
@@ -428,7 +429,7 @@ test "随机对照朴素查找" {
     }
 }
 
-test "packed pair 模糊对照" {
+test "packed pair fuzz differential" {
     try std.testing.fuzz({}, fuzzPair, .{});
 }
 

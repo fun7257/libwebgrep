@@ -1,8 +1,9 @@
-//! Two-Way 字面量查找（Crochemore–Perrin）。
-//! 预处理 O(m)、常数额外空间，搜索最坏 O(n)。模式内存由调用方持有。
+//! Two-Way literal search (Crochemore-Perrin).
+//! O(m) preprocessing in constant extra space and O(n) worst-case search time. Pattern bytes are owned by the caller.
 //!
-//! 临界分解取两个顺序下的最大后缀里更靠右的那个。右半段先从左往右比，
-//! 对上后再把左半段从右往左比。周期情形记住已经对上的前缀，避免重复比较。
+//! Critical factorization picks the rightmost maximal suffix under both ordering directions.
+//! The right half is compared left-to-right first; once matched, the left half is compared right-to-left.
+//! For periodic patterns, the matched prefix length is remembered to avoid redundant comparisons.
 
 const std = @import("std");
 const ascii = @import("ascii.zig");
@@ -15,10 +16,10 @@ pub const Fold = enum {
 
 pub const TwoWay = struct {
     pattern: []const u8,
-    /// 右半段起点。0 表示左半段为空。
+    /// Start index of the right half. 0 means the left half is empty.
     crit: usize,
     period: usize,
-    /// 左半段等于以 period 为间隔的同一段，搜索时可以记住前缀。
+    /// True when the left half repeats at distance `period`, allowing prefix memory during search.
     periodic: bool,
     fold: Fold,
 
@@ -49,7 +50,7 @@ pub const TwoWay = struct {
         };
     }
 
-    /// 返回下一次匹配的起点。空模式在 `start <= haystack.len` 时匹配于 start。
+    /// Returns the start of the next match. An empty pattern matches at `start` when `start <= haystack.len`.
     pub fn find(self: TwoWay, haystack: []const u8, start: usize) ?usize {
         const m = self.pattern.len;
         if (m == 0) {
@@ -67,7 +68,7 @@ pub const TwoWay = struct {
 };
 
 const Suffix = struct {
-    /// 最大后缀起点减一。整串都是最大后缀时为 -1。
+    /// Start index of the maximal suffix minus one (-1 when the entire string is the maximal suffix).
     pos: isize,
     period: usize,
 };
@@ -142,8 +143,8 @@ fn findNonPeriodic(self: TwoWay, haystack: []const u8, start: usize) ?usize {
     const per = @max(self.crit, pat.len - self.crit) + 1;
     const crit = self.crit;
     const fold = self.fold == .ascii;
-    // 右半段非空时，第一个必须相等的字节用向量 memchr 跳过去。
-    // 失配后的位移仍按 Two-Way，最坏时间保持线性。
+    // When the right half is non-empty, use vectorized memchr to skip to the first required byte.
+    // Mismatch shifts still follow Two-Way, preserving linear worst-case time.
     const forms: [2]u8 = if (crit < pat.len and fold)
         ascii.caseVariants(pat[crit])
     else if (crit < pat.len)
@@ -206,7 +207,7 @@ fn scalarFind(haystack: []const u8, needle: []const u8, start: usize, fold: Fold
     return null;
 }
 
-test "空模式、找不到、模式比剩余输入长" {
+test "empty pattern, not found, and pattern longer than remaining input" {
     const empty = TwoWay.init("", .sensitive);
     try std.testing.expectEqual(@as(?usize, 0), empty.find("", 0));
     try std.testing.expectEqual(@as(?usize, 2), empty.find("ab", 2));
@@ -220,7 +221,7 @@ test "空模式、找不到、模式比剩余输入长" {
     try std.testing.expectEqual(@as(?usize, null), abc.find("xxabcxx", 3));
 }
 
-test "周期模式的重叠匹配" {
+test "overlapping matches in periodic patterns" {
     const aaa = TwoWay.init("aaa", .sensitive);
     try std.testing.expectEqual(@as(?usize, 0), aaa.find("aaaa", 0));
     try std.testing.expectEqual(@as(?usize, 1), aaa.find("aaaa", 1));
@@ -231,7 +232,7 @@ test "周期模式的重叠匹配" {
     try std.testing.expectEqual(@as(?usize, 3), aabaab.find("xxxaabaabaab", 0));
 }
 
-test "ASCII 忽略大小写" {
+test "ASCII case-insensitive matching" {
     const pat = TwoWay.init("AbC", .ascii);
     try std.testing.expectEqual(@as(?usize, 2), pat.find("xxabcXX", 0));
     try std.testing.expectEqual(@as(?usize, 2), pat.find("xxABCxx", 0));
@@ -240,7 +241,7 @@ test "ASCII 忽略大小写" {
     try std.testing.expectEqual(@as(?usize, null), sensitive.find("xxabcXX", 0));
 }
 
-test "短字母表上和朴素查找一致" {
+test "matches naive search over a binary alphabet" {
     const alphabet = "ab";
     var hay: [10]u8 = undefined;
     var pat: [5]u8 = undefined;
@@ -277,7 +278,7 @@ test "短字母表上和朴素查找一致" {
     }
 }
 
-test "随机输入对照 std.mem.findPos" {
+test "random inputs against std.mem.findPos" {
     var prng = std.Random.DefaultPrng.init(0x7A0);
     const random = prng.random();
     var hay: [80]u8 = undefined;
@@ -301,7 +302,7 @@ test "随机输入对照 std.mem.findPos" {
     }
 }
 
-test "Two-Way 模糊对照" {
+test "Two-Way fuzz differential" {
     try std.testing.fuzz({}, fuzzTwoWay, .{});
 }
 

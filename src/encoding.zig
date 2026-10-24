@@ -1,26 +1,26 @@
-//! 流开头的 BOM 与 UTF-16 转码。
+//! Leading BOM sniffing and UTF-16 / legacy charset transcoding.
 //!
-//! 匹配内核仍吃字节。这里只在搜索前把认出的 UTF-16 换成 UTF-8，
-//! 或者在交出一行时把非法 UTF-8 换成 U+FFFD。无 BOM 时不猜测编码。
+//! The matching kernel still operates on bytes. Here we only transcode recognized encodings to UTF-8 before searching,
+//! or replace invalid UTF-8 with U+FFFD when emitting a line. Without a BOM or explicit hint, no encoding is guessed.
 
 const std = @import("std");
 const unicode = std.unicode;
 const decompress = @import("decompress.zig");
 
 pub const Encoding = enum {
-    /// 只在流开头嗅探 BOM（无 BOM 时若有 `charset` 提示则按提示转码，否则按原始字节搜索）。
+    /// Only sniff for a BOM at the start of the stream (if no BOM is present, transcode using the `charset` hint if given, otherwise search raw bytes).
     auto,
-    /// 不嗅探、不转码。非法字节原样进入匹配。
+    /// Do not sniff or transcode. Invalid bytes enter matching as-is.
     none,
-    /// 按 UTF-8 处理（剥离开头 BOM，非法字节转 U+FFFD）。
+    /// Process as UTF-8 (strip leading BOM, replace invalid bytes with U+FFFD).
     utf8,
-    /// 按 UTF-16LE 转码为 UTF-8。
+    /// Transcode from UTF-16LE to UTF-8.
     utf16le,
-    /// 按 UTF-16BE 转码为 UTF-8。
+    /// Transcode from UTF-16BE to UTF-8.
     utf16be,
-    /// 按 GBK / GB2312 / CP936 转码为 UTF-8。
+    /// Transcode from GBK / GB2312 / CP936 to UTF-8.
     gbk,
-    /// 按 ISO-8859-1 / Latin-1 转码为 UTF-8。
+    /// Transcode from ISO-8859-1 / Latin-1 to UTF-8.
     latin1,
 };
 
@@ -51,7 +51,7 @@ pub const Pull = struct {
     eof: bool,
 };
 
-/// 只看流开头。`eof` 为真时，凑不齐的 BOM 前缀按原始字节处理。
+/// Inspects only the beginning of the stream. When `eof` is true, an incomplete BOM prefix is treated as raw bytes.
 pub fn sniff(bytes: []const u8, eof: bool) Sniff {
     if (bytes.len >= 3 and std.mem.eql(u8, bytes[0..3], "\xef\xbb\xbf")) return .utf8;
     if (bytes.len >= 2 and bytes[0] == 0xff and bytes[1] == 0xfe) return .utf16le;
@@ -68,7 +68,7 @@ pub fn sniff(bytes: []const u8, eof: bool) Sniff {
     return .raw;
 }
 
-/// 解析 WHATWG 字符集标签或 HTTP Content-Type 头部（如 `text/plain; charset=gbk`）为 `Encoding`。
+/// Parse a WHATWG charset label or HTTP Content-Type header (such as `text/plain; charset=gbk`) into an `Encoding`.
 pub fn fromCharset(label_or_header: []const u8) ?Encoding {
     var token = label_or_header;
     if (asciiIndexOfIgnoreCase(token, "charset=")) |idx| {
@@ -130,7 +130,7 @@ pub fn writeLossy(bytes: []const u8, out: []u8) usize {
     return convertInto(.utf8, bytes, out);
 }
 
-/// `start`、`end` 是原始字节上的位置。返回值按有损 UTF-8 的 UTF-16 码元计。
+/// `start` and `end` are byte offsets in the raw slice. The returned span is measured in UTF-16 code units on the lossy UTF-8 text.
 pub fn utf16Span(bytes: []const u8, start: usize, end: usize) Utf16Span {
     const from = @min(start, bytes.len);
     const to = @min(@max(end, from), bytes.len);
@@ -167,7 +167,7 @@ pub fn utf16Span(bytes: []const u8, start: usize, end: usize) Utf16Span {
     return .{ .start = u16_start, .end = u16_end };
 }
 
-/// 转成可搜索字节之后的长度。原始字节原样返回输入长度。
+/// Byte length after transcoding into searchable bytes. Returns `input.len` unchanged for raw bytes.
 pub fn decodedSize(kind: Sniff, input: []const u8) usize {
     const mode: coded_mode = switch (kind) {
         .utf8 => .utf8,
@@ -207,8 +207,8 @@ pub fn convertAllocWithMap(
     return buf;
 }
 
-/// 把上游读到的字节变成可搜索的字节。
-/// `encoding == .none` 或无 BOM 时，第一次读取的长度和直接读 `dest` 相同。
+/// Converts upstream bytes into searchable bytes.
+/// When `encoding == .none` or no BOM is present, the first read length matches reading directly into `dest`.
 pub const Decoder = struct {
     mode: Mode = .undecided,
     fallback_mode: Mode = .raw,
@@ -220,7 +220,7 @@ pub const Decoder = struct {
     out_i: usize = 0,
     raw_buf: []u8 = &.{},
     saw_eof: bool = false,
-    /// 解码输入缓冲的字节上限。超过就返回 `DecodeLimit`，不再扩容。
+    /// Byte limit for the decode input buffer. Returns `DecodeLimit` instead of growing past this cap.
     max_in: usize = std.math.maxInt(usize),
     raw_consumed: u64 = 0,
     out_produced: u64 = 0,
@@ -632,7 +632,7 @@ const GbkPair = struct {
     cp: u21,
 };
 
-/// 常用 GB2312/GBK 双字节汉字与标点精确映射表，其余合法双字节对按 GBK 区位映射至 CJK 统一表意文字区。
+/// Exact mapping table for common GB2312/GBK double-byte Chinese characters and punctuation; remaining valid double-byte pairs map linearly into the CJK Unified Ideographs block.
 const gbk_common_pairs = [_]GbkPair{
     .{ .b1 = 0xC4, .b2 = 0xE3, .cp = '你' },
     .{ .b1 = 0xBA, .b2 = 0xC3, .cp = '好' },
@@ -657,7 +657,7 @@ const gbk_common_pairs = [_]GbkPair{
     .{ .b1 = 0xBE, .b2 = 0xDD, .cp = '据' },
     .{ .b1 = 0xCF, .b2 = 0xB5, .cp = '系' },
     .{ .b1 = 0xCD, .b2 = 0xB3, .cp = '统' },
-    .{ .b1 = 0xA1, .b2 = 0xA1, .cp = 0x3000 }, // 全角空格
+    .{ .b1 = 0xA1, .b2 = 0xA1, .cp = 0x3000 }, // Ideographic space
     .{ .b1 = 0xA1, .b2 = 0xA3, .cp = '。' },
     .{ .b1 = 0xA3, .b2 = 0xAC, .cp = '，' },
     .{ .b1 = 0xA3, .b2 = 0xBA, .cp = '：' },
@@ -670,7 +670,7 @@ fn decodeGbk(bytes: []const u8, eof: bool) ?Step {
     if (bytes.len == 0) return null;
     const b1 = bytes[0];
     if (b1 < 0x80) return .{ .n = 1, .cp = b1 };
-    if (b1 == 0x80) return .{ .n = 1, .cp = 0x20AC }; // €
+    if (b1 == 0x80) return .{ .n = 1, .cp = 0x20AC }; // Euro sign
     if (b1 == 0xFF) return .{ .n = 1, .cp = unicode.replacement_character };
     if (bytes.len < 2) {
         if (!eof) return null;
@@ -683,7 +683,7 @@ fn decodeGbk(bytes: []const u8, eof: bool) ?Step {
     for (gbk_common_pairs) |pair| {
         if (pair.b1 == b1 and pair.b2 == b2) return .{ .n = 2, .cp = pair.cp };
     }
-    // GB2312 第 3 区全角 ASCII (0xA3 0xA1..0xFE -> U+FF01..U+FF5E)
+    // GB2312 Section 3 fullwidth ASCII (0xA3 0xA1..0xFE -> U+FF01..U+FF5E)
     if (b1 == 0xA3 and b2 >= 0xA1 and b2 <= 0xFE) {
         return .{ .n = 2, .cp = 0xFF01 + @as(u21, b2 - 0xA1) };
     }
@@ -750,7 +750,7 @@ fn encodeCp(cp: u21, out: []u8) usize {
 
 const testing = std.testing;
 
-test "BOM 只在开头识别" {
+test "BOM is only recognized at the beginning" {
     try testing.expectEqual(Sniff.utf8, sniff("\xef\xbb\xbfxyz", false));
     try testing.expectEqual(Sniff.utf16le, sniff("\xff\xfe\x61\x00", false));
     try testing.expectEqual(Sniff.utf16be, sniff("\xfe\xff\x00\x61", false));
@@ -761,7 +761,7 @@ test "BOM 只在开头识别" {
     try testing.expectEqual(Sniff.raw, sniff("\xff", true));
 }
 
-test "非法 UTF-16 码元换成 U+FFFD" {
+test "invalid UTF-16 code units are replaced with U+FFFD" {
     const lone = [_]u8{ 0x61, 0x00, 0x00, 0xD8, 0x62, 0x00 };
     const text = try convertAlloc(testing.allocator, .utf16le, &lone);
     defer testing.allocator.free(text);
@@ -778,7 +778,7 @@ test "非法 UTF-16 码元换成 U+FFFD" {
     try testing.expectEqualStrings("a\u{FFFD}", wide);
 }
 
-test "UTF-16 码元偏移" {
+test "UTF-16 code unit offsets" {
     const bytes = "aé你😀x";
     const x = utf16Span(bytes, 10, 11);
     try testing.expectEqual(@as(usize, 5), x.start);
@@ -812,7 +812,7 @@ const Chunk = struct {
     }
 };
 
-test "读缓冲小于 BOM 加一个码元时仍能转成 UTF-8" {
+test "transcodes to UTF-8 even when read buffer is smaller than BOM plus one code unit" {
     const le = [_]u8{ 0xFF, 0xFE, 'f', 0, 'o', 0, 'o', 0, '\n', 0 };
     var src = Chunk{ .rest = &le, .cap = 3 };
     var dec = Decoder.init(.auto);

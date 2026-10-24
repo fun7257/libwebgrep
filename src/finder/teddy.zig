@@ -1,11 +1,12 @@
-//! Teddy：少量多模式的半字节 SIMD 过滤。
+//! Teddy: nibble-based SIMD prefilter for small multi-pattern sets.
 //!
-//! 每 8 个模式一组，一个字节里的一位对应一个模式。指纹长度是 `min(最短模式, 3)`。
-//! 每个指纹偏移有一张低半字节表和一张高半字节表。一次看 `lanes` 个起点，
-//! 把各偏移的查表结果按位与，非 0 的路再逐个模式确认。假阳性可以留下，漏掉才是错误。
+//! Patterns are grouped into 8 buckets (one bit per bucket in a byte). The fingerprint length is `min(shortest_pattern, 3)`.
+//! Each fingerprint offset has a low-nibble table and a high-nibble table. Examining `lanes` start positions at once,
+//! table lookups across fingerprint offsets are bitwise-ANDed, and non-zero lanes are verified per pattern.
+//! False positives are acceptable; false negatives are not.
 //!
-//! 查表指令按 ISA 分文件。本文件只在 `-Dteddy` 不是 off 时被引用。
-//! 模式字节由调用方持有。这里不分配内存。
+//! Lookup instructions are separated by ISA. This file is referenced only when `-Dteddy` is not `off`.
+//! Pattern bytes are owned by the caller; no memory is allocated here.
 
 const std = @import("std");
 const ascii = @import("ascii.zig");
@@ -284,7 +285,7 @@ pub const Engine = struct {
         return self.confirm(haystack, at, mode, best, bucket_mask);
     }
 
-    /// `bucket_mask` 为空时检查全部模式，供窗口尾巴使用。否则只确认置位桶里的模式。
+    /// Checks all patterns when `bucket_mask` is null (used for tail bytes); otherwise verifies only patterns in set buckets.
     fn confirm(
         self: *const Engine,
         haystack: []const u8,
@@ -394,7 +395,7 @@ fn prefer(a: Cand, b: Cand) bool {
     return a.id < b.id;
 }
 
-test "指纹对齐后的命中和更早结束" {
+test "aligned fingerprint hits and earliest match termination" {
     const pats = [_][]const u8{ "abcdef", "de", "xyz", "qr" };
     const engine = Engine.init(&pats, false);
     const hay = "............abcdef....de";

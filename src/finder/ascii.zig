@@ -1,4 +1,4 @@
-//! 本次只折叠 ASCII 字母。非字母原样返回。
+//! Folds ASCII letters only; non-letters are returned unchanged.
 
 pub fn fold(b: u8) u8 {
     if (b >= 'A' and b <= 'Z') return b + ('a' - 'A');
@@ -18,7 +18,7 @@ pub fn eql(a: []const u8, b: []const u8, ignore_case: bool) bool {
     return true;
 }
 
-/// 字母的小写和大写。非字母两个位置相同。
+/// Lowercase and uppercase variants of a letter; identical in both slots for non-letters.
 pub fn caseVariants(b: u8) [2]u8 {
     const lower = fold(b);
     if (lower >= 'a' and lower <= 'z') return .{ lower, lower - ('a' - 'A') };

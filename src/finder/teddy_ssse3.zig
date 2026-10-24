@@ -1,8 +1,8 @@
-//! x86_64 SSSE3 的 Teddy 查表。只在 `-Dteddy=ssse3` 且目标是 x86_64 时编入。
+//! x86_64 SSSE3 Teddy lookup. Compiled only when `-Dteddy=ssse3` and targeting x86_64.
 //!
-//! `pshufb` 会改掉目的寄存器，所以先把表复制过去。索引的最高位为 1 时结果是 0。
-//! 调用方传入的半字节最高位是 0，低 4 位就是表下标。
-//! `palignr` 把目的寄存器当低 16 字节、源寄存器当高 16 字节，再按字节右移。
+//! `pshufb` clobbers the destination register, so the table is copied first. When the high bit
+//! of an index byte is 1, the result is 0; callers pass nibbles with high bit 0 and low 4 bits as the table index.
+//! `palignr` concatenates the destination register (low 16 bytes) and source register (high 16 bytes) and shifts right by bytes.
 
 pub const lanes: usize = 16;
 

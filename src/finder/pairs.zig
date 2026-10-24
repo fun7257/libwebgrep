@@ -1,12 +1,14 @@
-//! 邻接字节对的向量预过滤。
+//! Vectorized prefilter over adjacent byte pairs.
 //!
-//! 每条长度至少为 2 的模式取最稀有字节，再取它旁边更稀有的那一个字节。
-//! 不同的（偏移、锚点、搭档）不超过 16 种时，用 `@Vector` 同时看这两个字节。
-//! 单字节锚点会在常见字母上停下来；一对字节把确认留到真的可能命中。
-//! 逐对比较的向量算术很多，所以先把相邻两字节收成一个哈希，只和少量桶比较。
-//! 哈希命中后再做精确确认。假阳性可以留下，漏掉才是错。
-//! 构造时按模式数分配一张很小的表，查找不分配。
-//! 放不下、有空模式或有单字节模式时，调用方改走 Teddy 或自动机。
+//! For each pattern of length at least 2, selects the rarest byte and its rarer immediate neighbor.
+//! When the total number of distinct `(offset_direction, anchor, partner)` rules is at most 16,
+//! `@Vector` compares both bytes simultaneously.
+//! Single-byte anchors would stop on common letters; a byte pair defers verification until a likely hit.
+//! Because per-pair vector arithmetic can grow large, adjacent byte pairs are hashed into a single byte
+//! and compared against a small set of buckets when more than 2 rules exist, followed by exact verification on a hit.
+//! False positives are acceptable; false negatives are not.
+//! Allocates a small pattern-indexed table at construction time; searches do not allocate.
+//! When rules exceed capacity, or when any pattern is empty or single-byte, the caller falls back to Teddy or Aho-Corasick.
 
 const std = @import("std");
 const ascii = @import("ascii.zig");
@@ -53,7 +55,7 @@ pub const Engine = struct {
     items: []Item,
     allocator: std.mem.Allocator,
 
-    /// 能用不超过 16 种邻接对盖住全部模式时返回引擎。否则返回 null。
+    /// Returns an engine when all patterns can be covered by at most 16 adjacent-pair rules, or null otherwise.
     pub fn create(
         allocator: std.mem.Allocator,
         patterns: []const []const u8,
@@ -148,7 +150,7 @@ pub const Engine = struct {
         var pos = start;
         var nul_checked: usize = start;
         while (pos < haystack.len) {
-            // 邻接对很稀。确认一处之后若再扫到下一处，调用方每行找一次时会把文本读两遍。
+            // Adjacent pairs are rare. Bound the scan once a match is confirmed so line-by-line callers do not rescan the rest of the buffer.
             const limit = anchorLimit(haystack.len, pos, start, self.max_off, self.min_len, mode, best) orelse break;
             const at = self.findCandidate(haystack, pos, limit, watch_nul, &nul_checked, nul_out) orelse break;
             if (watch_nul and nul_out.* != null) break;
@@ -181,7 +183,7 @@ pub const Engine = struct {
         return .{ .start = chosen.start, .end = chosen.end };
     }
 
-    /// 还没有命中时扫到文本末尾。已有命中时，锚点再往右就不可能改写结果。
+    /// Scans to the end of the text before any hit is found; once a match exists, bounds how far right an anchor can still improve the result.
     fn anchorLimit(
         hay_len: usize,
         pos: usize,
@@ -249,8 +251,8 @@ pub const Engine = struct {
         return null;
     }
 
-    /// 正向字节对不超过 2 个时直接做向量比较，省掉移位加哈希；
-    /// 桶不超过 8 个时走哈希；再多就退回逐对比较。
+    /// Compares vectors directly when there are at most 2 forward byte pairs, avoiding shift-add hashing;
+    /// uses hash buckets for up to 8 buckets, and falls back to per-pair comparisons beyond that.
     noinline fn scan(
         self: *const Engine,
         hay: []const u8,
@@ -381,8 +383,8 @@ pub const Engine = struct {
         return null;
     }
 
-    /// `h = first + (second << 7)`。每个规则的哈希都放进桶里，所以不会漏。
-    /// 负偏移的规则看的是前一个字节和锚点组成的正向字节对。
+    /// `h = first + (second << 7)`. Every rule's hash is placed in a bucket, so no match can be missed.
+    /// Negative-offset rules hash the forward byte pair formed by the preceding byte and the anchor.
     noinline fn scanBuckets(
         self: *const Engine,
         hay: []const u8,
@@ -471,7 +473,7 @@ pub const Engine = struct {
         while (j < stop) : (j += 1) {
             if (self.hitScalar(hay, j)) return j;
         }
-        // 负偏移的锚点可能落在窗口后的第一个字节上，正向字节对的哈希在上一窗。
+        // A negative-offset anchor may land on the first byte past the window while its forward digram hash was in the current window.
         if (self.nneg != 0) {
             const edge = at + width;
             if (edge < end and edge < hay.len and self.hitScalar(hay, edge)) return edge;
@@ -836,7 +838,7 @@ fn prefer(a: Cand, b: Cand, mode: matcher.MatchMode) bool {
     }
 }
 
-test "邻接对和自动机看到同一处" {
+test "adjacent pairs match automaton at the same position" {
     const alloc = std.testing.allocator;
     const pats = [_][]const u8{ "abcdef", "de", "xxqz", "alpha" };
     var engine = (try Engine.create(alloc, &pats, false)).?;
@@ -865,11 +867,11 @@ test "邻接对和自动机看到同一处" {
     try std.testing.expect(try Engine.create(alloc, &wide, false) == null);
 }
 
-test "长文本里的邻接对，包括窗口边界" {
+test "adjacent pairs in long text, including window boundaries" {
     const alloc = std.testing.allocator;
     var buf: [200]u8 = undefined;
     @memset(&buf, 'x');
-    // “lp” 的稀有字节是 p，锚点落在窗口后的第一个字节上。
+    // For "lp", the rarer byte is 'p', placing the anchor on the first byte after the window boundary.
     buf[16] = 'l';
     buf[17] = 'p';
     buf[100] = 'b';

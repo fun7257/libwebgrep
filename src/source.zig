@@ -1,5 +1,5 @@
-//! 归档和网络输入的小接口。文件系统遍历不走这里，直接用 `std.Io.Dir`。
-//! P1 把接口定下来，并给一个内存目录，方便测试。
+//! Minimal interface for archive and network inputs. Filesystem traversal bypasses this and uses `std.Io.Dir` directly.
+//! Defines the interface and provides an in-memory directory for testing.
 
 const std = @import("std");
 
@@ -45,7 +45,7 @@ pub const Node = struct {
     children: []const *const Node = &.{},
 };
 
-/// 句柄是下标。0 保留，打开的节点从 1 起。
+/// Handles are 1-based slot indices; 0 is reserved.
 pub const Memory = struct {
     root: *const Node,
     slots: [8]?*const Node = @splat(null),
@@ -138,7 +138,7 @@ const vtable = VTable{
     .close = memClose,
 };
 
-test "内存目录能打开、列出和读取" {
+test "in-memory directory can open, list, and read" {
     const file = Node{ .name = "a.txt", .kind = .file, .bytes = "hello" };
     const dir = Node{ .name = "", .kind = .directory, .children = &.{&file} };
     var memory = Memory{ .root = &dir };

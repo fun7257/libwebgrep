@@ -1,7 +1,7 @@
-//! 目录遍历。忽略规则挂在不可变的父链上，发现的子目录交给调用方的队列。
-//! 文件系统走 `std.Io.Dir`，不经过 `source.zig` 的虚表。
+//! Directory traversal. Ignore rules are chained on an immutable parent list, and discovered subdirectories are pushed to the caller's queue.
+//! Filesystem access goes directly through `std.Io.Dir`, bypassing the vtable in `source.zig`.
 //!
-//! 默认跳过隐藏文件和 `.git`。不跟随符号链接。路径按字节拼接，不假定 UTF-8。
+//! Hidden files and `.git` are skipped by default. Symbolic links are never traversed. Paths are concatenated byte-by-byte without assuming UTF-8.
 
 const builtin = @import("builtin");
 const std = @import("std");
@@ -12,37 +12,37 @@ const list_dir = @import("list_dir.zig");
 const types = @import("types.zig");
 
 pub const Config = struct {
-    /// 服务端固定最大遍历深度硬顶（J09）。
+    /// Fixed server-side hard cap on maximum traversal depth.
     pub const max_depth_hard_cap: u32 = 64;
-    /// 服务端遍历来源条数硬顶（J11）。
+    /// Fixed server-side hard cap on the number of visited source entries.
     pub const max_entries_hard_cap: u64 = 100_000;
 
     hidden: bool = false,
     read_ignore: bool = true,
-    /// 细粒度忽略开关（J08）：dot（.ignore/.rgignore）、vcs（.gitignore）、仓库内 info 忽略与大小写。
+    /// Fine-grained ignore switches: dot (`.ignore`/`.rgignore`), vcs (`.gitignore`), repository-local info exclude, and case sensitivity.
     ignore_switches: ignore.LayerSwitch = .{},
-    /// 调用方注入的纯文本忽略规则切片（J05，不接受路径）。
+    /// Caller-supplied plain-text ignore rules (file paths are not accepted).
     ignore_texts: []const []const u8 = &.{},
-    /// null 表示使用服务端最大深度硬顶 `max_depth_hard_cap`。1 只看起始目录里的文件，0 什么也不列。
+    /// Null defaults to `max_depth_hard_cap`. 1 visits only files in the starting directory; 0 lists nothing.
     max_depth: ?u32 = null,
-    /// 遍历最多访问的文件来源条数预算（J11 / J13），受 `max_entries_hard_cap` 保护。
+    /// Maximum budget of file source entries visited during traversal, bounded by `max_entries_hard_cap`.
     max_entries: ?u64 = null,
-    /// 和来源扫描字节上限是同一个数。大于它的文件在遍历时跳过。null 表示这一层不按大小预跳过。
+    /// Shares the same value as the per-source scan byte limit. Files larger than this are skipped during traversal. Null disables size pre-skipping at this layer.
     max_filesize: ?u64 = null,
     globs: []const []const u8 = &.{},
-    /// 忽略 ASCII 大小写的 glob 规则列表（J02）。
+    /// Glob rules matched ASCII case-insensitively.
     iglobs: []const []const u8 = &.{},
-    /// 是否将 `globs` 也按忽略 ASCII 大小写处理（J02）。
+    /// Whether `globs` should also be matched ASCII case-insensitively.
     iglob: bool = false,
     types: []const []const u8 = &.{},
-    /// 排除的类型名列表（J12）。
+    /// Excluded file type names.
     types_not: []const []const u8 = &.{},
-    /// 调用方注入的自定义文件类型表（J12）。
+    /// Caller-supplied custom file type table.
     custom_types: []const types.Type = &.{},
-    /// 工作线程数，由调用方 `max_concurrency` 或显式配置决定（0 表示单线程 1，不探测宿主 CPU 核数）。
+    /// Worker thread count, determined by the caller's `max_concurrency` or explicit configuration (0 means single-threaded 1; host CPU core count is never probed).
     threads: u32 = 0,
     skip_git: bool = true,
-    /// 默认不进入与搜索根不同设备的目录。调用方可以关掉。没有打开链接跟随的字段。
+    /// By default, directories on a different device than the search root are not entered. Callers may disable this; there is no field to enable link traversal.
     one_file_system: bool = true,
 
     pub fn effectiveMaxDepth(self: Config) u32 {
@@ -57,7 +57,7 @@ pub const Config = struct {
 pub const Control = enum { cont, stop };
 
 pub const Visit = struct {
-    /// 只在这次回调期间有效。
+    /// Valid only for the duration of this callback.
     path: []const u8,
     dir: std.Io.Dir,
     name: []const u8,
@@ -80,15 +80,15 @@ pub const Host = struct {
 
 pub const Job = struct {
     dir: std.Io.Dir,
-    /// 调用方传入的根路径，遍历期间必须一直有效。
+    /// Root path passed by the caller; must remain valid throughout traversal.
     root: []const u8,
     rel: []u8,
     ignore: *const ignore.Set,
     depth: u32,
-    /// 这个目录所在设备。0 表示没取到，不据此判断跨设备。
+    /// Device ID of this directory. 0 means unavailable and is not used for cross-device checks.
     dev: u64 = 0,
     allocator: std.mem.Allocator,
-    /// 非 null 时这个任务只搜这些文件名，不再列目录。名字由本任务释放。
+    /// When non-null, this job visits only these filenames without listing the directory. Names are freed by this job.
     files: ?[][]u8 = null,
 
     pub fn destroy(self: *Job, io: std.Io) void {
@@ -176,7 +176,7 @@ fn openRoot(io: std.Io, path: []const u8) !std.Io.Dir {
     return std.Io.Dir.cwd().openDir(io, path, options);
 }
 
-/// 打开一个搜索根。不读取根之上的忽略规则。调用方把返回的任务放进队列。
+/// Opens a search root without reading ignore rules above it. The caller pushes the returned job into the queue.
 pub fn createRoot(host: *Host, root_path: []const u8) !*Job {
     try host.session.prepareConfig(host.io, host.config);
     const shown = trimSlash(root_path);
@@ -185,8 +185,8 @@ pub fn createRoot(host: *Host, root_path: []const u8) !*Job {
     return createJob(host, dir, shown, "", &host.session.empty, 1);
 }
 
-/// 打开目录和 stat 的默认行为会解析符号链接。遍历必须关掉这类布尔选项，
-/// 否则子目录或 `.git` 可能把读取带到调用方交给库的根外面。
+/// Opening a directory or stating a file resolves symbolic links by default. Traversal must disable
+/// such boolean options so subdirectories or `.git` cannot redirect reads outside the caller-supplied root.
 fn withoutLinkResolve(options: anytype) @TypeOf(options) {
     var out = options;
     const info = @typeInfo(@TypeOf(options)).@"struct";
@@ -197,7 +197,7 @@ fn withoutLinkResolve(options: anytype) @TypeOf(options) {
             @field(out, field_name) = false;
         }
     }
-    if (comptime !found) @compileError("目录选项里没有可关闭的符号链接解析");
+    if (comptime !found) @compileError("directory options lack a boolean flag to disable symlink resolution");
     return out;
 }
 
@@ -337,7 +337,7 @@ fn handleEntry(host: *Host, job: *Job, entry: std.Io.Dir.Entry, batch: *FileBatc
                 visitCheckedFile(host, job, name, rel);
             }
         },
-        // 链接本身不进入。目标即使在搜索根内也不读，遍历也不能顺着链接越出根。
+        // Symbolic links themselves are never entered; targets are not read even inside the search root, and traversal cannot escape the root via links.
         .sym_link => {},
         else => {},
     }
@@ -444,8 +444,8 @@ fn visitCheckedFile(
 
 fn duplicateDir(dir: std.Io.Dir) ?std.Io.Dir {
     if (builtin.os.tag == .windows) return null;
-    // `std.posix.system` 在没有链接 libc 时走 Linux 系统调用。
-    // `std.c.fcntl` 是 extern "c"，在 Linux 上会强制链接 libc。
+    // `std.posix.system` uses direct Linux syscalls when libc is not linked.
+    // `std.c.fcntl` is extern "c" and would force linking libc on Linux.
     const rc = std.posix.system.fcntl(dir.handle, std.posix.F.DUPFD_CLOEXEC, @as(usize, 0));
     if (std.posix.errno(rc) != .SUCCESS) return null;
     return .{ .handle = @intCast(rc) };
@@ -626,7 +626,7 @@ fn collectError(ctx: *anyopaque, path: []const u8, err: anyerror) void {
     std.debug.print("walk {s}: {t}\n", .{ path, err });
 }
 
-test "遍历跳过 gitignore、隐藏文件和 .git" {
+test "traversal skips gitignore, hidden files, and .git" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = std.testing.io;
@@ -681,7 +681,7 @@ fn countWalkError(ctx: *anyopaque, path: []const u8, err: anyerror) void {
     std.debug.print("walk {s}: {t}\n", .{ path, err });
 }
 
-test "符号链接不跟随，也不越出搜索根" {
+test "symbolic links are not traversed and cannot escape search root" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = std.testing.io;
@@ -794,7 +794,7 @@ fn collectWalk(root: []const u8, config: Config, found: *std.ArrayList([]u8)) !v
     while (stack.pop()) |item| process(&host, item);
 }
 
-test "不读搜索根之上的 gitignore 和 exclude" {
+test "does not read gitignore or exclude above search root" {
     inline for (@typeInfo(Config).@"struct".field_names) |field| {
         try std.testing.expect(std.mem.indexOf(u8, field, "parent") == null);
     }
@@ -821,7 +821,7 @@ test "不读搜索根之上的 gitignore 和 exclude" {
     try std.testing.expect(sawBase(found.items, "keep.log"));
 }
 
-test "不读全局 excludes" {
+test "does not read global excludes" {
     inline for (@typeInfo(Config).@"struct".field_names) |field| {
         try std.testing.expect(std.mem.indexOf(u8, field, "global") == null);
         try std.testing.expect(std.mem.indexOf(u8, field, "excludes") == null);
@@ -843,7 +843,7 @@ test "不读全局 excludes" {
     try std.testing.expect(sawBase(found.items, "keep.txt"));
 }
 
-test "默认不跨文件系统" {
+test "does not cross filesystems by default" {
     try std.testing.expect((Config{}).one_file_system);
     inline for (@typeInfo(Config).@"struct".field_names) |field| {
         try std.testing.expect(!std.mem.endsWith(u8, field, "symlinks"));
@@ -861,7 +861,7 @@ test "默认不跨文件系统" {
     try collectWalk(path_buf[0..path_len], .{}, &same);
     try std.testing.expect(sawBase(same.items, "inside.txt"));
 
-    const marker = "n7-cross.txt";
+    const marker = "cross-fs.txt";
     var shm = std.Io.Dir.openDirAbsolute(io, "/dev/shm", .{}) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
@@ -881,12 +881,12 @@ test "默认不跨文件系统" {
     try std.testing.expect(sawBase(opened.items, marker));
 }
 
-test "J04 无 git 目录时忽略规则同样生效" {
+test "ignore rules take effect even without a .git directory" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = std.testing.io;
 
-    // 不创建 .git 目录，验证 .gitignore、.ignore、.rgignore 依然生效且按优先级覆盖
+    // Without creating a .git directory, verify that .gitignore, .ignore, and .rgignore still take effect and override by priority
     try tmp.dir.writeFile(io, .{ .sub_path = ".gitignore", .data = "*.log\n*.tmp\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = ".ignore", .data = "!keep.log\n*.bak\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = ".rgignore", .data = "!keep.bak\n" });
@@ -915,7 +915,7 @@ test "J04 无 git 目录时忽略规则同样生效" {
     try std.testing.expect(!sawBase(found.items, "drop.bak"));
 }
 
-test "J09 固定服务端最大遍历深度与 J11 遍历条数上限" {
+test "fixed maximum traversal depth and entry count cap" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = std.testing.io;
@@ -930,7 +930,7 @@ test "J09 固定服务端最大遍历深度与 J11 遍历条数上限" {
     const path_len = try tmp.dir.realPath(io, &path_buf);
     const root = path_buf[0..path_len];
 
-    // 1. J09：超大的 max_depth 自动钳制在 max_depth_hard_cap，且显式深度生效
+    // 1. Oversized max_depth is clamped to max_depth_hard_cap, and explicit depth limits are respected
     const cfg_huge = Config{ .max_depth = 9999 };
     try std.testing.expectEqual(Config.max_depth_hard_cap, cfg_huge.effectiveMaxDepth());
 
@@ -941,7 +941,7 @@ test "J09 固定服务端最大遍历深度与 J11 遍历条数上限" {
     try std.testing.expect(sawBase(depth2_found.items, "d2.txt"));
     try std.testing.expect(!sawBase(depth2_found.items, "d3.txt"));
 
-    // 2. J11：max_entries 限制最多访问的文件来源条数
+    // 2. max_entries caps the number of visited file source entries
     var capped_found: std.ArrayList([]u8) = .empty;
     defer freeFound(&capped_found);
     try collectWalk(root, .{ .max_entries = 2 }, &capped_found);

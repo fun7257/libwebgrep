@@ -1,7 +1,8 @@
-//! AArch64 NEON 的 Teddy 查表。只在 `-Dteddy=neon` 且目标是 aarch64 时编入。
+//! AArch64 NEON Teddy lookup. Compiled only when `-Dteddy=neon` and targeting aarch64.
 //!
-//! `tbl` 用索引的低 4 位查 16 字节表，索引大于 15 则结果为 0。调用方传入的是半字节，范围是 0 到 15。
-//! `ext` 把两段 16 字节接起来再取后面的 16 字节，用来对齐指纹的后续字节。
+//! `tbl` indexes a 16-byte table using the low 4 bits and yields 0 for indices > 15.
+//! Callers pass nibbles in the range 0..15.
+//! `ext` concatenates two 16-byte vectors and extracts a shifted 16-byte window to align subsequent fingerprint bytes.
 
 const std = @import("std");
 
@@ -27,7 +28,7 @@ pub inline fn shift(a: @Vector(16, u8), b: @Vector(16, u8), comptime n: u8) @Vec
     return @shuffle(u8, a, b, mask);
 }
 
-test "NEON 移位让第 i 路对应起点 i" {
+test "NEON shift aligns lane i with start offset i" {
     const a: @Vector(16, u8) = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
     const b: @Vector(16, u8) = .{ 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 };
     const one = shift(a, b, 1);

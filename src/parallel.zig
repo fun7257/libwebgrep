@@ -1,16 +1,16 @@
-//! 目录调度留在库内。`run` 和 `Run.roots` 不从 `src/root.zig` 导出。
-//! 服务入口是 `searcher.searchSource` 和 `searcher.searchSourceSlice`。
+//! Directory scheduling stays internal to the library; `run` and `Run.roots` are not exported from `src/root.zig`.
+//! Service entry points are `searcher.searchSource` and `searcher.searchSourceSlice`.
 //!
-//! 目录搜索的调度。每个工人有自己的 Chase-Lev 队列、Finder 和搜索缓冲。
+//! Scheduling for directory search. Each worker owns a Chase-Lev deque, a Finder, and a search buffer.
 //!
-//! 工人从自己的队列尾部取任务（后进先出），从别人的队列头部偷（先进先出）。
-//! 忙的时候不加锁。这一轮取不到，就在 `std.Io.Condition` 上等待。
-//! 子目录入队时若已有空闲工人，就 `signal` 一个。全部空闲且锁里再偷一轮仍空，
-//! 或者搜索要提前停，就在同一把锁下置停止标志并 `broadcast`。
-//! 一个人时不建 `Io.Group`，调用线程自己跑同一套循环。
+//! Workers pop jobs from the bottom of their own deque (LIFO) and steal from the top of others' deques (FIFO).
+//! No locks are acquired while busy. When a worker finds no work in a pass, it waits on a `std.Io.Condition`.
+//! Enqueuing a subdirectory signals one worker if any are idle. When all workers are idle and a re-check under the lock
+//! still finds no work, or when search stops early, the stop flag is set and broadcasted under the same lock.
+//! With a single worker, no `Io.Group` is created; the calling thread runs the loop directly.
 //!
-//! 显式文件不进这里。调用方按参数顺序处理路径，目录才走这套调度。
-//! 工人之间不共享可变的搜索状态。输出用一把锁，按整个文件写出。
+//! Explicit files do not pass through here; callers process paths in argument order and use this scheduler only for directories.
+//! Workers share no mutable search state. Output uses a single lock and writes per complete file.
 
 const builtin = @import("builtin");
 const std = @import("std");
@@ -46,7 +46,7 @@ pub const Stats = struct {
 
 pub const Run = struct {
     pattern: []const u8 = "",
-    /// 多于一个时走多模式。空切片表示只用 `pattern`。
+    /// Uses multi-pattern search when more than one pattern is present. An empty slice uses `pattern`.
     patterns: []const []const u8 = &.{},
     find: matcher.FindOptions = .{},
     roots: []const []const u8,
@@ -55,12 +55,12 @@ pub const Run = struct {
     emit: Emit = .text,
     stdout: *std.Io.Writer,
     column: bool = false,
-    /// 保留给调用方。库内不再为分组写出分隔文本。
+    /// Retained for callers; the library no longer writes group separator text internally.
     use_separator: bool = false,
     saw_output: *bool,
-    /// 保留字段。汇总改由服务入口的 summary 事件发出，这里不再写终端文本。
+    /// Retained field; summaries are now emitted via service-entry summary events rather than terminal text here.
     write_summary: bool = false,
-    /// 可选流式事件回调（L04）：每个来源完成时立即流式交出事件，不为排序缓存全量结果。
+    /// Optional streaming event callback: delivers events immediately as each source completes without buffering full results for sorting.
     on_event: ?*const fn (*anyopaque, sink_mod.Event) sink_mod.Flow = null,
     event_ctx: ?*anyopaque = null,
 };
@@ -76,13 +76,13 @@ const Shared = struct {
     search: searcher.SearchConfig,
     emit: Emit,
     finder: finder_mod.Finder,
-    /// 非 null 时工人共享这一份只读自动机，不再使用 `finder`。
+    /// When non-null, workers share this read-only automaton instead of using `finder`.
     many: ?*multi_mod.Multi = null,
     column: bool,
     use_separator: bool,
     saw: *bool,
     lock: std.Io.Mutex = .init,
-    /// 只保护空闲等待。队列本身仍是 Chase-Lev，搜索热路径不拿这把锁。
+    /// Guards idle waiting only. Deques remain Chase-Lev and the hot search path does not acquire this lock.
     idle_mu: std.Io.Mutex = .init,
     idle_cv: std.Io.Condition = .init,
     stop: std.atomic.Value(bool) = .init(false),
@@ -327,10 +327,10 @@ fn workerLoop(worker: *Worker) !void {
     }
 }
 
-/// 锁里复查队列，没有活就睡。返回 `null` 表示已经停止。
+/// Re-checks queues under the lock and sleeps if no work is available. Returns `null` when stopped.
 ///
-/// `Condition.signal` 在没有等待者时会丢掉。入队一侧看见空闲人数是 0 就不再加锁，
-/// 所以先公布空闲，再在这把锁里复查；两边用同一把锁接上。
+/// `Condition.signal` is lost when there are no waiters, and the enqueue side skips locking when the idle count is 0,
+/// so a worker announces itself idle first and then re-checks under this lock; both sides synchronize on the same mutex.
 fn park(worker: *Worker) !?*walker.Job {
     const shared = worker.shared;
     const index = worker.index;
@@ -556,8 +556,8 @@ const Tally = struct {
     }
 };
 
-/// 工作线程数完全由调用方配置决定，绝不探测宿主 CPU 核数（J14）。
-/// 未指定（0）时固定为 1（单线程），且受服务端并发硬顶 `max_concurrency_hard_cap` 约束。
+/// Worker thread count is determined strictly by caller configuration and never probes the host CPU core count.
+/// Defaults to 1 (single-threaded) when unspecified (0) and is capped at `max_concurrency_hard_cap`.
 pub fn resolveThreads(requested: u32) u32 {
     if (builtin.single_threaded) return 1;
     if (requested == 0) return 1;
@@ -569,7 +569,7 @@ pub fn resolveConcurrency(walk_threads: u32, max_concurrency: ?u32) u32 {
     return resolveThreads(walk_threads);
 }
 
-test "J14 线程数严格受控且不探测 CPU 核数" {
+test "thread count is strictly bounded without probing CPU core count" {
     try testing.expectEqual(@as(u32, 1), resolveThreads(0));
     try testing.expectEqual(@as(u32, 1), resolveConcurrency(0, null));
     if (!builtin.single_threaded) {
@@ -588,7 +588,7 @@ fn tempRoot(dir: std.Io.Dir) ![]u8 {
     return testing.allocator.dupe(u8, buf[0..n]);
 }
 
-test "单线程遍历会跳过 gitignore 并统计命中" {
+test "single-threaded traversal skips gitignore and counts matches" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = testing.io;
@@ -622,7 +622,7 @@ test "单线程遍历会跳过 gitignore 并统计命中" {
     try testing.expect(std.mem.indexOf(u8, out.written(), ".git") == null);
 }
 
-test "两个工人不会丢匹配" {
+test "two workers do not lose matches" {
     if (builtin.single_threaded) return;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -650,7 +650,7 @@ test "两个工人不会丢匹配" {
     try testing.expectEqual(@as(u32, 0), stats.errors);
 }
 
-test "目录搜索共享只读的多模式自动机" {
+test "directory search shares read-only multi-pattern automaton" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = testing.io;
@@ -678,7 +678,7 @@ test "目录搜索共享只读的多模式自动机" {
     try testing.expectEqual(@as(u32, 0), stats.errors);
 }
 
-test "空闲工人被子目录叫醒后不会丢匹配" {
+test "idle workers woken by subdirectories do not lose matches" {
     if (builtin.single_threaded) return;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -709,7 +709,7 @@ test "空闲工人被子目录叫醒后不会丢匹配" {
     try testing.expectEqual(@as(u32, 0), stats.errors);
 }
 
-test "同一个大目录里的文件不会被多工人丢掉" {
+test "files in a single large directory are not lost across multiple workers" {
     if (builtin.single_threaded) return;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -740,7 +740,7 @@ test "同一个大目录里的文件不会被多工人丢掉" {
     try testing.expect(stats.bytes_searched >= 40);
 }
 
-test "quiet 命中会叫醒已经睡着的工人" {
+test "quiet match wakes sleeping workers" {
     if (builtin.single_threaded) return;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -767,7 +767,7 @@ test "quiet 命中会叫醒已经睡着的工人" {
     try testing.expectEqual(@as(u32, 0), stats.errors);
 }
 
-test "J13 仅列出来源计入遍历预算" {
+test "files-only listing counts toward traversal budget" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = testing.io;
@@ -784,7 +784,7 @@ test "J13 仅列出来源计入遍历预算" {
     defer out.deinit();
     var saw = false;
 
-    // 1. max_results 限制仅列出来源条数
+    // 1. max_results limits the number of sources listed in files_only mode
     const stats_res = try run(testing.allocator, io, .{
         .roots = &.{root},
         .emit = .files_only,
@@ -796,7 +796,7 @@ test "J13 仅列出来源计入遍历预算" {
     try testing.expectEqual(@as(u64, 2), stats_res.searches);
     try testing.expectEqual(@as(u64, 0), stats_res.bytes_searched);
 
-    // 2. walk.max_entries 限制遍历条数预算
+    // 2. walk.max_entries limits the traversal entry budget
     const stats_entries = try run(testing.allocator, io, .{
         .roots = &.{root},
         .emit = .files_only,
@@ -807,7 +807,7 @@ test "J13 仅列出来源计入遍历预算" {
     try testing.expectEqual(@as(u64, 3), stats_entries.searches);
 }
 
-test "L04 多来源流式交出事件且不为排序缓存全量结果" {
+test "multi-source streaming delivers events immediately without buffering all results for sorting" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = testing.io;
@@ -834,7 +834,7 @@ test "L04 多来源流式交出事件且不为排序缓存全量结果" {
                 .match => self.matches += 1,
                 .end => {
                     self.ends += 1;
-                    // 验证边搜边交出 end：第一个来源刚发完 end 就可立即叫停，证明没有先攒齐全部来源再排序输出
+                    // Verify that end events are streamed as sources finish: stopping right after the first end proves results are not buffered and sorted across all sources first
                     if (self.stopped_after_first_end) return .stop;
                 },
                 else => {},
@@ -859,7 +859,7 @@ test "L04 多来源流式交出事件且不为排序缓存全量结果" {
     try testing.expectEqual(@as(u32, 2), stream_all.matches);
     try testing.expectEqual(@as(u32, 3), stream_all.ends);
 
-    // 验证第一个来源收到 end 后立即停止，后续来源不再被扫描（证明流式交出而非全量缓冲）
+    // Verify that stopping on the first end event prevents subsequent sources from being scanned (proving streaming delivery rather than full buffering)
     var stream_early = StreamCheck{ .stopped_after_first_end = true };
     const stats_early = try run(testing.allocator, io, .{
         .pattern = "needle",

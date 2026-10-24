@@ -1,21 +1,21 @@
-//! 单个输入上的行语义。
+//! Line semantics over a single input.
 //!
-//! 先在缓冲里找匹配，命中后再向两侧找 `\n`。没有命中的区域不逐行扫描。
-//! 模式里的换行由 Finder 拒绝；这里假定匹配器不会跨行。
-//! 默认行终止符是 LF。交给 Sink 的行内容去掉结尾的 `\n`，再去掉紧挨着的一个 `\r`。
-//! `null_data` 改用 NUL 分隔记录，记录里的 LF 不断行，NUL 也不当成二进制。
+//! Searches for matches in the buffer first, then scans outward for `\n` upon a hit. Non-matching regions are never scanned line by line.
+//! Newlines in patterns are rejected by Finder; single-line matchers are assumed not to cross lines.
+//! The default line terminator is LF. Line content delivered to Sink has the trailing `\n` stripped, along with a single immediately preceding `\r`.
+//! `null_data` switches to NUL-delimited records, where LF inside a record does not break lines and NUL is not treated as binary.
 //!
-//! `encoding = .auto` 只在流开头嗅探 BOM。UTF-16 先转成 UTF-8 再搜索，非法序列换成
-//! U+FFFD。没有 BOM 就不猜测。`.none` 不嗅探、不转码。
+//! `encoding = .auto` sniffs for a BOM only at the start of the stream. UTF-16 is transcoded to UTF-8 before searching, replacing invalid sequences with
+//! U+FFFD. No encoding is guessed without a BOM or explicit hint. `.none` disables sniffing and transcoding.
 //!
-//! 没有 BOM 时切片搜索不分配。需要转码的切片用 `decode_allocator`。Reader 和文件搜索
-//! 使用调用方传入的分配器。读缓冲从 `buffer_size` 涨到单行上限，不再为了装下整行继续涨。
-//! 超过上限的行仍按流查找，交出去的是匹配附近的窗口。前置上下文放在环形缓冲里，不回退读取。
+//! Slice searches without a BOM or transcoding do not allocate. Slices requiring transcoding use `decode_allocator`. Reader and file searches
+//! use the caller-supplied allocator. The read buffer grows from `buffer_size` up to the single-line limit and stops growing further to fit whole lines.
+//! Lines exceeding the limit are still searched in a streaming fashion, emitting a window around the match. Leading context is kept in a ring buffer without seeking backward.
 //!
-//! 预算、取消和截止时间都由调用方传入。服务入口在缺省时填上单输入默认值，不能超过硬顶。
-//! 库不读环境变量，也不自己选租户配额。停止原因写在 `limit_hit` 上。
-//! 输入没扫完时 `partial` 为真。来源读失败是软错误，和致命错误、有匹配、无匹配分开。
-//! 返回给调用方的错误不含路径；路径只交给调用方提供的日志函数。
+//! Budgets, cancellation, and deadlines are all supplied by the caller. Service entry points fill in single-input defaults when omitted and cannot exceed hard caps.
+//! The library does not read environment variables or choose tenant quotas on its own. The stop reason is recorded in `limit_hit`.
+//! `partial` is true when the input was not scanned to completion. Source read failures are reported as soft errors, distinct from fatal errors, matches, and non-matches.
+//! Errors returned to the caller never contain file paths; paths are only passed to the caller-supplied logging callback.
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -29,24 +29,24 @@ pub const Encoding = encoding.Encoding;
 pub const Compression = decompress.Compression;
 
 pub const BinaryPolicy = enum {
-    /// 跳过。遇到 NUL 就停止读取。这是默认。
+    /// Skip: stop reading as soon as a NUL byte is encountered. This is the default.
     quit,
-    /// 继续搜索，直到知道有没有匹配，但是不返回行内容。
+    /// Continue searching until it is known whether a match exists, but withhold line contents.
     report,
-    /// 按文本处理，不把 NUL 当成二进制。
+    /// Treat as text; do not treat NUL bytes as binary.
     none,
 };
 
 pub const SearchConfig = struct {
-    /// 起始块大小。128 MiB 文件上四档里 1 MiB 最快，见 `BENCHMARKS.md`。默认 1 MiB。
+    /// Initial chunk size. 1 MiB is the fastest of the four tiers on a 128 MiB file (see `BENCHMARKS.md`). Defaults to 1 MiB.
     pub const default_buffer_size: usize = 1024 * 1024;
-    /// 单行字节上限。读缓冲不超过这个值加一个换行字节。更长的行改走窗口。
+    /// Single-line byte limit. The read buffer does not exceed this value plus one newline byte; longer lines use a sliding window.
     pub const default_max_line_len: usize = 2 * 1024 * 1024;
-    /// 上下文行数硬顶。调用方可以把实际上限调低，不能超过这里。
+    /// Hard cap on context line count. Callers may lower the effective limit, but cannot exceed this value.
     pub const context_lines_hard_cap: u32 = 10;
-    /// 单行字节硬顶。调用方可以在这之下覆盖 `max_line_len`。
+    /// Hard cap on single-line byte length. Callers may override `max_line_len` up to this value.
     pub const max_line_len_hard_cap: usize = 8 * 1024 * 1024;
-    /// 服务入口没写扫描上限时用这个。旧入口保持不限，直到调用方传入。
+    /// Default scan limit for service entry points when unspecified. Legacy entry points remain unlimited unless specified by the caller.
     pub const default_max_source_bytes: u64 = 16 * 1024 * 1024;
     pub const max_source_bytes_hard_cap: u64 = 64 * 1024 * 1024;
     pub const default_max_request_bytes: u64 = 16 * 1024 * 1024;
@@ -64,106 +64,106 @@ pub const SearchConfig = struct {
 
     line_numbers: bool = false,
     invert: bool = false,
-    /// 对称上下文。`before` 或 `after` 不是 null 时，对应的一侧改用那个值。
+    /// Symmetric context line count. When `before` or `after` is non-null, that side uses its explicit value instead.
     context: u32 = 0,
-    /// null 表示跟 `context` 走。
+    /// Null means fall back to `context`.
     before: ?u32 = null,
-    /// null 表示跟 `context` 走。
+    /// Null means fall back to `context`.
     after: ?u32 = null,
-    /// 服务层可以把上下文行数上限调得比硬顶更低。比硬顶大时仍按硬顶。
+    /// The service layer may set a context line limit lower than the hard cap. Values above the hard cap are clamped to the hard cap.
     max_context_lines: ?u32 = null,
-    /// 这个输入上最多报告多少条匹配行。null 表示不限。
-    /// 计入上限的是主循环找到的命中。`-A` 窗口里额外抬成匹配的行不占用额度，
-    /// 但仍然调用 `matched`，因此计数打印器会把它们算进去。这和 ripgrep 15 一致。
-    /// 达到上限后不再读下一块。缓冲里已经读入的 after 行仍会交出去。
+    /// Maximum number of matching lines to report for this input. Null means unlimited.
+    /// Only hits found by the main loop count toward this limit. Additional matching lines promoted inside an `-A` after-context window do not consume quota,
+    /// though they still invoke `matched` (so counting printers include them, matching ripgrep 15).
+    /// Once the limit is reached, no further chunks are read; after-context lines already in the buffer are still emitted.
     max_count: ?u64 = null,
-    /// 整词。只看匹配外侧那个字节是不是 ASCII 单词字符（字母、数字、下划线）。
-    /// 这是半边界：`-2` 能命中 `(-2)`，不能命中 `x-2` 或 `-2y`。
-    /// 和 `whole_line` 同时打开时不检查词边界。
+    /// Whole-word matching. Only checks whether the byte immediately outside the match is an ASCII word character (alphanumeric or underscore).
+    /// This is a half-boundary check: `-2` matches `(-2)`, but not `x-2` or `-2y`.
+    /// Ignored when `whole_line` is also enabled.
     whole_word: bool = false,
-    /// 整行。去掉 LF 和紧挨着的一个 CR 之后，行内容必须和某一条模式相同。
+    /// Whole-line matching. After stripping LF and a single preceding CR, the entire line content must match one of the patterns.
     whole_line: bool = false,
-    /// 行内容必须包含这里的每一条才输出。按字节比较，不折叠大小写。空表示不额外要求。
+    /// Every byte slice listed here must appear in the line content for the line to be emitted (exact byte comparison, no case folding). Empty means no extra requirement.
     contains: []const []const u8 = &.{},
-    /// 行内容必须不含这里的每一条。按字节比较。和 `invert` 是两个开关。
+    /// None of the byte slices listed here may appear in the line content (exact byte comparison). Independent of `invert`.
     excludes: []const []const u8 = &.{},
-    /// 匹配行数达到 `max_count` 时调用，用来关闭上游。没提供就不调用。
+    /// Invoked when `max_count` matching lines are reached to close the upstream source. Omitted if null.
     close_input: ?*const fn (?*anyopaque) void = null,
     close_ctx: ?*anyopaque = null,
     binary: BinaryPolicy = .quit,
-    /// 用 NUL 分隔记录。记录内部的 LF 不断行，NUL 也不当成二进制信号。
+    /// Delimit records by NUL. LF inside a record does not break lines, and NUL is not treated as a binary signal.
     null_data: bool = false,
-    /// 默认只在流开头嗅探 BOM。`.none` 关掉嗅探和转码。
+    /// Sniff for a BOM at the start of the stream by default. `.none` disables sniffing and transcoding.
     encoding: Encoding = .auto,
-    /// 可选的 HTTP Content-Type 或 WHATWG 字符集提示（如 `"gbk"`、`"text/plain; charset=gbk"`）。
-    /// 当 `encoding == .auto` 且流开头无 BOM 时按该提示转码。
+    /// Optional HTTP Content-Type or WHATWG charset hint (e.g., `"gbk"`, `"text/plain; charset=gbk"`).
+    /// Used to transcode when `encoding == .auto` and no BOM is present at the start of the stream.
     charset: ?[]const u8 = null,
-    /// 进程内流式解压模式（`.none`、`.auto`、`.gzip`、`.zstd`、`.xz`）。
+    /// In-process streaming decompression mode (`.none`, `.auto`, `.gzip`, `.zstd`, `.xz`).
     compression: Compression = .none,
-    /// 最大允许解压膨胀比（`decompressed_bytes / raw_bytes`），null 使用默认 100。超限记为 `LimitHit.decompressed_bytes`。
+    /// Maximum allowed decompression expansion ratio (`decompressed_bytes / raw_bytes`); null uses the default of 100. Exceeding this records `LimitHit.decompressed_bytes`.
     max_compression_ratio: ?u64 = null,
-    /// 切片上需要转码，或有损文本放不进栈缓冲时使用。流式搜索用函数上的分配器。
+    /// Used when a slice requires transcoding or lossy text does not fit in the stack buffer. Streaming search uses the allocator passed to the function.
     decode_allocator: ?std.mem.Allocator = null,
     buffer_size: usize = default_buffer_size,
     max_line_len: usize = default_max_line_len,
     match_mode: matcher_mod.MatchMode = .earliest,
-    /// 非 null 时复用这块缓冲。扩容后把新切片写回去。null 时这次调用自己分配、自己释放。
+    /// When non-null, reuses this buffer across calls and writes back any reallocated slice. When null, allocates and frees internally per call.
     scratch: ?*[]u8 = null,
-    /// 非 null 且为真时，下一块开始前停止。遍历用它做提前结束。
-    /// 这不是取消令牌：不关闭上游，也不写成 `limit_hit = cancelled`。
+    /// When non-null and set to true, stops before the next chunk begins. Used by directory traversal for early termination.
+    /// Not a cancellation token: does not close upstream or set `limit_hit = cancelled`.
     stop: ?*const std.atomic.Value(bool) = null,
-    /// 这个来源最多扫描多少字节。达到后不再读。null 表示旧入口不另加来源上限。
+    /// Maximum bytes to scan from this source. Stops reading once reached. Null means legacy entry points impose no per-source cap.
     max_source_bytes: ?u64 = null,
-    /// 这次请求最多扫描多少字节。和来源上限同时生效，先到的那个停。
+    /// Maximum bytes to scan across this request. Enforced alongside `max_source_bytes`; whichever is reached first stops the scan.
     max_request_bytes: ?u64 = null,
-    /// 请求级最多交出多少条匹配行。达到后 end 事件带 `resume_at`。
-    /// 和 `max_count` 不同：`max_count` 是单个来源的行数上限，不带续查位置。
+    /// Request-level cap on emitted matching lines. When reached, the `end` event carries `resume_at`.
+    /// Unlike `max_count`, which caps lines for a single source without a resume offset.
     max_results: ?u64 = null,
-    /// 从可搜索字节流的这个偏移继续。之前的字节不再产出匹配。
+    /// Resume scanning from this byte offset in the searchable stream. Bytes before this offset produce no matches.
     resume_from: u64 = 0,
-    /// 行事件（匹配和上下文）累计字节上限。窗口里的字节算进这一个上限。
+    /// Cumulative byte cap across emitted line events (both matches and context), including windowed bytes.
     max_output_bytes: ?u64 = null,
-    /// 从搜索开始允许的最长时间，纳秒。null 表示旧入口不限。
+    /// Maximum allowed duration in nanoseconds from the start of the search. Null means unlimited on legacy entry points.
     time_budget_ns: ?u64 = null,
-    /// 非 null 时用它代替单调时钟。测试靠它断言「超时后停止」，不看具体毫秒。
+    /// When non-null, replaces the monotonic clock. Used by tests to deterministically assert deadline expiration.
     clock: ?*const fn (?*anyopaque) i128 = null,
     clock_ctx: ?*anyopaque = null,
-    /// 取消令牌。置位后停止搜索，并关闭上游。
+    /// Cancellation token. When set, stops the search and closes the upstream source.
     cancel: ?*const std.atomic.Value(bool) = null,
-    /// 已经计入的解压字节。解压器落地之前保持调用方传入的值。
+    /// Decompressed bytes already accounted for prior to this search.
     decompressed_bytes: u64 = 0,
-    /// 解压字节上限。达到后 `limit_hit = decompressed_bytes`。
+    /// Decompressed byte cap. Reaching this sets `limit_hit = decompressed_bytes`.
     max_decompressed_bytes: ?u64 = null,
-    /// 前置上下文缓冲的字节上限。null 时用硬顶。
+    /// Byte cap for the before-context ring buffer. Null uses the hard cap.
     max_before_bytes: ?usize = null,
-    /// 解码输入缓冲的字节上限。null 时用硬顶。
+    /// Byte cap for the decode input buffer. Null uses the hard cap.
     max_decode_bytes: ?usize = null,
-    /// 等回调取走的那一条行事件的字节上限。同步回调不攒队列。
+    /// Byte cap for a single pending line event awaiting callback delivery. Synchronous callbacks do not queue multiple events.
     max_queued_event_bytes: ?usize = null,
-    /// 调用方注入的并发上限。单输入搜索不据此创建线程，也不改写这个数。
+    /// Caller-injected concurrency cap. Single-input search neither spawns threads nor modifies this value.
     max_concurrency: ?u32 = null,
-    /// 存在性查询。找到第一条匹配就返回，并关闭上游。不是有匹配来源列表。
+    /// Existence query: returns and closes upstream upon finding the first match. Distinct from listing matching sources.
     exists: bool = false,
-    /// 只要没有匹配的来源。找到第一条匹配就停止这个来源，并且不把行交出去。
-    /// 和 `invert` 不同：反选仍逐行交出不包含模式的行。
+    /// Sources-without-match query: stops scanning this source upon the first match without emitting any lines.
+    /// Distinct from `invert`, which emits every line that does not match the pattern.
     files_without_match: bool = false,
-    /// 每扫描这么多可搜索字节发一条 progress。null 或 0 表示不发。
+    /// Emit a `progress` event every time this many searchable bytes are scanned. Null or 0 disables progress events.
     progress_interval: ?u64 = null,
-    /// 调用方把输入标成实时流。空读是空闲，不是错误，也不是结束。
+    /// Marks the input as a live stream: a 0-byte read indicates idle rather than error or EOF.
     live: bool = false,
-    /// 实时流空闲超过这个时间就发心跳。
+    /// Emit a `heartbeat` event when a live stream remains idle for at least this duration.
     idle_timeout_ns: ?u64 = null,
-    /// 置位后，实时流的下一次空读才是结束。
+    /// Once set, the next 0-byte read on a live stream is treated as EOF.
     live_closed: ?*const std.atomic.Value(bool) = null,
-    /// 暂停后续搜。`resumeSourceSlice` 填入。
+    /// Continuation state for resuming after a pause, populated by `resumeSourceSlice`.
     continuation: ?*const sink_mod.ResumeState = null,
-    /// 有序输入在首条匹配之后遇到不匹配行立即停止并关闭上游。
+    /// For ordered inputs, immediately stop and close upstream upon encountering a non-matching line after the first match.
     stop_on_nonmatch: bool = false,
-    /// 全文高亮模式：输出所有行，不匹配行作为上下文事件交出，匹配行作为匹配事件交出。
+    /// Full-text highlighting mode: emit all lines, delivering non-matching lines as context events and matching lines as match events.
     passthru: bool = false,
-    /// 只读替换预览模板。非 null 时在 Span.replacement 与 Line.replaced / LineEvent.replaced 中给出替换后预览，不修改原输入。
+    /// Read-only replacement preview template. When non-null, populates `Span.replacement` and `Line.replaced` / `LineEvent.replaced` without modifying the input.
     replacement: ?[]const u8 = null,
-    /// 细节日志。消息可以含路径；返回的错误不含。库不把这些消息交给终端。
+    /// Diagnostic logging callback. Messages may include file paths, whereas returned errors never do. The library never writes these messages to a terminal.
     log: ?*const fn (?*anyopaque, []const u8) void = null,
     log_ctx: ?*anyopaque = null,
 };
@@ -213,13 +213,13 @@ const BufMatch = struct {
 const State = struct {
     pos: usize = 0,
     abs_base: u64 = 0,
-    /// 非 null 时，它是 `last_line_counted` 处的行号（从 1 开始）。
+    /// When non-null, holds the 1-based line number at `last_line_counted`.
     line_number: ?u64 = null,
     last_line_counted: usize = 0,
     last_line_visited: usize = 0,
     after_left: u32 = 0,
     has_sunk: bool = false,
-    /// 占用 max_count 的命中数。上下文里被抬成匹配的行不加。
+    /// Match count that consumes `max_count` quota. Lines promoted to matches inside context windows do not increment this.
     limit_count: u64 = 0,
     matched_lines: u64 = 0,
     matches: u64 = 0,
@@ -228,9 +228,9 @@ const State = struct {
     nul_offset: ?u64 = null,
     binary_status: sink_mod.BinaryStatus = .none,
     stopped: bool = false,
-    /// 已经交给 Sink 的最后一行的终点绝对偏移（含换行）。断点用它判断，不看缓冲下标。
+    /// Absolute end offset (including newline) of the last line delivered to Sink. Used to detect context breaks independent of buffer indices.
     last_abs_end: u64 = 0,
-    /// 这一位之前的完整行，要么已经交过，要么已经放进前置环。
+    /// Complete lines before this offset have either been emitted or pushed into the before-context ring.
     remembered_until: usize = 0,
     ring: BeforeRing = .{},
     long_active: bool = false,
@@ -244,16 +244,16 @@ const State = struct {
     long_line_len: u64 = 0,
     long_match_start: usize = 0,
     long_match_end: usize = 0,
-    /// 0 没有留窗口，1 行首窗口，2 匹配窗口。
+    /// 0: no window held, 1: line-prefix window, 2: match window.
     long_hold_kind: u2 = 0,
-    /// 这一块里很早就有匹配。后面的块改回先扫 NUL，避免每个密集块搜两遍。
+    /// An early match occurred in the current chunk; subsequent chunks revert to pre-scanning for NUL to avoid scanning dense chunks twice.
     prefer_prepass: bool = false,
-    /// 有损文本放不进栈缓冲时用。只在回调返回前有效。
+    /// Used when lossy text does not fit in the stack buffer. Valid only until the callback returns.
     text_alloc: ?std.mem.Allocator = null,
     text_buf: []u8 = &.{},
     replace_buf: []u8 = &.{},
     offset_map: ?*const decompress.OffsetMap = null,
-    /// 日志里用的来源名。不放进返回的错误。
+    /// Source name used in diagnostic logs; never included in returned errors.
     label: []const u8 = "",
     started_ns: i128 = 0,
     deadline_armed: bool = false,
@@ -403,8 +403,8 @@ fn materialize(haystack: []const u8, config: SearchConfig) SliceError!Prepared {
     }
 }
 
-/// 旧回调入口，在 `haystack` 上搜索。没有 BOM 时行切片直接指向 `haystack`。
-/// `name` 只传给旧的 `begin`。服务入口是 `searchSourceSlice`。
+/// Legacy callback entry point that searches `haystack`. Line slices point directly into `haystack` when no BOM or transcoding is involved.
+/// `name` is passed only to legacy `begin`. The service entry point is `searchSourceSlice`.
 pub fn searchSlice(
     comptime S: type,
     sink: *S,
@@ -523,8 +523,8 @@ fn searchPrepared(
     return finishSink(S, sink, &state, config);
 }
 
-/// 旧回调入口，从 `reader` 搜索。短读视为 EOF。缓冲在线程内由这一次调用独占，结束时释放。
-/// `name` 只传给旧的 `begin`。服务入口是 `searchSource`。
+/// Legacy callback entry point that searches from `reader`. Short reads are treated as EOF. The buffer is owned exclusively by this call on the current thread and freed upon return.
+/// `name` is passed only to legacy `begin`. The service entry point is `searchSource`.
 pub fn searchReader(
     comptime S: type,
     allocator: std.mem.Allocator,
@@ -543,9 +543,9 @@ pub fn searchReader(
     }.read, reader);
 }
 
-/// 从已经打开的文件里读。调用方自己持有文件，这里不接收路径。
-/// 默认用 `readPositional`。窗口映射只在构建选项打开时才会编译进来，默认构建不走那条路径。
-/// 本函数不从 `src/root.zig` 导出。服务入口是 `searchSource` 和 `searchSourceSlice`。
+/// Reads from an already opened file owned by the caller; does not accept a file path.
+/// Uses `readPositional` by default. Window mapping is compiled in only when enabled via build options and is not used in default builds.
+/// Not exported from `src/root.zig`. The service entry points are `searchSource` and `searchSourceSlice`.
 pub fn searchFile(
     comptime S: type,
     allocator: std.mem.Allocator,
@@ -578,13 +578,13 @@ pub fn searchFile(
     }.read, &ctx);
 }
 
-/// 服务入口：搜索一段内存里的字节。
-/// `source_id` 由调用方分配，库不解释。
-/// 行号从 1 开始。NUL 记录模式计的是记录号。
-/// `S` 提供 `pub fn event(self: *S, ev: Event) bool` 或返回 `Flow`。
-/// 返回 false 或 `.stop` 就停止。`.pause` 先停住，`resumeSourceSlice` 再继续。
-/// 行字节和匹配区间只在这次回调期间有效。每产生一个事件就调用一次。
-/// 输入扫完之后再发 summary。没扫完、暂停、或实时流还开着时不发。
+/// Service entry point: searches an in-memory byte slice.
+/// `source_id` is assigned by the caller and opaque to the library.
+/// Line numbers start at 1 (or count records in NUL-delimited mode).
+/// `S` provides `pub fn event(self: *S, ev: Event) bool` or returns `Flow`.
+/// Returning false or `.stop` stops the search; `.pause` pauses so `resumeSourceSlice` can continue later.
+/// Line bytes and match spans are valid only during the callback, which is invoked once per event.
+/// Emits `summary` after the input is completely scanned; omitted when incomplete, paused, or on an open live stream.
 pub fn searchSourceSlice(
     comptime S: type,
     sink: *S,
@@ -604,7 +604,7 @@ pub fn searchSourceSlice(
     return result;
 }
 
-/// 从上次暂停的地方继续搜同一段内存。不重复 begin。
+/// Resumes searching the same in-memory slice from where it was previously paused, without re-emitting `begin`.
 pub fn resumeSourceSlice(
     comptime S: type,
     sink: *S,
@@ -622,13 +622,13 @@ pub fn resumeSourceSlice(
     return searchSourceSlice(S, sink, source_id, haystack, matcher, cfg);
 }
 
-/// 服务入口：从 reader 搜索。没有标成实时流时，短读视为结束。
-/// `source_id` 由调用方分配，库不解释。
-/// 行号从 1 开始。NUL 记录模式计的是记录号。
-/// `S` 提供 `pub fn event(self: *S, ev: Event) bool` 或返回 `Flow`。
-/// 返回 false 或 `.stop` 就停止。`.pause` 先停住。
-/// 行字节和匹配区间只在这次回调期间有效。每产生一个事件就调用一次。
-/// 输入扫完之后再发 summary。没扫完、暂停、或实时流还开着时不发。
+/// Service entry point: searches from a reader. Unless marked as a live stream, short reads are treated as EOF.
+/// `source_id` is assigned by the caller and opaque to the library.
+/// Line numbers start at 1 (or count records in NUL-delimited mode).
+/// `S` provides `pub fn event(self: *S, ev: Event) bool` or returns `Flow`.
+/// Returning false or `.stop` stops the search; `.pause` pauses it.
+/// Line bytes and match spans are valid only during the callback, which is invoked once per event.
+/// Emits `summary` after the input is completely scanned; omitted when incomplete, paused, or on an open live stream.
 pub fn searchSource(
     comptime S: type,
     allocator: std.mem.Allocator,
@@ -673,7 +673,7 @@ fn eventFlow(inner: anytype, ev: Event) Flow {
     const Ret = @typeInfo(@TypeOf(@field(@TypeOf(inner.*), "event"))).@"fn".return_type.?;
     if (Ret == bool) return if (inner.event(ev)) .cont else .stop;
     if (Ret == Flow) return inner.event(ev);
-    @compileError("event 必须返回 bool 或 Flow");
+    @compileError("event must return bool or Flow");
 }
 
 fn EventBridge(comptime S: type) type {
@@ -775,7 +775,7 @@ fn emitSummary(comptime S: type, sink: *S, source_id: []const u8, config: Search
     _ = eventFlow(sink, .{ .summary = makeSummary(source_id, result) });
 }
 
-/// 拉式迭代器交出的一条事件。切片在 `SourcePull.deinit` 之前有效。
+/// A single event yielded by the pull iterator. Slices remain valid until `SourcePull.deinit`.
 pub const PullEvent = struct {
     kind: enum { begin, match, context, context_break, progress, heartbeat, end, summary },
     source_id: []u8,
@@ -801,8 +801,8 @@ pub const PullEvent = struct {
     }
 };
 
-/// 能取出 begin、context、match、end 这一组事件的拉式接口。
-/// 单行的 `SliceIter` 没有上下文，也不带来源事件。
+/// Pull interface yielding `begin`, `context`, `match`, and `end` events.
+/// By contrast, single-line `SliceIter` carries neither context nor source lifecycle events.
 pub fn SourcePull(comptime M: type) type {
     return struct {
         allocator: std.mem.Allocator,
@@ -1196,8 +1196,8 @@ fn drive(
 
         const search_end = if (eof) filled else lastComplete(buf[0..filled], config);
         const view_end = if (eof) filled else search_end;
-        // 文本快路径把 NUL 检查并进查找。单独再扫一遍 NUL，1 GiB 热文件大约要 19 ms，
-        // 单字节模式会因此慢过 rg。上下文和密集匹配仍走原来的先扫 NUL。
+        // Fast text path fuses NUL detection into the pattern search. Scanning for NUL in a separate pass costs ~19 ms on a 1 GiB warm file,
+        // which would make single-byte patterns slower than rg. Context and dense-match paths still use the separate NUL pre-pass.
         const fuse = search_end > state.pos and canFuse(matcher, config, &state);
         var skip_match = false;
         if (fuse) {
@@ -1566,7 +1566,7 @@ fn guardLine(state: *State, config: SearchConfig, nbytes: usize) error{BufferLim
     return true;
 }
 
-/// 找到的匹配已经交出去了。返回 false 表示不要再找下一条。
+/// A matched line has been emitted. Returns false if no further matches should be sought.
 fn noteHitLimit(state: *State, config: SearchConfig, end_abs: u64) bool {
     if (config.exists) {
         state.stopped = true;
@@ -1630,7 +1630,7 @@ fn recordSep(config: SearchConfig) u8 {
     return if (config.null_data) 0 else '\n';
 }
 
-/// NUL 只在 LF 分行、并且不是 NUL 记录模式时当成二进制信号。
+/// NUL is treated as a binary signal only when splitting lines on LF and not in NUL-delimited record mode.
 fn watchesBinary(config: SearchConfig) bool {
     return config.binary != .none and !config.null_data;
 }
@@ -1650,7 +1650,7 @@ fn lastComplete(buf: []const u8, config: SearchConfig) usize {
     return 0;
 }
 
-/// 返回 false 表示停止，但不是错误。
+/// Returns false to stop scanning (not an error).
 fn matchBuffer(
     comptime S: type,
     sink: *S,
@@ -1713,7 +1713,7 @@ fn matchBuffer(
     } else {
         if (!try afterContext(S, sink, matcher, buf, buf.len, state, config)) return false;
     }
-    // 上限已经达到时，缓冲里的 after 行刚才交过了，不能再为后面的行去读。
+    // Once the limit is reached, buffered after-context lines have just been emitted; do not read further chunks for subsequent lines.
     if (state.exceeded(config)) return false;
     state.pos = buf.len;
     return !state.stopped;
@@ -1804,7 +1804,7 @@ fn isWordByte(b: u8) bool {
     };
 }
 
-/// 半边界：只看匹配外侧的字节，不要求匹配两端自身是单词字符。
+/// Half-boundary check: inspects only the bytes immediately outside the match, without requiring the match endpoints themselves to be word bytes.
 fn wordBounded(haystack: []const u8, start: usize, end: usize) bool {
     if (start > haystack.len or end > haystack.len or start > end) return false;
     if (start > 0 and isWordByte(haystack[start - 1])) return false;
@@ -1929,8 +1929,8 @@ fn beforeContext(
     config: SearchConfig,
 ) SliceError!bool {
     if (beforeCount(config) == 0) return true;
-    // 匹配可能落在本块开头，前置行已经在上一块推进环里。
-    // 那种情况下 last_line_visited == upto，仍然要把环交出去。
+    // The match may fall at the start of the current chunk with its before-context lines already pushed into the ring during the previous chunk.
+    // In that case `last_line_visited == upto`, and the ring must still be emitted.
     if (state.last_line_visited < upto) {
         rememberBefore(matcher, buf, state, config, upto);
     }
@@ -1957,8 +1957,8 @@ fn growSpans(alloc: ?std.mem.Allocator, store: []Span, heap: *[]Span, n: usize) 
     return heap.*;
 }
 
-/// 这一行里不重叠的匹配，相对预览窗口，按起点排序。
-/// 空模式只留一个零宽区间，避免按每个字节空转。
+/// Non-overlapping matches on this line, relative to the preview window and sorted by start offset.
+/// An empty pattern records only a single zero-width span to avoid spinning at every byte.
 fn gatherSpans(
     alloc: ?std.mem.Allocator,
     inline_buf: []Span,
@@ -2362,7 +2362,7 @@ fn matchInLine(matcher: anytype, buf: []const u8, line: Range, config: SearchCon
         return .{ .start = line.start, .end = end };
     }
     const found = nextMatch(matcher, buf, line.start, config) orelse return null;
-    // 空行的内容终点和起点重合，空模式在这里仍算命中。
+    // An empty line's content end equals its start; an empty pattern still counts as a match here.
     if (found.start < line.start or found.start > end or found.end > line.end) return null;
     if (found.start == end and found.end > end) return null;
     if (found.start >= line.end) return null;
@@ -2423,7 +2423,7 @@ fn nextLine(buf: []const u8, pos: usize, end: usize, config: SearchConfig) ?Rang
     return .{ .start = pos, .end = limit };
 }
 
-/// `count` 为 0 时返回最后一行的起点。
+/// Returns the start of the last line when `count` is 0.
 fn preceding(bytes: []const u8, count: usize) usize {
     if (bytes.len == 0) return 0;
     var pos: usize = bytes.len;
@@ -2570,7 +2570,7 @@ const Preview = struct {
     span: ?Span,
 };
 
-/// 窗口尽量包住整个匹配。匹配比上限长时，从匹配起点开始。
+/// Center the window around the match when possible; if the match exceeds the limit, start at the match start.
 fn windowOrigin(raw: usize, limit: usize, match_at: usize, match_end: usize) usize {
     if (limit == 0 or raw <= limit) return 0;
     const mend = @min(match_end, raw);
@@ -3226,7 +3226,7 @@ fn run(hay: []const u8, pattern: []const u8, config: SearchConfig) !Rec {
     return rec;
 }
 
-test "切片：行号、上下文和分隔" {
+test "slice: line numbers, context, and context break" {
     var rec = try run("a\nb\nMATCH\nc\nd\ne\nMATCH2\nf\n", "MATCH", .{
         .line_numbers = true,
         .before = 1,
@@ -3246,7 +3246,7 @@ test "切片：行号、上下文和分隔" {
     try testing.expectEqual(@as(u32, 1), rec.breaks);
 }
 
-test "切片：max_count 仍吐出 after，窗口内的命中保持匹配格式" {
+test "slice: max_count still flushes after-context, and hits inside the window keep match formatting" {
     var rec = try run("a\nb\nMATCH\nc\nd\ne\nMATCH2\nf\n", "MATCH", .{
         .line_numbers = true,
         .after = 4,
@@ -3263,7 +3263,7 @@ test "切片：max_count 仍吐出 after，窗口内的命中保持匹配格式"
     , rec.text.items);
 }
 
-test "切片：反选和反选上下文" {
+test "slice: inverted matching and inverted context" {
     var plain = try run("a\nb\nMATCH\nc\n", "MATCH", .{ .line_numbers = true, .invert = true });
     defer plain.deinit(testing.allocator);
     try testing.expectEqualStrings(
@@ -3289,7 +3289,7 @@ test "切片：反选和反选上下文" {
     , ctx.text.items);
 }
 
-test "切片：空行、无结尾换行、CRLF 去掉 CR" {
+test "slice: empty lines, missing trailing newline, and CRLF stripping CR" {
     var empty_lines = try run("a\n\nMATCH\n\nb\n", "MATCH", .{
         .line_numbers = true,
         .before = 1,
@@ -3312,7 +3312,7 @@ test "切片：空行、无结尾换行、CRLF 去掉 CR" {
     try testing.expectEqualStrings("2:MATCH\n", crlf.text.items);
 }
 
-test "切片：空模式匹配每一行，列号是第一个匹配的字节" {
+test "slice: empty pattern matches every line, column is the first matched byte" {
     var all = try run("a\nb\n", "", .{ .line_numbers = true });
     defer all.deinit(testing.allocator);
     try testing.expectEqualStrings("1:a\n2:b\n", all.text.items);
@@ -3330,7 +3330,7 @@ test "切片：空模式匹配每一行，列号是第一个匹配的字节" {
     try testing.expectEqual(@as(usize, 2), col.start);
 }
 
-test "切片：二进制 report 和 quit" {
+test "slice: binary report and quit policies" {
     var report = try run("xxMATCH\x00yy\n", "MATCH", .{ .binary = .report });
     defer report.deinit(testing.allocator);
     try testing.expectEqual(Outcome.binary_matched, (try finishOf("xxMATCH\x00yy\n", "MATCH", .report)).outcome);
@@ -3356,7 +3356,7 @@ fn finishOf(hay: []const u8, pattern: []const u8, policy: BinaryPolicy) !Result 
     return searchSlice(Rec, &rec, hay, "", &finder, .{ .binary = policy, .buffer_size = 64 });
 }
 
-test "切片：超长匹配行交出窗口" {
+test "slice: overlong matching line emits a window" {
     const Cap = struct {
         truncated: bool = false,
         line_len: u64 = 0,
@@ -3389,8 +3389,8 @@ test "切片：超长匹配行交出窗口" {
     try testing.expectEqual(@as(u64, 0), cap.window_start + cap.mstart);
 }
 
-test "分块读把 NUL 并进查找" {
-    // 按 LF 分行，且不是 NUL 记录模式，所以 NUL 仍是二进制信号。
+test "chunked reading fuses NUL detection into search" {
+    // Lines are split on LF and not in NUL record mode, so NUL remains a binary signal.
     var reader = std.Io.Reader.fixed("ab\ncd\nMATCH\n");
     var finder = try Finder.init("MATCH", .{});
     var rec = Rec{};
@@ -3443,7 +3443,7 @@ test "分块读把 NUL 并进查找" {
     try testing.expectEqualStrings("3:Z\n", byte_rec.text.items);
 }
 
-test "Reader 跨块保留半行" {
+test "Reader preserves partial lines across chunks" {
     const hay = "abcMATCH\nzzz\nMATCH\n";
     var reader = std.Io.Reader.fixed(hay);
     var finder = try Finder.init("MATCH", .{});
@@ -3459,7 +3459,7 @@ test "Reader 跨块保留半行" {
     try testing.expectEqualStrings("1:abcMATCH\n3:MATCH\n", rec.text.items);
 }
 
-test "文件读取与切片一致" {
+test "file reading matches slice search" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const hay = "a\nMATCH\nb\n";
@@ -3483,7 +3483,7 @@ test "文件读取与切片一致" {
     try testing.expectEqualStrings("t.txt", rec.begun);
 }
 
-test "分块读文件和切片一致" {
+test "chunked file reading matches slice search" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var hay: [4096 + 64]u8 = @splat('a');
@@ -3510,7 +3510,7 @@ test "分块读文件和切片一致" {
     try testing.expect(std.mem.indexOf(u8, rec.text.items, "MATCH") != null);
 }
 
-test "Sink 返回 false 时停止" {
+test "stops when Sink returns false" {
     var finder = try Finder.init("M", .{});
     var rec = Rec{ .stop_after = 1 };
     defer rec.deinit(testing.allocator);
@@ -3519,7 +3519,7 @@ test "Sink 返回 false 时停止" {
     try testing.expectEqualStrings("1:M\n", rec.text.items);
 }
 
-test "忽略大小写" {
+test "case-insensitive search" {
     var finder = try Finder.init("foo", .{ .case = .insensitive });
     var rec = Rec{};
     defer rec.deinit(testing.allocator);
@@ -3530,7 +3530,7 @@ test "忽略大小写" {
     try testing.expectEqualStrings("1:Foo\n3:FOO\n", rec.text.items);
 }
 
-test "Reader 上刚好达到单行上限的行可以读完" {
+test "Reader can finish reading a line that exactly reaches the single-line limit" {
     var reader = std.Io.Reader.fixed("abcd\nzzz\n");
     var finder = try Finder.init("zzz", .{});
     var rec = Rec{};
@@ -3545,7 +3545,7 @@ test "Reader 上刚好达到单行上限的行可以读完" {
     try testing.expectEqualStrings("2:zzz\n", rec.text.items);
 }
 
-test "Reader 超过单行上限仍返回窗口" {
+test "Reader still emits a window when a line exceeds the single-line limit" {
     var reader = std.Io.Reader.fixed("abcdef\n");
     var finder = try Finder.init("a", .{});
     const Cap = struct {
@@ -3574,7 +3574,7 @@ test "Reader 超过单行上限仍返回窗口" {
     try testing.expectEqualStrings("abcd", cap.text[0..cap.len]);
 }
 
-test "拉式迭代器" {
+test "pull iterator" {
     const Iter = sink_mod.SliceIter(*Finder);
     var finder = try Finder.init("ab", .{});
     var it = Iter{ .matcher = &finder, .haystack = "xxab\nab", .line_numbers = true };
@@ -3588,7 +3588,7 @@ test "拉式迭代器" {
     try testing.expect(it.next() == null);
 }
 
-test "外部停止标志让流式搜索不再读下一块" {
+test "external stop flag prevents streaming search from reading the next chunk" {
     var reader = std.Io.Reader.fixed("MATCH\nMATCH\n");
     var finder = try Finder.init("MATCH", .{});
     var flag = std.atomic.Value(bool).init(true);
@@ -3605,7 +3605,7 @@ test "外部停止标志让流式搜索不再读下一块" {
     try testing.expectEqual(@as(u64, 0), result.matched_lines);
 }
 
-test "scratch 在两次搜索之间复用" {
+test "scratch buffer is reused across searches" {
     var scratch: []u8 = &.{};
     defer testing.allocator.free(scratch);
     const Sink = struct {
@@ -3625,7 +3625,7 @@ test "scratch 在两次搜索之间复用" {
     try testing.expectEqual(ptr, scratch.ptr);
 }
 
-test "多模式分块读和切片一致，NUL 在命中前会停" {
+test "multi-pattern chunked reading matches slice search, and NUL before a hit stops" {
     const Multi = @import("finder/multi.zig").Multi;
     const pats = [_][]const u8{ "pq", "rs" };
     var multi = try Multi.init(testing.allocator, &pats, .{});
@@ -3690,7 +3690,7 @@ test "多模式分块读和切片一致，NUL 在命中前会停" {
     try testing.expectEqualStrings("", nul_rec.text.items);
 }
 
-test "基准场景的切片命中和基准同一配置" {
+test "benchmark scenario slice hits match the benchmark configuration" {
     const multi = @import("finder/multi.zig");
     var hay: [256]u8 = undefined;
     multi.fillScenarioText(&hay);
@@ -3725,7 +3725,7 @@ test "基准场景的切片命中和基准同一配置" {
     }
 }
 
-test "CRLF 行内容不含 CR，整行匹配不把 CR 算进去" {
+test "CRLF line content excludes CR, and whole-line matching does not include CR" {
     var plain = try run("a\r\nMATCH\r\nb\r\n", "MATCH", .{ .line_numbers = true, .binary = .none });
     defer plain.deinit(testing.allocator);
     try testing.expectEqualStrings("2:MATCH\n", plain.text.items);
@@ -3748,7 +3748,7 @@ test "CRLF 行内容不含 CR，整行匹配不把 CR 算进去" {
     try testing.expectEqualStrings("", longer.text.items);
 }
 
-test "整词的半边界" {
+test "whole-word half-boundary matching" {
     var paren = try run("(-2)\n", "-2", .{ .whole_word = true, .line_numbers = true, .binary = .none });
     defer paren.deinit(testing.allocator);
     try testing.expectEqualStrings("1:(-2)\n", paren.text.items);
@@ -3778,7 +3778,7 @@ test "整词的半边界" {
     try testing.expectEqualStrings("1:(foo)\n3:foo\n", rec.text.items);
 }
 
-test "整行优先于整词" {
+test "whole-line takes precedence over whole-word" {
     const both = SearchConfig{
         .whole_word = true,
         .whole_line = true,
@@ -3833,7 +3833,7 @@ fn searchOrReject(
     }.read, gate);
 }
 
-test "模式条数和总长度在构造前被拒绝" {
+test "pattern count and total byte length are rejected before construction" {
     const Multi = @import("finder/multi.zig").Multi;
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     const alloc = failing.allocator();
@@ -3894,7 +3894,7 @@ const CountedRead = struct {
     }
 };
 
-test "max_count 之后不再读上游" {
+test "stops reading upstream after max_count is reached" {
     const hay = "MATCH\nMATCH2\nbbbb\n";
     var ctx = CountedRead{ .rest = hay };
     var finder = try Finder.init("MATCH", .{});
@@ -3935,7 +3935,7 @@ test "max_count 之后不再读上游" {
     try testing.expectEqualStrings("1:MATCH\n", again.text.items);
 }
 
-test "AND 与 NOT 同时过滤，且与反选不同" {
+test "AND and NOT filters work together and are distinct from invert" {
     const hay =
         \\foo bar
         \\foo
@@ -4005,7 +4005,7 @@ const Win = struct {
     }
 };
 
-test "超长行只保留匹配窗口并且偏移精确" {
+test "overlong line retains only the match window with exact offsets" {
     const max_line: usize = 16;
     var hay = try testing.allocator.alloc(u8, 4001);
     defer testing.allocator.free(hay);
@@ -4052,7 +4052,7 @@ test "超长行只保留匹配窗口并且偏移精确" {
     try testing.expectEqual(@as(u64, match_at), read_win.window_start + read_win.mstart);
 }
 
-test "不匹配的超长行也不把缓冲涨过上限" {
+test "non-matching overlong line does not grow buffer past the limit" {
     const max_line: usize = 32;
     const line_len: usize = 3000;
     var hay = try testing.allocator.alloc(u8, line_len + 1 + 6);
@@ -4083,7 +4083,7 @@ test "不匹配的超长行也不把缓冲涨过上限" {
     try testing.expectEqualStrings("MATCH", win.bytes);
 }
 
-test "二进制默认跳过并带 binary_offset" {
+test "binary skips by default and populates binary_offset" {
     var ctx = CountedRead{ .rest = "abc\x00MATCH\nMORE\n" };
     var finder = try Finder.init("MATCH", .{});
     var rec = Rec{};
@@ -4101,7 +4101,7 @@ test "二进制默认跳过并带 binary_offset" {
     try testing.expectEqualStrings("", rec.text.items);
 }
 
-test "搜索二进制但不返回行内容" {
+test "searches binary input without returning line contents" {
     const Sink = struct {
         calls: u32 = 0,
         bytes: usize = 0,
@@ -4124,7 +4124,7 @@ test "搜索二进制但不返回行内容" {
     try testing.expectEqual(Outcome.binary_matched, result.outcome);
 }
 
-test "按文本处理的二进制仍走超长行窗口" {
+test "binary input treated as text still uses the overlong line window" {
     var hay = try testing.allocator.alloc(u8, 64);
     defer testing.allocator.free(hay);
     @memset(hay, 'q');
@@ -4145,7 +4145,7 @@ test "按文本处理的二进制仍走超长行窗口" {
     try testing.expect(win.bytes.len <= 8);
 }
 
-test "前置上下文容量不超过行数上限乘单行上限" {
+test "before-context capacity does not exceed context line limit times single-line limit" {
     const max_line: usize = 16;
     const before: u32 = 3;
     const cfg = SearchConfig{
@@ -4256,7 +4256,7 @@ const CountAlloc = struct {
     }
 };
 
-test "对称上下文可被单侧覆盖" {
+test "symmetric context can be overridden on either side" {
     var both = try run("a\nb\nM\nc\n", "M", .{
         .line_numbers = true,
         .context = 1,
@@ -4293,7 +4293,7 @@ test "对称上下文可被单侧覆盖" {
     try testing.expectEqualStrings("1-a\n2-b\n3:M\n4-c\n", mixed.text.items);
 }
 
-test "断点是标记而不是两个减号" {
+test "context break is an event marker rather than two hyphens" {
     var rec = try run("a\nb\nMATCH\nc\nd\ne\nMATCH2\nf\n", "MATCH", .{
         .line_numbers = true,
         .before = 1,
@@ -4306,7 +4306,7 @@ test "断点是标记而不是两个减号" {
     try testing.expectEqualStrings("2-b\n3:MATCH\n4-c\n6-e\n7:MATCH2\n8-f\n", rec.text.items);
 }
 
-test "上下文行数不能超过硬顶" {
+test "context line count cannot exceed the hard cap" {
     var finder = try Finder.init("M", .{});
     var rec = Rec{};
     defer rec.deinit(testing.allocator);
@@ -4387,9 +4387,9 @@ const Mark = struct {
     }
 };
 
-test "NUL 分隔符按记录计数" {
-    // 默认 binary 是 quit。NUL 记录模式里它只是分隔符，LF 不再断行。
-    // NUL 作为二进制信号只在 LF 分行、且不是这种原始记录模式时生效。
+test "NUL delimiter counts by record" {
+    // The default binary policy is quit. In NUL record mode, NUL is just the record delimiter and LF does not break lines.
+    // NUL acts as a binary signal only when splitting on LF and not in this raw record mode.
     const hay = "a\nb\x00c\x00d\ne";
     var first = try run(hay, "b", .{ .line_numbers = true, .null_data = true });
     defer first.deinit(testing.allocator);
@@ -4430,7 +4430,7 @@ test "NUL 分隔符按记录计数" {
     try testing.expectEqualStrings("3:d\ne\n", streamed.text.items);
 }
 
-test "UTF-8 BOM 被跳过且不参与匹配" {
+test "UTF-8 BOM is stripped and excluded from matching" {
     const hay = "\xEF\xBB\xBFfoo\nbar\n";
     var hit = try run(hay, "foo", .{ .line_numbers = true, .binary = .none });
     defer hit.deinit(testing.allocator);
@@ -4475,8 +4475,8 @@ test "UTF-8 BOM 被跳过且不参与匹配" {
     try testing.expectEqualStrings("1:foo\n", rec.text.items);
 }
 
-test "UTF-16LE 与 UTF-16BE 转成 UTF-8 后命中" {
-    // 读缓冲比 BOM（2 字节）加一个 UTF-16 码元（2 字节）还小，码元会拆在两块里。
+test "UTF-16LE and UTF-16BE match after transcoding to UTF-8" {
+    // The read buffer is smaller than the BOM (2 bytes) plus one UTF-16 code unit (2 bytes), splitting the code unit across two chunks.
     const cap: usize = 3;
     try testing.expect(cap < 4);
 
@@ -4521,7 +4521,7 @@ test "UTF-16LE 与 UTF-16BE 转成 UTF-8 后命中" {
     try testing.expectEqual(@as(?u64, 1), slice_mark.number);
 }
 
-test "非法 UTF-16 变成 U+FFFD" {
+test "invalid UTF-16 is replaced with U+FFFD" {
     const lone = [_]u8{ 0xFF, 0xFE, 0x61, 0x00, 0x00, 0xD8, 0x62, 0x00, 0x0A, 0x00 };
     var mark = Mark{};
     var finder = try Finder.init("\u{FFFD}", .{});
@@ -4555,7 +4555,7 @@ test "非法 UTF-16 变成 U+FFFD" {
     try testing.expectEqualStrings("a\u{FFFD}", be_mark.bytes[0..be_mark.len]);
 }
 
-test "原始字节模式不嗅探 BOM" {
+test "raw byte mode does not sniff BOM" {
     const hay = "\xEF\xBB\xBFfoo\n";
     var kept = try run(hay, "\xEF\xBB\xBF", .{
         .encoding = .none,
@@ -4584,7 +4584,7 @@ test "原始字节模式不嗅探 BOM" {
     try testing.expectEqual(@as(u64, 1), bom.matches);
 }
 
-test "匹配的 UTF-16 偏移按码元计数" {
+test "match UTF-16 offsets are measured in code units" {
     const hay = "aé你😀x\n";
     var ex = Mark{};
     var ex_finder = try Finder.init("é", .{});
@@ -4614,7 +4614,7 @@ test "匹配的 UTF-16 偏移按码元计数" {
     try testing.expectEqual(@as(?u64, 6), ex_x.column);
 }
 
-test "非法 UTF-8 同时给出有损文本和原始字节" {
+test "invalid UTF-8 provides both lossy text and raw bytes" {
     const hay = "a\xffb\n";
     var letter = Mark{};
     var letter_finder = try Finder.init("b", .{});
@@ -4789,7 +4789,7 @@ fn searchId(bag: *Bag, id: []const u8, hay: []const u8, pattern: []const u8, con
     return searchSourceSlice(Bag, bag, id, hay, &finder, config);
 }
 
-test "服务入口只接受来源 ID" {
+test "service entry points accept only a source ID" {
     var bag = Bag{};
     defer bag.deinit();
     const slice_result = try searchId(&bag, "sid-7", "MATCH\n", "MATCH", .{});
@@ -4811,7 +4811,7 @@ test "服务入口只接受来源 ID" {
     try testing.expect(bag.items.items[bag.items.items.len - 1].kind == .summary);
 }
 
-test "事件带行号、字节列号和绝对偏移" {
+test "events include line number, byte column, and absolute offset" {
     var bag = Bag{};
     defer bag.deinit();
     _ = try searchId(&bag, "pos", "éMATCH\nzz\nMATCH\n", "MATCH", .{});
@@ -4836,7 +4836,7 @@ test "事件带行号、字节列号和绝对偏移" {
     try testing.expectEqualStrings("zzMATCH", record.bytes);
 }
 
-test "一行多个匹配区间按起点排序" {
+test "multiple match spans on a single line are sorted by start offset" {
     var bag = Bag{};
     defer bag.deinit();
     _ = try searchId(&bag, "many", "abXabYab\n", "ab", .{});
@@ -4856,7 +4856,7 @@ test "一行多个匹配区间按起点排序" {
     try testing.expect(std.mem.indexOfScalar(u8, line.bytes, 0x1b) == null);
 }
 
-test "每个事件只有来源 ID" {
+test "each event carries only the source ID" {
     var bag = Bag{};
     defer bag.deinit();
     _ = try searchId(&bag, "id-9", "a\nb\nMATCH\nc\nd\ne\nMATCH2\nf\n", "MATCH", .{
@@ -4872,7 +4872,7 @@ test "每个事件只有来源 ID" {
     for (bag.items.items) |item| try testing.expectEqualStrings("id-9", item.id);
 }
 
-test "二进制状态三种取值" {
+test "three binary status values" {
     var bag = Bag{};
     defer bag.deinit();
     _ = try searchId(&bag, "plain", "MATCH\n", "MATCH", .{});
@@ -4894,7 +4894,7 @@ test "二进制状态三种取值" {
     try testing.expectEqual(@as(usize, 0), bag.kindCount(.match));
 }
 
-test "截断字段来自超长行窗口" {
+test "truncation fields come from the overlong line window" {
     var hay: [80]u8 = undefined;
     @memset(&hay, 'z');
     const match_at: usize = 40;
@@ -4913,7 +4913,7 @@ test "截断字段来自超长行窗口" {
     try testing.expectEqual(@as(u64, match_at), line.window_start + line.matches[0].start);
 }
 
-test "未命中来源也有 begin 和 end" {
+test "unmatched source still emits begin and end" {
     var bag = Bag{};
     defer bag.deinit();
     const result = try searchId(&bag, "miss", "nope\n", "MATCH", .{});
@@ -4927,7 +4927,7 @@ test "未命中来源也有 begin 和 end" {
     try testing.expectEqual(@as(usize, 0), bag.kindCount(.match));
 }
 
-test "行首空白原样返回" {
+test "leading whitespace on a line is returned verbatim" {
     var bag = Bag{};
     defer bag.deinit();
     _ = try searchId(&bag, "pad", "  MATCH\n", "MATCH", .{});
@@ -4942,7 +4942,7 @@ test "行首空白原样返回" {
     try testing.expect(std.mem.indexOf(u8, line.bytes, "<") == null);
 }
 
-test "事件逐条回调" {
+test "events are delivered one by one via callback" {
     var scratch: [8]u8 = undefined;
     var src = std.testing.Reader.init(&scratch, &.{.{ .buffer = "M\nM\n" }});
     src.artificial_limit = .limited(2);
@@ -5027,7 +5027,7 @@ fn driveCapped(finder: *Finder, hay: []const u8, source_cap: ?u64, request_cap: 
     return .{ .result = result, .rest = ctx.rest.len, .closed = ctx.closed };
 }
 
-test "来源字节上限和请求字节上限都会停" {
+test "both source byte cap and request byte cap stop the search" {
     const hay = "MATCH\nMATCH\nMORE\n";
     var finder = try Finder.init("MATCH", .{});
     const source = try driveCapped(&finder, hay, 6, null);
@@ -5087,7 +5087,7 @@ const DeadlineGate = struct {
     }
 };
 
-test "截止时间在匹配循环中生效" {
+test "deadline is enforced inside the matching loop" {
     var gate = DeadlineGate{ .rest = "MATCH\nMATCH\nTAIL\n" };
     var finder = try Finder.init("MATCH", .{});
     const result = try drive(DeadlineGate, testing.allocator, &gate, &finder, .{
@@ -5135,7 +5135,7 @@ const CancelGate = struct {
     }
 };
 
-test "取消令牌关闭上游" {
+test "cancellation token closes upstream" {
     var gate = CancelGate{ .rest = "MATCH\nMATCH\nTAIL\n" };
     var finder = try Finder.init("MATCH", .{});
     const result = try drive(CancelGate, testing.allocator, &gate, &finder, .{
@@ -5181,7 +5181,7 @@ const Page = struct {
     }
 };
 
-test "最大结果数带继续位置" {
+test "max_results populates resume offset" {
     const hay = "aa MATCH\nbb MATCH\ncc MATCH\n";
     var finder = try Finder.init("MATCH", .{});
     var first = Page{};
@@ -5225,7 +5225,7 @@ const OutCount = struct {
     }
 };
 
-test "输出字节上限停止再产生行事件" {
+test "output byte cap stops emitting further line events" {
     var finder = try Finder.init("MATCH", .{});
     var lines = OutCount{};
     _ = try searchSourceSlice(OutCount, &lines, "out", "MATCH\nMATCH\n", &finder, .{
@@ -5284,7 +5284,7 @@ const DecodeFeed = struct {
     }
 };
 
-test "三种缓冲都有上限" {
+test "all three internal buffers enforce their caps" {
     var finder = try Finder.init("MATCH", .{});
     var reads: usize = 0;
     const CountRead = struct {
@@ -5334,7 +5334,7 @@ test "三种缓冲都有上限" {
     try testing.expectEqual(@as(u32, 1), queued.max_live);
 }
 
-test "预算来自调用方参数" {
+test "budgets come from caller parameters" {
     const hay = "MATCH\nMATCH\nMORE\n";
     var finder = try Finder.init("MATCH", .{});
     const tight = try driveCapped(&finder, hay, 4, null);
@@ -5367,7 +5367,7 @@ test "预算来自调用方参数" {
     try testing.expectEqual(sink_mod.LimitHit.max_bytes, served.limit_hit);
 }
 
-test "直接传入的流也受来源大小上限约束" {
+test "directly passed streams are also subject to the source size cap" {
     var finder = try Finder.init("MATCH", .{});
     var sink = Quiet{};
     var reader = std.Io.Reader.fixed("MATCH\nMORE MATCH\n");
@@ -5410,11 +5410,11 @@ test "直接传入的流也受来源大小上限约束" {
     try testing.expect(capped.bytes_read < big.len);
 }
 
-test "默认构建不映射文件" {
+test "default build does not memory-map files" {
     try testing.expect(!build_options.window_map);
 }
 
-test "软错误与有无匹配可区分" {
+test "soft errors are distinguishable from matches and non-matches" {
     var finder = try Finder.init("MATCH", .{});
     var sink = Quiet{};
     const matched = try searchSlice(Quiet, &sink, "MATCH\n", "", &finder, .{ .binary = .none });
@@ -5443,7 +5443,7 @@ test "软错误与有无匹配可区分" {
     }));
 }
 
-test "返回的错误不含路径" {
+test "returned errors do not contain file paths" {
     const secret = "/var/lib/secret/path.txt";
     var log = CapLog{};
     var finder = try Finder.init("MATCH", .{});
@@ -5471,7 +5471,7 @@ test "返回的错误不含路径" {
     try testing.expect(std.mem.indexOf(u8, @tagName(soft.soft_error.?), "/") == null);
 }
 
-test "core 不读取环境变量" {
+test "core does not read environment variables" {
     var finder = try Finder.init("MATCH", .{});
     var sink = Quiet{};
     const open = try searchSlice(Quiet, &sink, "MATCH\n", "", &finder, .{});
@@ -5511,7 +5511,7 @@ const ExistsGate = struct {
     }
 };
 
-test "存在性查询在第一条匹配后停止" {
+test "existence query stops after the first match" {
     var gate = ExistsGate{ .rest = "MATCH\nMORE MATCH\n" };
     var finder = try Finder.init("MATCH", .{});
     const result = try drive(ExistsGate, testing.allocator, &gate, &finder, .{
@@ -5529,7 +5529,7 @@ test "存在性查询在第一条匹配后停止" {
     try testing.expectEqual(sink_mod.LimitHit.none, result.limit_hit);
 }
 
-test "limit_hit 覆盖每种停止原因" {
+test "limit_hit covers every stop reason" {
     var seen: [@typeInfo(sink_mod.LimitHit).@"enum".field_names.len]bool = @splat(false);
     var finder = try Finder.init("MATCH", .{});
     var sink = Quiet{};
@@ -5585,7 +5585,7 @@ test "limit_hit 覆盖每种停止原因" {
     }
 }
 
-test "未扫完的计数带 partial" {
+test "incomplete scans mark counts as partial" {
     var finder = try Finder.init("MATCH", .{});
     var watch = Page{};
     defer watch.deinit();
@@ -5616,7 +5616,7 @@ test "未扫完的计数带 partial" {
     try testing.expectEqual(@as(u64, 2), done.matched_lines);
 }
 
-test "匹配次数和匹配行数不同" {
+test "match count is distinct from matched line count" {
     var bag = Bag{};
     defer bag.deinit();
     const result = try searchId(&bag, "g03", "MATCH MATCH\nMATCH\n", "MATCH", .{ .binary = .none });
@@ -5626,7 +5626,7 @@ test "匹配次数和匹配行数不同" {
     try testing.expectEqual(@as(u64, 3), bag.find(.end).match_count);
 }
 
-test "无匹配来源列表在第一条命中处停止" {
+test "files_without_match stops at the first hit" {
     const Watch = struct {
         matches: u32 = 0,
         pub fn event(self: *@This(), ev: Event) bool {
@@ -5669,7 +5669,7 @@ test "无匹配来源列表在第一条命中处停止" {
     try testing.expectEqual(@as(usize, 0), bag.kindCount(.match));
 }
 
-test "零命中来源的 end 仍有计数" {
+test "zero-match source still has counts in end event" {
     var bag = Bag{};
     defer bag.deinit();
     const result = try searchId(&bag, "zero", "nothing\n", "MATCH", .{ .binary = .none });
@@ -5681,7 +5681,7 @@ test "零命中来源的 end 仍有计数" {
     try testing.expectEqualStrings("zero", end.id);
 }
 
-test "计数：单文件、多文件、零次和二进制" {
+test "counts: single file, multiple files, zero matches, and binary" {
     var one = Bag{};
     defer one.deinit();
     const single = try searchId(&one, "one", "MATCH\nno\nMATCH MATCH\n", "MATCH", .{ .binary = .none });
@@ -5714,7 +5714,7 @@ test "计数：单文件、多文件、零次和二进制" {
     try testing.expectEqual(@as(u64, 2), bin.find(.end).matched_lines);
 }
 
-test "计数：max_count 的 after 窗口里抬成匹配的行也算" {
+test "counts: lines promoted to matches inside max_count after-context window are also counted" {
     const Nop = struct {
         pub fn matched(_: *@This(), _: Line) bool {
             return true;
@@ -5731,7 +5731,7 @@ test "计数：max_count 的 after 窗口里抬成匹配的行也算" {
     try testing.expectEqual(@as(u64, 2), result.matched_lines);
 }
 
-test "汇总字段齐全且未结束时没有 summary" {
+test "summary fields are complete and summary is omitted when scan is incomplete" {
     const Clock = struct {
         now: i128 = 0,
         fn tick(ctx: ?*anyopaque) i128 {
@@ -5772,7 +5772,7 @@ test "汇总字段齐全且未结束时没有 summary" {
     try testing.expectEqual(@as(usize, 1), bag.kindCount(.end));
 }
 
-test "progress 含已扫描字节和匹配数" {
+test "progress includes bytes_searched and match counts" {
     var bag = Bag{};
     defer bag.deinit();
     _ = try searchId(&bag, "prog", "MATCH\nabcd\nMATCH\n", "MATCH", .{
@@ -5791,7 +5791,7 @@ test "progress 含已扫描字节和匹配数" {
     try testing.expect(saw_matches);
 }
 
-test "回调可以暂停后继续" {
+test "callback can pause and resume" {
     const Gate = struct {
         hits: u32 = 0,
         ends: u32 = 0,
@@ -5849,7 +5849,7 @@ test "回调可以暂停后继续" {
     try testing.expect(!stopped.scanned_all);
 }
 
-test "拉式接口取出 begin 到 end" {
+test "pull interface yields begin through end" {
     var finder = try Finder.init("MATCH", .{});
     var pull = openSourcePull(testing.allocator, &finder, "pull-1", "a\nMATCH\nb\n", .{
         .before = 1,
@@ -5891,7 +5891,7 @@ test "拉式接口取出 begin 到 end" {
     try testing.expect(saw_end);
 }
 
-test "实时流空闲时产生心跳" {
+test "live stream emits heartbeat when idle" {
     const Src = struct {
         step: u8 = 0,
         now: i128 = 0,
@@ -5976,7 +5976,7 @@ test "实时流空闲时产生心跳" {
     try testing.expect(src.saw_summary);
 }
 
-test "命中一次就写出路径并停止" {
+test "writes source ID and stops on the first hit" {
     const Stop = struct {
         id: []const u8 = "",
         hits: u32 = 0,
@@ -6011,7 +6011,7 @@ test "命中一次就写出路径并停止" {
     try testing.expect(src.next_offset < hay.len);
 }
 
-test "A03 空行模式匹配所有行且超限在构造前拒绝" {
+test "empty line in pattern list matches all lines and limits are checked before construction" {
     const Multi = @import("finder/multi.zig").Multi;
     var multi = try Multi.initFromText(testing.allocator, "alpha\r\n\nomega", .{});
     defer multi.deinit();
@@ -6021,7 +6021,7 @@ test "A03 空行模式匹配所有行且超限在构造前拒绝" {
     try testing.expectEqual(@as(u64, 3), res.matched_lines);
 }
 
-test "B13 有序输入在首条不匹配行处停止并关闭上游" {
+test "ordered input stops and closes upstream at the first non-matching line after a hit" {
     const OrderedSrc = struct {
         reads: usize = 0,
         closed: bool = false,
@@ -6074,7 +6074,7 @@ test "B13 有序输入在首条不匹配行处停止并关闭上游" {
     try testing.expect(src.closed);
 }
 
-test "E06 全文高亮输出全部行且受输出字节上限约束" {
+test "passthru mode emits all lines and respects max_output_bytes" {
     const PassSink = struct {
         match_lines: u32 = 0,
         context_lines: u32 = 0,
@@ -6116,7 +6116,7 @@ test "E06 全文高亮输出全部行且受输出字节上限约束" {
     try testing.expectEqual(@as(u32, 1), capped.context_lines);
 }
 
-test "B14 替换预览不修改输入且区间与替换文本一致" {
+test "replacement preview does not mutate input and matches span replacement text" {
     const ReplSink = struct {
         saw_line: bool = false,
         replaced_copy: [64]u8 = undefined,
@@ -6161,7 +6161,7 @@ test "B14 替换预览不修改输入且区间与替换文本一致" {
     try testing.expectEqualStrings("hello BAR_BAZ and BAR_BAZ!", sink.replaced_copy[0..sink.replaced_len]);
 }
 
-test "B16 正则与 Searcher 联动及替换预览" {
+test "Regex integration with Searcher and replacement preview" {
     const Regex = @import("regex.zig").Regex;
     const Collect = struct {
         hits: u32 = 0,
@@ -6193,7 +6193,7 @@ test "B16 正则与 Searcher 联动及替换预览" {
     try testing.expectEqualStrings("fail CODE and CODE!", sink.replaced_buf[0..sink.replaced_len]);
 }
 
-test "B17 跨行窗口耗尽后不再读上游" {
+test "stops reading upstream once multiline window is exhausted" {
     const Regex = @import("regex.zig").Regex;
     const MlStream = struct {
         reads: usize = 0,
@@ -6252,7 +6252,7 @@ test "B17 跨行窗口耗尽后不再读上游" {
     try testing.expect(src.closed);
 }
 
-test "A04 gzip 炸弹被压缩比与解压字节上限拦截" {
+test "gzip bomb is blocked by compression ratio and decompressed byte caps" {
     var finder = try Finder.init("MATCH", .{});
     const gz_ok = try decompress.compressGzipStoredAlloc(testing.allocator, "skip\nMATCH_HERE\n");
     defer testing.allocator.free(gz_ok);
@@ -6265,7 +6265,7 @@ test "A04 gzip 炸弹被压缩比与解压字节上限拦截" {
     try testing.expectEqual(@as(u64, 1), ok_res.matched_lines);
     try testing.expectEqual(sink_mod.LimitHit.none, ok_res.limit_hit);
 
-    // 1. 被解压字节上限 max_decompressed_bytes 拦截
+    // 1. Blocked by decompressed byte cap `max_decompressed_bytes`
     const cap_res = try searchSourceSlice(Quiet, &quiet, "gz-cap", gz_ok, &finder, .{
         .compression = .auto,
         .decode_allocator = testing.allocator,
@@ -6274,7 +6274,7 @@ test "A04 gzip 炸弹被压缩比与解压字节上限拦截" {
     try testing.expectEqual(sink_mod.LimitHit.decompressed_bytes, cap_res.limit_hit);
     try testing.expect(cap_res.partial);
 
-    // 2. 被最大压缩比 max_compression_ratio 拦截（24 字节 Gzip 炸弹解压出 1032 字节）
+    // 2. Blocked by maximum compression ratio `max_compression_ratio` (24-byte Gzip bomb inflating to 1032 bytes)
     const bomb_gz = [_]u8{
         0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03,
         0x73, 0x74, 0xa4, 0x3d, 0x00, 0x00, 0x8d, 0xef, 0x72, 0x2f,
@@ -6289,7 +6289,7 @@ test "A04 gzip 炸弹被压缩比与解压字节上限拦截" {
     try testing.expect(bomb_res.partial);
 }
 
-test "A05 zstd 解压共用防爆上限且损坏归为软错误" {
+test "zstd decompression shares bomb limits and classifies corruption as a soft error" {
     var finder = try Finder.init("MATCH_ZSTD", .{});
     const zst_ok = try decompress.compressZstdRawAlloc(testing.allocator, "line1\nMATCH_ZSTD\n");
     defer testing.allocator.free(zst_ok);
@@ -6302,7 +6302,7 @@ test "A05 zstd 解压共用防爆上限且损坏归为软错误" {
     try testing.expectEqual(@as(u64, 1), ok_res.matched_lines);
     try testing.expect(ok_res.soft_error == null);
 
-    // 解压上限拦截
+    // Blocked by decompression limit
     var cap_reader = std.Io.Reader.fixed(zst_ok);
     const cap_res = try searchSource(Quiet, testing.allocator, &quiet, &cap_reader, "zst-cap", &finder, .{
         .compression = .auto,
@@ -6310,7 +6310,7 @@ test "A05 zstd 解压共用防爆上限且损坏归为软错误" {
     });
     try testing.expectEqual(sink_mod.LimitHit.decompressed_bytes, cap_res.limit_hit);
 
-    // 损坏的 zstd 流不抛致命错误，归为 SoftError.read_failed
+    // A corrupt zstd stream does not raise a fatal error; it maps to SoftError.read_failed
     const corrupt_zst = [_]u8{ 0x28, 0xB5, 0x2F, 0xFD, 0xFF, 0xFF, 0xFF };
     var bad_reader = std.Io.Reader.fixed(&corrupt_zst);
     const bad_res = try searchSource(Quiet, testing.allocator, &quiet, &bad_reader, "zst-bad", &finder, .{
@@ -6319,9 +6319,9 @@ test "A05 zstd 解压共用防爆上限且损坏归为软错误" {
     try testing.expectEqual(sink_mod.SoftError.read_failed, bad_res.soft_error.?);
 }
 
-test "C06 GBK 与 charset 提示转码命中" {
-    // GBK 编码的 "你好\n测试错误日志\n"：
-    // 你好 = C4 E3 BA C3, 测试 = B2 E2 CA D4, 错误 = B4 ED CE F3, 日志 = C8 D5 D6 BE
+test "GBK transcoding via charset hint matches and maps offsets" {
+    // GBK-encoded lines:
+    // Line 1: C4 E3 BA C3, Line 2: B2 E2 CA D4 B4 ED CE F3 C8 D5 D6 BE
     const gbk_bytes = "\xC4\xE3\xBA\xC3\n\xB2\xE2\xCA\xD4\xB4\xED\xCE\xF3\xC8\xD5\xD6\xBE\n";
     var finder = try Finder.init("错误", .{});
 
@@ -6347,12 +6347,12 @@ test "C06 GBK 与 charset 提示转码命中" {
     });
     try testing.expectEqual(@as(u64, 1), res.matched_lines);
     try testing.expectEqual(@as(u32, 1), sink.hits);
-    // UTF-8 下 "你好\n" 占 3 + 3 + 1 = 7 字节；原始 GBK 下 "\xC4\xE3\xBA\xC3\n" 占 2 + 2 + 1 = 5 字节
+    // In UTF-8 the first line takes 3 + 3 + 1 = 7 bytes; in raw GBK "\xC4\xE3\xBA\xC3\n" takes 2 + 2 + 1 = 5 bytes
     try testing.expectEqual(@as(u64, 7), sink.abs_off);
     try testing.expectEqual(@as(u64, 5), sink.raw_off);
 }
 
-test "F12 转码与解压后仍能给出原始字节流偏移" {
+test "preserves raw byte stream offsets after transcoding and decompression" {
     const OffsetSink = struct {
         abs_off: u64 = 0,
         raw_off: u64 = 0,
@@ -6366,8 +6366,8 @@ test "F12 转码与解压后仍能给出原始字节流偏移" {
         }
     };
 
-    // UTF-16LE 带 2 字节 BOM (FF FE)，第一行 "ab\n" (6 字节)，第二行 "HIT\n" (8 字节)
-    // 第二行在转码后 UTF-8 中的偏移是 3 ("ab\n")，在原始 UTF-16LE 流中的偏移是 2 (BOM) + 6 ("ab\n") = 8！
+    // UTF-16LE with 2-byte BOM (FF FE), line 1 "ab\n" (6 bytes), line 2 "HIT\n" (8 bytes).
+    // Line 2 is at offset 3 ("ab\n") in transcoded UTF-8, and at offset 2 (BOM) + 6 ("ab\n") = 8 in the raw UTF-16LE stream.
     const utf16le_data = [_]u8{
         0xFF, 0xFE,
         'a',  0,

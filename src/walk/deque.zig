@@ -1,8 +1,8 @@
-//! Chase-Lev 工作窃取双端队列。
+//! Chase-Lev work-stealing deque.
 //!
-//! owner 从 bottom 压入、弹出，是 LIFO。stealer 从 top 取，是 FIFO。
-//! 只有 owner 会扩容。旧缓冲留到 `deinit`，stealer 仍能读到已经发布的元素。
-//! 队列里放指针。空位是 null。
+//! The owner pushes and pops from the bottom in LIFO order. Stealers take from the top in FIFO order.
+//! Only the owner grows the buffer. Old buffers are retained until `deinit` so stealers can still read published items.
+//! The queue stores pointers; empty slots are null.
 
 const std = @import("std");
 
@@ -41,7 +41,7 @@ pub fn Deque(comptime T: type) type {
             self.* = undefined;
         }
 
-        /// 只给 owner 调用。
+        /// Called only by the owner.
         pub fn push(self: *Self, item: *T) !void {
             const b = self.bottom.load(.monotonic);
             const t = self.top.load(.acquire);
@@ -50,15 +50,15 @@ pub fn Deque(comptime T: type) type {
                 buf = try self.grow(buf, b, t);
             }
             buf.slots[@as(usize, @intCast(b)) & buf.mask].store(item, .unordered);
-            // release 存储本身发布之前的槽位写入。Zig 0.14 起没有独立的 @fence。
+            // The release store publishes the preceding slot write. Zig 0.14+ has no standalone @fence.
             self.bottom.store(b +% 1, .release);
         }
 
-        /// 只给 owner 调用。
+        /// Called only by the owner.
         pub fn pop(self: *Self) ?*T {
             const b = self.bottom.load(.monotonic) -% 1;
             const buf = self.buf.load(.monotonic);
-            // 原来的 seq_cst 栅栏改成两边都用 seq_cst，让 bottom 的存储和 top 的加载进入同一全序。
+            // Use seq_cst on both sides instead of a standalone seq_cst fence so the bottom store and top load share a single total order.
             self.bottom.store(b, .seq_cst);
             const t = self.top.load(.seq_cst);
             if (t <= b) {
@@ -73,10 +73,10 @@ pub fn Deque(comptime T: type) type {
             return null;
         }
 
-        /// 任意线程可以调用。
+        /// May be called by any thread.
         pub fn steal(self: *Self) ?*T {
             while (true) {
-                // 同样用 seq_cst 负载代替独立栅栏，避免 owner 和 stealer 同时拿走最后一个元素。
+                // Likewise use seq_cst loads in place of a standalone fence so the owner and a stealer cannot both take the last item.
                 const t = self.top.load(.seq_cst);
                 const b = self.bottom.load(.seq_cst);
                 if (t >= b) return null;
@@ -115,7 +115,7 @@ pub fn Deque(comptime T: type) type {
 
 const Box = struct { value: usize };
 
-test "owner 后进先出，stealer 先进先出" {
+test "owner is LIFO and stealer is FIFO" {
     const Q = Deque(Box);
     var q = try Q.init(std.testing.allocator, 8);
     defer q.deinit();
@@ -130,7 +130,7 @@ test "owner 后进先出，stealer 先进先出" {
     try std.testing.expect(q.steal() == null);
 }
 
-test "扩容之后 owner 和 stealer 还能取到原来的元素" {
+test "owner and stealer still retrieve original items after growth" {
     const Q = Deque(Box);
     var q = try Q.init(std.testing.allocator, 8);
     defer q.deinit();
@@ -165,7 +165,7 @@ fn stealLoop(shared: *Shared, total: usize) void {
     }
 }
 
-test "两个 stealer 和 owner 交错不会丢元素" {
+test "interleaving two stealers and owner does not lose items" {
     if (builtinSingleThread()) return;
     const total: usize = 4000;
     var shared = Shared{ .queue = try Deque(Box).init(std.testing.allocator, 8) };

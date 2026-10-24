@@ -1,12 +1,12 @@
-//! 大文件按 8 MiB 窗口映射，再拷进 Searcher 已有的缓冲。
+//! Large files are mapped in 8 MiB windows and copied into the Searcher's existing buffer.
 //!
-//! 这是可选的文件读取方式，不是默认路径。只有构建选项打开时，
-//! 文件搜索才会调用这里。默认构建不编译这份文件。
-//! 小文件、比搜索缓冲还小的文件、以及映射失败，都退回 `readPositional`。
+//! This is an optional file-reading path, not the default. File search invokes it only when enabled
+//! via build options; default builds do not compile this file.
+//! Small files, files smaller than the search buffer, and mapping failures all fall back to `readPositional`.
 //!
-//! 丢掉窗口时通知内核可以回收页面。Linux 走 `madvise` 系统调用，不链接 libc。
-//! macOS 用系统 libc 里的 `madvise`。Windows 和 WASI 跳过。
-//! 这里没有 CPU 分派。向量宽度仍由 P0 的 `suggestVectorLength` 决定。
+//! When dropping a window, the kernel is advised that pages can be reclaimed. Linux uses the `madvise` syscall without linking libc.
+//! macOS uses `madvise` from system libc. Windows and WASI are no-ops.
+//! There is no CPU dispatch here; vector width is still determined by `suggestVectorLength`.
 
 const builtin = @import("builtin");
 const std = @import("std");
@@ -63,7 +63,7 @@ pub const Reader = struct {
     }
 };
 
-/// 文件不大于 `small_limit`，或第一次映射失败时返回 null。只有内存不足向上传。
+/// Returns null if the file is no larger than `small_limit` or if the initial mapping fails. Only `OutOfMemory` is propagated.
 pub fn open(io: std.Io, file: std.Io.File, small_limit: usize) error{OutOfMemory}!?Reader {
     const stat = file.stat(io) catch return null;
     if (stat.kind != .file) return null;
@@ -116,7 +116,7 @@ fn readPositional(self: *Reader, dest: []u8) ReadError!usize {
 fn adviseDontNeed(memory: []align(std.heap.page_size_min) u8) void {
     switch (comptime builtin.os.tag) {
         .linux => {
-            // musl 目标不会自动链接 libc。直接系统调用，失败也不影响读到的字节。
+            // musl targets do not link libc automatically; invoke the syscall directly and ignore failures since read bytes are unaffected.
             _ = std.os.linux.madvise(memory.ptr, memory.len, std.os.linux.MADV.DONTNEED);
         },
         .windows, .wasi => {},
@@ -127,7 +127,7 @@ fn adviseDontNeed(memory: []align(std.heap.page_size_min) u8) void {
     }
 }
 
-test "比缓冲大的文件能从窗口里读出" {
+test "file larger than buffer can be read from window" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = std.testing.io;

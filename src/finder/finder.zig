@@ -1,7 +1,7 @@
-//! 单模式字面量查找器。
-//! 一个字节走 memchr。长度不超过 32 的模式走向量 packed pair，自己完成确认。
-//! 更长的模式仍用 packed pair，但两个稀有字节挤在一起、确认又总是失败时改走 Two-Way。
-//! 不分配内存。模式字节由调用方持有，并且不能含有换行。
+//! Single-pattern literal finder.
+//! Single-byte patterns use memchr. Patterns up to 32 bytes use SIMD packed pair and complete verification directly.
+//! Longer patterns still use packed pair, falling back to Two-Way when the two rare bytes are close together and verification repeatedly fails.
+//! Does not allocate memory. Pattern bytes are owned by the caller and must not contain newlines.
 
 const std = @import("std");
 const ascii = @import("ascii.zig");
@@ -16,10 +16,10 @@ pub const Finder = struct {
     ignore_case: bool,
     kind: Kind,
     fp_threshold: f32,
-    /// 本次生命周期里 packed pair 看到的候选数。可用 `resetStats` 清零。
+    /// Number of candidates seen by packed pair during this lifetime. Can be cleared with `resetStats`.
     candidates: u32 = 0,
     confirms: u32 = 0,
-    /// 为真之后，后续查找都走 Two-Way。
+    /// Once true, subsequent searches use Two-Way.
     use_two_way: bool = false,
     two_way: two_way.TwoWay,
 
@@ -56,8 +56,8 @@ pub const Finder = struct {
         };
     }
 
-    /// 单个字面量下 `earliest` 和 `leftmost_first` 是同一次匹配。
-    /// 这条路径单独写，不经过 NUL 监视。密集命中时它会被内联进搜索循环。
+    /// For a single literal, `earliest` and `leftmost_first` produce the same match.
+    /// Kept separate from NUL watching so it can be inlined into tight search loops on dense hits.
     pub fn find(self: *Finder, haystack: []const u8, start: usize, mode: matcher.MatchMode) ?matcher.Match {
         _ = mode;
         switch (self.kind) {
@@ -77,8 +77,8 @@ pub const Finder = struct {
         }
     }
 
-    /// 和 `find` 一样，另外把扫描过的区间里第一个 NUL 写到 `nul`。
-    /// 返回匹配时，只保证这个匹配起点之前没有 NUL。
+    /// Same as `find`, additionally writing the first NUL within the scanned span to `nul`.
+    /// When returning a match, only guarantees no NUL precedes the match start.
     pub fn findWatched(self: *Finder, haystack: []const u8, start: usize, nul: *?usize) ?matcher.Match {
         switch (self.kind) {
             .empty => {
@@ -104,13 +104,13 @@ pub const Finder = struct {
         }
     }
 
-    /// 供将来的正则预过滤使用。忽略大小写时字节仍是原模式，不能当成大小写敏感的必要子串。
+    /// For future regex prefiltering. When case-insensitive, bytes remain the raw pattern and must not be treated as a case-sensitive required substring.
     pub fn requiredLiteral(self: *const Finder) ?matcher.RequiredLiteral {
         if (self.pattern.len == 0) return null;
         return .{ .bytes = self.pattern, .offset_in_match = 0 };
     }
 
-    /// 每个新输入开始时调用，避免上一个输入的假阳性把这个输入锁进 Two-Way。
+    /// Called at the start of each new input so false positives from a previous input do not lock this input into Two-Way.
     pub fn resetStats(self: *Finder) void {
         self.candidates = 0;
         self.confirms = 0;
@@ -123,8 +123,8 @@ pub const Finder = struct {
         if (self.use_two_way) return self.findLinear(haystack, start, m);
         if (m > haystack.len or start > haystack.len - m) return null;
 
-        // 短模式的最坏情况是常数倍的线性时间，不切到标量 Two-Way。
-        // 长模式只在调用方把阈值设到 1 以下、并且预过滤跳不动时才切。
+        // Short patterns have a constant-factor linear worst case, so they never switch to scalar Two-Way.
+        // Long patterns switch only when the caller lowers the threshold below 1 and the prefilter fails to make progress.
         var guard: packed_pair.Guard = .{};
         const watch = m > packed_pair.owns_search_max_len and self.fp_threshold < 1;
         const at = pair.find(memchr.native_width, haystack, start, if (watch) &guard else null);
@@ -182,14 +182,14 @@ pub const Finder = struct {
         return .{ .start = at, .end = at + m };
     }
 
-    /// 行内容（不含换行，也不含行尾的一个 CR）是否和这条模式相同。
+    /// Whether the line content (excluding newline and a trailing CR) equals this pattern.
     pub fn acceptsSpan(self: *const Finder, haystack: []const u8, start: usize, end: usize) bool {
         if (start > end or end > haystack.len) return false;
         return ascii.eql(self.pattern, haystack[start..end], self.ignore_case);
     }
 
-    /// 和 `find` 一样，但 `allow` 拒绝时从匹配起点的下一个字节继续。
-    /// 单模式在同一起点只有一种长度。
+    /// Same as `find`, advancing one byte past the match start when `allow` rejects a candidate.
+    /// A single pattern has only one possible length at any given start position.
     pub fn findAllowed(
         self: *Finder,
         haystack: []const u8,
@@ -229,7 +229,7 @@ fn scalarFind(haystack: []const u8, pattern: []const u8, start: usize, ignore_ca
     return null;
 }
 
-test "换行、空模式、单字节、smart case" {
+test "newline error, empty pattern, single byte, and smart case" {
     try std.testing.expectError(error.PatternHasNewline, Finder.init("a\nb", .{}));
 
     var empty = try Finder.init("", .{});
@@ -249,7 +249,7 @@ test "换行、空模式、单字节、smart case" {
     try std.testing.expectEqual(@as(usize, 0), smart_lower.find("FOO", 0, .earliest).?.start);
 }
 
-test "多字节命中，短模式不因常见字节切到 Two-Way" {
+test "multi-byte match: short patterns do not switch to Two-Way on frequent bytes" {
     var finder = try Finder.init("qx", .{});
     try std.testing.expectEqual(@as(usize, 4), finder.find("qqq qx", 0, .earliest).?.start);
     try std.testing.expect(!finder.use_two_way);
@@ -268,7 +268,7 @@ test "多字节命中，短模式不因常见字节切到 Two-Way" {
     try std.testing.expect(!noisy.use_two_way);
 }
 
-test "长模式在两个稀有字节挤在一起时改走 Two-Way，并且仍能找到" {
+test "long pattern switches to Two-Way when rare bytes cluster and still finds match" {
     var rank: [256]u8 = @splat(100);
     rank['a'] = 0;
     rank['b'] = 1;
@@ -293,7 +293,7 @@ test "长模式在两个稀有字节挤在一起时改走 Two-Way，并且仍能
     try std.testing.expectEqual(@as(u32, 0), noisy.candidates);
 }
 
-test "Finder 与朴素查找一致" {
+test "Finder matches naive search" {
     var prng = std.Random.DefaultPrng.init(0xF1A0);
     const random = prng.random();
     var hay: [120]u8 = undefined;
@@ -320,7 +320,7 @@ test "Finder 与朴素查找一致" {
     }
 }
 
-test "必需字面量" {
+test "required literal" {
     var finder = try Finder.init("abc", .{});
     const lit = finder.requiredLiteral().?;
     try std.testing.expectEqualStrings("abc", lit.bytes);

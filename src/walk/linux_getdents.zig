@@ -1,7 +1,7 @@
-//! Linux 专用的目录枚举。只在 `-Dlinux-getdents` 且目标是 Linux 时编进遍历。
+//! Linux-specific directory enumeration. Compiled into traversal only when `-Dlinux-getdents` is enabled on a Linux target.
 //!
-//! 直接调用 `getdents64`，解析 `dirent64`，跳过 `.` 和 `..`。
-//! 取消点走 `Io.checkCancel`。没有这组构建选项时，遍历使用 `std.Io.Dir.Reader`。
+//! Invokes `getdents64` directly, parses `dirent64`, and skips `.` and `..`.
+//! Cancellation checkpoints use `Io.checkCancel`. Without this build option, traversal uses `std.Io.Dir.Reader`.
 
 const std = @import("std");
 

@@ -1,6 +1,6 @@
-//! 目录枚举。默认用 `std.Io.Dir.Reader` 和调用方提供的 32 KiB 缓冲。
-//! Linux 上标准库自己会走 `getdents64`，所以这条路径已经是大缓冲的 getdents。
-//! `-Dlinux-getdents` 才改用 `linux_getdents.zig` 里的直接系统调用。
+//! Directory enumeration. Uses `std.Io.Dir.Reader` with a caller-supplied 32 KiB buffer by default.
+//! On Linux, the standard library already uses `getdents64`, so this path is already large-buffer getdents.
+//! `-Dlinux-getdents` switches to the direct syscall implementation in `linux_getdents.zig`.
 
 const std = @import("std");
 const build_options = @import("build_options");

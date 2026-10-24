@@ -1,9 +1,11 @@
-//! 带字节等价类的 Aho-Corasick 稠密 DFA。
+//! Dense Aho-Corasick DFA with byte equivalence classes.
 //!
-//! 建自动机时分配内存。建完之后的查找不分配。
-//! 等价类把「在所有状态上转移都相同」的字节合成一类，转移表按类存储。
-//! 锚点字节不超过 16 种时，查找先用向量扫这些字节，再只确认挂在上面的模式。
-//! 这是按 Aho 与 Corasick 的失败函数另写的，没有复制别的项目的源码。
+//! Memory is allocated only during automaton construction; searches do not allocate.
+//! Equivalence classes group bytes that share identical transitions across all states,
+//! storing the transition table by class.
+//! When there are at most 16 distinct anchor bytes, search first scans for those bytes
+//! with SIMD vectors and then verifies only the patterns attached to them.
+//! Implemented directly from the Aho and Corasick failure function without copying third-party source.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -635,7 +637,7 @@ fn rarest(pat: []const u8, ignore: bool) struct { byte: u8, offset: u32 } {
     return .{ .byte = byte, .offset = @intCast(best_i) };
 }
 
-test "锚点预过滤和稠密自动机同一处命中" {
+test "anchor prefilter matches dense automaton at the same position" {
     const alloc = std.testing.allocator;
     const pats = [_][]const u8{ "abcdef", "de", "xxqz", "alpha", "zq0004miss" };
     var engine = try build(alloc, &pats, false);
@@ -693,7 +695,7 @@ fn scalarAc(hay: []const u8, start: usize, pats: []const []const u8, mode: match
     return .{ .start = chosen.start, .end = chosen.end };
 }
 
-test "锚点预过滤扫过第一跨，第二跨和朴素查找一致" {
+test "anchor prefilter skips first stride and matches naive search on second stride" {
     const stride = @import("memchr.zig").native_width * 4;
     const pats = [_][]const u8{ "abcdef", "de", "xxqz", "alpha", "zq0004miss" };
     var engine = try build(std.testing.allocator, &pats, false);

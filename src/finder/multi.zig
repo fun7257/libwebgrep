@@ -1,16 +1,19 @@
-//! 多模式字面量。
+//! Multi-pattern literal search.
 //!
-//! 全部是单字节时走字节集。邻接对不超过 16 种时走向量过滤，不建自动机。
-//! 否则在 Teddy 打得开、不超过 32 个且没有空模式时走 Teddy。剩下走 Aho-Corasick，
-//! 锚点字节不超过 16 种时自动机仍先做单字节向量预过滤。
-//! Teddy 由 `-Dteddy` 选择。aarch64 默认是 neon，其他架构默认关闭。
+//! When all patterns are single bytes, dispatches to `byteset`. When adjacent byte pairs fit within
+//! 16 distinct rules, uses vectorized pair prefiltering without building an automaton.
+//! Otherwise, when Teddy is enabled, there are at most 32 patterns, and none are empty, uses Teddy.
+//! All remaining cases use Aho-Corasick, which still applies a single-byte SIMD prefilter when
+//! anchor bytes fit within 16 distinct values.
+//! Teddy is selected via `-Dteddy` (defaults to `neon` on aarch64 and `off` on other architectures).
 //!
-//! 智能大小写按每条模式判断：全是小写才忽略大小写。判断不一致时走标量扫描，
-//! 一致时仍走上面的引擎。这和 rg 整组判断不同，说明写在 `matcher.zig`。
+//! Smart case is evaluated per pattern: a pattern ignores case only if it contains no uppercase letters.
+//! When patterns disagree on case sensitivity, search falls back to a scalar scan; when they agree,
+//! the SIMD engines above are used. This differs from ripgrep's whole-set smart case; see `matcher.zig`.
 //!
-//! 模式字节由调用方持有，并且不能含有换行。复制本结构只复制指针，表在
-//! `deinit` 之前只读，工人可以共享。只有创建者调用 `deinit`。
-//! 条数和字节总长在分配这些表之前检查。
+//! Pattern bytes are owned by the caller and must not contain newlines. Copying this struct copies only
+//! pointers; internal tables are read-only until `deinit` and can be shared across worker threads.
+//! Only the creator calls `deinit`. Pattern count and total byte limits are checked before allocating tables.
 
 const std = @import("std");
 const aho = @import("aho.zig");
@@ -31,7 +34,7 @@ pub const Multi = struct {
     kind: Kind,
     ignore_case: bool,
     empty_only: bool,
-    /// 调用方持有。整行比较和整词的逐条确认用它，不另外复制模式字节。
+    /// Owned by the caller. Used for whole-line comparison and whole-word per-pattern verification without copying pattern bytes.
     patterns: []const []const u8,
     owned_patterns: ?[][]const u8 = null,
     owned_variant_bytes: ?[][]u8 = null,
@@ -55,7 +58,7 @@ pub const Multi = struct {
         patterns: []const []const u8,
         options: matcher.FindOptions,
     ) (matcher.LimitError || error{ PatternHasNewline, OutOfMemory })!Multi {
-        // 超限在分配邻接对表、Teddy 或自动机之前返回，调用方还没开始扫描。
+        // Reject limit violations before allocating pair tables, Teddy, or the automaton.
         try matcher.checkPatternLimits(patterns, options);
         for (patterns) |pat| {
             if (std.mem.findScalar(u8, pat, '\n') != null) return error.PatternHasNewline;
@@ -112,9 +115,11 @@ pub const Multi = struct {
         };
     }
 
-    /// 从按行分隔的模式文本构造多模式查找器。每行一条模式，行尾紧挨着的一个 CR 会被去掉。
-    /// 空行表示空模式，匹配所有行。只接受内存文本，不读文件系统路径。
-    /// 条数和字节总长在分配模式切片与内部表之前检查。`text` 的字节由调用方持有。
+    /// Builds a multi-pattern finder from newline-separated pattern text. Each line is one pattern,
+    /// stripping a single trailing CR before LF. Empty lines represent empty patterns that match every line.
+    /// Accepts in-memory text only and never reads filesystem paths.
+    /// Pattern count and total byte limits are checked before allocating pattern slices or internal tables.
+    /// The `text` bytes remain owned by the caller.
     pub fn initFromText(
         allocator: std.mem.Allocator,
         text: []const u8,
@@ -183,7 +188,7 @@ pub const Multi = struct {
         return self.empty_only;
     }
 
-    /// 微基准用来核对这次落到哪条引擎。改分派时基准场景测试会失败。
+    /// Used by microbenchmarks to verify which engine was selected. Changing dispatch rules will fail scenario tests.
     pub fn engineName(self: *const Multi) []const u8 {
         return switch (self.kind) {
             .bytes => "bytes",
@@ -215,7 +220,7 @@ pub const Multi = struct {
         }
     }
 
-    /// 行内容是否和其中某一条模式相同。大小写按那一条自己的规则。
+    /// Whether the line span equals any pattern, using each pattern's own case-folding rule.
     pub fn acceptsSpan(self: *const Multi, haystack: []const u8, start: usize, end: usize) bool {
         if (start > end or end > haystack.len) return false;
         const span = haystack[start..end];
@@ -225,8 +230,9 @@ pub const Multi = struct {
         return false;
     }
 
-    /// 逐条确认，让同一起点上没被选中的另一条模式仍能通过 `allow`。
-    /// 整词要用这个：引擎只返回一条，短的那条被词边界拒绝时，长的那条可能成立。
+    /// Verifies each pattern individually so another pattern at the same start position can still pass `allow`.
+    /// Required for whole-word matching: an engine returns only one match per position, so if a shorter
+    /// pattern is rejected by a word boundary, a longer pattern at the same start may still succeed.
     pub fn findAllowed(
         self: *Multi,
         haystack: []const u8,
@@ -315,8 +321,9 @@ fn allowAll(haystack: []const u8, start: usize, end: usize) bool {
     return true;
 }
 
-/// 这一条模式在 `mode` 下是否忽略 ASCII 大小写。
-/// `smart` 只看这一条：全是小写才折叠。旁边有大写的模式不会把这一条改成区分大小写。
+/// Returns whether this single pattern ignores ASCII case under `mode`.
+/// In `smart` mode, only this pattern is inspected: it folds case iff it has no uppercase letters.
+/// Another pattern containing uppercase letters does not force this pattern to be case-sensitive.
 pub fn patternIgnoresCase(pattern: []const u8, mode: matcher.CaseMode) bool {
     return switch (mode) {
         .sensitive => false,
@@ -416,7 +423,7 @@ fn initUnicodeFolded(
     };
 }
 
-/// 全部模式的大小写判断一致时返回那个值。`smart` 下不一致则返回 null。
+/// Returns the shared case-insensitivity flag when all patterns agree, or null when `smart` mode produces mixed sensitivity.
 fn uniformIgnore(patterns: []const []const u8, mode: matcher.CaseMode) ?bool {
     switch (mode) {
         .sensitive => return false,
@@ -453,17 +460,17 @@ const digram_pats = blk: {
     break :blk pats;
 };
 
-/// 微基准和场景测试共用这些模式。文本形状见 `fillScenarioText`。
-/// 字节集是两个不会出现的单字节。邻接对里有末尾那个 `NEEDLE`。
-/// 17 条双字节超过邻接对的 16 条上限，Teddy 开着时走 Teddy，否则走自动机。
-/// 33 条超过 Teddy 的 32 条上限，只能走自动机。这些字节都不在样例文本里。
+/// Patterns shared between microbenchmarks and scenario tests; see `fillScenarioText` for the input shape.
+/// `scenario_bytes` uses two single bytes absent from the sample text. `scenario_pairs` includes the trailing `NEEDLE`.
+/// 17 two-byte patterns exceed the 16-rule limit of `pairs`, routing to Teddy when enabled or Aho-Corasick otherwise.
+/// 33 patterns exceed Teddy's 32-pattern limit, routing to Aho-Corasick. None of those digram bytes appear in the sample text.
 pub const scenario_bytes: []const []const u8 = &.{ "Q", "Z" };
 pub const scenario_pairs: []const []const u8 = &.{ "NEEDLE", "ZXZQ" };
 pub const scenario_teddy: []const []const u8 = digram_pats[0..17];
 pub const scenario_ac: []const []const u8 = &digram_pats;
 
-/// 基准文本：全是 `a`，每 64 字节一个换行，末尾盖上 `NEEDLE\n`。
-/// `bench/micro.zig` 和场景测试用同一形状。缓冲至少要容得下末尾那 7 个字节。
+/// Benchmark text: filled with `'a'`, a newline every 64 bytes, and `NEEDLE\n` overwritten at the end.
+/// `bench/micro.zig` and scenario tests share this shape. The buffer must hold at least the trailing 7 bytes.
 pub fn fillScenarioText(buf: []u8) void {
     const needle = "NEEDLE\n";
     std.debug.assert(buf.len >= needle.len);
@@ -532,7 +539,7 @@ fn better(a: Naive, b: Naive, mode: matcher.MatchMode) bool {
     }
 }
 
-test "换行、空集、单字节和模式顺序" {
+test "newline error, empty set, single bytes, and pattern priority order" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(error.PatternHasNewline, Multi.init(alloc, &.{ "a", "b\nc" }, .{}));
 
@@ -562,7 +569,7 @@ test "换行、空集、单字节和模式顺序" {
     try std.testing.expectEqual(@as(usize, 3), still_early.end);
 }
 
-test "同一行上的非重叠命中和空模式" {
+test "non-overlapping matches on the same line and empty patterns" {
     var many = try Multi.init(std.testing.allocator, &.{ "aa", "a" }, .{});
     defer many.deinit();
     const first = many.find("aaa", 0, .leftmost_first).?;
@@ -584,7 +591,7 @@ test "同一行上的非重叠命中和空模式" {
     try std.testing.expectEqual(@as(usize, 0), miss.end);
 }
 
-test "智能大小写按每个模式判断" {
+test "smart case is evaluated per pattern" {
     var folded = try Multi.init(std.testing.allocator, &.{ "Ab", "zz" }, .{ .case = .insensitive });
     defer folded.deinit();
     try std.testing.expect(folded.kind != .mixed);
@@ -594,8 +601,8 @@ test "智能大小写按每个模式判断" {
     try std.testing.expect(patternIgnoresCase("bar", .smart));
     try std.testing.expect(patternIgnoresCase("foo", .smart));
 
-    // Foo 含大写，仍区分大小写。bar 全是小写，单独忽略大小写。
-    // rg 会因为整组里有 Foo 而让 bar 也区分大小写。
+    // "Foo" contains uppercase and stays case-sensitive; "bar" is all lowercase and folds case independently.
+    // By contrast, ripgrep would make "bar" case-sensitive because "Foo" is in the same pattern set.
     var smart = try Multi.init(std.testing.allocator, &.{ "Foo", "bar" }, .{ .case = .smart });
     defer smart.deinit();
     try std.testing.expect(smart.kind == .mixed);
@@ -619,7 +626,7 @@ test "智能大小写按每个模式判断" {
     try std.testing.expectEqual(@as(usize, 0), mixed_case.find("ZZ", 0, .leftmost_first).?.start);
 }
 
-test "经典失败链和随机对照" {
+test "classic failure links and random differential" {
     var classic = try Multi.init(std.testing.allocator, &.{ "he", "she", "his", "hers" }, .{});
     defer classic.deinit();
     const hit = classic.find("ushers", 0, .leftmost_first).?;
@@ -664,7 +671,7 @@ test "经典失败链和随机对照" {
     }
 }
 
-test "邻接对放不下时走 Teddy 或自动机" {
+test "falls back to Teddy or automaton when adjacent pairs exceed capacity" {
     var buf: [17][2]u8 = undefined;
     var pats: [17][]const u8 = undefined;
     for (&buf, 0..) |*slot, i| {
@@ -686,7 +693,7 @@ test "邻接对放不下时走 Teddy 或自动机" {
     try std.testing.expectEqual(@as(usize, 3), got.end);
 }
 
-test "窗口边界、邻接对，以及更晚但更早结束" {
+test "window boundaries, adjacent pairs, and later-starting match ending earlier" {
     const pats = [_][]const u8{
         "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota",
     };
@@ -740,7 +747,7 @@ fn expectNaive(multi: *Multi, hay: []const u8, pats: []const []const u8) !void {
     }
 }
 
-test "第二跨：邻接对先整窗未命中，再命中" {
+test "second stride: adjacent pairs miss full window before hitting" {
     const stride = vec_width * 8;
     const pats = [_][]const u8{ "lp", "be" };
     var multi = try Multi.init(std.testing.allocator, &pats, .{});
@@ -763,7 +770,7 @@ test "第二跨：邻接对先整窗未命中，再命中" {
     try expectNaive(&multi, &edge, &pats);
 }
 
-test "第二跨：Teddy 四窗或自动机，和朴素查找一致" {
+test "second stride: Teddy 4-window or automaton matches naive search" {
     var buf: [17][2]u8 = undefined;
     var pats: [17][]const u8 = undefined;
     for (&buf, 0..) |*slot, i| {
@@ -790,7 +797,7 @@ test "第二跨：Teddy 四窗或自动机，和朴素查找一致" {
     try expectNaive(&multi, &skipped, &pats);
 }
 
-test "全是单字节时走字节集，第二跨和朴素查找一致" {
+test "all single-byte patterns use byteset and match naive search on second stride" {
     const stride = vec_width * 4;
     var one_buf: [1]u8 = .{'q'};
     const one_pats = [_][]const u8{&one_buf};
@@ -815,7 +822,7 @@ test "全是单字节时走字节集，第二跨和朴素查找一致" {
     try std.testing.expect(many.find(&hay, stride + 2, .leftmost_first) == null);
 }
 
-test "基准场景的模式落到各自的引擎" {
+test "benchmark scenario patterns dispatch to their expected engines" {
     try std.testing.expectEqual(@as(usize, 17), scenario_teddy.len);
     try std.testing.expectEqual(@as(usize, 33), scenario_ac.len);
 
@@ -846,7 +853,7 @@ test "基准场景的模式落到各自的引擎" {
     try std.testing.expect(teddy.find(&hay, 0, .earliest) == null);
     try std.testing.expect(ac.find(&hay, 0, .earliest) == null);
 
-    // 样例文本本身命中不了这三组。种进一个模式字节，确认不是空转。
+    // The sample text does not contain patterns from these three sets; plant a pattern byte to verify they match.
     hay[80] = scenario_bytes[0][0];
     try std.testing.expectEqual(@as(usize, 80), bytes.find(&hay, 0, .earliest).?.start);
 
@@ -859,11 +866,11 @@ test "基准场景的模式落到各自的引擎" {
     try std.testing.expectEqual(@as(usize, 120), ac.find(&hay, 0, .earliest).?.start);
 }
 
-test "多模式模糊对照" {
+test "multi-pattern fuzz differential" {
     try std.testing.fuzz({}, fuzzMulti, .{});
 }
 
-test "A03 空行模式匹配所有行且超限在构造前拒绝" {
+test "empty line pattern matches all lines and limit violations are rejected before allocation" {
     var empty_multi = try Multi.initFromText(std.testing.allocator, "foo\r\n\r\nbar\n", .{});
     defer empty_multi.deinit();
     try std.testing.expectEqual(@as(usize, 3), empty_multi.patterns.len);
@@ -886,9 +893,9 @@ test "A03 空行模式匹配所有行且超限在构造前拒绝" {
     try std.testing.expectEqual(@as(usize, 0), fail_alloc.allocations);
 }
 
-test "B05 Unicode 折叠按单条模式智能大小写生效" {
-    // 1. 同一组 Multi 中："Δelta" 含大写希腊字母 Δ，按 smart 保持区分大小写；
-    //    "σigma" 全小写，按 smart 自动折叠匹配 Σigma / σigma / ςigma。
+test "Unicode case folding applies smart case per pattern" {
+    // 1. Within the same Multi set: "Δelta" contains uppercase Greek Δ and stays case-sensitive under smart case;
+    //    "σigma" is all lowercase and folds under smart case to match Σigma / σigma / ςigma.
     var smart_uni = try Multi.init(std.testing.allocator, &.{ "Δelta", "σigma" }, .{
         .case = .smart,
         .unicode_case = true,
@@ -900,7 +907,7 @@ test "B05 Unicode 折叠按单条模式智能大小写生效" {
     try std.testing.expectEqual(@as(usize, 0), smart_uni.find("ΣIGMA", 0, .earliest).?.start);
     try std.testing.expectEqual(@as(usize, 0), smart_uni.find("ςigma", 0, .earliest).?.start);
 
-    // 2. 全小写 Unicode 模式组直接走高性能 SIMD 引擎（非 mixed），并支持跨 ASCII 折叠（如 Kelvin K U+212A <-> k）
+    // 2. All-lowercase Unicode pattern sets dispatch directly to a SIMD engine (not `mixed`) and support cross-ASCII folding (e.g., Kelvin K U+212A <-> k).
     var all_lower = try Multi.init(std.testing.allocator, &.{ "δelta", "kelvin" }, .{
         .case = .smart,
         .unicode_case = true,

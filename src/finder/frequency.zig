@@ -1,7 +1,7 @@
-//! 默认字节频率秩。值越小越稀有，packed pair 会优先拿它做锚点。
+//! Default byte frequency ranks. Smaller values indicate rarer bytes, which packed pair prefers as anchors.
 //!
-//! 这是按英文散文和源码的常见程度手写的秩，不是从别的项目抄来的表。
-//! 调用方可以换成自己的 `[256]u8`。
+//! Hand-assigned ranks based on English prose and source code frequency rather than copied from another project.
+//! Callers can supply their own `[256]u8` table.
 
 const std = @import("std");
 
@@ -10,14 +10,15 @@ pub const default_rank: [256]u8 = defaultRank();
 fn defaultRank() [256]u8 {
     var rank: [256]u8 = @splat(12);
 
-    // 控制字节和 NUL 极少出现在文本里。
+    // Control bytes and NUL rarely appear in text.
     for (0..32) |i| rank[i] = 1;
     rank['\t'] = 80;
     rank['\n'] = 140;
     rank['\r'] = 40;
     rank[' '] = 255;
 
-    // 小写按英文频率从高到低。大写在源码和散文里都更少，秩大约减半。
+    // Lowercase letters ordered from most to least frequent in English.
+    // Uppercase is rarer in both source code and prose, so its rank is roughly scaled down.
     const lower_by_frequency = "etaoinshrdlcumwfgypbvkjxqz";
     var score: u8 = 230;
     for (lower_by_frequency) |c| {
@@ -36,7 +37,7 @@ fn defaultRank() [256]u8 {
     return rank;
 }
 
-test "越常见的字节秩越高" {
+test "more frequent bytes have higher rank" {
     const rank = default_rank;
     try std.testing.expect(rank['z'] < rank['e']);
     try std.testing.expect(rank['E'] < rank['e']);

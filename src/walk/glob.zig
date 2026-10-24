@@ -1,5 +1,5 @@
-//! 字节 glob。`*` 和 `?` 不跨 `/`，`**` 只在作为完整路径分量时跨目录。
-//! 字符类支持区间和 `!` / `^` 取反。路径按字节比较，不假定 UTF-8。
+//! Byte-level glob matching. `*` and `?` do not cross `/`, and `**` crosses directories only as a complete path component.
+//! Character classes support ranges and `!` / `^` negation. Paths are compared byte-by-byte without assuming UTF-8.
 
 const std = @import("std");
 
@@ -21,18 +21,18 @@ pub const CompileOptions = struct {
 };
 
 pub const Class = enum {
-    /// 没有元字符。
+    /// No metacharacters.
     exact,
-    /// `*.ext`，键是含点的后缀。
+    /// `*.ext`, where the key is the dot-prefixed extension.
     ext,
-    /// 字面量前缀加一个末尾 `*`。
+    /// Literal prefix followed by a trailing `*`.
     prefix,
-    /// 一个开头 `*` 加字面量后缀。
+    /// Leading `*` followed by a literal suffix.
     suffix,
     general,
 };
 
-/// 一条已经解析好的 glob。`text` 和 `key` 由调用方持有。
+/// A parsed glob rule. `text` and `key` are owned by the caller.
 pub const Glob = struct {
     text: []const u8,
     key: []const u8,
@@ -43,12 +43,12 @@ pub const Glob = struct {
     case_insensitive: bool = false,
 };
 
-/// 按元字符给模式分类。`key` 指向 `text` 里的字面量部分。
+/// Classifies a pattern by its metacharacters. `key` slices into the literal portion of `text`.
 pub fn classify(text: []const u8) Glob {
     return classifyWithCase(text, false);
 }
 
-/// 按元字符给模式分类，并指定是否忽略 ASCII 大小写。
+/// Classifies a pattern by its metacharacters and sets whether ASCII case is ignored.
 pub fn classifyWithCase(text: []const u8, case_insensitive: bool) Glob {
     const class = classifyClass(text);
     const key = switch (class) {
@@ -64,7 +64,7 @@ pub fn classifyWithCase(text: []const u8, case_insensitive: bool) Glob {
     };
 }
 
-/// 展开嵌套花括号 `{a,{b,c}}`，并校验规则条数、单条长度与嵌套深度上限。
+/// Expands nested braces `{a,{b,c}}` while enforcing limits on rule count, rule length, and nesting depth.
 pub fn expandBraces(
     allocator: std.mem.Allocator,
     pattern: []const u8,
@@ -222,7 +222,7 @@ fn expandBracesInner(
     }
 }
 
-/// 编译一组支持 `!` 取反与 `{a,{b,c}}` 嵌套花括号的 glob 规则，并执行条数与长度硬顶检查。
+/// Compiles glob rules supporting `!` negation and `{a,{b,c}}` nested braces while enforcing hard caps on rule count and length.
 pub fn compileGlobs(
     arena: std.mem.Allocator,
     patterns: []const []const u8,
@@ -272,7 +272,7 @@ pub fn compileGlobs(
     return out.toOwnedSlice(arena);
 }
 
-/// 按“后写优先”评估一组用户 glob 规则：若存在正向规则，未命中的路径默认排除；`!` 规则排除命中路径。
+/// Evaluates user glob rules with last-match-wins precedence: when positive rules exist, unmatched paths are excluded by default; `!` rules exclude matching paths.
 pub fn matchGlobs(globs: []const Glob, rel: []const u8, base: []const u8, is_dir: bool) bool {
     var any_positive = false;
     var decision: ?bool = null;
@@ -300,7 +300,7 @@ fn classifyClass(text: []const u8) Class {
     return .general;
 }
 
-/// `rel` 是相对本层目录的路径，`base` 是它的最后一段。
+/// `rel` is the path relative to the current directory level, and `base` is its final segment.
 pub fn matches(glob: Glob, rel: []const u8, base: []const u8, is_dir: bool) bool {
     if (glob.dir_only and !is_dir) return false;
     const hay = if (glob.anchored) rel else base;
@@ -320,7 +320,7 @@ pub fn matches(glob: Glob, rel: []const u8, base: []const u8, is_dir: bool) bool
     };
 }
 
-/// `**` 必须占完整的路径分量，否则按普通 `*` 处理。
+/// `**` must occupy an entire path component; otherwise it is treated as a regular `*`.
 fn isDoubleStar(pat: []const u8, index: usize) bool {
     if (index + 1 >= pat.len or pat[index] != '*' or pat[index + 1] != '*') return false;
     if (index != 0 and pat[index - 1] != '/') return false;
@@ -417,7 +417,7 @@ pub fn basename(path: []const u8) []const u8 {
     return path[slash + 1 ..];
 }
 
-test "分类：精确、扩展名、前后缀" {
+test "classify: exact, extension, prefix, and suffix" {
     const exact = classify("foo");
     try std.testing.expectEqual(Class.exact, exact.class);
 
@@ -438,7 +438,7 @@ test "分类：精确、扩展名、前后缀" {
     try std.testing.expectEqual(Class.general, classify("foo*bar").class);
 }
 
-test "glob 不让星号跨过斜杠，双星可以" {
+test "glob disallows single star across slash while double star crosses" {
     try std.testing.expect(matchText("*.log", "a.log"));
     try std.testing.expect(matchText("*.log", ".log"));
     try std.testing.expect(!matchText("*.log", "dir/a.log"));
@@ -460,7 +460,7 @@ test "glob 不让星号跨过斜杠，双星可以" {
     try std.testing.expect(!matchText("a*b*c", "a/b/c"));
 }
 
-test "字符类和取反" {
+test "character classes and negation" {
     try std.testing.expect(matchText("[abc]", "b"));
     try std.testing.expect(!matchText("[abc]", "d"));
     try std.testing.expect(matchText("[a-c]", "b"));
@@ -473,12 +473,12 @@ test "字符类和取反" {
     try std.testing.expect(!matchText("*.[ch]", "a.cc"));
 }
 
-test "J01 后写的 glob 优先且花括号可嵌套并受上限保护" {
+test "later globs take precedence and nested braces respect limits" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // 1. 嵌套花括号展开 + 后写的规则优先
+    // 1. Nested brace expansion + later rules take precedence
     const globs = try compileGlobs(arena, &.{
         "*.{zig,{c,h}}",
         "!bad.{c,h}",
@@ -491,26 +491,26 @@ test "J01 后写的 glob 优先且花括号可嵌套并受上限保护" {
     try std.testing.expect(matchGlobs(globs, "src/bad.h", "bad.h", false));
     try std.testing.expect(!matchGlobs(globs, "src/readme.md", "readme.md", false));
 
-    // 2. 展开后条数超过上限时拒绝
+    // 2. Reject when expanded rule count exceeds the limit
     try std.testing.expectError(
         error.GlobCountExceeded,
         compileGlobs(arena, &.{"*.{a,{b,{c,d}}}"}, .{ .max_rules = 3 }),
     );
 
-    // 3. 单条长度超过上限时拒绝
+    // 3. Reject when a single rule exceeds the length limit
     try std.testing.expectError(
         error.GlobTooLong,
         compileGlobs(arena, &.{"abcdef"}, .{ .max_rule_len = 4 }),
     );
 
-    // 4. 花括号嵌套深度超过硬顶时拒绝
+    // 4. Reject when brace nesting depth exceeds the hard cap
     try std.testing.expectError(
         error.GlobBraceDepthExceeded,
         compileGlobs(arena, &.{"{a,{b,{c,{d,{e,{f,{g,{h,{i,j}}}}}}}}}"}, .{}),
     );
 }
 
-test "J02 glob 忽略大小写" {
+test "case-insensitive glob matching" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();

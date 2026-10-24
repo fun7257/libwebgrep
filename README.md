@@ -1,50 +1,60 @@
 # libwebgrep
 
-可嵌入的字面量行搜索库。用 Zig 0.17.0 和标准库写成，没有第三方依赖，也不链接 C 库。
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-当前做到 P2：在一段内存、一个 `std.Io.Reader` 或一个已打开的文件里做字面量搜索，也能够遍历目录、应用 gitignore 和 glob、用多个工人并行，并写出 JSON Lines 或文件名列表。多个模式走 `Multi`：全部是单字节时用字节集。能收成不超过 16 种邻接对时用邻接对哈希。放不下时，aarch64 上不超过 32 个非空模式默认用 NEON Teddy，其它架构要显式打开。其余走 Aho-Corasick。锚点字节不超过 16 种时，自动机先做向量预过滤。
+**`libwebgrep`** is an ultra-fast, embeddable SIMD text and regular expression search engine library written in pure **Zig 0.17.0**, purpose-built for multi-tenant web services, log analytics, and code search backends.
 
-## 依赖
+It ships with **zero external dependencies**, **does not link `libc`**, guarantees **worst-case $O(n)$ linear time** across all literal, multi-pattern, and regex queries, and enforces strict **multi-tenant resource budgets** (scan bytes, wall-clock deadlines, memory caps, and Zip-Bomb decompression guards).
 
-- Zig 0.17.0
+---
 
-## 构建
+## Key Highlights
 
-```sh
-zig build test
-zig build -Doptimize=ReleaseFast
-zig build bench -Doptimize=ReleaseFast
-```
+- **Blazing SIMD Throughput (24–62 GB/s)**:
+  - **Single-Byte Primitives (`memchr`)**: 4-vector unrolled SIMD loops reaching **48.3–62.4 GB/s**.
+  - **Single-Literal (`Finder`)**: Frequency-ranked `PackedPair` 4-window SIMD filtering with branchless `(block | 0x20)` ASCII case folding (**42.6 GB/s** sensitive, **24.9 GB/s** case-insensitive) and automatic worst-case $O(n)$ `TwoWay` fallback.
+  - **4-Tier Multi-Pattern OR Matrix (`Multi`)**: Automatically dispatches across `ByteSet` (**34.2 GB/s**), `RarePair` (**32.2 GB/s**), 8-bucket Slim `Teddy` (`vtbl`/`pshufb`/`vpshufb`, **24.1 GB/s**), and byte-equivalence-compressed `AhoCorasick` DFA with a 64-byte high-nibble SIMD skip loop (**24.3 GB/s**).
+  - **Linear-Time Regex (`Regex`)**: Lockstep Thompson NFA / PikeVM engine immune to catastrophic backtracking (ReDoS), paired with automatic AST `RequiredLiteral` extraction and SIMD prefiltering (**42.9 GB/s**).
+- **In-Process Bomb-Safe Streaming Decompression & Transcoding**:
+  - Streams **Gzip**, **Zstd**, and **XZ** in-process without spawning external binaries, enforcing both `max_decompressed_bytes` and `max_compression_ratio` (default `100:1`) on every chunk to stop Zip Bombs immediately.
+  - Sniffs UTF-8 / UTF-16LE / UTF-16BE BOMs and transcodes **GBK / GB2312 / Latin-1** via WHATWG or HTTP `Content-Type` `charset` hints, while maintaining an `OffsetMap` to report exact original stream offsets (`raw_offset`) alongside UTF-8 byte and UTF-16 code-unit spans.
+- **Hardened for Multi-Tenant Server Embedding**:
+  - Public search entry points (`searchSource`, `searchSourceSlice`, `resumeSourceSlice`, `openSourcePull`) operate strictly on caller-supplied `std.Io.Reader` streams or memory slices with caller-assigned `source_id`—eliminating path traversal (`CWE-22`) by design.
+  - Built-in budgets for scan bytes, output bytes, wall-clock nanosecond deadlines (`time_budget_ns`), atomic cancellation (`cancel`), and stateless cursor pagination (`Flow.pause` / `resume_at`).
+  - Controlled multi-source pipeline (`walk_glob`, `walk_ignore`, `walk_types`) supporting nested brace expansion `{a,{b,c}}`, in-memory ignore rules, and work-stealing concurrency strictly bounded by `max_concurrency`.
 
-`bench` 只接受 ReleaseFast。它编译 `bench/micro.zig` 并直接调用库。场景和上次记录在 `BENCHMARKS.md`。
+---
 
-单独跑某一个模糊测试：
+## Performance Overview
 
-```sh
-zig build test --fuzz=100K -Doptimize=ReleaseFast -Dfuzz-filter='packed pair 模糊'
-```
+Measured in-process with `zig build bench -Doptimize=ReleaseFast` on Apple M2 (`aarch64`, 16-byte NEON vectors, 64 MiB buffer):
 
-交叉编译只检查能不能编过：
+| Benchmark Scenario | Engine / Path | Throughput |
+| :--- | :--- | ---: |
+| `memchr_either` | 2-byte 4-vector unrolled SIMD | **62.39 GB/s** |
+| `memchr_find` | Single-byte SIMD scan | **48.25 GB/s** |
+| `regex_prefilter` | `Regex` (`"libweb.*[0-9]*grep"`, Thompson NFA + SIMD prefilter) | **42.87 GB/s** |
+| `finder_alphabet` | `Finder` (`"libwebgrep"` on repeating alphabet text) | **42.82 GB/s** |
+| `finder_sensitive` | `Finder` (`PackedPair` 4-window SIMD, `"NEEDLE"`) | **42.62 GB/s** |
+| `multi_bytes` | `Multi` → `ByteSet` (4-way unrolled SIMD single-byte set) | **34.18 GB/s** |
+| `multi_pairs` | `Multi` → `RarePair` (2-stage direct SIMD pair compare) | **32.16 GB/s** |
+| `search_slice` | Full `searchSlice` pipeline (line framing + fused NUL watch) | **28.06 GB/s** |
+| `finder_ignore` | `Finder` (case-insensitive branchless `(block \| 0x20)`) | **24.88 GB/s** |
+| `multi_ac` | `Multi` → `AhoCorasick` (dense DFA + 64B high-nibble SIMD skip) | **24.27 GB/s** |
+| `multi_teddy` | `Multi` → `Teddy` (NEON `vtbl` nibble mask + 2-phase verify) | **24.13 GB/s** |
+| `file_1MiB` | Streaming 128 MiB file via `1 MiB` rolling buffer | **10.99 GB/s** |
 
-```sh
-zig build check -Dtarget=x86_64-linux-musl
-zig build check -Dtarget=x86_64-windows
-zig build check -Dtarget=aarch64-linux-musl
-```
+See [BENCHMARKS.md](BENCHMARKS.md) for full methodology and detailed breakdowns.
 
-系统和 CPU 专属的优化用构建选项区分。窗口映射和裸 `getdents64` 默认关闭。没有运行时 CPU 分派。
+---
 
-```sh
-zig build test -Dmmap-windows
-zig build check -Dtarget=x86_64-linux-musl -Dlinux-getdents
-zig build test -Dteddy=off
-zig build check -Dtarget=x86_64-linux-musl -Dteddy=ssse3
-zig build check -Dtarget=x86_64-linux-musl -Dteddy=avx2
-```
+## Getting Started
 
-`-Dlinux-getdents` 只适用于 Linux 目标。`-Dteddy` 的取值是 `off`、`neon`、`ssse3`、`avx2`。aarch64 默认 `neon`，其它架构默认 `off`。`neon` 只适用于 aarch64，`ssse3` 和 `avx2` 只适用于 x86_64。架构不符时，`test`、`check` 和 `install` 会失败。`-Dmmap-windows` 让大于搜索缓冲的文件按 8 MiB 窗口映射。细节在 `DESIGN.md` 的「构建特性」。SSSE3 和 AVX2 改用 LLVM 后端，不链接 libc。这两档只交叉编译过，没有计时。
+### Requirements
 
-在自己的 `build.zig` 里引用：
+- **Zig `0.17.0`**
+
+### Adding `libwebgrep` to Your `build.zig`
 
 ```zig
 const libwebgrep_dep = b.dependency("libwebgrep", .{
@@ -54,103 +64,100 @@ const libwebgrep_dep = b.dependency("libwebgrep", .{
 exe.root_module.addImport("libwebgrep", libwebgrep_dep.module("libwebgrep"));
 ```
 
-## 搜索一行内存
-
-Sink 是 comptime 泛型。方法返回 `false` 就停止。行切片指向调用方的 haystack，只在这次回调里使用。可选方法必须声明成 `pub`，`@hasDecl` 才看得见。
+### Quick Example: Service Entry Point (`searchSourceSlice`)
 
 ```zig
 const std = @import("std");
 const libwebgrep = @import("libwebgrep");
 
-const Collect = struct {
-    lines: usize = 0,
+const Collector = struct {
+    matches: usize = 0,
 
-    pub fn matched(self: *Collect, line: libwebgrep.Line) bool {
-        _ = line;
-        self.lines += 1;
-        return true;
+    pub fn event(self: *Collector, ev: libwebgrep.Event) libwebgrep.Flow {
+        switch (ev) {
+            .match => |line| {
+                self.matches += line.matches.len;
+                // Borrowed slices (`line.bytes`, `line.matches`) are valid during this callback.
+            },
+            else => {},
+        }
+        return .cont;
     }
 };
 
-pub fn countMatches(haystack: []const u8, pattern: []const u8) !usize {
-    var finder = try libwebgrep.Finder.init(pattern, .{ .case = .smart });
-    var sink: Collect = .{};
-    _ = try libwebgrep.searchSlice(Collect, &sink, haystack, "", &finder, .{
-        .line_numbers = true,
-    });
-    return sink.lines;
+pub fn runExample() !void {
+    var finder = try libwebgrep.Finder.init("needle", .{ .case = .smart });
+    var sink = Collector{};
+    const result = try libwebgrep.searchSourceSlice(
+        Collector,
+        &sink,
+        "log-chunk-01",
+        "info: ok\nwarn: NEEDLE detected\n",
+        &finder,
+        .{
+            .replacement = "[REDACTED]",
+        },
+    );
+    std.debug.assert(result.outcome == .complete);
+    std.debug.assert(sink.matches == 1);
 }
 ```
 
-`searchSlice` 不分配内存。模式里有换行时 `Finder.init` 返回 `error.PatternHasNewline`。
-
-多个模式用 `Multi`。调用方持有模式字节。构造可能分配自动机，`find` 不分配。只有创建者调用 `deinit`。
+### Multi-Literal OR & Linear-Time Regex
 
 ```zig
-var many = try libwebgrep.Multi.init(allocator, &.{ "foo", "bar" }, .{ .case = .smart });
+// 1. Multi-literal OR search (with optional Unicode Simple Case Folding)
+var many = try libwebgrep.Multi.init(allocator, &.{ "ERR_TIMEOUT", "ERR_RESET" }, .{
+    .case = .smart,
+    .unicode_case = true,
+});
 defer many.deinit();
-if (many.find(haystack, 0, .leftmost_first)) |match| {
-    _ = haystack[match.start..match.end];
-}
+
+// 2. Linear-time Thompson NFA Regex with automatic SIMD literal prefiltering
+var re = try libwebgrep.Regex.init(allocator, "ERR_[0-9]{2,4}_TIMEOUT", .{
+    .case = .sensitive,
+    .multiline = false,
+});
+defer re.deinit();
 ```
 
-`leftmost_first` 取起点最靠左的那次，同一起点上更早给出的模式胜出。`earliest` 取更早结束的那次。库的搜索配置默认是 `earliest`。全部是单字节时两种结果相同。智能大小写按每条模式判断：全是小写才忽略大小写。这和 rg 不同，rg 在整组里出现大写就全部区分大小写。
+---
 
-直接拿查找器扫字节，不处理行：
+## Building, Testing & Cross-Compiling
 
-```zig
-var finder = try libwebgrep.Finder.init("needle", .{});
-if (finder.find(haystack, 0, .earliest)) |match| {
-    _ = haystack[match.start..match.end];
-}
+```sh
+# Run all 182 unit tests and compile-checked API documentation examples
+zig build test --summary all
+
+# Run the in-process ReleaseFast microbenchmark suite
+zig build bench -Doptimize=ReleaseFast
+
+# Cross-compile verification (no execution required)
+zig build check -Dtarget=x86_64-linux-musl -Doptimize=ReleaseFast
+zig build check -Dtarget=x86_64-linux-musl -Dteddy=avx2
+zig build check -Dtarget=aarch64-linux-musl
 ```
 
-没有上下文时也可以拉着迭代。`Line.bytes` 一直指向原来的切片：
+### Build Options
 
-```zig
-var iter = libwebgrep.SliceIter(*libwebgrep.Finder){
-    .matcher = &finder,
-    .haystack = haystack,
-    .line_numbers = true,
-};
-while (iter.next()) |line| {
-    _ = line.bytes;
-}
-```
+| Option | Values | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `-Dteddy` | `off`, `neon`, `ssse3`, `avx2` | `neon` on `aarch64`, `off` otherwise | Selects the SIMD ISA backend for the Slim Teddy multi-pattern engine |
+| `-Dlinux-getdents` | `bool` | `false` | Uses raw `getdents64` syscall for directory enumeration on Linux |
+| `-Dmmap-windows` | `bool` | `false` | Maps large files in 8 MiB rolling windows instead of `readPositional` |
+| `-Dsanitize-thread` | `bool` | `false` | Enables ThreadSanitizer (`TSan`) |
 
-运行时才决定 Sink 类型时用虚表。缺的方法保持继续搜索：
+---
 
-```zig
-const vtable = libwebgrep.anyVtable(Collect);
-var any = libwebgrep.AnySink{ .ctx = @ptrCast(&sink), .vtable = &vtable };
-_ = try libwebgrep.searchSlice(libwebgrep.AnySink, &any, haystack, "", &finder, .{});
-```
+## Documentation
 
-## 搜索一个来源
+- [**API Reference (`docs/API.md`)**](docs/API.md) — Complete specification of all exported types, functions, events, and multi-tenant budgets.
+- [**Architecture & Design (`DESIGN.md`)**](DESIGN.md) — Deep dive into the SIMD kernels, Thompson NFA regex engine, streaming decompression, and work-stealing scheduler.
+- [**Benchmarks (`BENCHMARKS.md`)**](BENCHMARKS.md) — Reproducible microbenchmark suite and throughput analysis.
+- [**Feature Matrix (`docs/FEATURES.md`)**](docs/FEATURES.md) — Overview of implemented capabilities and security boundaries.
 
-公共入口是 `searchSource`（调用方打开的 reader）和 `searchSourceSlice`（内存切片）。来源标识由调用方分配，库不解释，事件里也不带服务器路径。要搜多个来源，调用方自己打开每一路流，分别传入来源标识。库不接收文件系统路径。
+---
 
-会分配或做 I/O 的函数显式接收分配器和 `std.Io`。热路径上的逐块查找不再分配，也不加锁。默认缓冲 1 MiB，单行上限 2 MiB，并且不超过硬顶。
+## License
 
-```zig
-const Collect = struct {
-    pub fn event(self: *@This(), ev: libwebgrep.Event) bool {
-        _ = self;
-        _ = ev;
-        return true;
-    }
-};
-var found = Collect{};
-var reader = std.Io.Reader.fixed("alpha\nbeta\n");
-var one = try libwebgrep.Finder.init("alpha", .{});
-_ = try libwebgrep.searchSource(Collect, allocator, &found, &reader, "src-1", &one, .{});
-_ = try libwebgrep.searchSourceSlice(Collect, &found, "src-2", "beta\n", &one, .{});
-```
-
-二进制策略默认是 `.quit`：读到 NUL 就停。`.report` 继续确认有没有匹配，但是不返回行内容。`.none` 按文本处理。调用方可以在硬顶之内改上下文、单行、扫描字节和时间上限。跟随符号链接、读取全局忽略和父目录忽略都不能打开。
-
-## 范围
-
-做了：单模式和多模式字面量、ASCII 大小写和 smart case、行语义、文本、计数、JSON Lines、文件名列表、gitignore、glob、类型过滤、目录并行。多模式能收成邻接对时用哈希预过滤；放不下时，aarch64 默认还可以用 NEON Teddy。
-
-没做：正则、多行匹配、C ABI、Unicode 大小写、压缩包读取、FDR、AVX-512、运行时 CPU 分派。窗口映射和裸 `getdents64` 有源文件，默认不编进去。x86 的 Teddy 要显式打开，还没有计时。见 `DESIGN.md`。
+Released under the [MIT License](LICENSE). See [NOTICE](NOTICE) for algorithmic attributions and academic references.

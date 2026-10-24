@@ -1,5 +1,5 @@
-//! 基准直接引用库内文件。公共模块 `src/root.zig` 不导出这里。
-//! `searchFile` 和 `parallel.run` 因此到不了公共入口。
+//! Benchmarks import this internal module directly. The public module `src/root.zig` does not export it,
+//! keeping `searchFile` and `parallel.run` out of the public API surface.
 
 const searcher = @import("searcher.zig");
 const finder_mod = @import("finder/finder.zig");

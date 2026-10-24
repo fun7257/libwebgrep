@@ -1,5 +1,5 @@
-//! 测试用的库外 NDJSON 编码器。
-//! 不从 `src/root.zig` 导出。序列化留在库外，core 只提供事件字段。
+//! External NDJSON encoder used for testing.
+//! Not exported from `src/root.zig`. Serialization stays outside the core library, which only provides event fields.
 
 const std = @import("std");
 const searcher = @import("searcher.zig");
@@ -31,7 +31,7 @@ fn writeStatus(writer: *std.Io.Writer, status: searcher.BinaryStatus) !void {
     try writeString(writer, name);
 }
 
-/// 把一条事件写成一行 JSON。字段和事件结构一一对应，调用方可以再解析回来。
+/// Write a single event as a line of JSON. Fields map 1-to-1 to the event structure so callers can parse them back.
 pub fn writeEvent(writer: *std.Io.Writer, ev: Event) !void {
     switch (ev) {
         .begin => |b| {
@@ -162,7 +162,7 @@ const SummaryRow = struct {
     sources_failed: u64,
 };
 
-test "事件可被库外编码器写成 NDJSON" {
+test "events can be encoded as NDJSON by an external encoder" {
     const Capture = struct {
         lines: std.ArrayList([]u8) = .empty,
 

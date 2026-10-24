@@ -1,8 +1,9 @@
-//! 全部是单字节模式时的成员查找。
+//! Membership search when all patterns are single bytes.
 //!
-//! 不超过 16 个不同字节时，按个数在编译期展开 `@Vector` 比较，splat 提在循环外。
-//! 更多字节用一张 256 项的表。运行时按半字节查表需要 `tbl` / `pshufb`，
-//! 那部分放在 Teddy 里，不进这条通用路径。
+//! For up to 16 distinct bytes, `@Vector` comparisons are unrolled at comptime by count
+//! with splats hoisted out of the loop.
+//! Larger sets use a 256-entry lookup table. Runtime nibble lookup requires `tbl` / `pshufb`,
+//! which lives in Teddy rather than this general path.
 
 const std = @import("std");
 const ascii = @import("ascii.zig");
@@ -16,7 +17,7 @@ pub const Set = struct {
     bytes: [16]u8 = @splat(0),
     used: u16 = 0,
 
-    /// 成员扫描用。重复字节只记一次。不分配。
+    /// Initializes a set for membership scanning. Duplicate bytes are recorded once. Does not allocate.
     pub fn initBytes(bytes: []const u8) Set {
         var self = Set{};
         for (bytes) |byte| self.note(byte, 0);
@@ -205,7 +206,7 @@ fn expectByte(set: Set, needle: u8) !void {
     try std.testing.expect(set.find(&blank, 0) == null);
 }
 
-test "1 个、16 个、17 个字节，第二跨和表一致" {
+test "1, 16, and 17 bytes match lookup table on second stride" {
     var one_buf: [1]u8 = .{7};
     const one = Set.init(&.{&one_buf}, false);
     try std.testing.expectEqual(@as(u16, 1), one.used);

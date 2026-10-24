@@ -1,9 +1,9 @@
-//! 打开文件的设备号和 inode。
+//! Device ID and inode for open files.
 //!
-//! 这是各平台拿到同一对数字的办法，不是可选的性能开关：
-//! Linux 用 `statx` 的 `dev_major` / `dev_minor` / `ino`。
-//! 其他 POSIX 用 `fstat` 的 `dev` / `ino`。
-//! Windows 的 `File.Stat` 没有设备号，只用 inode，并在设计说明里记一笔。
+//! This is how each platform obtains the same pair of numbers, not an optional performance toggle:
+//! Linux uses `dev_major` / `dev_minor` / `ino` from `statx`.
+//! Other POSIX platforms use `dev` / `ino` from `fstat`.
+//! Windows `File.Stat` lacks a device ID, so only the inode is used (noted in the design documentation).
 
 const builtin = @import("builtin");
 const std = @import("std");
@@ -68,7 +68,7 @@ fn toU64(value: anytype) u64 {
     };
 }
 
-test "同一文件的两次打开得到同一个身份" {
+test "opening the same file twice yields the same identity" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.txt", .data = "a" });

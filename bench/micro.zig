@@ -1,13 +1,10 @@
-//! 库场景基准。只在 ReleaseFast 下有意义。直接调用库，不经过命令行。
+//! In-process microbenchmark suite (`ReleaseFast` only).
 //!
-//! 每一行是 `scenario 名字 bytes 字节数 gbs 吞吐 iters 次数 sink 累计结果`。
-//! 吞吐是 `字节 / 秒 / 1e9`。先空跑一次，不计入。之后至少再跑 300 ms，并且至少两次。
-//! 每次调用前有内存屏障。会改写缓冲的查找还会翻转第一个字节，避免被当成死代码删掉。
-//! `sink` 是各次返回值的和。返回值和预期不一致时，基准直接失败，不把空结果当成吞吐。
-//!
-//! 单模式 `Finder` 在计时外建好，循环里只清统计再查找。多模式表在 `multi.zig`，
-//! 和 `zig build test` 的场景测试同一份，也在计时外建好。目录场景每次都走完整的
-//! `parallel.run`，包含建工人和拆工人。
+//! Each line is printed as:
+//! `scenario <name> bytes <n> gbs <throughput> iters <count> sink <checksum>`
+//! Throughput is measured in `bytes / second / 1e9` (GB/s). Every scenario runs one unmeasured warmup
+//! iteration followed by at least 300 ms and at least 2 measured iterations, with compiler memory
+//! barriers and first-byte bit-flipping to prevent dead-code elimination.
 
 const std = @import("std");
 const internal = @import("libwebgrep_internal");
@@ -267,8 +264,8 @@ fn benchWalk(gpa: std.mem.Allocator, io: std.Io) !void {
     const hits = try prepareWalk(io);
     var ctx = WalkCtx{ .gpa = gpa, .io = io, .hits = hits, .threads = 1 };
     try report(io, "walk_1", walk_bytes, @intCast(hits), walkRun, &ctx);
-    ctx.threads = 0;
-    try report(io, "walk_default", walk_bytes, @intCast(hits), walkRun, &ctx);
+    ctx.threads = 4;
+    try report(io, "walk_4", walk_bytes, @intCast(hits), walkRun, &ctx);
 }
 
 const WalkCtx = struct {
@@ -395,7 +392,8 @@ fn report(
     });
 }
 
-/// 空跑一次后开始计时。返回处理过的字节除以秒，单位 GB/s（10^9）。
+/// Runs one unmeasured warmup pass, then times until >= 300 ms and >= 2 iterations have elapsed.
+/// Returns throughput in GB/s (`bytes / second / 1e9`).
 fn measure(io: std.Io, nbytes: usize, comptime run: anytype, ctx: anytype) !Sample {
     barrier();
     _ = try run(ctx);

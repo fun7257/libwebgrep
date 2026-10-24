@@ -1,10 +1,10 @@
-//! 线性时间正则表达式引擎（Thompson NFA / PikeVM + SIMD 必需字面量预过滤 + 有界跨行窗口）。
+//! Linear-time regular expression engine (Thompson NFA / PikeVM + SIMD required literal prefiltering + bounded multiline window).
 //!
-//! 设计铁律：
-//! 1. 绝不使用指数级回溯（无回溯栈），每个输入字节上每条 NFA 指令最多激活一次，最坏时间复杂度严格为 O(N * M)。
-//! 2. 编译期强制校验指令数硬顶（`max_inst_hard_cap`），超限在扫描开始前返回 `error.RegexTooLarge`。
-//! 3. 自动从正则语法树提取必需字面量（`RequiredLiteral`）并挂载 SIMD `Finder` 预过滤，带字面量锚点的正则保持 20+ GB/s 吞吐。
-//! 4. 跨行匹配（`multiline`）严格受有界窗口（`max_multiline_window`）约束，窗口耗尽仍未闭合即判定失配。
+//! Design invariants:
+//! 1. Never use exponential backtracking (no backtracking stack); each NFA instruction activates at most once per input byte, guaranteeing O(N * M) worst-case time complexity.
+//! 2. Enforce a hard cap on compiled instruction count (`max_inst_hard_cap`) at compile time, returning `error.RegexTooLarge` before scanning begins if exceeded.
+//! 3. Automatically extract a required literal (`RequiredLiteral`) from the regex syntax tree and attach a SIMD `Finder` prefilter so regexes with literal anchors sustain 20+ GB/s throughput.
+//! 4. Multiline matching (`multiline`) is strictly constrained by a bounded window (`max_multiline_window`); if the window is exhausted before closing the match, it immediately fails.
 
 const std = @import("std");
 const matcher = @import("matcher.zig");
@@ -16,11 +16,11 @@ pub const MatchMode = matcher.MatchMode;
 pub const CaseMode = matcher.CaseMode;
 pub const RequiredLiteral = matcher.RequiredLiteral;
 
-/// 编译后 NFA 指令数服务端硬顶。
+/// Server hard cap on compiled NFA instruction count.
 pub const max_inst_hard_cap: usize = 4096;
-/// 有界跨行匹配窗口服务端硬顶（8 MiB）。
+/// Server hard cap on bounded multiline match window (8 MiB).
 pub const max_multiline_window_hard_cap: usize = 8 * 1024 * 1024;
-/// 默认有界跨行匹配窗口（64 KiB）。
+/// Default bounded multiline match window (64 KiB).
 pub const default_multiline_window: usize = 64 * 1024;
 
 pub const Error = error{
@@ -34,13 +34,13 @@ pub const Error = error{
 
 pub const RegexOptions = struct {
     case: CaseMode = .sensitive,
-    /// 允许匹配跨越多行（包含 `\n`），且 `^` / `$` 匹配行首与行尾。
+    /// Allow matches to span multiple lines (including `\n`), with `^` and `$` matching line boundaries.
     multiline: bool = false,
-    /// 允许 `.` 匹配 `\n`（需配合 `multiline = true` 跨行）。
+    /// Allow `.` to match `\n` (requires `multiline = true` to cross lines).
     dot_all: bool = false,
-    /// 编译指令数上限。null 使用 `max_inst_hard_cap`；大于硬顶时返回 `RegexTooLarge`。
+    /// Maximum compiled instruction count. Null uses `max_inst_hard_cap`; values above the hard cap return `RegexTooLarge`.
     max_inst: ?usize = null,
-    /// 跨行匹配的最大字节跨度窗口。超过硬顶返回 `RegexTooLarge`。
+    /// Maximum byte span window for multiline matching. Values exceeding the hard cap return `RegexTooLarge`.
     max_multiline_window: usize = default_multiline_window,
 };
 
@@ -81,19 +81,19 @@ pub const ByteSet = struct {
 };
 
 pub const Inst = union(enum) {
-    /// 匹配单个字节（`ignore_case` 时忽略 ASCII 大小写）。
+    /// Match a single byte (ignoring ASCII case when `ignore_case` is true).
     byte: struct { b: u8, ignore_case: bool, out: u32 },
-    /// 匹配任意字节（`allow_nl` 为假时不匹配 `\n`）。
+    /// Match any byte (excluding `\n` when `allow_nl` is false).
     any: struct { allow_nl: bool, out: u32 },
-    /// 匹配 256 位字符集。
+    /// Match a 256-bit byte class.
     class: struct { set: ByteSet, out: u32 },
-    /// 零宽分支：优先走 `out1`，次选 `out2`。
+    /// Zero-width branch: prefers `out1`, then `out2`.
     split: struct { out1: u32, out2: u32 },
-    /// 无条件跳转。
+    /// Unconditional jump.
     jmp: u32,
-    /// 零宽锚点。
+    /// Zero-width assertion anchor.
     assert: struct { kind: AssertKind, out: u32 },
-    /// 匹配成功终点。
+    /// Accepting match state.
     match,
 };
 
@@ -120,16 +120,16 @@ pub const Regex = struct {
     dot_all: bool,
     anchored_start: bool = false,
     max_multiline_window: usize,
-    /// 提取出的必需字面量（指向内部分配的字节）。
+    /// Extracted required literal (points to internally allocated bytes).
     req_literal_bytes: []u8 = &.{},
     req_literal_offset: usize = 0,
     req_is_prefix: bool = false,
     req_is_exact: bool = false,
     prefilter: ?Finder = null,
-    /// 尾随必需字面量（如 `ERROR.*timeout` 中的 `"timeout"`），用于在预过滤命中后二次快速过滤。
+    /// Trailing required literal (such as `"timeout"` in `ERROR.*timeout`), used for a fast secondary check after a prefilter hit.
     tail_literal_bytes: []u8 = &.{},
     tail_finder: ?Finder = null,
-    /// 统计 NFA 状态转移步数，用于测试断言线性时间复杂度。
+    /// Counts NFA state transition steps for unit tests asserting linear time complexity.
     steps: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, pattern: []const u8, options: RegexOptions) Error!Regex {
@@ -218,14 +218,14 @@ pub const Regex = struct {
         if (start > haystack.len) return null;
         if (self.anchored_start and start > 0) return null;
 
-        // 快路径 1：整条正则就是纯字面量
+        // Fast path 1: the entire regex is a pure literal
         if (self.req_is_exact) {
             if (self.prefilter) |*pf| {
                 return pf.find(haystack, start, mode);
             }
         }
 
-        // 快路径 2：带前缀必需字面量（如 `ERROR.*timeout` 或 `WARN_[0-9]+`）
+        // Fast path 2: has a required literal prefix (e.g., `ERROR.*timeout` or `WARN_[0-9]+`)
         if (self.req_is_prefix) {
             if (self.prefilter) |*pf| {
                 var pos = start;
@@ -233,10 +233,10 @@ pub const Regex = struct {
                     const hit = pf.find(haystack, pos, .earliest) orelse return null;
                     const win_end = self.windowLimit(haystack, hit.start);
                     if (self.tail_finder) |*tf| {
-                        // 若还有尾随必需字面量，先检查候选窗口内是否存在该尾随字面量
+                        // If a trailing required literal exists, verify it appears within the candidate window first
                         const tail_hit = tf.find(haystack[0..win_end], hit.end, .earliest) orelse {
                             if (!self.multiline) {
-                                // 单行模式下尾随字面量在当前行都不存在，直接跳到行尾后继续
+                                // In single-line mode, if the trailing literal is absent on this line, skip past the end of the line
                                 pos = @min(haystack.len + 1, win_end + 1);
                             } else {
                                 pos = hit.start + 1;
@@ -254,7 +254,7 @@ pub const Regex = struct {
             }
         }
 
-        // 快路径 3：带内部必需字面量（如 `[0-9]+ERROR`）
+        // Fast path 3: has an interior required literal (e.g., `[0-9]+ERROR`)
         if (self.prefilter) |*pf| {
             var pos = start;
             while (pos <= haystack.len) {
@@ -272,7 +272,7 @@ pub const Regex = struct {
             return null;
         }
 
-        // 通用路径：无固定字面量时运行线性时间 PikeVM
+        // General path: run linear-time PikeVM when no fixed literal is available
         return self.runUnanchored(haystack, start, haystack.len, mode);
     }
 
@@ -326,12 +326,12 @@ pub const Regex = struct {
         return @min(haystack.len, from +| self.max_multiline_window);
     }
 
-    /// 锚定在 `anchor_pos` 起点运行 Thompson NFA，扫描范围不超过 `limit`。
+    /// Run Thompson NFA anchored at `anchor_pos`, scanning no further than `limit`.
     fn runAnchored(self: *Regex, haystack: []const u8, anchor_pos: usize, limit: usize, mode: MatchMode) ?Match {
         return self.runRange(haystack, anchor_pos, anchor_pos, limit, mode);
     }
 
-    /// 在 `[from .. max_start]` 范围内寻找起点，扫描终点不超过 `limit`。
+    /// Search for a match start in `[from .. max_start]`, scanning no further than `limit`.
     fn runWindow(self: *Regex, haystack: []const u8, from: usize, max_start: usize, limit: usize, mode: MatchMode) ?Match {
         return self.runRange(haystack, from, max_start, limit, mode);
     }
@@ -387,7 +387,7 @@ pub const Regex = struct {
                 gen = 1;
             }
 
-            // 若还没有找到匹配，且当前位置仍在允许的新起点范围内，注入新起点线程
+            // If no match has been found yet and the current position is still within the allowed start range, spawn a new start thread
             if (best == null and pos <= start_hi and (!self.anchored_start or pos == 0)) {
                 self.addThread(curr, &curr_len, gen_table, gen, self.start_pc, pos, haystack, pos);
             }
@@ -410,7 +410,7 @@ pub const Regex = struct {
             const is_nl = has_byte and b == '\n';
 
             for (curr[0..curr_len]) |th| {
-                // 有界跨行窗口检查：若该线程距离其起点已超出窗口上限，立即丢弃
+                // Bounded multiline window check: drop this thread immediately if its distance from start exceeds the window limit
                 if (pos - th.start > self.max_multiline_window) continue;
 
                 const inst = self.insts[th.pc];
@@ -420,7 +420,7 @@ pub const Regex = struct {
                             best = .{ .start = th.start, .end = pos };
                         }
                         if (mode == .earliest and next_len == 0) return best;
-                        // 同一优先级的后续备选被当前 match 截断
+                        // Lower-priority alternatives are cut off by the current match
                         break;
                     },
                     .byte => |by| {
@@ -455,7 +455,7 @@ pub const Regex = struct {
             }
 
             if (pos >= limit) break;
-            // 单行模式下遇到换行符且当前没有找到匹配，清空跨行残留状态
+            // In single-line mode, clear residual states upon hitting a newline if no match was found
             if (!self.multiline and is_nl) {
                 if (best != null) break;
                 curr_len = 0;
@@ -508,7 +508,7 @@ pub const Regex = struct {
     }
 
     fn extractLiterals(self: *Regex, pattern: []const u8, case_mode: CaseMode) !void {
-        // 分析主干上的必需字面量片段：不在分支 `(a|b)`、`*`、`?`、`{0,...}` 内的顶层连续字面量
+        // Analyze required literal runs on the main spine: top-level contiguous literals outside `(a|b)`, `*`, `?`, or `{0,...}`
         var first_lit = std.ArrayList(u8).empty;
         defer first_lit.deinit(self.allocator);
         var best_lit = std.ArrayList(u8).empty;
@@ -554,7 +554,7 @@ pub const Regex = struct {
                     i += 1;
                 },
                 '*', '?', '{' => {
-                    // 量词作用于前一个原子：若 curr_lit 非空，需要回退最后一个字节（因為 `*`/`?`/`{0,}` 可选，或 `+`/`{m,}` 重复）
+                    // Quantifier applies to the preceding atom: pop the last byte from curr_lit if non-empty (since `*`/`?`/`{0,}` is optional or `{m,}` repeats)
                     if (curr_lit.items.len > 0) {
                         _ = curr_lit.pop();
                         if (prefix_active and first_lit.items.len > 0) {
@@ -576,7 +576,7 @@ pub const Regex = struct {
                     if (i < pattern.len) i += 1;
                 },
                 '+' => {
-                    // `a+` 至少出现一次，最后一个字符仍然属于必需前缀！但后续偏移不再固定
+                    // `a+` occurs at least once, so the last character remains part of the required prefix, though subsequent offsets are no longer fixed
                     if (curr_lit.items.len > best_lit.items.len) {
                         best_lit.clearRetainingCapacity();
                         try best_lit.appendSlice(self.allocator, curr_lit.items);
@@ -686,7 +686,7 @@ pub const Regex = struct {
             self.req_is_exact = exact_only and !self.multiline;
             self.prefilter = Finder.init(self.req_literal_bytes, find_opts) catch null;
 
-            // 若除前缀字面量外，末尾或中间还有另一段长必需字面量（如 `ERROR.*timeout`），保存为 tail_finder
+            // If another required literal of length >= 2 exists beyond the prefix literal (e.g., `ERROR.*timeout`), save it as tail_finder
             if (!exact_only and curr_lit.items.len >= 2 and !std.mem.eql(u8, curr_lit.items, first_lit.items)) {
                 self.tail_literal_bytes = try self.allocator.dupe(u8, curr_lit.items);
                 self.tail_finder = Finder.init(self.tail_literal_bytes, find_opts) catch null;
@@ -935,7 +935,7 @@ const Compiler = struct {
 
         var current: ?Frag = null;
         if (min == 0) {
-            // first_atom 被当作可选分支或丢弃，重新从 0 构建
+            // first_atom is treated as optional or discarded; rebuild from 0
             self.insts.shrinkRetainingCapacity(first_atom.start);
         } else {
             current = first_atom;
@@ -1156,7 +1156,7 @@ fn addShorthand(set: *ByteSet, kind: u8) void {
     for (0..4) |i| set.bits[i] |= tmp.bits[i];
 }
 
-test "B16 正则编译大小超过硬顶时拒绝" {
+test "regex compilation size exceeding hard cap is rejected" {
     try std.testing.expectError(
         error.RegexTooLarge,
         Regex.init(std.testing.allocator, "a{5000}", .{}),
@@ -1167,9 +1167,9 @@ test "B16 正则编译大小超过硬顶时拒绝" {
     );
 }
 
-test "B16 病态模式步数随输入长度线性增长" {
-    // 传统回溯引擎在 `(a+)+b` 面对全 `a` 串时会发生 O(2^n) 指数爆炸，
-    // Thompson NFA 在任意长度输入下每个字节每条指令最多访问一次。
+test "pathological pattern steps scale linearly with input length" {
+    // Traditional backtracking engines suffer O(2^n) exponential blowup on `(a+)+b` against all-'a' strings;
+    // Thompson NFA visits each instruction at most once per input byte regardless of input length.
     var re = try Regex.init(std.testing.allocator, "(a+)+b", .{});
     defer re.deinit();
 
@@ -1183,12 +1183,12 @@ test "B16 病态模式步数随输入长度线性增长" {
     try std.testing.expect(re.find(&large_input, 0, .earliest) == null);
     const steps_256 = re.steps;
 
-    // 256 字节的步数应当约为 64 字节的 4 倍（允许常数误差，绝不可能指数增长）
+    // Steps for 256 bytes should be roughly 4x those for 64 bytes (allowing a small constant factor, never exponential)
     try std.testing.expect(steps_256 <= steps_64 * 5);
     try std.testing.expect(steps_256 <= 256 * re.insts.len * 2);
 }
 
-test "B16 RequiredLiteral 提取与 SIMD 预过滤命中" {
+test "RequiredLiteral extraction and SIMD prefilter hit" {
     var re = try Regex.init(std.testing.allocator, "ERROR_[0-9]+:.*timeout", .{});
     defer re.deinit();
 
@@ -1201,7 +1201,7 @@ test "B16 RequiredLiteral 提取与 SIMD 预过滤命中" {
     try std.testing.expectEqualStrings("ERROR_404: gateway timeout", hay[hit.start..hit.end]);
 }
 
-test "B17 有界跨行窗口内命中且超窗立即失配" {
+test "bounded multiline window matches within limit and fails immediately when exceeded" {
     var re = try Regex.init(std.testing.allocator, "BEGIN.*END", .{
         .multiline = true,
         .dot_all = true,
@@ -1213,7 +1213,7 @@ test "B17 有界跨行窗口内命中且超窗立即失配" {
     const hit = re.find(short_hay, 0, .leftmost_first).?;
     try std.testing.expectEqualStrings("BEGIN\nmid\nEND", short_hay[hit.start..hit.end]);
 
-    // 跨度超过 32 字节窗口时，立即判定该跨行匹配不成立
+    // When the span exceeds the 32-byte window, the multiline match immediately fails
     const filler: [40]u8 = @splat('x');
     const long_hay = "BEGIN\n" ++ filler ++ "\nEND\n";
     try std.testing.expect(re.find(long_hay, 0, .leftmost_first) == null);

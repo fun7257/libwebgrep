@@ -1,31 +1,33 @@
-//! 单字节查找。
+//! Single-byte search.
 //!
-//! `find` 直接调用 `std.mem.findScalarPos`。决定改用 std 的那次是手写
-//! 55.8 GB/s、std 54.6 GB/s，差距约 2%。后来的微基准记在 `BENCHMARKS.md`。
-//! 两个不同字节的 `findEither`、反向查找和计数仍用手写 `@Vector`：
-//! std 的 `findScalarLast` 是标量循环，计数也没有对应的向量实现。
+//! `find` delegates directly to `std.mem.findScalarPos`. At the time of that decision,
+//! custom SIMD measured 55.8 GB/s vs. std's 54.6 GB/s (~2% difference); later microbenchmarks
+//! are recorded in `BENCHMARKS.md`.
+//! `findEither` (two distinct bytes), reverse search, and byte counting still use custom `@Vector`
+//! loops because std's `findScalarLast` is scalar and std has no vectorized count.
 //!
-//! 16 字节比较的结果收成 64 位半字节掩码：把比较结果看成 8 个 16 位通道，
-//! 右移 4 位再窄化成 8 位。匹配字节对应 4 个 1，所以下标是 `ctz / 4`，
-//! 个数是 `popcount / 4`。32 字节拆成两段 16 字节做同样的事。
+//! A 16-byte comparison is packed into a 64-bit nibble mask: reinterpret the comparison result
+//! as 8x 16-bit lanes, shift right by 4 bits, and narrow to 8 bits. Each matching byte produces
+//! four 1-bits, so its index is `ctz / 4` and the match count is `popcount / 4`.
+//! 32-byte vectors are split into two 16-byte halves processed the same way.
 
 const std = @import("std");
 
-/// 运行时默认宽度。不超过 32：AVX-512 要等基准证明有收益再加。
+/// Default runtime vector width. Capped at 32 until benchmarks justify AVX-512.
 pub const native_width: comptime_int = blk: {
     const suggested = std.simd.suggestVectorLength(u8) orelse 16;
     if (suggested >= 32) break :blk 32;
     break :blk 16;
 };
 
-/// 在 `haystack[start..]` 中查找第一个 `needle`。
-/// `width` 只用于保持和 `findEither` 相同的调用形式，实际走 std。
+/// Finds the first occurrence of `needle` in `haystack[start..]`.
+/// `width` is kept only for call-site symmetry with `findEither`; delegates to std.
 pub fn find(comptime width: comptime_int, haystack: []const u8, start: usize, needle: u8) ?usize {
     comptime checkWidth(width);
     return std.mem.findScalarPos(u8, haystack, start, needle);
 }
 
-/// 查找第一个等于 `a` 或 `b` 的字节。两者相同时就是 `find`。
+/// Finds the first byte equal to `a` or `b`. Equivalent to `find` when `a == b`.
 pub fn findEither(comptime width: comptime_int, haystack: []const u8, start: usize, a: u8, b: u8) ?usize {
     comptime checkWidth(width);
     if (start >= haystack.len) return null;
@@ -67,7 +69,7 @@ pub fn findEither(comptime width: comptime_int, haystack: []const u8, start: usi
     return scalarEither(haystack, i, n, a, b);
 }
 
-/// 在 `haystack[start..end]` 中查找最后一个 `needle`。`end` 是开区间。
+/// Finds the last occurrence of `needle` in `haystack[start..end]`. `end` is exclusive.
 pub fn findLast(comptime width: comptime_int, haystack: []const u8, start: usize, end: usize, needle: u8) ?usize {
     comptime checkWidth(width);
     const limit = @min(end, haystack.len);
@@ -86,7 +88,7 @@ pub fn findLast(comptime width: comptime_int, haystack: []const u8, start: usize
     return null;
 }
 
-/// 统计 `haystack[start..end]` 里 `needle` 的个数。
+/// Counts occurrences of `needle` in `haystack[start..end]`.
 pub fn count(comptime width: comptime_int, haystack: []const u8, start: usize, end: usize, needle: u8) usize {
     comptime checkWidth(width);
     const limit = @min(end, haystack.len);
@@ -125,13 +127,13 @@ pub fn count(comptime width: comptime_int, haystack: []const u8, start: usize, e
 }
 
 fn checkWidth(comptime width: comptime_int) void {
-    if (width != 16 and width != 32) @compileError("memchr 宽度只支持 16 和 32");
+    if (width != 16 and width != 32) @compileError("memchr width must be 16 or 32");
 }
 
 pub const AnyHit = struct { index: usize, byte: u8 };
 
-/// 查找 `a`、`b`、`c` 中最先出现的字节。三者可以相同。
-/// 没命中的循环只做向量比较和归约，落到命中再算下标。
+/// Finds the first occurrence among `a`, `b`, or `c` (which need not be distinct).
+/// The miss loop performs only vector comparisons and reductions, computing the index only on a hit.
 pub fn findAny(comptime width: comptime_int, haystack: []const u8, start: usize, a: u8, b: u8, c: u8) ?AnyHit {
     comptime checkWidth(width);
     if (start >= haystack.len) return null;
@@ -249,7 +251,7 @@ fn countIn(comptime width: comptime_int, block: @Vector(width, u8), needle: u8) 
     return countMask(mask16(block, needle, needle));
 }
 
-/// 匹配字节在掩码里占 4 个连续的 1。没有匹配时返回 null。
+/// Each matching byte occupies 4 consecutive 1-bits in the mask. Returns null if no match.
 fn indexFromMask(mask: u64) ?usize {
     if (mask == 0) return null;
     return @as(usize, @ctz(mask)) / 4;
@@ -264,7 +266,7 @@ fn countMask(mask: u64) usize {
     return @as(usize, @popCount(mask)) / 4;
 }
 
-/// 16 字节比较收成 64 位半字节掩码。
+/// Packs a 16-byte comparison into a 64-bit nibble mask.
 fn mask16(block: @Vector(16, u8), a: u8, b: u8) u64 {
     const cmp = if (a == b)
         block == @as(@Vector(16, u8), @splat(a))
@@ -274,7 +276,7 @@ fn mask16(block: @Vector(16, u8), a: u8, b: u8) u64 {
     return nibbleMask(bytes);
 }
 
-/// 命中字节是 `0xFF` 时，每字节收成 4 个 1。NEON 没有 movemask，用这个代替。
+/// Compresses each `0xFF` hit byte into four 1-bits. Used in place of movemask on NEON.
 pub inline fn nibbleMask(flags: @Vector(16, u8)) u64 {
     const lanes: @Vector(8, u16) = @bitCast(flags);
     const shifted = lanes >> @as(@Vector(8, u16), @splat(@as(u16, 4)));
@@ -282,14 +284,14 @@ pub inline fn nibbleMask(flags: @Vector(16, u8)) u64 {
     return @bitCast(narrowed);
 }
 
-/// 半字节掩码里第一个命中的字节下标。没有命中时返回 null。
+/// Returns the byte index of the first hit in a nibble mask, or null if none.
 pub inline fn index16(flags: @Vector(16, u8)) ?usize {
     const mask = nibbleMask(flags);
     if (mask == 0) return null;
     return @as(usize, @ctz(mask)) / 4;
 }
 
-/// `native_width` 个 `0xFF` 标志里第一个字节下标。32 宽先拆成两段 16。
+/// Returns the first byte index among `native_width` `0xFF` flags, splitting 32-byte vectors into two 16-byte halves.
 pub inline fn indexWidth(flags: @Vector(native_width, u8)) ?usize {
     if (comptime native_width == 32) {
         const halves: [2]@Vector(16, u8) = @bitCast(flags);
@@ -318,7 +320,7 @@ fn scalarCount(haystack: []const u8, start: usize, end: usize, needle: u8) usize
     return n;
 }
 
-test "空输入和越界起点" {
+test "empty input and out-of-bounds start" {
     inline for (.{ 16, 32 }) |w| {
         try std.testing.expectEqual(@as(?usize, null), find(w, "", 0, 'a'));
         try std.testing.expectEqual(@as(?usize, null), find(w, "abc", 3, 'a'));
@@ -328,7 +330,7 @@ test "空输入和越界起点" {
     }
 }
 
-test "每个偏移都能找到，也能数对" {
+test "finds and counts accurately at every offset" {
     var buf: [96]u8 = undefined;
     @memset(&buf, '.');
     inline for (.{ 16, 32 }) |w| {
@@ -345,7 +347,7 @@ test "每个偏移都能找到，也能数对" {
     }
 }
 
-test "同一向量里的多次命中" {
+test "multiple hits within the same vector" {
     var buf: [32]u8 = undefined;
     @memset(&buf, 0);
     const hits = [_]usize{ 0, 1, 7, 8, 15, 16, 31 };
@@ -360,7 +362,7 @@ test "同一向量里的多次命中" {
     }
 }
 
-test "三个候选字节，先出现的那个胜出" {
+test "three candidate bytes: earliest occurrence wins" {
     var buf: [80]u8 = undefined;
     @memset(&buf, 'a');
     buf[5] = 0;
@@ -376,7 +378,7 @@ test "三个候选字节，先出现的那个胜出" {
     }
 }
 
-test "两个候选字节" {
+test "two candidate bytes" {
     var buf: [40]u8 = undefined;
     @memset(&buf, 'a');
     buf[3] = 'B';
@@ -388,7 +390,7 @@ test "两个候选字节" {
     }
 }
 
-test "与标量和 std.mem.findScalarPos 一致" {
+test "matches scalar and std.mem.findScalarPos" {
     var prng = std.Random.DefaultPrng.init(0x51);
     const random = prng.random();
     var buf: [300]u8 = undefined;
@@ -411,7 +413,7 @@ test "与标量和 std.mem.findScalarPos 一致" {
     }
 }
 
-test "memchr 模糊对照" {
+test "memchr fuzz differential" {
     try std.testing.fuzz({}, fuzzMemchr, .{});
 }
 

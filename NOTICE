@@ -1,33 +1,30 @@
 # NOTICE
 
-libwebgrep 的代码是原作。
+`libwebgrep` is an original implementation written in pure Zig.
 
-字节频率秩在 `src/finder/frequency.zig`。它是按英文散文和源码的常见程度手写的，不是从 memchr crate、ripgrep 或其他项目抄来的表。调用方可以换成自己的 `[256]u8`。
+## Algorithmic References & Attributions
 
-长度不超过 32 的字面量用通用 SIMD 做配对过滤：一次加载两个偏移上的字节，向量比较后取与，只有同时命中才做整段确认。算法来自 Wojciech Muła 的文章 “SIMD-friendly algorithms for substring searching”（2016-11-28，http://0x80.pl/articles/simd-strfind.html ）。锚点按本仓库自己的字节频率秩挑选，不是文章里的首尾字节。长模式在至少 50 个候选且平均每次跳过少于 8 字节时改走 Two-Way。这两个阈值和“32 字节以内不回退”是 memchr 公开发表的预过滤策略里的常数，实现是按这个策略另写的，没有复制 memchr 或 ripgrep 的源码。
+1. **Byte Frequency Heuristic (`src/finder/frequency.zig`)**
+   The byte frequency rank table is hand-authored based on English prose and source code token distributions. Callers may supply a custom `[256]u8` rank table via `FindOptions.frequency`.
 
-Two-Way 按 Crochemore 与 Perrin 发表的算法实现：
+2. **SIMD Packed-Pair Substring Filtering (`src/finder/packed_pair.zig`)**
+   Literals up to 32 bytes use generic SIMD paired-byte filtering: two rare anchor offsets are loaded into vectors, compared in parallel, and bitwise-ANDed before full confirmation. This approach is based on Wojciech Muła's article *"SIMD-friendly algorithms for substring searching"* (2016-11-28, http://0x80.pl/articles/simd-strfind.html). Anchor selection uses our frequency rank table rather than fixed first/last bytes. For patterns longer than 32 bytes, adaptive fallback to Two-Way is triggered when at least 50 candidate verifications occur with an average skip below 8 bytes.
 
-> Maxime Crochemore and Dominique Perrin, “Two-way string-matching”, Journal of the ACM, 38(3):651–675, 1991.
+3. **Two-Way String Matching (`src/finder/two_way.zig`)**
+   Implemented from the algorithm published by Crochemore and Perrin:
+   > Maxime Crochemore and Dominique Perrin, "Two-way string-matching", *Journal of the ACM*, 38(3):651–675, 1991.
 
-实现是照论文描述写的，没有复制 memchr crate 或 ripgrep 的源码。
+4. **Work-Stealing Deque (`src/walk/deque.zig`)**
+   Implemented from the dynamic circular work-stealing deque paper:
+   > David Chase and Yossi Lev, "Dynamic Circular Work-Stealing Deque", *SPAA '05*, pages 21–28, 2005. https://doi.org/10.1145/1073970.1073974
 
-二进制文件那两句说明与 ripgrep 15 的用户可见文案相同，用来让示例 CLI 的输出能逐字节对照。没有复制 ripgrep 的实现。ripgrep 的许可证是 Unlicense 或 MIT。
+5. **Aho-Corasick Automaton (`src/finder/aho.zig`)**
+   Implemented from the failure-function automaton published by Aho and Corasick:
+   > Alfred V. Aho and Margaret J. Corasick, "Efficient string matching: an aid to bibliographic search", *Communications of the ACM*, 18(6):333–340, 1975.
 
-工作窃取队列按 Chase 与 Lev 的双端队列实现：
+6. **Slim Teddy Nibble-Mask SIMD Engine (`src/finder/teddy.zig`)**
+   The nibble-lookup SIMD multi-pattern prefilter (`vtbl` on NEON, `pshufb` on SSSE3, `vpshufb` on AVX2) is implemented from the public descriptions by Geoff Langdale (https://branchfree.org/2024/06/29/hyperscan-papers-harry-and-teddy-simd-literal-matchers/) and the paper:
+   > Kun Qiu, Harry Chang, Yang Hong, Wenjun Zhu, Xiang Wang, and Baoqian Li, "Teddy: An Efficient SIMD-based Literal Matching Engine for Scalable Deep Packet Inspection", *ICPP '21*, 2021. https://doi.org/10.1145/3472456.3473512
 
-> David Chase and Yossi Lev, “Dynamic Circular Work-Stealing Deque”, SPAA ’05, pages 21–28, 2005. https://doi.org/10.1145/1073970.1073974
-
-实现是照论文描述另写的。Zig 0.14 起没有独立的内存栅栏，弹出和窃取用 seq_cst 的加载和存储代替。没有复制论文里的示例代码，也没有复制别的项目里的 Chase-Lev 实现。
-
-多模式的稠密自动机按 Aho 与 Corasick 的失败函数实现：
-
-> Alfred V. Aho and Margaret J. Corasick, “Efficient string matching: an aid to bibliographic search”, Communications of the ACM, 18(6):333–340, 1975.
-
-字节等价类、ASCII 折叠和 `leftmost_first` 的取舍是按公开描述另写的。Andrew Gallant 的 aho-corasick 文档说明了 leftmost-first 在同一起点上取得更早的模式。没有复制该项目或 ripgrep 的源码。
-
-Teddy 是半字节 SIMD 过滤。名字和做法来自 Geoff Langdale 在 Hyperscan 里公开的匹配器：用 `pshufb` 或 NEON `tbl` 按半字节查表，再把指纹各偏移的结果按位与，非 0 的路做确认。论文是：
-
-> Kun Qiu, Harry Chang, Yang Hong, Wenjun Zhu, Xiang Wang, and Baoqian Li, “Teddy: An Efficient SIMD-based Literal Matching Engine for Scalable Deep Packet Inspection”, ICPP ’21, 2021. https://doi.org/10.1145/3472456.3473512
-
-Langdale 在 https://branchfree.org/2024/06/29/hyperscan-papers-harry-and-teddy-simd-literal-matchers/ 把这篇和 Hyperscan 的 Teddy 对应起来。本仓库的实现是按这些公开描述另写的，指纹最长 3 字节，一组最多 8 个模式。没有复制 Hyperscan、aho-corasick 或 ripgrep 的源码。没有实现 FDR，也没有 AVX-512。
+7. **Thompson NFA / PikeVM Regular Expression Engine (`src/regex.zig`)**
+   Linear-time lockstep Thompson NFA simulation is based on Ken Thompson's 1968 CACM paper (*"Programming Techniques: Regular expression search algorithm"*) and Russ Cox's *"Regular Expression Matching: the Virtual Machine Approach"* (https://swtch.com/~rsc/regexp/regexp2.html).

@@ -1,5 +1,5 @@
-//! 按扩展名和少量固定文件名过滤。名字对齐 ripgrep 的 `-t`，只收了常用的一组。
-//! 模式复用 glob：没有斜杠时对最后一段文件名匹配。
+//! File filtering by extension and a small set of fixed filenames. Names align with ripgrep's `-t` for common file types.
+//! Patterns reuse glob matching: when no slash is present, they match against the final filename segment.
 
 const std = @import("std");
 const glob = @import("glob.zig");
@@ -39,7 +39,7 @@ pub fn find(name: []const u8) ?Type {
     return findInTable(&.{}, name);
 }
 
-/// 先在调用方注入的 `table` 中按后写优先查找，未找到则回退至 `builtin`。
+/// Searches the caller-supplied `table` in reverse (last-defined wins) before falling back to `builtin`.
 pub fn findInTable(table: []const Type, name: []const u8) ?Type {
     var i: usize = table.len;
     while (i > 0) {
@@ -52,7 +52,7 @@ pub fn findInTable(table: []const Type, name: []const u8) ?Type {
     return null;
 }
 
-/// 将调用方选择与排除的类型名（结合注入的 `table` 与 `builtin`）展开为 `glob.Glob` 切片。
+/// Expands caller-selected and excluded type names (combining `table` and `builtin`) into a slice of `glob.Glob`.
 pub fn expandTypesToGlobs(
     arena: std.mem.Allocator,
     table: []const Type,
@@ -80,7 +80,7 @@ pub fn expandTypesToGlobs(
     return glob.compileGlobs(arena, raw_list.items, .{});
 }
 
-/// `selected` 为空表示不过滤正向类型；命中任一 `excluded` 类型则直接拒绝。
+/// An empty `selected` slice applies no positive type filter; matching any `excluded` type rejects the file immediately.
 pub fn matchesWithTable(
     table: []const Type,
     selected: []const []const u8,
@@ -107,12 +107,12 @@ pub fn matchesWithTable(
     return false;
 }
 
-/// `selected` 为空表示不过滤。否则文件名只要命中其中一个类型即可。
+/// An empty `selected` slice applies no filter. Otherwise, the filename matches if it hits at least one selected type.
 pub fn matches(selected: []const []const u8, base: []const u8) bool {
     return matchesWithTable(&.{}, selected, &.{}, base);
 }
 
-test "类型表能认出 zig 和 Makefile" {
+test "type table recognizes zig and Makefile" {
     try std.testing.expect(find("zig") != null);
     try std.testing.expect(find("nope") == null);
     try std.testing.expect(matches(&.{"zig"}, "main.zig"));
@@ -122,7 +122,7 @@ test "类型表能认出 zig 和 Makefile" {
     try std.testing.expect(matches(&.{}, "anything"));
 }
 
-test "J12 调用方注入类型表展开为 glob 与排除过滤" {
+test "caller-supplied type table expands to globs and filters exclusions" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();

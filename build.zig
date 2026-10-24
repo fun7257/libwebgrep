@@ -3,27 +3,27 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const sanitize_thread = b.option(bool, "sanitize-thread", "启用 ThreadSanitizer") orelse false;
-    const fuzz_filter = b.option([]const u8, "fuzz-filter", "只运行名称包含该子串的测试");
-    // 系统和 CPU 专属优化都走构建选项。窗口映射和裸 getdents64 默认关闭。
-    // Teddy 在 aarch64 上默认 neon，其它架构默认关闭。通用路径不依赖它们。
+    const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer") orelse false;
+    const fuzz_filter = b.option([]const u8, "fuzz-filter", "Run only tests whose name contains this substring");
+    // OS- and ISA-specific optimizations are controlled via build options.
+    // Windowed mmap and raw getdents64 are disabled by default.
+    // Teddy defaults to neon on aarch64 and off on other architectures.
     const want_linux_getdents = b.option(
         bool,
         "linux-getdents",
-        "Linux 上用裸 getdents64 枚举目录。默认关闭，走 std.Io.Dir.Reader",
+        "Use raw getdents64 syscall for directory enumeration on Linux (default: false, uses std.Io.Dir.Reader)",
     ) orelse false;
     const window_map = b.option(
         bool,
         "mmap-windows",
-        "大文件按 8 MiB 窗口映射后再搜索。默认关闭，走 readPositional",
+        "Map large files in 8 MiB windows before searching (default: false, uses readPositional)",
     ) orelse false;
     const TeddyIsa = enum { off, neon, ssse3, avx2 };
-    // aarch64 上 NEON 比稠密 DFA 快，测过之后才作为默认。x86 没有计时，仍要显式打开。
     const teddy_default: TeddyIsa = if (target.result.cpu.arch == .aarch64) .neon else .off;
     const teddy_request = b.option(
         TeddyIsa,
         "teddy",
-        "多模式 Teddy：off、neon、ssse3、avx2。aarch64 默认 neon，其他架构默认 off",
+        "Multi-pattern Teddy SIMD engine: off, neon, ssse3, avx2 (default: neon on aarch64, off otherwise)",
     ) orelse teddy_default;
     const teddy_matches = switch (teddy_request) {
         .off => true,
@@ -31,8 +31,8 @@ pub fn build(b: *std.Build) void {
         .ssse3, .avx2 => target.result.cpu.arch == .x86_64,
     };
     const teddy: TeddyIsa = if (teddy_matches) teddy_request else .off;
-    // x86_64 的 Debug 走自研后端，编不出 pshufb / vpshufb。这两档改用 LLVM，不因此链接 libc。
-    // AVX2 还要打开 ymm。只加 avx2，标准库会补上它依赖的 avx 和 sse。
+    // x86_64 Debug uses the self-hosted backend which does not encode pshufb/vpshufb.
+    // Use the LLVM backend when SSSE3 or AVX2 Teddy is requested, without linking libc.
     const use_llvm: ?bool = if (teddy == .ssse3 or teddy == .avx2) true else null;
     const compile_target = if (teddy == .avx2) blk: {
         var query = target.query;
@@ -70,7 +70,8 @@ pub fn build(b: *std.Build) void {
     });
     const run_lib_tests = b.addRunArtifact(lib_tests);
 
-    // 示例只有 docs/API.md 里的那一份。这里抽出它，编成测试，避免另写一份会漂移的副本。
+    // Extract the single canonical code example from docs/API.md and compile it as a test
+    // so the documentation example can never drift out of sync with the library API.
     const api_doc = readRepoFile(b, "docs/API.md");
     const root_src = readRepoFile(b, "src/root.zig");
     checkApiDoc(b, root_src, api_doc);
@@ -93,26 +94,26 @@ pub fn build(b: *std.Build) void {
     });
     const run_example_tests = b.addRunArtifact(example_tests);
 
-    const test_step = b.step("test", "运行单元测试");
+    const test_step = b.step("test", "Run all unit and documentation tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_example_tests.step);
 
-    // 交叉编译时只编译，不运行。例如：
-    // zig build check -Dtarget=x86_64-linux-musl
-    const check_step = b.step("check", "编译库和测试，不运行");
+    // Cross-compilation verification step (compiles library and tests without executing):
+    // e.g. zig build check -Dtarget=x86_64-linux-musl -Dteddy=avx2
+    const check_step = b.step("check", "Compile library and tests without running");
     check_step.dependOn(&lib_tests.step);
     check_step.dependOn(&example_tests.step);
     if (want_linux_getdents and target.result.os.tag != .linux) {
-        const fail = b.addFail("-Dlinux-getdents 只适用于 os 为 linux 的目标");
+        const fail = b.addFail("-Dlinux-getdents is only supported when targeting Linux");
         test_step.dependOn(&fail.step);
         check_step.dependOn(&fail.step);
         b.getInstallStep().dependOn(&fail.step);
     }
     if (!teddy_matches) {
         const message = switch (teddy_request) {
-            .neon => "-Dteddy=neon 只适用于 aarch64",
-            .ssse3 => "-Dteddy=ssse3 只适用于 x86_64",
-            .avx2 => "-Dteddy=avx2 只适用于 x86_64",
+            .neon => "-Dteddy=neon is only supported on aarch64",
+            .ssse3 => "-Dteddy=ssse3 is only supported on x86_64",
+            .avx2 => "-Dteddy=avx2 is only supported on x86_64",
             .off => unreachable,
         };
         const fail = b.addFail(message);
@@ -121,9 +122,9 @@ pub fn build(b: *std.Build) void {
         b.getInstallStep().dependOn(&fail.step);
     }
 
-    const bench_step = b.step("bench", "ReleaseFast 内核微基准，直接调用库");
+    const bench_step = b.step("bench", "Run in-process ReleaseFast microbenchmarks");
     if (optimize != .fast) {
-        const fail = b.addFail("基准只在 ReleaseFast 下运行：zig build bench -Doptimize=ReleaseFast");
+        const fail = b.addFail("Benchmarks must be run with ReleaseFast: zig build bench -Doptimize=ReleaseFast");
         bench_step.dependOn(&fail.step);
     } else {
         const micro = b.addExecutable(.{
@@ -155,13 +156,13 @@ fn readRepoFile(b: *std.Build, sub_path: []const u8) []const u8 {
         b.allocator,
         .limited(4 * 1024 * 1024),
     ) catch |err| {
-        std.process.fatal("读取 {s} 失败：{s}", .{ sub_path, @errorName(err) });
+        std.process.fatal("failed to read {s}: {s}", .{ sub_path, @errorName(err) });
     };
 }
 
 fn extractApiExample(md: []const u8) []const u8 {
     const open = "```zig\n";
-    const marker = "test \"API 文档示例能跑通\"";
+    const marker = "test \"API documentation example\"";
     var rest = md;
     var found: ?[]const u8 = null;
     while (std.mem.indexOf(u8, rest, open)) |rel| {
@@ -171,7 +172,7 @@ fn extractApiExample(md: []const u8) []const u8 {
         }
         const tail = rest[rel + open.len ..];
         const end = std.mem.indexOf(u8, tail, "\n```") orelse {
-            std.process.fatal("docs/API.md 的示例代码块没有结束", .{});
+            std.process.fatal("unclosed zig code block in docs/API.md", .{});
         };
         const after = tail[end + 1 ..];
         const line_end = std.mem.indexOfScalar(u8, after, '\n') orelse after.len;
@@ -184,45 +185,45 @@ fn extractApiExample(md: []const u8) []const u8 {
             rest = tail[end + 1 + line_end ..];
             continue;
         }
-        if (found != null) std.process.fatal("docs/API.md 里的 API 文档示例出现了两次", .{});
+        if (found != null) std.process.fatal("duplicate API documentation example in docs/API.md", .{});
         found = body;
         rest = tail[end + 1 + line_end ..];
     }
-    return found orelse std.process.fatal("docs/API.md 缺少能编译的 API 文档示例", .{});
+    return found orelse std.process.fatal("docs/API.md is missing compilable test \"API documentation example\"", .{});
 }
 
 fn checkApiDoc(b: *std.Build, root_src: []const u8, api_md: []const u8) void {
     const required = [_][]const u8{
-        "\n## 范围\n",
-        "\n## 入口\n",
-        "\n## 来源\n",
-        "\n## 匹配\n",
-        "\n## 行与编码\n",
-        "\n## 二进制\n",
-        "\n## 上下文\n",
-        "\n## 事件\n",
-        "\n## 预算与错误\n",
-        "\n## 默认值\n",
-        "\n## 示例\n",
-        "智能大小写按模式分别判断",
-        "大小写折叠只支持 ASCII",
-        "二进制默认跳过",
-        "未命中的来源也有 begin 和 end",
-        "尚未提供",
-        "不接收文件系统路径",
-        "不执行外部命令",
-        "不输出终端文本或 NDJSON",
-        "切片只在回调返回前有效",
+        "\n## Scope\n",
+        "\n## Entry Points\n",
+        "\n## Sources\n",
+        "\n## Matching\n",
+        "\n## Lines and Encoding\n",
+        "\n## Binary Detection\n",
+        "\n## Context\n",
+        "\n## Events\n",
+        "\n## Budgets and Errors\n",
+        "\n## Defaults\n",
+        "\n## Non-Goals\n",
+        "\n## Example\n",
+        "Smart case is evaluated per pattern",
+        "ASCII case folding by default",
+        "Binary inputs are skipped by default",
+        "Sources with zero matches still emit begin and end",
+        "does not accept filesystem paths",
+        "does not spawn external processes",
+        "does not format terminal colors or serialize NDJSON",
+        "Borrowed slices are valid only until the callback returns",
     };
     for (required) |text| {
         if (std.mem.indexOf(u8, api_md, text) == null) {
-            std.process.fatal("docs/API.md 缺少：{s}", .{text});
+            std.process.fatal("docs/API.md is missing required text: {s}", .{text});
         }
     }
-    const banned = [_][]const u8{ "路径参数", "ANSI", "PCRE", "子进程", "--" };
+    const banned = [_][]const u8{ "ANSI", "PCRE", "ChildProcess", "--" };
     for (banned) |text| {
         if (std.mem.indexOf(u8, api_md, text) != null) {
-            std.process.fatal("docs/API.md 含有不允许出现的文本：{s}", .{text});
+            std.process.fatal("docs/API.md contains banned text: {s}", .{text});
         }
     }
 
@@ -237,10 +238,10 @@ fn checkApiDoc(b: *std.Build, root_src: []const u8, api_md: []const u8) void {
             const rest = line["pub const ".len..];
             const name_len = std.mem.indexOfAny(u8, rest, " :=") orelse rest.len;
             const name = std.mem.trim(u8, rest[0..name_len], " ");
-            if (!prev_doc) std.process.fatal("src/root.zig 的 {s} 缺少文档注释", .{name});
+            if (!prev_doc) std.process.fatal("src/root.zig export '{s}' is missing a /// doc comment", .{name});
             const heading = std.fmt.allocPrint(b.allocator, "\n### {s}\n", .{name}) catch @panic("OOM");
             if (std.mem.indexOf(u8, api_md, heading) == null) {
-                std.process.fatal("docs/API.md 缺少小节 {s}", .{name});
+                std.process.fatal("docs/API.md is missing section '### {s}'", .{name});
             }
             prev_doc = false;
             continue;

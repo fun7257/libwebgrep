@@ -1,45 +1,44 @@
-//! 匹配器约定。字面量内核和将来的正则都实现 `find`。
-//! Searcher 不依赖具体内核，只要求这个形状。
+//! Matcher contract. Both literal kernels and regex engines implement `find`.
+//! Searcher does not depend on a concrete kernel; it only requires this shape.
 
 const std = @import("std");
 
-/// 匹配语义。
-/// 单个字面量下两种模式结果相同：最左边的那一次就是最早的那一次。
-/// 多模式时才分开。`leftmost_first` 和 `rg -F` 的交替顺序一致，用于列号和高亮。
+/// Matching semantics.
+/// With a single literal, both modes produce the same result: the leftmost match is also the earliest match.
+/// They only diverge with multiple patterns. `leftmost_first` matches the alternation order of `rg -F` and is used for column numbers and highlighting.
 pub const MatchMode = enum {
-    /// 结束位置最早的那一次。同样的结束位置，取得起点更靠左的；再相同则取得更早加入的模式。
+    /// The match with the earliest end position. On ties, the leftmost start position wins; further ties prefer the pattern added earlier.
     earliest,
-    /// 起点最靠左的那一次。同一起点上，更早加入的模式胜出，不是更长的那个。
+    /// The match with the leftmost start position. At the same start position, the pattern added earlier wins rather than the longer one.
     leftmost_first,
 };
 
-/// 一次匹配。偏移相对本次传给 `find` 的 haystack，不是文件绝对偏移。
+/// A single match. Offsets are relative to the `haystack` passed to `find`, not absolute file offsets.
 pub const Match = struct {
     start: usize,
     end: usize,
 };
 
-/// 正则预留的“必需字面量”。Searcher 在匹配器提供该方法时先用它做预过滤，
-/// 再用真正的匹配器验证。字面量匹配器被问到时返回模式本身，偏移为 0。
-/// 本次不实现正则。
+/// Required literal extracted for regex prefiltering. When provided by the matcher, Searcher uses it for prefiltering first
+/// and then verifies with the full matcher. Literal matchers return the pattern itself with offset 0.
 pub const RequiredLiteral = struct {
     bytes: []const u8,
-    /// 该字面量在完整匹配中的起始偏移。
+    /// Starting offset of this literal within the full match.
     offset_in_match: usize,
 };
 
-/// 大小写。本次只折叠 ASCII。
-/// `smart` 按每一条模式单独判断：全是小写才忽略大小写，出现 `A-Z` 就区分大小写。
-/// 这和 rg 不同。rg 的 `-S` 是整组判断：整组里出现大写就全部区分大小写。
+/// Case sensitivity mode.
+/// `smart` evaluates each pattern individually: case-insensitive only if all lowercase, and case-sensitive if `A-Z` appears.
+/// This differs from `rg -S`, which evaluates the entire pattern set together.
 pub const CaseMode = enum {
     sensitive,
     insensitive,
     smart,
 };
 
-/// 模式条数硬顶。调用方可以把上限调低，不能超过这个值。
+/// Hard cap on pattern count. Callers may lower the limit, but cannot exceed this value.
 pub const pattern_count_hard_cap: usize = 1024;
-/// 全部模式字节总长硬顶。按每条模式的长度相加。
+/// Hard cap on total byte length across all patterns, summed over each pattern's length.
 pub const pattern_bytes_hard_cap: usize = 256 * 1024;
 
 pub const LimitError = error{
@@ -47,20 +46,20 @@ pub const LimitError = error{
     PatternBytesExceeded,
 };
 
-/// 构造查找器的选项。频率表的值越小，该字节越适合做预过滤锚点。
+/// Options for constructing a finder. Lower values in the frequency table indicate bytes better suited as prefilter anchors.
 pub const FindOptions = struct {
     case: CaseMode = .sensitive,
-    /// 开启 Unicode 简单大小写折叠（Simple Case Folding）。默认 false（仅折叠 ASCII）。
+    /// Enable Unicode Simple Case Folding. Defaults to false (ASCII case folding only).
     unicode_case: bool = false,
-    /// null 用内置表。
+    /// Null uses the built-in frequency table.
     frequency: ?[256]u8 = null,
-    /// 长于 32 字节的模式，在两个稀有字节的平均间距小于 8、并且确认失败时，
-    /// 剩下的查找改走 Two-Way。设为 1 或更大则一直留在 packed pair。
-    /// 不超过 32 字节的模式不使用这个阈值。
+    /// For patterns longer than 32 bytes, when the distance between the two rarest bytes is less than 8 and verification fails,
+    /// subsequent searches switch to Two-Way. Set to 1 or greater to stay in packed pair.
+    /// Patterns of 32 bytes or fewer do not use this threshold.
     prefilter_fp_threshold: f32 = 0.80,
-    /// 模式条数上限。null 用硬顶。比硬顶大时仍按硬顶拒绝。
+    /// Maximum number of patterns. Null uses the hard cap; values above the hard cap are still rejected at the hard cap.
     max_pattern_count: ?usize = null,
-    /// 模式字节总长上限。null 用硬顶。比硬顶大时仍按硬顶拒绝。
+    /// Maximum total pattern bytes. Null uses the hard cap; values above the hard cap are still rejected at the hard cap.
     max_pattern_bytes: ?usize = null,
 };
 
@@ -72,7 +71,7 @@ pub fn patternBytesLimit(options: FindOptions) usize {
     return @min(options.max_pattern_bytes orelse pattern_bytes_hard_cap, pattern_bytes_hard_cap);
 }
 
-/// 在分配自动机、Teddy 表或邻接对表之前调用。超限时搜索还没有开始。
+/// Called before allocating automata, Teddy tables, or pair tables. Rejects before searching begins if limits are exceeded.
 pub fn checkPatternLimits(patterns: []const []const u8, options: FindOptions) LimitError!void {
     if (patterns.len > patternCountLimit(options)) return error.PatternCountExceeded;
     const byte_limit = patternBytesLimit(options);
@@ -83,13 +82,13 @@ pub fn checkPatternLimits(patterns: []const []const u8, options: FindOptions) Li
     }
 }
 
-/// Matcher 需要的方法形状。写在这里供调用方对照，不产生运行时对象。
+/// Expected method shape for a Matcher. Documented here for reference; produces no runtime object.
 ///
 /// ```
 /// pub fn find(self: *Self, haystack: []const u8, start: usize, mode: MatchMode) ?Match
 /// ```
 ///
-/// 可选：
+/// Optional:
 ///
 /// ```
 /// pub fn requiredLiteral(self: *const Self) ?RequiredLiteral

@@ -892,7 +892,10 @@ fn drive(
     }
     if (rejectEmptyResults(&state, config)) return finishSink(S, sink, &state, config);
 
-    const initial = bufferWindow(config);
+    const initial = if (isMultilineMatcher(matcher))
+        @max(bufferWindow(config), multilineWindow(matcher, config))
+    else
+        bufferWindow(config);
     const cap0 = @max(initial, 1);
     const borrowed = config.scratch != null;
     var buf: []u8 = undefined;
@@ -1042,6 +1045,14 @@ fn drive(
             }
         }
 
+        const is_ml = isMultilineMatcher(matcher);
+        const ml_win = if (is_ml) multilineWindow(matcher, config) else 0;
+        if (is_ml and !eof and filled < ml_win and !config.passthru and !config.invert) {
+            if (matcher.find(buf[0..search_end], state.pos, config.match_mode) == null) {
+                continue;
+            }
+        }
+
         if (!skip_match and (search_end > state.pos or eof)) {
             if (!try matchBuffer(S, sink, matcher, buf[0..view_end], &state, config)) {
                 state.stopped = true;
@@ -1050,13 +1061,25 @@ fn drive(
             }
         }
 
+        if (is_ml and isStartAnchoredMatcher(matcher) and state.abs_base + filled >= ml_win) {
+            state.stopped = true;
+            state.need_close = true;
+            break;
+        }
+
         if (eof) {
             state.scanned_all = !state.output_blocked and state.soft_error == null;
             break;
         }
         if (state.stopped) break;
 
-        const consumed = search_end;
+        const consumed = if (is_ml and search_end > ml_win)
+            @max(state.last_line_visited, lineEnd(buf[0..search_end], search_end - ml_win, config))
+        else
+            search_end;
+        if (is_ml and consumed < search_end) {
+            state.pos = consumed;
+        }
         rememberBefore(matcher, buf, &state, config, consumed);
         countLines(buf, consumed, &state, config);
         const remain = filled - consumed;
@@ -1368,8 +1391,28 @@ fn grow(allocator: std.mem.Allocator, buf: []u8, config: SearchConfig) error{Out
     return try allocator.realloc(buf, next);
 }
 
+fn isMultilineMatcher(matcher: anytype) bool {
+    const T = @TypeOf(matcher.*);
+    if (@hasDecl(T, "isMultiline")) return matcher.isMultiline();
+    return false;
+}
+
+fn isStartAnchoredMatcher(matcher: anytype) bool {
+    const T = @TypeOf(matcher.*);
+    if (@hasDecl(T, "isStartAnchored")) return matcher.isStartAnchored();
+    return false;
+}
+
+fn multilineWindow(matcher: anytype, config: SearchConfig) usize {
+    const T = @TypeOf(matcher.*);
+    const cap = if (config.max_line_len == 0) 1 else config.max_line_len;
+    if (@hasDecl(T, "multilineWindow")) return @min(matcher.multilineWindow(), cap);
+    return cap;
+}
+
 fn canFuse(matcher: anytype, config: SearchConfig, state: *const State) bool {
     if (config.null_data) return false;
+    if (isMultilineMatcher(matcher)) return false;
     if (config.passthru or config.stop_on_nonmatch) return false;
     if (state.prefer_prepass or state.nul_offset != null) return false;
     if (config.binary == .none or config.invert or beforeCount(config) != 0 or afterCount(config) != 0) return false;
@@ -5913,4 +5956,95 @@ test "B14 替换预览不修改输入且区间与替换文本一致" {
     try testing.expectEqual(@as(usize, 2), sink.span_count);
     try testing.expectEqualStrings("BAR_BAZ", sink.first_repl);
     try testing.expectEqualStrings("hello BAR_BAZ and BAR_BAZ!", sink.replaced_copy[0..sink.replaced_len]);
+}
+
+test "B16 正则与 Searcher 联动及替换预览" {
+    const Regex = @import("regex.zig").Regex;
+    const Collect = struct {
+        hits: u32 = 0,
+        replaced_buf: [64]u8 = undefined,
+        replaced_len: usize = 0,
+
+        pub fn event(self: *@This(), ev: Event) bool {
+            if (ev == .match) {
+                self.hits += 1;
+                if (ev.match.replaced) |r| {
+                    @memcpy(self.replaced_buf[0..r.len], r);
+                    self.replaced_len = r.len;
+                }
+            }
+            return true;
+        }
+    };
+
+    var re = try Regex.init(testing.allocator, "ERR_[0-9]+", .{});
+    defer re.deinit();
+
+    var sink = Collect{};
+    const res = try searchSourceSlice(Collect, &sink, "log", "ok\nfail ERR_502 and ERR_504!\n", &re, .{
+        .replacement = "CODE",
+    });
+    try testing.expectEqual(@as(u64, 1), res.matched_lines);
+    try testing.expectEqual(@as(u64, 2), res.matches);
+    try testing.expectEqual(@as(u32, 1), sink.hits);
+    try testing.expectEqualStrings("fail CODE and CODE!", sink.replaced_buf[0..sink.replaced_len]);
+}
+
+test "B17 跨行窗口耗尽后不再读上游" {
+    const Regex = @import("regex.zig").Regex;
+    const MlStream = struct {
+        reads: usize = 0,
+        closed: bool = false,
+        hits: u32 = 0,
+
+        fn read(ctx: *anyopaque, dest: []u8) ReadError!usize {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.reads += 1;
+            const chunk: []const u8 = switch (self.reads) {
+                1 => "BEGIN\n1234567890\n",
+                2 => "12345678901234567890\n",
+                3 => "END\n",
+                else => "",
+            };
+            @memcpy(dest[0..chunk.len], chunk);
+            return chunk.len;
+        }
+
+        fn close(ctx: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.closed = true;
+        }
+
+        pub fn event(self: *@This(), ev: Event) bool {
+            if (ev == .match) self.hits += 1;
+            return true;
+        }
+    };
+
+    var src = MlStream{};
+    var re = try Regex.init(testing.allocator, "\\ABEGIN.*END", .{
+        .multiline = true,
+        .dot_all = true,
+        .max_multiline_window = 24,
+    });
+    defer re.deinit();
+
+    const cfg = SearchConfig{
+        .close_input = MlStream.close,
+        .close_ctx = &src,
+        .buffer_size = 64,
+        .max_line_len = 64,
+        .binary = .none,
+        .encoding = .none,
+    };
+    var bridge = EventBridge(MlStream){
+        .inner = &src,
+        .source_id = "ml",
+        .config = cfg,
+    };
+    const res = try drive(EventBridge(MlStream), testing.allocator, &bridge, &re, cfg, "ml", MlStream.read, &src);
+    try testing.expectEqual(@as(u64, 0), res.matched_lines);
+    try testing.expectEqual(@as(u32, 0), src.hits);
+    try testing.expectEqual(@as(usize, 2), src.reads);
+    try testing.expect(src.closed);
 }

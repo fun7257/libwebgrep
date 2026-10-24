@@ -48,6 +48,11 @@ pub fn main(init: std.process.Init) !void {
     var alphabet_ctx = FinderCtx{ .data = buf, .finder = &alphabet, .at = alphabet_at };
     try report(io, "finder_alphabet", buf.len, alphabet_at, finderRun, &alphabet_ctx);
 
+    var re_anchor = try internal.Regex.init(gpa, "libweb.*[0-9]*grep", .{});
+    defer re_anchor.deinit();
+    var regex_ctx = RegexCtx{ .data = buf, .re = &re_anchor, .at = alphabet_at };
+    try report(io, "regex_prefilter", buf.len, alphabet_at, regexRun, &regex_ctx);
+
     try benchSweep(gpa, io);
     try benchWalk(gpa, io);
 }
@@ -113,6 +118,21 @@ const FinderCtx = struct {
     finder: *internal.Finder,
     at: usize,
 };
+
+const RegexCtx = struct {
+    data: []u8,
+    re: *internal.Regex,
+    at: usize,
+};
+
+fn regexRun(ctx: *RegexCtx) !usize {
+    ctx.data[0] ^= 1;
+    defer ctx.data[0] ^= 1;
+    ctx.re.resetStats();
+    const hit = ctx.re.find(ctx.data, 0, .earliest) orelse return error.ExpectedMatch;
+    if (hit.start != ctx.at) return error.UnexpectedOffset;
+    return hit.start;
+}
 
 fn finderRun(ctx: *FinderCtx) !usize {
     ctx.data[0] ^= 1;

@@ -12,3 +12,4 @@ pub const memchr = @import("finder/memchr.zig");
 pub const Finder = finder_mod.Finder;
 pub const multi = @import("finder/multi.zig");
 pub const Multi = multi.Multi;
+pub const Regex = @import("regex.zig").Regex;

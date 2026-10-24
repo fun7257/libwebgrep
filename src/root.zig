@@ -158,12 +158,19 @@ pub const Finder = finder.Finder;
 pub const multi = @import("finder/multi.zig");
 /// 多条字面量。调用方持有模式字节，`deinit` 只释放内部表。
 pub const Multi = multi.Multi;
+/// `Regex` 的定义模块。线性时间 Thompson NFA 与必需字面量 SIMD 预过滤。
+pub const regex = @import("regex.zig");
+/// 线性时间正则表达式匹配器，支持编译大小硬顶与有界跨行窗口。
+pub const Regex = regex.Regex;
+/// 构造 `Regex` 的选项：大小写、有界跨行、`.` 是否匹配换行与指令数硬顶。
+pub const RegexOptions = regex.RegexOptions;
 
 test {
     _ = @import("encoding.zig");
     _ = @import("matcher.zig");
     _ = @import("sink.zig");
     _ = @import("searcher.zig");
+    _ = @import("regex.zig");
     _ = @import("ndjson_fixture.zig");
     _ = @import("finder/memchr.zig");
     _ = @import("finder/two_way.zig");

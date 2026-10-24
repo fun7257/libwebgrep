@@ -16,7 +16,7 @@
 
 旧回调入口是 `searchSlice` 和 `searchReader`。它们不填那些默认预算，留空表示该项不另加上限。回调形状是 `begin`、`matched`、`context`、`finish`，不是服务入口的 `event`。新代码用服务入口。
 
-匹配器传 `*Finder` 或 `*Multi`。搜索函数在开始时调用它的 `resetStats`。
+匹配器传 `*Finder`、`*Multi` 或 `*Regex`。搜索函数在开始时调用它的 `resetStats`。
 
 服务入口的接收者 `S` 实现：
 
@@ -232,6 +232,31 @@ Multi.deinit(self)
 
 导出 `src/finder/multi.zig`，也就是 `Multi` 的定义模块。
 
+### Regex
+
+线性时间正则表达式匹配器（Thompson NFA + SIMD 必需字面量预过滤 + 有界跨行窗口）。
+
+```text
+Regex.init(allocator, pattern, options) !Regex
+Regex.deinit(self)
+```
+
+采用无回溯的 Thompson NFA 执行，最坏步数随输入长度线性增长。构造时校验编译指令数上限（硬顶 4096）与跨行窗口上限（硬顶 8 MiB），超限在扫描开始前返回 `RegexTooLarge`。自动从语法树提取必需字面量（`requiredLiteral`）并挂载 `Finder` 做 SIMD 预过滤。提供 `find`、`findWatched`、`findAllowed`、`acceptsSpan`、`resetStats`。
+
+### RegexOptions
+
+构造 `Regex` 的选项。
+
+- `case`：默认 `sensitive`。大小写折叠只支持 ASCII。
+- `multiline`：默认 false。为真时允许匹配跨越 LF，且 `^` 与 `$` 匹配行首与行尾。
+- `dot_all`：默认 false。为真且 `multiline` 打开时 `.` 可匹配 LF。
+- `max_inst`：编译指令数上限，null 使用硬顶 4096。
+- `max_multiline_window`：有界跨行窗口字节上限，默认 64 KiB，硬顶 8 MiB。跨行跨度耗尽该窗口仍未闭合匹配时立即判定失配。
+
+### regex
+
+导出 `src/regex.zig`，也就是 `Regex` 与 `RegexOptions` 的定义模块。
+
 ### MatchMode
 
 `earliest` 或 `leftmost_first`。含义见上面的匹配一节。
@@ -266,7 +291,7 @@ Multi.deinit(self)
 
 ### RequiredLiteral
 
-`bytes` 加上 `offset_in_match`。这是为以后的正则预留的「必需字面量」。正则尚未提供。字面量查找器被问到时，非空模式返回自身，偏移为 0。
+`bytes` 加上 `offset_in_match`。`Regex` 从语法树提取出必需字面量时返回该片段及其起始偏移；字面量查找器被问到时，非空模式返回自身，偏移为 0。
 
 ### memchr
 
@@ -588,7 +613,6 @@ Multi.deinit(self)
 - Unicode 大小写折叠。
 - GBK 等其它编码，以及用 HTTP charset 做提示。
 - 转码或解压之后，位置在原始字节流上的偏移。
-- 正则。
 
 `walk_glob`、`walk_ignore`、`walk_types`、`walk_list`、`walk_deque`、`walk_file_id` 已经导出，但搜索入口不调用它们来列举或过滤来源。
 

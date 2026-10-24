@@ -19,7 +19,7 @@ flowchart TD
 | **阶段一** | **轻量高价值检索能力** | `A03`, `B13`, `E06`, `B14` | **已完成 (DONE)** | 零新增外部依赖；有序日志流查询提前终止；替换与全文高亮严格受 `max_output_bytes` 约束 |
 | **阶段二** | **线性正则 + SIMD 预过滤** | `B16`, `B17` | **已完成 (DONE)** | 编译大小硬顶防爆；最坏 $O(n)$ 步数保证；利用 `RequiredLiteral` 保持 20+ GB/s 级预过滤吞吐 |
 | **阶段三** | **流式解压与编码扩展** | `A04`, `B05`, `F12`, `A05`, `C06` | **已完成 (DONE)** | Gzip/Zstd/XZ 进程内流式解压 + 压缩比/输出字节双硬顶拦截 Zip Bomb；Unicode 折叠不劣化 ASCII SIMD 快路径 |
-| **阶段四** | **抽象多来源管线收口** | `J01`–`J05`, `J08`, `J09`, `J11`–`J15`, `L04` | 待实施 | Glob/Ignore 条数与深度硬顶；移除 CPU 核数探测，完全由 `max_concurrency` 驱动；不缓存全量事件 |
+| **阶段四** | **抽象多来源管线收口** | `J01`–`J05`, `J08`, `J09`, `J11`–`J15`, `L04` | **已完成 (DONE)** | Glob/Ignore 条数与深度硬顶；移除 CPU 核数探测，完全由 `max_concurrency` 驱动；不缓存全量事件 |
 
 ---
 
@@ -63,15 +63,15 @@ flowchart TD
 
 ---
 
-### 阶段四：抽象多来源文件管线收口（N8）
+### 阶段四：抽象多来源文件管线收口（N8，已完成）
 
 将现有的 `src/walk/` 与 `src/parallel.zig` 彻底脱离 OS 路径假设，收口到抽象 `Source` 与多租户并发配额之下。
 
-| 任务项 | 目标模块 | 高性能实现方案 | 验收测试标准 |
-| :--- | :--- | :--- | :--- |
-| **1. Glob 完备化与上限保护 (`J01`, `J02`)** | `src/walk/glob.zig` | 增加嵌套花括号 `{a,{b,c}}` 展开器、规则条数与长度硬顶校验，以及 `--iglob` ASCII 大小写不敏感匹配。 | `test "J01 后写的 glob 优先且花括号可嵌套并受上限保护"`<br/>`test "J02 glob 忽略大小写"` |
-| **2. Ignore 规则与类型表注入 (`J03`–`J05`, `J08`, `J12`)** | `src/walk/ignore.zig`<br/>`src/walk/types.zig` | 支持纯文本忽略规则注入（不收路径），支持无 `.git` 目录时读取 `.gitignore`/`.ignore`/`.rgignore`，提供 `dot`/`exclude`/`vcs`/大小写独立开关；提供接收调用方类型表的 `expandTypesToGlobs` 接口。 | `test "J04 无 git 目录时忽略规则同样生效"`<br/>`test "J05 纯文本忽略规则与 J08 细分开关"` |
-| **3. 受控并发与遍历预算 (`J09`, `J11`, `J13`–`J15`, `L04`)** | `src/walk/walker.zig`<br/>`src/parallel.zig` | 固定服务端最大遍历深度（`J09`）；支持仅列出来源并计入遍历预算（`J13`）；从生产代码中移除 `getCpuCount`，工作线程数严格由调用方 `max_concurrency` 决定（`J14`）；确保多来源边搜边交出 `end`，绝不为排序缓存全量事件（`L04`）。 | `test "J13 仅列出来源计入遍历预算"`<br/>`test "J14 线程数严格受控且不探测 CPU 核数"` |
+| 任务项 | 目标模块 | 高性能实现方案 | 验收测试标准 | 状态 |
+| :--- | :--- | :--- | :--- | :---: |
+| **1. Glob 完备化与上限保护 (`J01`, `J02`)** | `src/walk/glob.zig` | 增加嵌套花括号 `{a,{b,c}}` 展开器、规则条数与长度硬顶校验，以及 `--iglob` ASCII 大小写不敏感匹配。 | `test "J01 后写的 glob 优先且花括号可嵌套并受上限保护"`<br/>`test "J02 glob 忽略大小写"` | **DONE** |
+| **2. Ignore 规则与类型表注入 (`J03`–`J05`, `J08`, `J12`)** | `src/walk/ignore.zig`<br/>`src/walk/types.zig` | 支持纯文本忽略规则注入（不收路径），支持无 `.git` 目录时读取 `.gitignore`/`.ignore`/`.rgignore`，提供 `dot`/`exclude`/`vcs`/大小写独立开关；提供接收调用方类型表的 `expandTypesToGlobs` 接口。 | `test "J04 无 git 目录时忽略规则同样生效"`<br/>`test "J05 纯文本忽略规则与 J08 细分开关"` | **DONE** |
+| **3. 受控并发与遍历预算 (`J09`, `J11`, `J13`–`J15`, `L04`)** | `src/walk/walker.zig`<br/>`src/parallel.zig` | 固定服务端最大遍历深度（`J09`）；支持仅列出来源并计入遍历预算（`J13`）；从生产代码中移除 `getCpuCount`，工作线程数严格由调用方 `max_concurrency` 决定（`J14`）；确保多来源边搜边交出 `end`，绝不为排序缓存全量事件（`L04`）。 | `test "J13 仅列出来源计入遍历预算"`<br/>`test "J14 线程数严格受控且不探测 CPU 核数"` | **DONE** |
 
 ---
 

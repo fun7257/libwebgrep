@@ -12,19 +12,46 @@ const list_dir = @import("list_dir.zig");
 const types = @import("types.zig");
 
 pub const Config = struct {
+    /// 服务端固定最大遍历深度硬顶（J09）。
+    pub const max_depth_hard_cap: u32 = 64;
+    /// 服务端遍历来源条数硬顶（J11）。
+    pub const max_entries_hard_cap: u64 = 100_000;
+
     hidden: bool = false,
     read_ignore: bool = true,
-    /// null 表示不限制。1 只看起始目录里的文件，0 什么也不列。和 rg 的 `--max-depth` 一致。
+    /// 细粒度忽略开关（J08）：dot（.ignore/.rgignore）、vcs（.gitignore）、仓库内 info 忽略与大小写。
+    ignore_switches: ignore.LayerSwitch = .{},
+    /// 调用方注入的纯文本忽略规则切片（J05，不接受路径）。
+    ignore_texts: []const []const u8 = &.{},
+    /// null 表示使用服务端最大深度硬顶 `max_depth_hard_cap`。1 只看起始目录里的文件，0 什么也不列。
     max_depth: ?u32 = null,
+    /// 遍历最多访问的文件来源条数预算（J11 / J13），受 `max_entries_hard_cap` 保护。
+    max_entries: ?u64 = null,
     /// 和来源扫描字节上限是同一个数。大于它的文件在遍历时跳过。null 表示这一层不按大小预跳过。
     max_filesize: ?u64 = null,
     globs: []const []const u8 = &.{},
+    /// 忽略 ASCII 大小写的 glob 规则列表（J02）。
+    iglobs: []const []const u8 = &.{},
+    /// 是否将 `globs` 也按忽略 ASCII 大小写处理（J02）。
+    iglob: bool = false,
     types: []const []const u8 = &.{},
-    /// 0 表示由调度层选择。Darwin 上性能核更少时用性能核数，否则用逻辑 CPU 数。
+    /// 排除的类型名列表（J12）。
+    types_not: []const []const u8 = &.{},
+    /// 调用方注入的自定义文件类型表（J12）。
+    custom_types: []const types.Type = &.{},
+    /// 工作线程数，由调用方 `max_concurrency` 或显式配置决定（0 表示单线程 1，不探测宿主 CPU 核数）。
     threads: u32 = 0,
     skip_git: bool = true,
     /// 默认不进入与搜索根不同设备的目录。调用方可以关掉。没有打开链接跟随的字段。
     one_file_system: bool = true,
+
+    pub fn effectiveMaxDepth(self: Config) u32 {
+        return if (self.max_depth) |d| @min(d, max_depth_hard_cap) else max_depth_hard_cap;
+    }
+
+    pub fn effectiveMaxEntries(self: Config) u64 {
+        return if (self.max_entries) |n| @min(n, max_entries_hard_cap) else max_entries_hard_cap;
+    }
 };
 
 pub const Control = enum { cont, stop };
@@ -81,6 +108,9 @@ pub const Session = struct {
     gpa: std.mem.Allocator,
     empty: ignore.Set = .{},
     user_globs: []const glob.Glob = &.{},
+    globs_prepared: bool = false,
+    ignore_prepared: bool = false,
+    entries_visited: std.atomic.Value(u64) = .init(0),
 
     pub fn init(gpa: std.mem.Allocator) Session {
         return .{
@@ -97,20 +127,46 @@ pub const Session = struct {
         self.lock.lockUncancelable(io);
         defer self.lock.unlock(io);
         const arena = self.arena.allocator();
-        const owned = try arena.alloc(glob.Glob, texts.len);
-        for (texts, owned) |text, *slot| {
-            var body = text;
-            var negated = false;
-            if (body.len > 0 and body[0] == '!') {
-                negated = true;
-                body = body[1..];
+        self.user_globs = try glob.compileGlobs(arena, texts, .{});
+        self.globs_prepared = true;
+    }
+
+    pub fn prepareConfig(self: *Session, io: std.Io, config: Config) !void {
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        const arena = self.arena.allocator();
+        if (!self.globs_prepared and (config.globs.len > 0 or config.iglobs.len > 0)) {
+            var list: std.ArrayList(glob.Glob) = .empty;
+            if (config.globs.len > 0) {
+                const compiled = try glob.compileGlobs(arena, config.globs, .{
+                    .case_insensitive = config.iglob,
+                });
+                try list.appendSlice(arena, compiled);
             }
-            const copy = try arena.dupe(u8, body);
-            slot.* = glob.classify(copy);
-            slot.negated = negated;
-            slot.anchored = std.mem.indexOfScalar(u8, copy, '/') != null;
+            if (config.iglobs.len > 0) {
+                if (list.items.len >= glob.rule_count_hard_cap) return error.GlobCountExceeded;
+                const remain = glob.rule_count_hard_cap - list.items.len;
+                const compiled_i = try glob.compileGlobs(arena, config.iglobs, .{
+                    .case_insensitive = true,
+                    .max_rules = remain,
+                });
+                try list.appendSlice(arena, compiled_i);
+            }
+            self.user_globs = try list.toOwnedSlice(arena);
+            self.globs_prepared = true;
         }
-        self.user_globs = owned;
+        if (!self.ignore_prepared and config.ignore_texts.len > 0) {
+            var ig_list: std.ArrayList(glob.Glob) = .empty;
+            try ignore.parseTextsInto(arena, config.ignore_texts, &ig_list, .{
+                .case_insensitive = config.ignore_switches.case_insensitive,
+                .max_rules = config.ignore_switches.max_rules,
+            });
+            if (ig_list.items.len > 0) {
+                const owned = try ig_list.toOwnedSlice(arena);
+                self.empty = try ignore.build(arena, self.gpa, null, 0, &.{}, owned);
+            }
+            self.ignore_prepared = true;
+        }
     }
 };
 
@@ -122,6 +178,7 @@ fn openRoot(io: std.Io, path: []const u8) !std.Io.Dir {
 
 /// 打开一个搜索根。不读取根之上的忽略规则。调用方把返回的任务放进队列。
 pub fn createRoot(host: *Host, root_path: []const u8) !*Job {
+    try host.session.prepareConfig(host.io, host.config);
     const shown = trimSlash(root_path);
     const dir = try openRoot(host.io, shown);
     errdefer dir.close(host.io);
@@ -162,9 +219,7 @@ pub fn process(host: *Host, job: *Job) void {
 
     defer job.destroy(host.io);
     if (host.stop.load(.acquire)) return;
-    if (host.config.max_depth) |max| {
-        if (job.depth > max) return;
-    }
+    if (job.depth > host.config.effectiveMaxDepth()) return;
 
     const scratch = host.allocator.alignedAlloc(
         u8,
@@ -275,7 +330,7 @@ fn handleEntry(host: *Host, job: *Job, entry: std.Io.Dir.Entry, batch: *FileBatc
         .file => {
             if (ignore.isIgnored(job.ignore, rel, false, &scratch)) return;
             if (!allowFile(host, rel)) return;
-            if (!types.matches(host.config.types, name)) return;
+            if (!types.matchesWithTable(host.config.custom_types, host.config.types, host.config.types_not, name)) return;
             if (host.config.threads > 1) {
                 batch.push(host, job, name);
             } else {
@@ -314,11 +369,9 @@ fn descend(
         child_dir.close(host.io);
         return;
     }
-    if (host.config.max_depth) |max| {
-        if (job.depth >= max) {
-            child_dir.close(host.io);
-            return;
-        }
+    if (job.depth >= host.config.effectiveMaxDepth()) {
+        child_dir.close(host.io);
+        return;
     }
     const child = createJob(host, child_dir, job.root, rel, job.ignore, job.depth + 1) catch |err| {
         child_dir.close(host.io);
@@ -349,6 +402,13 @@ fn visitCheckedFile(
         };
         size = stat.size;
         if (size > limit) return;
+    }
+
+    const entry_cap = host.config.effectiveMaxEntries();
+    const seen = host.session.entries_visited.fetchAdd(1, .monotonic);
+    if (seen >= entry_cap) {
+        host.stop.store(true, .release);
+        return;
     }
 
     var stack_path: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -451,18 +511,32 @@ fn loadRules(
     prefix: usize,
 ) !*const ignore.Set {
     if (!host.config.read_ignore) return parent;
-    const git = readOptional(host, dir, ".gitignore");
+    const sw = host.config.ignore_switches;
+    const git_excl = if (sw.exclude and prefix == 0) readOptional(host, dir, ".git/info/exclude") else null;
+    defer if (git_excl) |bytes| host.allocator.free(bytes);
+    const git = if (sw.vcs) readOptional(host, dir, ".gitignore") else null;
     defer if (git) |bytes| host.allocator.free(bytes);
-    const local = readOptional(host, dir, ".ignore");
+    const local = if (sw.dot) readOptional(host, dir, ".ignore") else null;
     defer if (local) |bytes| host.allocator.free(bytes);
-    if ((git == null or git.?.len == 0) and (local == null or local.?.len == 0)) return parent;
+    const rg = if (sw.dot) readOptional(host, dir, ".rgignore") else null;
+    defer if (rg) |bytes| host.allocator.free(bytes);
+
+    const has_any = (git_excl != null and git_excl.?.len > 0) or
+        (git != null and git.?.len > 0) or
+        (local != null and local.?.len > 0) or
+        (rg != null and rg.?.len > 0);
+    if (!has_any) return parent;
 
     host.session.lock.lockUncancelable(host.io);
     defer host.session.lock.unlock(host.io);
     const arena = host.session.arena.allocator();
     var globs: std.ArrayList(glob.Glob) = .empty;
-    if (git) |bytes| try ignore.parseInto(arena, bytes, &globs);
-    if (local) |bytes| try ignore.parseInto(arena, bytes, &globs);
+    try ignore.parseLayerInto(arena, .{
+        .git_exclude = git_excl,
+        .gitignore = git,
+        .ignore = local,
+        .rgignore = rg,
+    }, sw, &globs);
     if (globs.items.len == 0) {
         globs.deinit(arena);
         return parent;
@@ -805,4 +879,71 @@ test "默认不跨文件系统" {
     defer freeFound(&opened);
     try collectWalk("/dev", .{ .one_file_system = false, .max_depth = 2 }, &opened);
     try std.testing.expect(sawBase(opened.items, marker));
+}
+
+test "J04 无 git 目录时忽略规则同样生效" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+
+    // 不创建 .git 目录，验证 .gitignore、.ignore、.rgignore 依然生效且按优先级覆盖
+    try tmp.dir.writeFile(io, .{ .sub_path = ".gitignore", .data = "*.log\n*.tmp\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ignore", .data = "!keep.log\n*.bak\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".rgignore", .data = "!keep.bak\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "ok" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "drop.log", .data = "no" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "keep.log", .data = "ok" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "drop.tmp", .data = "no" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "drop.bak", .data = "no" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "keep.bak", .data = "ok" });
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+    const root = path_buf[0..path_len];
+
+    var found: std.ArrayList([]u8) = .empty;
+    defer freeFound(&found);
+    try collectWalk(root, .{
+        .ignore_texts = &.{"injected_skip.txt\n"},
+    }, &found);
+
+    try std.testing.expect(sawBase(found.items, "a.txt"));
+    try std.testing.expect(sawBase(found.items, "keep.log"));
+    try std.testing.expect(sawBase(found.items, "keep.bak"));
+    try std.testing.expect(!sawBase(found.items, "drop.log"));
+    try std.testing.expect(!sawBase(found.items, "drop.tmp"));
+    try std.testing.expect(!sawBase(found.items, "drop.bak"));
+}
+
+test "J09 固定服务端最大遍历深度与 J11 遍历条数上限" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "d1.txt", .data = "1" });
+    try tmp.dir.createDir(io, "sub1", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "sub1/d2.txt", .data = "2" });
+    try tmp.dir.createDir(io, "sub1/sub2", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "sub1/sub2/d3.txt", .data = "3" });
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+    const root = path_buf[0..path_len];
+
+    // 1. J09：超大的 max_depth 自动钳制在 max_depth_hard_cap，且显式深度生效
+    const cfg_huge = Config{ .max_depth = 9999 };
+    try std.testing.expectEqual(Config.max_depth_hard_cap, cfg_huge.effectiveMaxDepth());
+
+    var depth2_found: std.ArrayList([]u8) = .empty;
+    defer freeFound(&depth2_found);
+    try collectWalk(root, .{ .max_depth = 2 }, &depth2_found);
+    try std.testing.expect(sawBase(depth2_found.items, "d1.txt"));
+    try std.testing.expect(sawBase(depth2_found.items, "d2.txt"));
+    try std.testing.expect(!sawBase(depth2_found.items, "d3.txt"));
+
+    // 2. J11：max_entries 限制最多访问的文件来源条数
+    var capped_found: std.ArrayList([]u8) = .empty;
+    defer freeFound(&capped_found);
+    try collectWalk(root, .{ .max_entries = 2 }, &capped_found);
+    try std.testing.expectEqual(@as(usize, 2), capped_found.items.len);
 }

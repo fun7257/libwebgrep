@@ -204,15 +204,15 @@ pub const two_way = @import("finder/two_way.zig");
 
 /// 内存树接口。搜索入口不接收它，也不打开它。
 pub const source = @import("source.zig");
-/// 字节 glob 辅助。搜索入口不按它选择来源。嵌套花括号尚未提供。
+/// 字节 glob 辅助（支持嵌套花括号、上限保护与忽略大小写）。搜索入口不按它选择来源。
 pub const walk_glob = @import("walk/glob.zig");
-/// 解析调用方已有的忽略文本。不读环境，也不读父目录。搜索入口不应用它。
+/// 解析调用方已有的忽略文本（支持纯文本注入与细分开关）。不读环境，也不读父目录。搜索入口不应用它。
 pub const walk_ignore = @import("walk/ignore.zig");
 /// 指针的工作窃取队列。搜索入口不创建它，也不起线程。
 pub const walk_deque = @import("walk/deque.zig");
 /// 已打开目录或文件的设备号和 inode。搜索入口不调用它。
 pub const walk_file_id = @import("walk/file_id.zig");
-/// 固定类型名到文件名的辅助。搜索入口不按类型过滤。
+/// 类型名到文件名的辅助（支持调用方注入自定义类型表并展开为 glob）。搜索入口不按类型过滤。
 pub const walk_types = @import("walk/types.zig");
 /// 枚举已打开的目录。搜索入口不列举目录。
 pub const walk_list = @import("walk/list_dir.zig");

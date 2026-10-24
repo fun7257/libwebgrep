@@ -19,7 +19,10 @@ const finder_mod = @import("finder/finder.zig");
 const matcher = @import("matcher.zig");
 const multi_mod = @import("finder/multi.zig");
 const searcher = @import("searcher.zig");
+const sink_mod = @import("sink.zig");
 const walker = @import("walk/walker.zig");
+
+pub const max_concurrency_hard_cap: u32 = 32;
 
 pub const Emit = enum {
     text,
@@ -57,6 +60,9 @@ pub const Run = struct {
     saw_output: *bool,
     /// 保留字段。汇总改由服务入口的 summary 事件发出，这里不再写终端文本。
     write_summary: bool = false,
+    /// 可选流式事件回调（L04）：每个来源完成时立即流式交出事件，不为排序缓存全量结果。
+    on_event: ?*const fn (*anyopaque, sink_mod.Event) sink_mod.Flow = null,
+    event_ctx: ?*anyopaque = null,
 };
 
 const Queue = deque.Deque(walker.Job);
@@ -93,6 +99,22 @@ const Shared = struct {
     errors: std.atomic.Value(u32) = .init(0),
     any_match: std.atomic.Value(bool) = .init(false),
     write_failed: std.atomic.Value(bool) = .init(false),
+    on_event: ?*const fn (*anyopaque, sink_mod.Event) sink_mod.Flow = null,
+    event_ctx: ?*anyopaque = null,
+
+    fn emitEvent(self: *Shared, ev: sink_mod.Event) bool {
+        const cb = self.on_event orelse return true;
+        const ctx = self.event_ctx orelse return true;
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
+        return switch (cb(ctx, ev)) {
+            .cont => true,
+            .pause, .stop => blk: {
+                requestStop(self);
+                break :blk false;
+            },
+        };
+    }
 
     fn note(self: *Shared, path: []const u8, err: anyerror) void {
         _ = self.errors.fetchAdd(1, .monotonic);
@@ -167,7 +189,7 @@ fn alignBudgets(search: searcher.SearchConfig, walk: walker.Config) Budgets {
 }
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, req: Run) !Stats {
-    const workers = resolveThreads(req.walk.threads);
+    const workers = resolveConcurrency(req.walk.threads, req.search.max_concurrency);
     const budgets = alignBudgets(req.search, req.walk);
     var walk_cfg = budgets.walk;
     walk_cfg.threads = workers;
@@ -186,7 +208,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, req: Run) !Stats {
         queue.* = try Queue.init(allocator, 8);
         ready += 1;
     }
-    try session.prepareGlobs(io, req.walk.globs);
+    try session.prepareConfig(io, req.walk);
 
     const started = std.Io.Timestamp.now(io, .awake);
     var many: ?multi_mod.Multi = null;
@@ -213,6 +235,8 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, req: Run) !Stats {
         .use_separator = req.use_separator and req.emit == .text,
         .saw = req.saw_output,
         .workers = workers,
+        .on_event = req.on_event,
+        .event_ctx = req.event_ctx,
     };
 
     var bootstrap = Worker{
@@ -422,8 +446,23 @@ fn onFile(ctx: *anyopaque, visit: walker.Visit) anyerror!walker.Control {
         return .stop;
     }
     if (shared.emit == .files_only) {
-        _ = shared.searches.fetchAdd(1, .monotonic);
+        const count = shared.searches.fetchAdd(1, .monotonic) + 1;
+        _ = shared.searches_with_match.fetchAdd(1, .monotonic);
         shared.any_match.store(true, .release);
+        _ = shared.emitEvent(.{ .begin = .{ .source_id = visit.path } });
+        _ = shared.emitEvent(.{ .end = .{
+            .source_id = visit.path,
+            .matched_lines = 0,
+            .matches = 0,
+            .bytes_read = 0,
+            .outcome = .complete,
+        } });
+        if (shared.search.max_results) |max_res| {
+            if (count >= max_res) {
+                requestStop(shared);
+                return .stop;
+            }
+        }
         return .cont;
     }
 
@@ -460,10 +499,25 @@ fn searchWith(worker: *Worker, engine: anytype, file: std.Io.File, path: []const
     var sink = Tally{
         .shared = worker.shared,
         .stop_file = worker.shared.emit == .files_with_matches,
+        .source_id = path,
     };
+    _ = worker.shared.emitEvent(.{ .begin = .{ .source_id = path } });
     const result = try searcher.searchFile(Tally, worker.shared.allocator, worker.shared.io, &sink, file, path, engine, cfg);
     noteSoft(worker, path, result);
     worker.shared.addSearch(result, result.matches, result.bytes_read, 0);
+    _ = worker.shared.emitEvent(.{ .end = .{
+        .source_id = path,
+        .binary_status = if (result.nul_offset == null) .none else if (result.outcome == .binary_quit) .suppressed else .detected,
+        .binary_offset = result.binary_offset,
+        .matched_lines = result.matched_lines,
+        .matches = result.matches,
+        .bytes_read = result.bytes_read,
+        .outcome = result.outcome,
+        .limit_hit = result.limit_hit,
+        .partial = result.partial,
+        .resume_at = result.resume_at,
+        .soft_error = result.soft_error,
+    } });
     const charged = worker.shared.request_used.fetchAdd(result.bytes_read, .monotonic);
     if (charged + result.bytes_read >= worker.shared.request_cap) requestStop(worker.shared);
 }
@@ -471,9 +525,28 @@ fn searchWith(worker: *Worker, engine: anytype, file: std.Io.File, path: []const
 const Tally = struct {
     shared: *Shared,
     stop_file: bool,
+    source_id: []const u8 = "",
 
     pub fn matched(self: *Tally, line: searcher.Line) bool {
-        _ = line;
+        if (self.shared.on_event != null) {
+            if (!self.shared.emitEvent(.{ .match = .{
+                .source_id = self.source_id,
+                .line_number = line.number orelse 1,
+                .column = line.column,
+                .u16_column = line.u16_column,
+                .absolute_offset = line.offset,
+                .raw_offset = line.raw_offset,
+                .bytes = line.bytes,
+                .text = line.text,
+                .raw = line.raw,
+                .replaced = line.replaced,
+                .matches = line.matches,
+                .truncated = line.truncated,
+                .line_len = line.line_len,
+                .window_start = line.window_start,
+                .binary_status = line.binary_status,
+            } })) return false;
+        }
         if (self.shared.emit == .quiet) {
             requestStop(self.shared);
             return false;
@@ -483,45 +556,28 @@ const Tally = struct {
     }
 };
 
+/// 工作线程数完全由调用方配置决定，绝不探测宿主 CPU 核数（J14）。
+/// 未指定（0）时固定为 1（单线程），且受服务端并发硬顶 `max_concurrency_hard_cap` 约束。
 pub fn resolveThreads(requested: u32) u32 {
     if (builtin.single_threaded) return 1;
-    if (requested != 0) return requested;
-    const logical = std.Thread.getCpuCount() catch 1;
-    var count = logical;
-    // 大小核上，逻辑 CPU 数会把一半工人放到能效核。目录搜索要等最慢的工人，
-    // 8 线程的合计 system 时间大约是 4 个性能核的两倍，墙钟更慢。显式 -j 不走这里。
-    if (performanceCoreCount()) |perf| {
-        if (perf > 0 and perf < logical) count = perf;
-    }
-    if (count == 0) return 1;
-    return @intCast(@min(count, std.math.maxInt(u32)));
+    if (requested == 0) return 1;
+    return @min(requested, max_concurrency_hard_cap);
 }
 
-fn performanceCoreCount() ?usize {
-    if (comptime !builtin.os.tag.isDarwin()) return null;
-    var count: c_int = 0;
-    var len: usize = @sizeOf(c_int);
-    const rc = std.posix.system.sysctlbyname("hw.perflevel0.physicalcpu", &count, &len, null, 0);
-    switch (std.posix.errno(rc)) {
-        .SUCCESS => {},
-        else => return null,
-    }
-    if (count <= 0) return null;
-    return @intCast(count);
+pub fn resolveConcurrency(walk_threads: u32, max_concurrency: ?u32) u32 {
+    if (max_concurrency) |mc| return resolveThreads(mc);
+    return resolveThreads(walk_threads);
 }
 
-test "默认工人数在性能核更少时用性能核" {
-    if (builtin.single_threaded) return;
-    const logical = std.Thread.getCpuCount() catch 1;
-    const n = resolveThreads(0);
-    if (performanceCoreCount()) |perf| {
-        if (perf > 0 and perf < logical) {
-            try testing.expectEqual(@as(u32, @intCast(perf)), n);
-            return;
-        }
+test "J14 线程数严格受控且不探测 CPU 核数" {
+    try testing.expectEqual(@as(u32, 1), resolveThreads(0));
+    try testing.expectEqual(@as(u32, 1), resolveConcurrency(0, null));
+    if (!builtin.single_threaded) {
+        try testing.expectEqual(@as(u32, 4), resolveThreads(4));
+        try testing.expectEqual(@as(u32, 6), resolveConcurrency(2, 6));
+        try testing.expectEqual(max_concurrency_hard_cap, resolveThreads(999));
+        try testing.expectEqual(max_concurrency_hard_cap, resolveConcurrency(1, 999));
     }
-    const expect: u32 = @intCast(@min(@max(logical, 1), std.math.maxInt(u32)));
-    try testing.expectEqual(expect, n);
 }
 
 const testing = std.testing;
@@ -709,4 +765,112 @@ test "quiet 命中会叫醒已经睡着的工人" {
     try testing.expect(stats.matched);
     try testing.expect(stats.matched_lines >= 1);
     try testing.expectEqual(@as(u32, 0), stats.errors);
+}
+
+test "J13 仅列出来源计入遍历预算" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "1\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.txt", .data = "2\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "c.txt", .data = "3\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "d.txt", .data = "4\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "skip.log", .data = "5\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".gitignore", .data = "*.log\n" });
+
+    const root = try tempRoot(tmp.dir);
+    defer testing.allocator.free(root);
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var saw = false;
+
+    // 1. max_results 限制仅列出来源条数
+    const stats_res = try run(testing.allocator, io, .{
+        .roots = &.{root},
+        .emit = .files_only,
+        .search = .{ .max_results = 2 },
+        .walk = .{ .threads = 1 },
+        .stdout = &out.writer,
+        .saw_output = &saw,
+    });
+    try testing.expectEqual(@as(u64, 2), stats_res.searches);
+    try testing.expectEqual(@as(u64, 0), stats_res.bytes_searched);
+
+    // 2. walk.max_entries 限制遍历条数预算
+    const stats_entries = try run(testing.allocator, io, .{
+        .roots = &.{root},
+        .emit = .files_only,
+        .walk = .{ .threads = 1, .max_entries = 3 },
+        .stdout = &out.writer,
+        .saw_output = &saw,
+    });
+    try testing.expectEqual(@as(u64, 3), stats_entries.searches);
+}
+
+test "L04 多来源流式交出事件且不为排序缓存全量结果" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "s1.txt", .data = "needle\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "s2.txt", .data = "other\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "s3.txt", .data = "needle\n" });
+
+    const root = try tempRoot(tmp.dir);
+    defer testing.allocator.free(root);
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var saw = false;
+
+    const StreamCheck = struct {
+        begins: u32 = 0,
+        matches: u32 = 0,
+        ends: u32 = 0,
+        stopped_after_first_end: bool = false,
+
+        fn onEvent(ctx: *anyopaque, ev: sink_mod.Event) sink_mod.Flow {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (ev) {
+                .begin => self.begins += 1,
+                .match => self.matches += 1,
+                .end => {
+                    self.ends += 1;
+                    // 验证边搜边交出 end：第一个来源刚发完 end 就可立即叫停，证明没有先攒齐全部来源再排序输出
+                    if (self.stopped_after_first_end) return .stop;
+                },
+                else => {},
+            }
+            return .cont;
+        }
+    };
+
+    var stream_all = StreamCheck{};
+    const stats_all = try run(testing.allocator, io, .{
+        .pattern = "needle",
+        .roots = &.{root},
+        .walk = .{ .threads = 1 },
+        .emit = .count,
+        .stdout = &out.writer,
+        .saw_output = &saw,
+        .on_event = StreamCheck.onEvent,
+        .event_ctx = &stream_all,
+    });
+    try testing.expectEqual(@as(u64, 3), stats_all.searches);
+    try testing.expectEqual(@as(u32, 3), stream_all.begins);
+    try testing.expectEqual(@as(u32, 2), stream_all.matches);
+    try testing.expectEqual(@as(u32, 3), stream_all.ends);
+
+    // 验证第一个来源收到 end 后立即停止，后续来源不再被扫描（证明流式交出而非全量缓冲）
+    var stream_early = StreamCheck{ .stopped_after_first_end = true };
+    const stats_early = try run(testing.allocator, io, .{
+        .pattern = "needle",
+        .roots = &.{root},
+        .walk = .{ .threads = 1 },
+        .emit = .count,
+        .stdout = &out.writer,
+        .saw_output = &saw,
+        .on_event = StreamCheck.onEvent,
+        .event_ctx = &stream_early,
+    });
+    try testing.expectEqual(@as(u64, 1), stats_early.searches);
+    try testing.expectEqual(@as(u32, 1), stream_early.ends);
 }

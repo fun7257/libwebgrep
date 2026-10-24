@@ -622,9 +622,9 @@ Regex.deinit(self)
 
 下面这些现在不能当作已经可以调用的搜索能力：
 
-- 把目录列举、glob、忽略规则、类型过滤接到搜索入口。嵌套花括号也尚未提供。
+- 把目录列举、glob、忽略规则、类型过滤直接作为单输入搜索入口的参数自动打开文件（单输入搜索入口只搜调用方已打开的流或切片，目录路径的自动打开尚未提供在公共搜索入口上）。
 
-`walk_glob`、`walk_ignore`、`walk_types`、`walk_list`、`walk_deque`、`walk_file_id` 已经导出，但搜索入口不调用它们来列举或过滤来源。
+`walk_glob`、`walk_ignore`、`walk_types`、`walk_list`、`walk_deque`、`walk_file_id` 已经导出，供调用方在构造或过滤来源集合时直接使用，单输入搜索入口不隐式调用它们来列举目录。
 
 ### sink_mod
 
@@ -638,13 +638,14 @@ Regex.deinit(self)
 
 ### walk_glob
 
-导出 `src/walk/glob.zig`。字节 glob，不分配。`*` 和 `?` 不跨 `/`。`**` 只有占满一整段时才跨目录。字符类支持区间，以及 `!` 或 `^` 取反。按字节比较。
+导出 `src/walk/glob.zig`。字节 glob。`*` 和 `?` 不跨 `/`。`**` 只有占满一整段时才跨目录。字符类支持区间，以及 `!` 或 `^` 取反。按字节比较，支持 ASCII 忽略大小写（`case_insensitive`）与嵌套花括号 `{a,{b,c}}` 展开，内置规则条数硬顶（`rule_count_hard_cap = 1024`）、单条长度硬顶（`rule_len_hard_cap = 4096`）与花括号嵌套深度硬顶（`brace_depth_hard_cap = 8`）。
 
 - `Class`：`exact`、`ext`、`prefix`、`suffix`、`general`。
-- `Glob`：`text`、`key`、`class`，以及 `anchored`、`dir_only`、`negated`。`text` 和 `key` 由调用方持有。
-- `classify(text)` 按元字符分类。`key` 指向 `text` 里的字面量部分。
-- `matches(glob, rel, base, is_dir)`：`rel` 是相对这一层的名字，`base` 是最后一段。
-- `matchText(pattern, text)` 做一般匹配。
+- `Glob`：`text`、`key`、`class`，以及 `anchored`、`dir_only`、`negated`、`case_insensitive`。`text` 和 `key` 由调用方持有。
+- `classify(text)`、`classifyWithCase(text, case_insensitive)` 按元字符分类。`key` 指向 `text` 里的字面量部分。
+- `expandBraces(allocator, pattern, out, max_rules)`、`compileGlobs(arena, patterns, options)`：展开嵌套花括号并校验规则条数与长度上限。
+- `matches(glob, rel, base, is_dir)`、`matchGlobs(globs, rel, base, is_dir)`：`rel` 是相对这一层的名字，`base` 是最后一段，多条规则按后写优先裁决。
+- `matchText(pattern, text)`、`matchTextCase(pattern, text, case_insensitive)` 做一般匹配。
 - `basename` 取最后一个 `/` 之后的字节。输入是调用方已有的切片。
 
 搜索入口不按 glob 选择来源。
@@ -655,8 +656,9 @@ Regex.deinit(self)
 
 - `Affix`：`text` 和 `index`。
 - `Set`：一层规则。`parent` 把更深层链到外层。建好之后只读，可以共享。
-- `parseLine` 解析一行。空行和 `#` 注释返回 null。`!` 表示否定，尾部 `/` 表示只对目录。文本由分配器复制。
-- `parseInto` 把整段文本追加进 `std.ArrayList(glob.Glob)`。
+- `ParseOptions`、`LayerFiles`、`LayerSwitch`：支持控制 `dot`（`.ignore` 与 `.rgignore`）、`vcs`（`.gitignore`）、`exclude`（仓库内 info 忽略）、`case_insensitive` 与条数上限。
+- `parseLine`、`parseLineWithOptions` 解析一行。空行和 `#` 注释返回 null。`!` 表示否定，尾部 `/` 表示只对目录。文本由分配器复制。
+- `parseInto`、`parseIntoWithOptions`、`parseTextsInto`、`parseLayerInto` 把单段或多段纯文本规则追加进 `std.ArrayList(glob.Glob)`。
 - `build` 用 arena 做索引。glob 的文本必须活得和集合一样久。
 - `isIgnored(set, rel, is_dir, scratch)`。`scratch` 要能放下前缀加相对名称。放不下时这一层自己的规则不参与判断。父层已经忽略时，里面的名字也算忽略，后写的否定不能把它救回来。同一层里后写的规则胜出。
 
@@ -676,7 +678,7 @@ Regex.deinit(self)
 
 ### walk_types
 
-导出 `src/walk/types.zig`。按一组固定的类型名做文件名过滤。`Type` 有 `name` 和 `patterns`。`builtin` 是这张表。`find(name)` 按名字查找。`matches(selected, base)`：`selected` 为空表示不过滤，否则文件名命中其中一个类型即可。搜索入口不按类型过滤。类型表不能由这次调用追加。
+导出 `src/walk/types.zig`。按类型名做文件名过滤并支持调用方注入自定义类型表。`Type` 有 `name` 和 `patterns`。`builtin` 是内置表。`find(name)`、`findInTable(table, name)` 按名字查找。`expandTypesToGlobs(arena, table, include, exclude)` 把包含与排除的类型名展开为 `glob.Glob` 切片。`matches(selected, base)`、`matchesWithTable(table, selected, excluded, base)`：`selected` 为空表示不过滤正向类型，命中 `excluded` 则直接拒绝。搜索入口不按类型过滤。
 
 ### walk_list
 

@@ -29,21 +29,105 @@ pub const Set = struct {
     general: []const u32 = &.{},
 };
 
+pub const ParseOptions = struct {
+    case_insensitive: bool = false,
+    max_rules: ?usize = null,
+};
+
+pub const LayerFiles = struct {
+    git_exclude: ?[]const u8 = null,
+    gitignore: ?[]const u8 = null,
+    ignore: ?[]const u8 = null,
+    rgignore: ?[]const u8 = null,
+};
+
+pub const LayerSwitch = struct {
+    /// 是否启用 `.ignore` 与 `.rgignore`。
+    dot: bool = true,
+    /// 是否启用 `.gitignore`。
+    vcs: bool = true,
+    /// 是否启用仓库内的 `.git/info/exclude`。
+    exclude: bool = true,
+    /// 忽略规则是否忽略 ASCII 大小写。
+    case_insensitive: bool = false,
+    /// 单次解析规则条数上限（不超过硬顶）。
+    max_rules: ?usize = null,
+};
+
 /// 把一份忽略文件追加成 glob。`text` 会复制进 `allocator`。
 pub fn parseInto(allocator: std.mem.Allocator, text: []const u8, out: *std.ArrayList(glob.Glob)) !void {
+    return parseIntoWithOptions(allocator, text, out, .{});
+}
+
+/// 按选项解析一份忽略规则文本并追加至 `out`，受条数上限保护。
+pub fn parseIntoWithOptions(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    out: *std.ArrayList(glob.Glob),
+    options: ParseOptions,
+) !void {
+    const cap = if (options.max_rules) |m| @min(m, glob.rule_count_hard_cap) else glob.rule_count_hard_cap;
     var line_start: usize = 0;
     while (line_start <= text.len) {
         const line_end = std.mem.indexOfScalarPos(u8, text, line_start, '\n') orelse text.len;
         var line = text[line_start..line_end];
         if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-        if (try parseLine(allocator, line)) |item| try out.append(allocator, item);
+        if (try parseLineWithOptions(allocator, line, options.case_insensitive)) |item| {
+            if (out.items.len >= cap) return error.GlobCountExceeded;
+            try out.append(allocator, item);
+        }
         if (line_end == text.len) break;
         line_start = line_end + 1;
     }
 }
 
+/// 解析调用方注入的多段纯文本忽略规则（不接受路径）。
+pub fn parseTextsInto(
+    allocator: std.mem.Allocator,
+    texts: []const []const u8,
+    out: *std.ArrayList(glob.Glob),
+    options: ParseOptions,
+) !void {
+    for (texts) |text| {
+        try parseIntoWithOptions(allocator, text, out, options);
+    }
+}
+
+/// 按优先级（`git_exclude` < `.gitignore` < `.ignore` < `.rgignore`）与细分开关解析同一层目录的忽略文本。
+pub fn parseLayerInto(
+    allocator: std.mem.Allocator,
+    files: LayerFiles,
+    switches: LayerSwitch,
+    out: *std.ArrayList(glob.Glob),
+) !void {
+    const opts = ParseOptions{
+        .case_insensitive = switches.case_insensitive,
+        .max_rules = switches.max_rules,
+    };
+    if (switches.exclude) {
+        if (files.git_exclude) |bytes| try parseIntoWithOptions(allocator, bytes, out, opts);
+    }
+    if (switches.vcs) {
+        if (files.gitignore) |bytes| try parseIntoWithOptions(allocator, bytes, out, opts);
+    }
+    if (switches.dot) {
+        if (files.ignore) |bytes| try parseIntoWithOptions(allocator, bytes, out, opts);
+        if (files.rgignore) |bytes| try parseIntoWithOptions(allocator, bytes, out, opts);
+    }
+}
+
 /// 解析一行。空行和注释返回 null。
 pub fn parseLine(allocator: std.mem.Allocator, line: []const u8) !?glob.Glob {
+    return parseLineWithOptions(allocator, line, false);
+}
+
+/// 解析一行，支持指定 ASCII 忽略大小写。
+pub fn parseLineWithOptions(
+    allocator: std.mem.Allocator,
+    line: []const u8,
+    case_insensitive: bool,
+) !?glob.Glob {
+    if (line.len > glob.rule_len_hard_cap) return error.GlobTooLong;
     const trimmed = stripTrailingSpace(line);
     if (trimmed.len == 0 or trimmed[0] == '#') return null;
 
@@ -87,7 +171,7 @@ pub fn parseLine(allocator: std.mem.Allocator, line: []const u8) !?glob.Glob {
 
     const owned = try allocator.dupe(u8, pattern);
     raw.deinit(allocator);
-    var item = glob.classify(owned);
+    var item = glob.classifyWithCase(owned, case_insensitive);
     item.anchored = anchored;
     item.dir_only = dir_only;
     item.negated = negated;
@@ -151,7 +235,7 @@ pub fn build(
 
     for (globs, 0..) |item, index| {
         const id: u32 = @intCast(index);
-        if (item.anchored or item.class == .general) {
+        if (item.anchored or item.case_insensitive or item.class == .general) {
             try general.append(gpa, id);
             continue;
         }
@@ -342,4 +426,50 @@ test "深层集合覆盖浅层" {
     try std.testing.expect(isIgnored(&child, "dir/no.log", false, &scratch));
     try std.testing.expect(!isIgnored(&child, "dir/keep.log", false, &scratch));
     try std.testing.expect(isIgnored(&parent, "dir/keep.log", false, &scratch));
+}
+
+test "J05 纯文本忽略规则与 J08 细分开关" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // 1. J05：多段纯文本忽略规则注入（后段覆盖前段，支持大小写忽略）
+    var injected: std.ArrayList(glob.Glob) = .empty;
+    try parseTextsInto(
+        arena,
+        &.{ "*.TMP\nsecret.txt\n", "!keep.tmp\n" },
+        &injected,
+        .{ .case_insensitive = true },
+    );
+    const injected_set = try build(arena, std.testing.allocator, null, 0, &.{}, injected.items);
+    var scratch: [256]u8 = undefined;
+    try std.testing.expect(isIgnored(&injected_set, "cache.tmp", false, &scratch));
+    try std.testing.expect(!isIgnored(&injected_set, "KEEP.TMP", false, &scratch));
+    try std.testing.expect(isIgnored(&injected_set, "SECRET.TXT", false, &scratch));
+
+    // 2. J03 / J08：层级文件优先级（git_exclude < .gitignore < .ignore < .rgignore）与细分开关
+    const files = LayerFiles{
+        .git_exclude = "*.bak\n",
+        .gitignore = "*.log\n",
+        .ignore = "!app.log\n*.out\n",
+        .rgignore = "!final.out\n",
+    };
+
+    var all_globs: std.ArrayList(glob.Glob) = .empty;
+    try parseLayerInto(arena, files, .{}, &all_globs);
+    const full_set = try build(arena, std.testing.allocator, null, 0, &.{}, all_globs.items);
+    try std.testing.expect(isIgnored(&full_set, "a.bak", false, &scratch));
+    try std.testing.expect(isIgnored(&full_set, "debug.log", false, &scratch));
+    try std.testing.expect(!isIgnored(&full_set, "app.log", false, &scratch));
+    try std.testing.expect(isIgnored(&full_set, "temp.out", false, &scratch));
+    try std.testing.expect(!isIgnored(&full_set, "final.out", false, &scratch));
+
+    // 关闭 vcs 与 exclude，仅保留 dot（.ignore / .rgignore）
+    var dot_only_globs: std.ArrayList(glob.Glob) = .empty;
+    try parseLayerInto(arena, files, .{ .vcs = false, .exclude = false, .dot = true }, &dot_only_globs);
+    const dot_set = try build(arena, std.testing.allocator, null, 0, &.{}, dot_only_globs.items);
+    try std.testing.expect(!isIgnored(&dot_set, "a.bak", false, &scratch));
+    try std.testing.expect(!isIgnored(&dot_set, "debug.log", false, &scratch));
+    try std.testing.expect(isIgnored(&dot_set, "temp.out", false, &scratch));
+    try std.testing.expect(!isIgnored(&dot_set, "final.out", false, &scratch));
 }

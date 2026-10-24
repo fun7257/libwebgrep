@@ -15,6 +15,8 @@ pub const Span = struct {
     end: usize,
     u16_start: usize = 0,
     u16_end: usize = 0,
+    /// `SearchConfig.replacement` 非 null 时附带替换文本。只在本次回调期间有效。
+    replacement: ?[]const u8 = null,
 };
 
 /// 回调对搜索的控制。`bool` 仍然表示继续或停止；服务入口也可以返回这个枚举。
@@ -124,6 +126,9 @@ pub const LineEvent = struct {
     bytes: []const u8,
     text: []const u8 = &.{},
     raw: []const u8 = &.{},
+    /// `SearchConfig.replacement` 非 null 时，把这一行的匹配区间替换后的预览文本。
+    /// 原始 `bytes` 与输入字节保持不变。只在本次回调期间有效。
+    replaced: ?[]const u8 = null,
     /// 半开字节区间，相对 `bytes`，按起点排序。
     /// 只显示命中片段时用这些区间切 `bytes`。没有单独的片段输出模式。
     /// core 只给出区间，不插入颜色码或标记。
@@ -210,6 +215,9 @@ pub const Line = struct {
     /// 这一行的原始字节，字节偏移相对它。通常与 `bytes` 相同。
     /// 只在本次回调期间有效。
     raw: []const u8 = &.{},
+    /// `SearchConfig.replacement` 非 null 时，把这一行的匹配区间替换后的预览文本。
+    /// 原始 `bytes` 与输入字节保持不变。只在本次回调期间有效。
+    replaced: ?[]const u8 = null,
     /// 该行第一个字节在可搜索字节流里的绝对偏移。转码之后从转码结果计。
     offset: u64,
     /// 从 1 开始。未打开行号时为 null。NUL 记录模式按记录计数。

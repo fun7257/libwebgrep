@@ -148,6 +148,12 @@ pub const SearchConfig = struct {
     live_closed: ?*const std.atomic.Value(bool) = null,
     /// 暂停后续搜。`resumeSourceSlice` 填入。
     continuation: ?*const sink_mod.ResumeState = null,
+    /// 有序输入在首条匹配之后遇到不匹配行立即停止并关闭上游。
+    stop_on_nonmatch: bool = false,
+    /// 全文高亮模式：输出所有行，不匹配行作为上下文事件交出，匹配行作为匹配事件交出。
+    passthru: bool = false,
+    /// 只读替换预览模板。非 null 时在 Span.replacement 与 Line.replaced / LineEvent.replaced 中给出替换后预览，不修改原输入。
+    replacement: ?[]const u8 = null,
     /// 细节日志。消息可以含路径；返回的错误不含。库不把这些消息交给终端。
     log: ?*const fn (?*anyopaque, []const u8) void = null,
     log_ctx: ?*anyopaque = null,
@@ -236,6 +242,7 @@ const State = struct {
     /// 有损文本放不进栈缓冲时用。只在回调返回前有效。
     text_alloc: ?std.mem.Allocator = null,
     text_buf: []u8 = &.{},
+    replace_buf: []u8 = &.{},
     /// 日志里用的来源名。不放进返回的错误。
     label: []const u8 = "",
     started_ns: i128 = 0,
@@ -334,6 +341,7 @@ fn searchPrepared(
     armClock(&state, config);
     state.text_alloc = config.decode_allocator;
     defer if (state.text_buf.len != 0) if (state.text_alloc) |alloc| alloc.free(state.text_buf);
+    defer if (state.replace_buf.len != 0) if (state.text_alloc) |alloc| alloc.free(state.replace_buf);
     state.ring.cap = beforeCount(config);
     state.ring.stride = config.max_line_len;
     if (config.line_numbers) state.line_number = 1;
@@ -829,6 +837,7 @@ fn lineEvent(source_id: []const u8, line: Line) sink_mod.LineEvent {
         .bytes = line.bytes,
         .text = if (line.text.len == 0) line.bytes else line.text,
         .raw = if (line.raw.len == 0) line.bytes else line.raw,
+        .replaced = line.replaced,
         .matches = line.matches,
         .truncated = line.truncated,
         .line_len = line.line_len,
@@ -858,6 +867,7 @@ fn drive(
     state.from_reader = true;
     state.text_alloc = allocator;
     defer if (state.text_buf.len != 0) allocator.free(state.text_buf);
+    defer if (state.replace_buf.len != 0) allocator.free(state.replace_buf);
     state.ring.cap = beforeCount(config);
     state.ring.stride = config.max_line_len;
     if (state.ring.cap > 0) {
@@ -1360,6 +1370,7 @@ fn grow(allocator: std.mem.Allocator, buf: []u8, config: SearchConfig) error{Out
 
 fn canFuse(matcher: anytype, config: SearchConfig, state: *const State) bool {
     if (config.null_data) return false;
+    if (config.passthru or config.stop_on_nonmatch) return false;
     if (state.prefer_prepass or state.nul_offset != null) return false;
     if (config.binary == .none or config.invert or beforeCount(config) != 0 or afterCount(config) != 0) return false;
     if (config.whole_word or config.whole_line or config.contains.len != 0 or config.excludes.len != 0) return false;
@@ -1415,6 +1426,12 @@ fn matchBuffer(
                 state.pos = line.end;
                 continue;
             }
+            if (config.stop_on_nonmatch and state.matched_lines > 0 and line.start > state.pos) {
+                state.pos = lineEnd(buf, state.pos, config);
+                state.stopped = true;
+                state.need_close = true;
+                return false;
+            }
             if (config.files_without_match) {
                 state.limit_count += 1;
                 state.matched_lines += 1;
@@ -1426,18 +1443,32 @@ fn matchBuffer(
                 return false;
             }
             state.limit_count += 1;
-            if (beforeCount(config) > 0 or afterCount(config) > 0) {
+            if (config.passthru) {
+                if (!try passthruTo(S, sink, matcher, buf, line.start, state, config)) return false;
+            } else if (beforeCount(config) > 0 or afterCount(config) > 0) {
                 if (!try afterContext(S, sink, matcher, buf, line.start, state, config)) return false;
                 if (!try beforeContext(S, sink, matcher, buf, line.start, state, config)) return false;
             }
             state.pos = line.end;
             const known = BufMatch{ .start = line.mstart, .end = line.mend };
             if (!try sinkMatched(S, sink, matcher, buf, line.range(), known, state, config)) return false;
-        } else break;
+        } else {
+            if (config.stop_on_nonmatch and state.matched_lines > 0) {
+                state.pos = lineEnd(buf, state.pos, config);
+                state.stopped = true;
+                state.need_close = true;
+                return false;
+            }
+            break;
+        }
     }
     if (state.stopped) return false;
     if (!maybeProgress(S, sink, state, config)) return false;
-    if (!try afterContext(S, sink, matcher, buf, buf.len, state, config)) return false;
+    if (config.passthru and !state.exceeded(config)) {
+        if (!try passthruTo(S, sink, matcher, buf, buf.len, state, config)) return false;
+    } else {
+        if (!try afterContext(S, sink, matcher, buf, buf.len, state, config)) return false;
+    }
     // 上限已经达到时，缓冲里的 after 行刚才交过了，不能再为后面的行去读。
     if (state.exceeded(config)) return false;
     state.pos = buf.len;
@@ -1545,29 +1576,74 @@ fn matchInvert(
     state: *State,
     config: SearchConfig,
 ) SliceError!bool {
+    var found_nonmatch = false;
+    var nonmatch_range: Range = .{ .start = 0, .end = 0 };
     const gap: Range = if (try findLine(matcher, buf, state, config)) |line| blk: {
         const g = Range{ .start = state.pos, .end = line.start };
         state.pos = line.end;
+        found_nonmatch = true;
+        nonmatch_range = line.range();
         break :blk g;
     } else blk: {
         const g = Range{ .start = state.pos, .end = buf.len };
         state.pos = buf.len;
         break :blk g;
     };
-    if (gap.start == gap.end) return true;
-
-    if (beforeCount(config) > 0 or afterCount(config) > 0) {
-        if (!try afterContext(S, sink, matcher, buf, gap.start, state, config)) return false;
-        if (!try beforeContext(S, sink, matcher, buf, gap.start, state, config)) return false;
+    if (gap.start < gap.end) {
+        if (config.passthru) {
+            if (!try passthruTo(S, sink, matcher, buf, gap.start, state, config)) return false;
+        } else if (beforeCount(config) > 0 or afterCount(config) > 0) {
+            if (!try afterContext(S, sink, matcher, buf, gap.start, state, config)) return false;
+            if (!try beforeContext(S, sink, matcher, buf, gap.start, state, config)) return false;
+        }
+        var cursor = gap.start;
+        while (nextLine(buf, cursor, gap.end, config)) |line| {
+            cursor = line.end;
+            const content_end = contentEnd(buf, line, config);
+            if (!linePassesFilters(buf, line.start, content_end, config)) {
+                if (config.stop_on_nonmatch and state.matched_lines > 0) {
+                    state.pos = line.end;
+                    state.stopped = true;
+                    state.need_close = true;
+                    return false;
+                }
+                if (config.passthru) {
+                    if (!try sinkContext(S, sink, matcher, buf, line, .after, state, config)) return false;
+                }
+                continue;
+            }
+            state.limit_count += 1;
+            if (!try sinkMatched(S, sink, matcher, buf, line, null, state, config)) return false;
+            if (state.exceeded(config)) return false;
+        }
     }
-    var cursor = gap.start;
-    while (nextLine(buf, cursor, gap.end, config)) |line| {
+    if (found_nonmatch) {
+        if (config.stop_on_nonmatch and state.matched_lines > 0) {
+            state.stopped = true;
+            state.need_close = true;
+            return false;
+        }
+        if (config.passthru) {
+            if (!try sinkContext(S, sink, matcher, buf, nonmatch_range, .after, state, config)) return false;
+        }
+    }
+    return true;
+}
+
+fn passthruTo(
+    comptime S: type,
+    sink: *S,
+    matcher: anytype,
+    buf: []const u8,
+    upto: usize,
+    state: *State,
+    config: SearchConfig,
+) SliceError!bool {
+    var cursor = state.last_line_visited;
+    if (cursor > upto) return true;
+    while (nextLine(buf, cursor, upto, config)) |line| {
         cursor = line.end;
-        const content_end = contentEnd(buf, line, config);
-        if (!linePassesFilters(buf, line.start, content_end, config)) continue;
-        state.limit_count += 1;
-        if (!try sinkMatched(S, sink, matcher, buf, line, null, state, config)) return false;
-        if (state.exceeded(config)) return false;
+        if (!try sinkContext(S, sink, matcher, buf, line, .after, state, config)) return false;
     }
     return true;
 }
@@ -1711,6 +1787,7 @@ fn sinkLine(
     truncated: bool,
     line_len: u64,
     window_start: u64,
+    replacement: ?[]const u8,
 ) bool {
     var one: [1]Span = undefined;
     var multi = matches;
@@ -1721,13 +1798,15 @@ fn sinkLine(
         }
     }
     var scratch: [1024]u8 = undefined;
-    const line = buildLine(state, &scratch, bytes, span, multi, offset, number, truncated, line_len, window_start);
+    var replace_scratch: [4096]u8 = undefined;
+    const line = buildLine(state, &scratch, &replace_scratch, bytes, span, multi, offset, number, truncated, line_len, window_start, replacement);
     return callOpt(S, name, sink, .{line});
 }
 
 fn buildLine(
     state: *State,
     scratch: []u8,
+    replace_scratch: []u8,
     bytes: []const u8,
     span: ?Span,
     matches: []Span,
@@ -1736,6 +1815,7 @@ fn buildLine(
     truncated: bool,
     line_len: u64,
     window_start: u64,
+    replacement: ?[]const u8,
 ) Line {
     const text = lossyText(state, scratch, bytes);
     for (matches) |*item| {
@@ -1744,6 +1824,7 @@ fn buildLine(
         const units = encoding.utf16Span(bytes, from, to);
         item.u16_start = units.start;
         item.u16_end = units.end;
+        item.replacement = replacement;
     }
     var match = span;
     var u16_column: ?u64 = null;
@@ -1756,14 +1837,20 @@ fn buildLine(
             .end = found.end,
             .u16_start = units.start,
             .u16_end = units.end,
+            .replacement = replacement,
         };
         u16_column = units.start + 1;
     }
+    const replaced: ?[]const u8 = if (replacement) |repl|
+        if (matches.len > 0) buildReplaced(state, replace_scratch, bytes, matches, repl) else null
+    else
+        null;
     const column: ?u64 = if (matches.len > 0) @as(u64, matches[0].start) + 1 else null;
     return .{
         .bytes = bytes,
         .text = text,
         .raw = bytes,
+        .replaced = replaced,
         .offset = offset,
         .number = number,
         .match = match,
@@ -1775,6 +1862,62 @@ fn buildLine(
         .line_len = line_len,
         .window_start = window_start,
     };
+}
+
+fn buildReplaced(
+    state: *State,
+    scratch: []u8,
+    bytes: []const u8,
+    matches: []const Span,
+    repl: []const u8,
+) ?[]const u8 {
+    var need: usize = 0;
+    var cursor: usize = 0;
+    for (matches) |item| {
+        const from = @min(item.start, bytes.len);
+        const to = @min(@max(item.end, from), bytes.len);
+        if (from > cursor) need += from - cursor;
+        need += repl.len;
+        cursor = @max(cursor, to);
+    }
+    if (cursor < bytes.len) need += bytes.len - cursor;
+    const dest = replaceDest(state, scratch, need) orelse return null;
+    cursor = 0;
+    var out: usize = 0;
+    for (matches) |item| {
+        const from = @min(item.start, bytes.len);
+        const to = @min(@max(item.end, from), bytes.len);
+        if (from > cursor) {
+            const seg = bytes[cursor..from];
+            @memcpy(dest[out .. out + seg.len], seg);
+            out += seg.len;
+        }
+        if (repl.len > 0) {
+            @memcpy(dest[out .. out + repl.len], repl);
+            out += repl.len;
+        }
+        cursor = @max(cursor, to);
+    }
+    if (cursor < bytes.len) {
+        const tail = bytes[cursor..];
+        @memcpy(dest[out .. out + tail.len], tail);
+        out += tail.len;
+    }
+    return dest[0..out];
+}
+
+fn replaceDest(state: *State, scratch: []u8, need: usize) ?[]u8 {
+    if (need <= scratch.len) return scratch[0..need];
+    const alloc = state.text_alloc orelse return null;
+    if (state.replace_buf.len < need) {
+        if (state.replace_buf.len == 0) {
+            state.replace_buf = alloc.alloc(u8, need) catch return null;
+        } else {
+            state.replace_buf = alloc.realloc(state.replace_buf, need) catch return null;
+        }
+    }
+    if (state.replace_buf.len < need) return null;
+    return state.replace_buf[0..need];
 }
 
 fn lossyText(state: *State, scratch: []u8, bytes: []const u8) []const u8 {
@@ -1863,6 +2006,7 @@ fn sinkMatched(
         preview.truncated and !withheld,
         preview.line_len,
         if (withheld) 0 else preview.window_start,
+        if (withheld) null else config.replacement,
     );
     releaseQueue(state);
     state.last_line_visited = line.end;
@@ -1931,6 +2075,7 @@ fn sinkContext(
         preview.truncated and !withheld,
         preview.line_len,
         if (withheld) 0 else preview.window_start,
+        if (withheld) null else config.replacement,
     );
     releaseQueue(state);
     state.last_line_visited = line.end;
@@ -1949,6 +2094,7 @@ fn sinkBreakAt(
     state: *State,
     config: SearchConfig,
 ) SliceError!bool {
+    if (config.passthru) return true;
     const any_context = beforeCount(config) > 0 or afterCount(config) > 0;
     if (!any_context or !state.has_sunk or line_abs <= state.last_abs_end) return true;
     const keep = callOpt(S, "contextBreak", sink, .{});
@@ -2380,6 +2526,7 @@ fn emitRing(
             slot.truncated and !withheld,
             slot.line_len,
             if (withheld) 0 else slot.window_start,
+            if (withheld) null else config.replacement,
         );
         releaseQueue(state);
         state.last_abs_end = slot.end_abs;
@@ -2562,10 +2709,11 @@ fn emitHold(
     const truncated = state.long_line_len > config.max_line_len and !withheld;
     const window = if (withheld) 0 else state.long_window_start;
     var none: [0]Span = .{};
+    const repl = if (withheld) null else config.replacement;
     const keep = if (as_match)
-        sinkLine(S, "matched", sink, state, bytes, span, &none, state.long_origin, state.long_number, truncated, state.long_line_len, window)
+        sinkLine(S, "matched", sink, state, bytes, span, &none, state.long_origin, state.long_number, truncated, state.long_line_len, window, repl)
     else
-        sinkLine(S, "context", sink, state, bytes, span, &none, state.long_origin, state.long_number, truncated, state.long_line_len, window);
+        sinkLine(S, "context", sink, state, bytes, span, &none, state.long_origin, state.long_number, truncated, state.long_line_len, window, repl);
     releaseQueue(state);
     if (as_match) {
         state.matched_lines += 1;
@@ -2598,10 +2746,17 @@ fn finishLong(
     if (!filters_ok) is_hit = false;
     const end_abs = state.abs_base + drop_buf;
     if (is_hit and !state.exceeded(config)) {
-        if (!try emitRing(S, sink, buf.*, state, config)) return false;
+        if (!config.passthru) {
+            if (!try emitRing(S, sink, buf.*, state, config)) return false;
+        }
         state.limit_count += 1;
         if (!try emitHold(S, sink, hold, state, config, true, end_abs)) return false;
         state.after_left = afterCount(config);
+    } else if (!is_hit and config.stop_on_nonmatch and state.matched_lines > 0) {
+        state.stopped = true;
+        state.need_close = true;
+    } else if (config.passthru and !state.exceeded(config)) {
+        if (!try emitHold(S, sink, hold, state, config, false, end_abs)) return false;
     } else if (state.after_left > 0) {
         if (!try emitHold(S, sink, hold, state, config, is_hit, end_abs)) return false;
         if (state.after_left > 0) state.after_left -= 1;
@@ -2656,7 +2811,7 @@ fn beginLong(
     }
     if (seen.len > 0) @memset(seen.*, false);
     const bytes = buf.*[0..filled.*];
-    if (config.invert or beforeCount(config) > 0 or state.after_left > 0) {
+    if (config.invert or config.passthru or beforeCount(config) > 0 or state.after_left > 0) {
         try savePrefix(allocator, bytes, hold, state, config);
     }
     try noteLong(allocator, matcher, bytes, hold, seen, state, config, false);
@@ -5608,4 +5763,154 @@ test "命中一次就写出路径并停止" {
     try testing.expectEqual(@as(u32, 1), stop.hits);
     try testing.expectEqual(@as(u64, 1), result.matched_lines);
     try testing.expect(src.next_offset < hay.len);
+}
+
+test "A03 空行模式匹配所有行且超限在构造前拒绝" {
+    const Multi = @import("finder/multi.zig").Multi;
+    var multi = try Multi.initFromText(testing.allocator, "alpha\r\n\nomega", .{});
+    defer multi.deinit();
+    var rec = Rec{};
+    defer rec.deinit(testing.allocator);
+    const res = try searchSlice(Rec, &rec, "one\ntwo\nthree\n", "", &multi, .{ .line_numbers = true });
+    try testing.expectEqual(@as(u64, 3), res.matched_lines);
+}
+
+test "B13 有序输入在首条不匹配行处停止并关闭上游" {
+    const OrderedSrc = struct {
+        reads: usize = 0,
+        closed: bool = false,
+        matched: u32 = 0,
+
+        fn read(ctx: *anyopaque, dest: []u8) ReadError!usize {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.reads += 1;
+            const chunk: []const u8 = switch (self.reads) {
+                1 => "2026-01-01 skip\n2026-01-02 MATCH-1\n",
+                2 => "2026-01-02 MATCH-2\n2026-01-03 after\n",
+                3 => "2026-01-02 MATCH-LATE\n",
+                else => "",
+            };
+            @memcpy(dest[0..chunk.len], chunk);
+            return chunk.len;
+        }
+
+        fn close(ctx: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.closed = true;
+        }
+
+        pub fn event(self: *@This(), ev: Event) bool {
+            if (ev == .match) self.matched += 1;
+            return true;
+        }
+    };
+
+    var src = OrderedSrc{};
+    var finder = try Finder.init("2026-01-02", .{});
+    const cfg = SearchConfig{
+        .stop_on_nonmatch = true,
+        .close_input = OrderedSrc.close,
+        .close_ctx = &src,
+        .buffer_size = 64,
+        .max_line_len = 64,
+        .binary = .none,
+        .encoding = .none,
+    };
+    var bridge = EventBridge(OrderedSrc){
+        .inner = &src,
+        .source_id = "ordered",
+        .config = cfg,
+    };
+    const result = try drive(EventBridge(OrderedSrc), testing.allocator, &bridge, &finder, cfg, "ordered", OrderedSrc.read, &src);
+    try testing.expectEqual(@as(u64, 2), result.matched_lines);
+    try testing.expectEqual(@as(u32, 2), src.matched);
+    try testing.expectEqual(@as(usize, 2), src.reads);
+    try testing.expect(src.closed);
+}
+
+test "E06 全文高亮输出全部行且受输出字节上限约束" {
+    const PassSink = struct {
+        match_lines: u32 = 0,
+        context_lines: u32 = 0,
+        breaks: u32 = 0,
+
+        pub fn event(self: *@This(), ev: Event) bool {
+            switch (ev) {
+                .match => self.match_lines += 1,
+                .context => self.context_lines += 1,
+                .context_break => self.breaks += 1,
+                else => {},
+            }
+            return true;
+        }
+    };
+
+    var finder = try Finder.init("HIT", .{});
+    const hay = "line1\nHIT-line2\nline3\nHIT-line4\nline5\n";
+
+    var full = PassSink{};
+    const res_full = try searchSourceSlice(PassSink, &full, "doc", hay, &finder, .{
+        .passthru = true,
+        .line_numbers = true,
+    });
+    try testing.expectEqual(@as(u64, 2), res_full.matched_lines);
+    try testing.expectEqual(@as(u32, 2), full.match_lines);
+    try testing.expectEqual(@as(u32, 3), full.context_lines);
+    try testing.expectEqual(@as(u32, 0), full.breaks);
+    try testing.expect(!res_full.partial);
+
+    var capped = PassSink{};
+    const res_capped = try searchSourceSlice(PassSink, &capped, "doc", hay, &finder, .{
+        .passthru = true,
+        .max_output_bytes = 16,
+    });
+    try testing.expect(res_capped.partial);
+    try testing.expect(!res_capped.scanned_all);
+    try testing.expectEqual(@as(u32, 1), capped.match_lines);
+    try testing.expectEqual(@as(u32, 1), capped.context_lines);
+}
+
+test "B14 替换预览不修改输入且区间与替换文本一致" {
+    const ReplSink = struct {
+        saw_line: bool = false,
+        replaced_copy: [64]u8 = undefined,
+        replaced_len: usize = 0,
+        span_count: usize = 0,
+        first_repl: []const u8 = "",
+        raw_ref: []const u8 = "",
+
+        pub fn event(self: *@This(), ev: Event) bool {
+            switch (ev) {
+                .match => |line| {
+                    self.saw_line = true;
+                    self.raw_ref = line.bytes;
+                    self.span_count = line.matches.len;
+                    if (line.matches.len > 0) {
+                        self.first_repl = line.matches[0].replacement orelse "";
+                    }
+                    if (line.replaced) |r| {
+                        @memcpy(self.replaced_copy[0..r.len], r);
+                        self.replaced_len = r.len;
+                    }
+                },
+                else => {},
+            }
+            return true;
+        }
+    };
+
+    var input_buf = "hello foo and foo!\n".*;
+    var finder = try Finder.init("foo", .{});
+    var sink = ReplSink{};
+    const res = try searchSourceSlice(ReplSink, &sink, "repl", &input_buf, &finder, .{
+        .replacement = "BAR_BAZ",
+    });
+    try testing.expectEqual(@as(u64, 1), res.matched_lines);
+    try testing.expectEqual(@as(u64, 2), res.matches);
+    try testing.expect(sink.saw_line);
+    try testing.expectEqualStrings("hello foo and foo!\n", &input_buf);
+    try testing.expectEqualStrings("hello foo and foo!", sink.raw_ref);
+    try testing.expectEqual(@as(usize, 2), sink.span_count);
+    try testing.expectEqualStrings("BAR_BAZ", sink.first_repl);
+    try testing.expectEqualStrings("hello BAR_BAZ and BAR_BAZ!", sink.replaced_copy[0..sink.replaced_len]);
 }

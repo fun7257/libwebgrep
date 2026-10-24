@@ -186,6 +186,10 @@ SliceIter(M)
 
 `exists` 是存在性查询。找到第一条匹配就返回，那一行会作为 `match` 事件交出，并关闭上游。
 
+`stop_on_nonmatch` 用于有序输入（如按时间戳递增的日志流）。在已经出现至少一条匹配行之后，一旦遇到第一条不匹配的行就立即停止读取，并调用 `close_input` 关闭上游。
+
+`replacement` 提供只读替换预览。设置非 null 的模板切片后，库不修改输入缓冲或 `bytes`、`raw`，而是在每个命中的 `Span.replacement` 上填入该切片，并在 `Line.replaced` 与 `LineEvent.replaced` 上给出替换后的整行预览切片（只在本次回调返回前有效）。
+
 `max_count` 是这个来源最多报告多少条匹配行。null 表示不限。达到后不再读后面的块，`outcome` 为 `stopped`，不写 `limit_hit`，也不带 `resume_at`。已经在缓冲里的后置上下文仍会交。后置窗口里被抬成匹配的行不占用这个额度，但仍作为 `match` 事件交出。
 
 `MatchMode.earliest` 取结束位置最早的一次；结束位置相同则起点更靠左，再相同则更早加入的模式。`leftmost_first` 取起点最靠左的一次；同一起点上更早加入的模式胜出，不是更长的那条。单条字面量下两种结果相同。默认 `earliest`。
@@ -214,10 +218,11 @@ Finder.init(pattern, options) !Finder
 
 ```text
 Multi.init(allocator, patterns, options) !Multi
+Multi.initFromText(allocator, text, options) !Multi
 Multi.deinit(self)
 ```
 
-`allocator` 只用于内部表。模式字节和指针数组都由调用方持有，`deinit` 不释放它们。只有创建者调用 `deinit`。复制结构体只复制指针，建好之后表只读，可以共享给别的调用者去 `find`。
+`allocator` 只用于内部表。`Multi.init` 的模式字节和指针数组都由调用方持有，`deinit` 不释放它们。`Multi.initFromText` 按 LF（兼容 CRLF）切分调用方给出的模式列表文本（不接受文件名），其中的空行作为空模式 `""`（匹配所有行），在分配自动机前先校验条数与字节总长上限；`text` 字节由调用方持有，切分出的模式切片数组由 `deinit` 释放。只有创建者调用 `deinit`。复制结构体只复制指针，建好之后表只读，可以共享给别的调用者去 `find`。
 
 错误是 `PatternHasNewline`、`PatternCountExceeded`、`PatternBytesExceeded`、`OutOfMemory`。
 
@@ -333,7 +338,7 @@ Multi.deinit(self)
 
 前置缓冲的字节量是前置行数乘以 `max_line_len`。它不能超过 `max_before_bytes`，否则返回 `BufferLimit`。服务入口在留空时把 `max_before_bytes` 至少设成 20 MiB，并且不超过硬顶 80 MiB。切片入口的前置直接指向调用方的 haystack。reader 入口用分配器拷贝，返回前释放。
 
-全文高亮尚未提供。输出字节上限已经算进行事件，见预算一节。
+`passthru` 打开全文高亮模式：不匹配的行全部作为 `context` 事件交出，匹配的行作为带区间的 `match` 事件交出，中间不发 `context_break`。所有交出的行字节同样计入 `max_output_bytes`，达到上限时停止并把未扫完的来源标成 `partial = true`。
 
 ## 事件
 
@@ -364,15 +369,16 @@ Multi.deinit(self)
 - `u16_column`：从 1 开始的 UTF-16 列。没有匹配时为 null。
 - `absolute_offset`：行起点的绝对偏移。
 - `bytes`、`text`、`raw`：见「行与编码」。
+- `replaced`：设置了 `SearchConfig.replacement` 且本行有匹配区间时为替换后的预览切片，否则为 null。只在本次回调返回前有效。
 - `matches`：半开区间，相对 `bytes`，按起点排序。
 - `truncated`、`line_len`、`window_start`：超长行窗口。
 - `binary_status`
 
 ### Line
 
-旧回调入口上的一行。`bytes`、`text`、`raw`、`matches` 只在本次回调返回前有效。
+旧回调入口上的一行。`bytes`、`text`、`raw`、`replaced`、`matches` 只在本次回调返回前有效。
 
-- `bytes`、`text`、`raw`：与 `LineEvent` 同一含义。
+- `bytes`、`text`、`raw`、`replaced`：与 `LineEvent` 同一含义。
 - `offset`：行起点的绝对偏移。
 - `number`：从 1 开始。旧入口没打开行号时为 null。
 - `match`：发现这一行的那一次匹配。普通上下文和反选命中行可以是 null。
@@ -382,7 +388,7 @@ Multi.deinit(self)
 
 ### Span
 
-半开区间。`start`、`end` 在事件里相对行的 `bytes`，在 `Match` 里相对 `find` 的 haystack。`u16_start`、`u16_end` 是同一段在有损文本上的 UTF-16 码元，半开，扫描时算好。
+半开区间。`start`、`end` 在事件里相对行的 `bytes`，在 `Match` 里相对 `find` 的 haystack。`u16_start`、`u16_end` 是同一段在有损文本上的 UTF-16 码元，半开，扫描时算好。`replacement` 在设置了 `SearchConfig.replacement` 时指向替换模板切片，否则为 null。
 
 ### EndEvent
 
@@ -547,6 +553,9 @@ Multi.deinit(self)
 - `progress_interval`：null 或 0 不发进度。
 - `live`、`idle_timeout_ns`、`live_closed`。
 - `continuation`：由 `resumeSourceSlice` 填入。
+- `stop_on_nonmatch`：默认 false。有序输入在出现匹配后遇到第一条不匹配行立即停止并关闭上游。
+- `passthru`：默认 false。全文高亮模式，输出全部行并受 `max_output_bytes` 约束。
+- `replacement`：默认 null。非 null 时提供只读替换预览。
 - `log`、`log_ctx`。
 
 ## 默认值
@@ -575,13 +584,9 @@ Multi.deinit(self)
 下面这些现在不能当作已经可以调用的搜索能力：
 
 - 把目录列举、glob、忽略规则、类型过滤接到搜索入口。嵌套花括号也尚未提供。
-- 一行一条的模式文本，以及用空行匹配所有行。
 - gzip、bzip2、xz、zstd。
 - Unicode 大小写折叠。
-- 调用方声明输入有序后，在第一条不匹配的行停止。
-- 替换预览。
 - GBK 等其它编码，以及用 HTTP charset 做提示。
-- 全文高亮。
 - 转码或解压之后，位置在原始字节流上的偏移。
 - 正则。
 

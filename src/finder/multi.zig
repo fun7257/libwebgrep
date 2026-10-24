@@ -32,6 +32,8 @@ pub const Multi = struct {
     empty_only: bool,
     /// 调用方持有。整行比较和整词的逐条确认用它，不另外复制模式字节。
     patterns: []const []const u8,
+    owned_patterns: ?[][]const u8 = null,
+    patterns_alloc: ?std.mem.Allocator = null,
 
     const Mixed = struct {
         ignore: []bool,
@@ -105,6 +107,47 @@ pub const Multi = struct {
         };
     }
 
+    /// 从按行分隔的模式文本构造多模式查找器。每行一条模式，行尾紧挨着的一个 CR 会被去掉。
+    /// 空行表示空模式，匹配所有行。只接受内存文本，不读文件系统路径。
+    /// 条数和字节总长在分配模式切片与内部表之前检查。`text` 的字节由调用方持有。
+    pub fn initFromText(
+        allocator: std.mem.Allocator,
+        text: []const u8,
+        options: matcher.FindOptions,
+    ) (matcher.LimitError || error{ PatternHasNewline, OutOfMemory })!Multi {
+        const count_limit = matcher.patternCountLimit(options);
+        const byte_limit = matcher.patternBytesLimit(options);
+        var count: usize = 0;
+        var total_bytes: usize = 0;
+        var pos: usize = 0;
+        while (pos < text.len) {
+            count += 1;
+            if (count > count_limit) return error.PatternCountExceeded;
+            const nl = memchr.find(memchr.native_width, text, pos, '\n') orelse text.len;
+            var end = nl;
+            if (end > pos and text[end - 1] == '\r') end -= 1;
+            const len = end - pos;
+            total_bytes = std.math.add(usize, total_bytes, len) catch return error.PatternBytesExceeded;
+            if (total_bytes > byte_limit) return error.PatternBytesExceeded;
+            pos = if (nl < text.len) nl + 1 else text.len;
+        }
+        const list = try allocator.alloc([]const u8, count);
+        errdefer allocator.free(list);
+        pos = 0;
+        var idx: usize = 0;
+        while (pos < text.len) : (idx += 1) {
+            const nl = memchr.find(memchr.native_width, text, pos, '\n') orelse text.len;
+            var end = nl;
+            if (end > pos and text[end - 1] == '\r') end -= 1;
+            list[idx] = text[pos..end];
+            pos = if (nl < text.len) nl + 1 else text.len;
+        }
+        var self = try init(allocator, list, options);
+        self.owned_patterns = list;
+        self.patterns_alloc = allocator;
+        return self;
+    }
+
     pub fn deinit(self: *Multi) void {
         switch (self.kind) {
             .bytes => {},
@@ -114,6 +157,9 @@ pub const Multi = struct {
                 if (comptime teddy_on) engine.deinit();
             },
             .mixed => |*mixed| mixed.allocator.free(mixed.ignore),
+        }
+        if (self.owned_patterns) |list| {
+            if (self.patterns_alloc) |alloc| alloc.free(list);
         }
         self.* = undefined;
     }
@@ -709,6 +755,29 @@ test "基准场景的模式落到各自的引擎" {
 
 test "多模式模糊对照" {
     try std.testing.fuzz({}, fuzzMulti, .{});
+}
+
+test "A03 空行模式匹配所有行且超限在构造前拒绝" {
+    var empty_multi = try Multi.initFromText(std.testing.allocator, "foo\r\n\r\nbar\n", .{});
+    defer empty_multi.deinit();
+    try std.testing.expectEqual(@as(usize, 3), empty_multi.patterns.len);
+    try std.testing.expectEqualStrings("foo", empty_multi.patterns[0]);
+    try std.testing.expectEqualStrings("", empty_multi.patterns[1]);
+    try std.testing.expectEqualStrings("bar", empty_multi.patterns[2]);
+    const hit = empty_multi.find("anything", 0, .earliest).?;
+    try std.testing.expectEqual(@as(usize, 0), hit.start);
+    try std.testing.expectEqual(@as(usize, 0), hit.end);
+
+    var fail_alloc = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.PatternCountExceeded,
+        Multi.initFromText(fail_alloc.allocator(), "a\nb\nc\n", .{ .max_pattern_count = 2 }),
+    );
+    try std.testing.expectError(
+        error.PatternBytesExceeded,
+        Multi.initFromText(fail_alloc.allocator(), "abcd\nefgh\n", .{ .max_pattern_bytes = 6 }),
+    );
+    try std.testing.expectEqual(@as(usize, 0), fail_alloc.allocations);
 }
 
 fn fuzzMulti(_: void, smith: *std.testing.Smith) !void {

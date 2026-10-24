@@ -123,6 +123,8 @@ pub const LineEvent = struct {
     u16_column: ?u64 = null,
     /// 这一行起点在可搜索字节流里的绝对偏移。
     absolute_offset: u64,
+    /// 这一行起点在原始（转码/解压前）字节流里的偏移。未发生转码或解压时等于 `absolute_offset`。
+    raw_offset: u64 = 0,
     bytes: []const u8,
     text: []const u8 = &.{},
     raw: []const u8 = &.{},
@@ -220,6 +222,8 @@ pub const Line = struct {
     replaced: ?[]const u8 = null,
     /// 该行第一个字节在可搜索字节流里的绝对偏移。转码之后从转码结果计。
     offset: u64,
+    /// 该行第一个字节在原始（转码/解压前）字节流里的偏移。
+    raw_offset: u64 = 0,
     /// 从 1 开始。未打开行号时为 null。NUL 记录模式按记录计数。
     number: ?u64,
     /// 相对 `raw`。普通上下文行和反选命中行没有匹配区间。

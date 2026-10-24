@@ -50,6 +50,8 @@ pub const LimitError = error{
 /// 构造查找器的选项。频率表的值越小，该字节越适合做预过滤锚点。
 pub const FindOptions = struct {
     case: CaseMode = .sensitive,
+    /// 开启 Unicode 简单大小写折叠（Simple Case Folding）。默认 false（仅折叠 ASCII）。
+    unicode_case: bool = false,
     /// null 用内置表。
     frequency: ?[256]u8 = null,
     /// 长于 32 字节的模式，在两个稀有字节的平均间距小于 8、并且确认失败时，

@@ -19,12 +19,14 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
+const decompress = @import("decompress.zig");
 const encoding = @import("encoding.zig");
 const matcher_mod = @import("matcher.zig");
 const memchr = @import("finder/memchr.zig");
 const sink_mod = @import("sink.zig");
 
 pub const Encoding = encoding.Encoding;
+pub const Compression = decompress.Compression;
 
 pub const BinaryPolicy = enum {
     /// 跳过。遇到 NUL 就停止读取。这是默认。
@@ -93,6 +95,13 @@ pub const SearchConfig = struct {
     null_data: bool = false,
     /// 默认只在流开头嗅探 BOM。`.none` 关掉嗅探和转码。
     encoding: Encoding = .auto,
+    /// 可选的 HTTP Content-Type 或 WHATWG 字符集提示（如 `"gbk"`、`"text/plain; charset=gbk"`）。
+    /// 当 `encoding == .auto` 且流开头无 BOM 时按该提示转码。
+    charset: ?[]const u8 = null,
+    /// 进程内流式解压模式（`.none`、`.auto`、`.gzip`、`.zstd`、`.xz`）。
+    compression: Compression = .none,
+    /// 最大允许解压膨胀比（`decompressed_bytes / raw_bytes`），null 使用默认 100。超限记为 `LimitHit.decompressed_bytes`。
+    max_compression_ratio: ?u64 = null,
     /// 切片上需要转码，或有损文本放不进栈缓冲时使用。流式搜索用函数上的分配器。
     decode_allocator: ?std.mem.Allocator = null,
     buffer_size: usize = default_buffer_size,
@@ -243,6 +252,7 @@ const State = struct {
     text_alloc: ?std.mem.Allocator = null,
     text_buf: []u8 = &.{},
     replace_buf: []u8 = &.{},
+    offset_map: ?*const decompress.OffsetMap = null,
     /// 日志里用的来源名。不放进返回的错误。
     label: []const u8 = "",
     started_ns: i128 = 0,
@@ -276,34 +286,120 @@ const Prepared = struct {
     bytes: []const u8,
     owned: []u8 = &.{},
     alloc: ?std.mem.Allocator = null,
+    offset_map: decompress.OffsetMap = .{},
+    decompressed_bytes: u64 = 0,
+    decompress_limit_hit: bool = false,
+    corrupt_stream: bool = false,
 
-    fn deinit(self: *const Prepared) void {
+    fn deinit(self: *Prepared) void {
         if (self.owned.len != 0) if (self.alloc) |alloc| alloc.free(self.owned);
+        if (self.alloc) |alloc| self.offset_map.deinit(alloc);
     }
 };
 
 fn materialize(haystack: []const u8, config: SearchConfig) SliceError!Prepared {
-    if (config.encoding != .auto) return .{ .bytes = haystack };
+    var prep = Prepared{
+        .bytes = haystack,
+        .decompressed_bytes = config.decompressed_bytes,
+    };
+    errdefer prep.deinit();
+
+    var current = haystack;
+    if (config.compression != .none) {
+        const det = if (config.compression == .auto) decompress.sniff(haystack, true) else .gzip;
+        if (det != .raw and det != .need_more) {
+            const alloc = config.decode_allocator orelse return error.OutOfMemory;
+            prep.alloc = alloc;
+            const max_dec = config.max_decompressed_bytes orelse config.max_source_bytes;
+            if (decompress.decompressSlice(
+                alloc,
+                haystack,
+                config.compression,
+                config.decompressed_bytes,
+                max_dec,
+                config.max_compression_ratio,
+                &prep.decompressed_bytes,
+                &prep.offset_map,
+            )) |maybe_dec| {
+                if (maybe_dec) |dec_buf| {
+                    prep.owned = dec_buf;
+                    prep.bytes = dec_buf;
+                    current = dec_buf;
+                }
+            } else |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.DecompressLimit => {
+                    prep.bytes = &.{};
+                    prep.decompress_limit_hit = true;
+                    return prep;
+                },
+                error.CorruptStream => {
+                    prep.bytes = &.{};
+                    prep.corrupt_stream = true;
+                    return prep;
+                },
+            }
+        }
+    }
+
+    const resolved = encoding.resolveHint(config.encoding, config.charset);
+    if (resolved == .none) return prep;
+
     const cap = decodeCap(config);
-    switch (encoding.sniff(haystack, true)) {
-        .raw, .need_more => return .{ .bytes = haystack },
+    const bom_kind = encoding.sniff(current, true);
+    switch (bom_kind) {
+        .raw, .need_more => {
+            const target: encoding.Sniff = switch (resolved) {
+                .auto => return prep,
+                .none => return prep,
+                .utf8 => if (encoding.validUtf8(current)) return prep else .utf8,
+                .utf16le => .utf16le,
+                .utf16be => .utf16be,
+                .gbk => .gbk,
+                .latin1 => .latin1,
+            };
+            if (encoding.decodedSize(target, current) > cap) return error.DecodeLimit;
+            const alloc = config.decode_allocator orelse return error.OutOfMemory;
+            prep.alloc = alloc;
+            const map_ptr: ?*decompress.OffsetMap = if (prep.offset_map.active) null else &prep.offset_map;
+            const owned = try encoding.convertAllocWithMap(alloc, target, current, 0, map_ptr);
+            if (prep.owned.len != 0) alloc.free(prep.owned);
+            prep.owned = owned;
+            prep.bytes = owned;
+            return prep;
+        },
         .utf8 => {
-            const rest = if (haystack.len >= 3) haystack[3..] else haystack[0..0];
-            if (encoding.validUtf8(rest)) return .{ .bytes = rest };
+            const rest = if (current.len >= 3) current[3..] else current[0..0];
+            if (!prep.offset_map.active) prep.offset_map.base_raw_offset = 3;
+            if (encoding.validUtf8(rest)) {
+                prep.bytes = rest;
+                return prep;
+            }
             if (encoding.decodedSize(.utf8, rest) > cap) return error.DecodeLimit;
             const alloc = config.decode_allocator orelse return error.OutOfMemory;
-            const owned = try encoding.convertAlloc(alloc, .utf8, rest);
-            return .{ .bytes = owned, .owned = owned, .alloc = alloc };
+            prep.alloc = alloc;
+            const map_ptr: ?*decompress.OffsetMap = if (prep.offset_map.active) null else &prep.offset_map;
+            const owned = try encoding.convertAllocWithMap(alloc, .utf8, rest, 3, map_ptr);
+            if (prep.owned.len != 0) alloc.free(prep.owned);
+            prep.owned = owned;
+            prep.bytes = owned;
+            return prep;
         },
         .utf16le, .utf16be => |kind| {
-            if (encoding.decodedSize(kind, if (haystack.len >= 2) haystack[2..] else haystack[0..0]) > cap) {
+            const payload = if (current.len >= 2) current[2..] else current[0..0];
+            if (encoding.decodedSize(kind, payload) > cap) {
                 return error.DecodeLimit;
             }
             const alloc = config.decode_allocator orelse return error.OutOfMemory;
-            const payload = if (haystack.len >= 2) haystack[2..] else haystack[0..0];
-            const owned = try encoding.convertAlloc(alloc, kind, payload);
-            return .{ .bytes = owned, .owned = owned, .alloc = alloc };
+            prep.alloc = alloc;
+            const map_ptr: ?*decompress.OffsetMap = if (prep.offset_map.active) null else &prep.offset_map;
+            const owned = try encoding.convertAllocWithMap(alloc, kind, payload, 2, map_ptr);
+            if (prep.owned.len != 0) alloc.free(prep.owned);
+            prep.owned = owned;
+            prep.bytes = owned;
+            return prep;
         },
+        .gbk, .latin1 => unreachable,
     }
 }
 
@@ -317,19 +413,24 @@ pub fn searchSlice(
     matcher: anytype,
     config: SearchConfig,
 ) SliceError!Result {
-    const view = try materialize(haystack, config);
+    validateBudgets(config) catch |err| {
+        logDetail(config, name, err);
+        return err;
+    };
+    var view = try materialize(haystack, config);
     defer view.deinit();
-    return searchPrepared(S, sink, view.bytes, name, matcher, config);
+    return searchPrepared(S, sink, &view, name, matcher, config);
 }
 
 fn searchPrepared(
     comptime S: type,
     sink: *S,
-    haystack: []const u8,
+    prepared: *const Prepared,
     name: []const u8,
     matcher: anytype,
     config: SearchConfig,
 ) SliceError!Result {
+    const haystack = prepared.bytes;
     validateBudgets(config) catch |err| {
         logDetail(config, name, err);
         return err;
@@ -337,7 +438,8 @@ fn searchPrepared(
     resetStats(matcher);
     var state = State{};
     state.label = name;
-    state.decompressed_bytes = config.decompressed_bytes;
+    state.decompressed_bytes = prepared.decompressed_bytes;
+    state.offset_map = &prepared.offset_map;
     armClock(&state, config);
     state.text_alloc = config.decode_allocator;
     defer if (state.text_buf.len != 0) if (state.text_alloc) |alloc| alloc.free(state.text_buf);
@@ -346,6 +448,16 @@ fn searchPrepared(
     state.ring.stride = config.max_line_len;
     if (config.line_numbers) state.line_number = 1;
     restoreCounters(&state, config);
+    if (prepared.decompress_limit_hit) {
+        _ = callOpt(S, "begin", sink, .{name});
+        noteLimit(&state, .decompressed_bytes);
+        return finishSink(S, sink, &state, config);
+    }
+    if (prepared.corrupt_stream) {
+        _ = callOpt(S, "begin", sink, .{name});
+        state.soft_error = .read_failed;
+        return finishSink(S, sink, &state, config);
+    }
     const view = budgetView(haystack, &state, config);
     if (!callOpt(S, "begin", sink, .{name})) {
         noteRejected(S, &state, sink);
@@ -834,6 +946,7 @@ fn lineEvent(source_id: []const u8, line: Line) sink_mod.LineEvent {
         .column = line.column,
         .u16_column = u16_column,
         .absolute_offset = line.offset,
+        .raw_offset = line.raw_offset,
         .bytes = line.bytes,
         .text = if (line.text.len == 0) line.bytes else line.text,
         .raw = if (line.raw.len == 0) line.bytes else line.raw,
@@ -913,8 +1026,12 @@ fn drive(
     }
     defer if (!borrowed) allocator.free(buf);
     var filled: usize = 0;
-    var decoder = encoding.Decoder.init(config.encoding);
+    var offset_map = decompress.OffsetMap{};
+    defer offset_map.deinit(allocator);
+    state.offset_map = &offset_map;
+    var decoder = encoding.Decoder.initWithHint(config.encoding, config.charset);
     decoder.max_in = decodeCap(config);
+    decoder.offset_map = &offset_map;
     defer decoder.deinit(allocator);
     var upstream = Upstream{
         .inner = read_ctx,
@@ -922,6 +1039,69 @@ fn drive(
         .config = config,
         .sink = @ptrCast(sink),
     };
+    var decompressed_stream: ?[]u8 = null;
+    defer if (decompressed_stream) |ds| allocator.free(ds);
+    var decompressed_pos: usize = 0;
+
+    if (config.compression != .none) {
+        var raw_compressed = std.ArrayList(u8).empty;
+        defer raw_compressed.deinit(allocator);
+        var raw_chunk: [16384]u8 = undefined;
+        var read_err = false;
+        while (!stopForBudget(&state, config)) {
+            var max_chunk = raw_chunk.len;
+            if (scanRemaining(&state, config)) |left| {
+                if (left == 0) {
+                    noteLimit(&state, .max_bytes);
+                    break;
+                }
+                if (max_chunk > left) max_chunk = @intCast(left);
+            }
+            const rn = readUpstream(S, readFn, &upstream, raw_chunk[0..max_chunk]) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                state.soft_error = .read_failed;
+                logDetail(config, name, err);
+                state.need_close = true;
+                read_err = true;
+                break;
+            };
+            state.bytes_read += rn;
+            if (rn == 0) break;
+            try raw_compressed.appendSlice(allocator, raw_chunk[0..rn]);
+        }
+        if (read_err or state.limit_hit != .none) {
+            return finishSink(S, sink, &state, config);
+        }
+        const max_dec = config.max_decompressed_bytes orelse config.max_source_bytes;
+        if (decompress.decompressSlice(
+            allocator,
+            raw_compressed.items,
+            config.compression,
+            state.decompressed_bytes,
+            max_dec,
+            config.max_compression_ratio,
+            &state.decompressed_bytes,
+            &offset_map,
+        )) |maybe_dec| {
+            if (maybe_dec) |dec_buf| {
+                decompressed_stream = dec_buf;
+            } else {
+                decompressed_stream = try raw_compressed.toOwnedSlice(allocator);
+            }
+        } else |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.DecompressLimit => {
+                noteLimit(&state, .decompressed_bytes);
+                state.need_close = true;
+                return finishSink(S, sink, &state, config);
+            },
+            error.CorruptStream => {
+                state.soft_error = .read_failed;
+                state.need_close = true;
+                return finishSink(S, sink, &state, config);
+            },
+        }
+    }
 
     while (!state.stopped) {
         if (state.exceeded(config)) {
@@ -950,7 +1130,27 @@ fn drive(
             }
             if (dest.len > left) dest = dest[0..left];
         }
-        const pulled = decoder.pull(allocator, struct {
+        var raw_read_sink: u64 = 0;
+        const pulled = if (decompressed_stream) |ds| blk: {
+            const SliceCtx = struct {
+                data: []const u8,
+                pos: *usize,
+                fn read(ctx: *anyopaque, out: []u8) error{}!usize {
+                    const self: *@This() = @ptrCast(@alignCast(ctx));
+                    const avail = self.data.len - self.pos.*;
+                    const n = @min(avail, out.len);
+                    if (n > 0) @memcpy(out[0..n], self.data[self.pos.* .. self.pos.* + n]);
+                    self.pos.* += n;
+                    return n;
+                }
+            };
+            var sctx = SliceCtx{ .data = ds, .pos = &decompressed_pos };
+            break :blk decoder.pull(allocator, SliceCtx.read, &sctx, bufferWindow(config), dest, &raw_read_sink) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                if (err == error.DecodeLimit) return error.DecodeLimit;
+                unreachable;
+            };
+        } else decoder.pull(allocator, struct {
             fn read(ctx: *anyopaque, out: []u8) readRet(readFn) {
                 return readUpstream(S, readFn, ctx, out);
             }
@@ -1335,6 +1535,7 @@ fn validateBudgets(config: SearchConfig) error{ ContextLinesExceeded, BudgetExce
     if (config.max_queued_event_bytes) |n| if (n > SearchConfig.max_queued_event_bytes_hard_cap) return error.BudgetExceeded;
     if (config.max_before_bytes) |n| if (n > SearchConfig.max_before_bytes_hard_cap) return error.BudgetExceeded;
     if (config.max_decompressed_bytes) |n| if (n > SearchConfig.max_source_bytes_hard_cap) return error.BudgetExceeded;
+    if (config.max_compression_ratio) |r| if (r == 0 or r > decompress.max_compression_ratio_hard_cap) return error.BudgetExceeded;
     const before_cap = config.max_before_bytes orelse SearchConfig.max_before_bytes_hard_cap;
     if (beforeContextCapacity(config) > before_cap) return error.BufferLimit;
 }
@@ -1889,12 +2090,14 @@ fn buildLine(
     else
         null;
     const column: ?u64 = if (matches.len > 0) @as(u64, matches[0].start) + 1 else null;
+    const raw_offset: u64 = if (state.offset_map) |m| m.map(offset) else offset;
     return .{
         .bytes = bytes,
         .text = text,
         .raw = bytes,
         .replaced = replaced,
         .offset = offset,
+        .raw_offset = raw_offset,
         .number = number,
         .match = match,
         .matches = matches,
@@ -6047,4 +6250,139 @@ test "B17 跨行窗口耗尽后不再读上游" {
     try testing.expectEqual(@as(u32, 0), src.hits);
     try testing.expectEqual(@as(usize, 2), src.reads);
     try testing.expect(src.closed);
+}
+
+test "A04 gzip 炸弹被压缩比与解压字节上限拦截" {
+    var finder = try Finder.init("MATCH", .{});
+    const gz_ok = try decompress.compressGzipStoredAlloc(testing.allocator, "skip\nMATCH_HERE\n");
+    defer testing.allocator.free(gz_ok);
+
+    var quiet = Quiet{};
+    const ok_res = try searchSourceSlice(Quiet, &quiet, "gz-ok", gz_ok, &finder, .{
+        .compression = .auto,
+        .decode_allocator = testing.allocator,
+    });
+    try testing.expectEqual(@as(u64, 1), ok_res.matched_lines);
+    try testing.expectEqual(sink_mod.LimitHit.none, ok_res.limit_hit);
+
+    // 1. 被解压字节上限 max_decompressed_bytes 拦截
+    const cap_res = try searchSourceSlice(Quiet, &quiet, "gz-cap", gz_ok, &finder, .{
+        .compression = .auto,
+        .decode_allocator = testing.allocator,
+        .max_decompressed_bytes = 8,
+    });
+    try testing.expectEqual(sink_mod.LimitHit.decompressed_bytes, cap_res.limit_hit);
+    try testing.expect(cap_res.partial);
+
+    // 2. 被最大压缩比 max_compression_ratio 拦截（24 字节 Gzip 炸弹解压出 1032 字节）
+    const bomb_gz = [_]u8{
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03,
+        0x73, 0x74, 0xa4, 0x3d, 0x00, 0x00, 0x8d, 0xef, 0x72, 0x2f,
+        0x08, 0x04, 0x00, 0x00,
+    };
+    var bomb_reader = std.Io.Reader.fixed(&bomb_gz);
+    const bomb_res = try searchSource(Quiet, testing.allocator, &quiet, &bomb_reader, "gz-bomb", &finder, .{
+        .compression = .gzip,
+        .max_compression_ratio = 3,
+    });
+    try testing.expectEqual(sink_mod.LimitHit.decompressed_bytes, bomb_res.limit_hit);
+    try testing.expect(bomb_res.partial);
+}
+
+test "A05 zstd 解压共用防爆上限且损坏归为软错误" {
+    var finder = try Finder.init("MATCH_ZSTD", .{});
+    const zst_ok = try decompress.compressZstdRawAlloc(testing.allocator, "line1\nMATCH_ZSTD\n");
+    defer testing.allocator.free(zst_ok);
+
+    var quiet = Quiet{};
+    var ok_reader = std.Io.Reader.fixed(zst_ok);
+    const ok_res = try searchSource(Quiet, testing.allocator, &quiet, &ok_reader, "zst-ok", &finder, .{
+        .compression = .auto,
+    });
+    try testing.expectEqual(@as(u64, 1), ok_res.matched_lines);
+    try testing.expect(ok_res.soft_error == null);
+
+    // 解压上限拦截
+    var cap_reader = std.Io.Reader.fixed(zst_ok);
+    const cap_res = try searchSource(Quiet, testing.allocator, &quiet, &cap_reader, "zst-cap", &finder, .{
+        .compression = .auto,
+        .max_decompressed_bytes = 6,
+    });
+    try testing.expectEqual(sink_mod.LimitHit.decompressed_bytes, cap_res.limit_hit);
+
+    // 损坏的 zstd 流不抛致命错误，归为 SoftError.read_failed
+    const corrupt_zst = [_]u8{ 0x28, 0xB5, 0x2F, 0xFD, 0xFF, 0xFF, 0xFF };
+    var bad_reader = std.Io.Reader.fixed(&corrupt_zst);
+    const bad_res = try searchSource(Quiet, testing.allocator, &quiet, &bad_reader, "zst-bad", &finder, .{
+        .compression = .auto,
+    });
+    try testing.expectEqual(sink_mod.SoftError.read_failed, bad_res.soft_error.?);
+}
+
+test "C06 GBK 与 charset 提示转码命中" {
+    // GBK 编码的 "你好\n测试错误日志\n"：
+    // 你好 = C4 E3 BA C3, 测试 = B2 E2 CA D4, 错误 = B4 ED CE F3, 日志 = C8 D5 D6 BE
+    const gbk_bytes = "\xC4\xE3\xBA\xC3\n\xB2\xE2\xCA\xD4\xB4\xED\xCE\xF3\xC8\xD5\xD6\xBE\n";
+    var finder = try Finder.init("错误", .{});
+
+    const OffsetSink = struct {
+        hits: u32 = 0,
+        abs_off: u64 = 0,
+        raw_off: u64 = 0,
+
+        pub fn event(self: *@This(), ev: Event) bool {
+            if (ev == .match) {
+                self.hits += 1;
+                self.abs_off = ev.match.absolute_offset;
+                self.raw_off = ev.match.raw_offset;
+            }
+            return true;
+        }
+    };
+
+    var sink = OffsetSink{};
+    const res = try searchSourceSlice(OffsetSink, &sink, "gbk-doc", gbk_bytes, &finder, .{
+        .charset = "text/plain; charset=GBK",
+        .decode_allocator = testing.allocator,
+    });
+    try testing.expectEqual(@as(u64, 1), res.matched_lines);
+    try testing.expectEqual(@as(u32, 1), sink.hits);
+    // UTF-8 下 "你好\n" 占 3 + 3 + 1 = 7 字节；原始 GBK 下 "\xC4\xE3\xBA\xC3\n" 占 2 + 2 + 1 = 5 字节
+    try testing.expectEqual(@as(u64, 7), sink.abs_off);
+    try testing.expectEqual(@as(u64, 5), sink.raw_off);
+}
+
+test "F12 转码与解压后仍能给出原始字节流偏移" {
+    const OffsetSink = struct {
+        abs_off: u64 = 0,
+        raw_off: u64 = 0,
+
+        pub fn event(self: *@This(), ev: Event) bool {
+            if (ev == .match) {
+                self.abs_off = ev.match.absolute_offset;
+                self.raw_off = ev.match.raw_offset;
+            }
+            return true;
+        }
+    };
+
+    // UTF-16LE 带 2 字节 BOM (FF FE)，第一行 "ab\n" (6 字节)，第二行 "HIT\n" (8 字节)
+    // 第二行在转码后 UTF-8 中的偏移是 3 ("ab\n")，在原始 UTF-16LE 流中的偏移是 2 (BOM) + 6 ("ab\n") = 8！
+    const utf16le_data = [_]u8{
+        0xFF, 0xFE,
+        'a',  0,
+        'b',  0,
+        '\n', 0,
+        'H',  0,
+        'I',  0,
+        'T',  0,
+        '\n', 0,
+    };
+    var finder = try Finder.init("HIT", .{});
+    var sink = OffsetSink{};
+    var reader = std.Io.Reader.fixed(&utf16le_data);
+    const res = try searchSource(OffsetSink, testing.allocator, &sink, &reader, "u16", &finder, .{});
+    try testing.expectEqual(@as(u64, 1), res.matched_lines);
+    try testing.expectEqual(@as(u64, 3), sink.abs_off);
+    try testing.expectEqual(@as(u64, 8), sink.raw_off);
 }

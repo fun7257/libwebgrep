@@ -18,7 +18,7 @@ flowchart TD
 | :--- | :--- | :--- | :---: | :--- |
 | **阶段一** | **轻量高价值检索能力** | `A03`, `B13`, `E06`, `B14` | **已完成 (DONE)** | 零新增外部依赖；有序日志流查询提前终止；替换与全文高亮严格受 `max_output_bytes` 约束 |
 | **阶段二** | **线性正则 + SIMD 预过滤** | `B16`, `B17` | **已完成 (DONE)** | 编译大小硬顶防爆；最坏 $O(n)$ 步数保证；利用 `RequiredLiteral` 保持 20+ GB/s 级预过滤吞吐 |
-| **阶段三** | **流式解压与编码扩展** | `A04`, `B05`, `F12`, `A05`, `C06` | 待实施 | Gzip 进程内流式解压 + 压缩比/输出字节双硬顶拦截 Zip Bomb；Unicode 折叠不劣化 ASCII SIMD 快路径 |
+| **阶段三** | **流式解压与编码扩展** | `A04`, `B05`, `F12`, `A05`, `C06` | **已完成 (DONE)** | Gzip/Zstd/XZ 进程内流式解压 + 压缩比/输出字节双硬顶拦截 Zip Bomb；Unicode 折叠不劣化 ASCII SIMD 快路径 |
 | **阶段四** | **抽象多来源管线收口** | `J01`–`J05`, `J08`, `J09`, `J11`–`J15`, `L04` | 待实施 | Glob/Ignore 条数与深度硬顶；移除 CPU 核数探测，完全由 `max_concurrency` 驱动；不缓存全量事件 |
 
 ---
@@ -50,16 +50,16 @@ flowchart TD
 
 ---
 
-### 阶段三：流式防爆解压与编码/Unicode 扩展（N9-Stream）
+### 阶段三：流式防爆解压与编码/Unicode 扩展（N9-Stream，已完成）
 
-面向归档日志流（`.gz` / `.zst`）与多语言文本搜索，所有解压与转码严格纳入 `SearchConfig` 的预算体系。
+面向归档日志流（`.gz` / `.zst` / `.xz`）与多语言文本搜索，所有解压与转码严格纳入 `SearchConfig` 的预算体系。
 
-| 任务项 | 目标模块 | 高性能实现方案 | 验收测试标准 |
-| :--- | :--- | :--- | :--- |
-| **1. 进程内 Gzip 流式防爆解压 (`A04`)** | `src/decompress.zig` (新增)<br/>`src/searcher.zig` | 在 `pull` 层前串联进程内 Gzip 流式解压器（识别 `1F 8B` 魔数或显式配置）。每产出解压字节实时累加 `state.decompressed_bytes`，同时检查 `max_decompressed_bytes` 与最大压缩比（如 `100:1`），超限立即返回 `LimitHit.decompressed_bytes`。 | `test "A04 gzip 炸弹被压缩比与解压字节上限拦截"` |
-| **2. Unicode 简单大小写折叠 (`B05`)** | `src/finder/unicode_fold.zig`<br/>`src/finder/multi.zig` | **分层加速**：若模式字符在 Unicode Simple Case Folding 下无跨 ASCII 多字节映射，直接走现有 `(block \| 0x20) == lower` 25 GB/s 快路径；若含多字节折叠码点（如 `U+00DF`、`U+212A` 或非 ASCII 字母），在构造期将折叠变体展开至 `Multi` 引擎。 | `test "B05 Unicode 折叠按单条模式智能大小写生效"` |
-| **3. 原始流偏移映射 (`F12`)** | `src/encoding.zig`<br/>`src/sink.zig` | 在流式转码（UTF-16 → UTF-8）与流式解压中维护块级原始偏移锚点，在 `LineEvent` 中额外提供 `raw_offset` 字段。 | `test "F12 转码与解压后仍能给出原始字节流偏移"` |
-| **4. 扩展压缩与编码 (`A05`, `C06`)** | `src/decompress.zig`<br/>`src/encoding.zig` | 接入进程内 `zstd`/`xz` 解压器（共用 `A04` 防爆配额，损坏流归入 `SoftError`）；在 `encoding.zig` 中增加 WHATWG 标签解析、HTTP `charset` 提示及 GBK 查表流式转码。 | `test "A05 zstd 解压共用防爆上限且损坏归为软错误"`<br/>`test "C06 GBK 与 charset 提示转码命中"` |
+| 任务项 | 目标模块 | 高性能实现方案 | 验收测试标准 | 状态 |
+| :--- | :--- | :--- | :--- | :---: |
+| **1. 进程内 Gzip 流式防爆解压 (`A04`)** | `src/decompress.zig`<br/>`src/searcher.zig` | 在读取层串联进程内 Gzip 流式解压器（识别 `1F 8B` 魔数或显式配置）。每产出解压字节实时累加 `state.decompressed_bytes`，同时检查 `max_decompressed_bytes` 与 `max_compression_ratio`（默认 `100:1`），超限立即返回 `LimitHit.decompressed_bytes`。 | `test "A04 gzip 炸弹被压缩比与解压字节上限拦截"` | **DONE** |
+| **2. Unicode 简单大小写折叠 (`B05`)** | `src/finder/unicode_fold.zig`<br/>`src/finder/multi.zig` | **分层加速**：默认保持纯 ASCII `(block \| 0x20) == lower` 25 GB/s 快路径；开启 `unicode_case` 时按单条模式的智能大小写将 Unicode 折叠变体展开至 `Multi` SIMD 引擎。 | `test "B05 Unicode 折叠按单条模式智能大小写生效"` | **DONE** |
+| **3. 原始流偏移映射 (`F12`)** | `src/decompress.zig`<br/>`src/encoding.zig`<br/>`src/sink.zig` | 在流式转码（UTF-16 / GBK → UTF-8）与流式解压中维护 `OffsetMap` 偏移锚点，在 `LineEvent` 与 `Line` 中提供 `raw_offset` 字段。 | `test "F12 转码与解压后仍能给出原始字节流偏移"` | **DONE** |
+| **4. 扩展压缩与编码 (`A05`, `C06`)** | `src/decompress.zig`<br/>`src/encoding.zig` | 接入进程内 `zstd`/`xz` 解压器（共用 `A04` 防爆配额，损坏流归入 `SoftError`）；在 `encoding.zig` 中增加 WHATWG 标签解析、HTTP `charset` 提示及 GBK / Latin-1 流式转码。 | `test "A05 zstd 解压共用防爆上限且损坏归为软错误"`<br/>`test "C06 GBK 与 charset 提示转码命中"` | **DONE** |
 
 ---
 

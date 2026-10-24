@@ -63,8 +63,12 @@ pub const ResumeState = sink_mod.ResumeState;
 
 /// 二进制处理。默认 `quit`，也就是二进制默认跳过。
 pub const BinaryPolicy = searcher.BinaryPolicy;
-/// `auto` 只在流开头嗅探 BOM。`none` 不转码。其它编码尚未提供。
+/// `auto` 在流开头嗅探 BOM（或使用 `charset` 提示），支持 UTF-8、UTF-16LE/BE、GBK 与 Latin-1。
 pub const Encoding = searcher.Encoding;
+/// 进程内流式解压模式：`none`、`auto`、`gzip`、`zstd`、`xz`。
+pub const Compression = searcher.Compression;
+/// 进程内流式解压与原始偏移映射模块。
+pub const decompress = @import("decompress.zig");
 /// 搜索配置。服务入口会给留空的预算填默认值，旧入口留空表示不另加上限。
 pub const SearchConfig = searcher.SearchConfig;
 /// 旧回调入口，搜索一块内存。不填服务默认预算。`name` 只传给 `begin`。
@@ -166,6 +170,7 @@ pub const Regex = regex.Regex;
 pub const RegexOptions = regex.RegexOptions;
 
 test {
+    _ = @import("decompress.zig");
     _ = @import("encoding.zig");
     _ = @import("matcher.zig");
     _ = @import("sink.zig");
@@ -175,6 +180,7 @@ test {
     _ = @import("finder/memchr.zig");
     _ = @import("finder/two_way.zig");
     _ = @import("finder/ascii.zig");
+    _ = @import("finder/unicode_fold.zig");
     _ = @import("finder/frequency.zig");
     _ = @import("finder/packed_pair.zig");
     _ = @import("finder/finder.zig");

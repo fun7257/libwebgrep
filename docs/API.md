@@ -170,9 +170,9 @@ SliceIter(M)
 
 条数硬顶 1024，全部模式的字节总长硬顶 256 KiB。`FindOptions.max_pattern_count` 和 `max_pattern_bytes` 只能把上限调低。超过硬顶的请求仍按硬顶拒绝。超限时返回 `PatternCountExceeded` 或 `PatternBytesExceeded`，表还没有分配。
 
-大小写默认敏感。`insensitive` 忽略大小写。大小写折叠只支持 ASCII，也就是 `A-Z` 与 `a-z`。Unicode 折叠尚未提供。
+大小写默认敏感。`insensitive` 忽略大小写。默认情况下大小写折叠只支持 ASCII，也就是 `A-Z` 与 `a-z`；当 `FindOptions.unicode_case` 设为真时，在 `Multi` 中启用 Unicode 简单大小写折叠（Simple Case Folding）。
 
-智能大小写按模式分别判断。这一条全是小写才忽略大小写，出现 `A-Z` 就对这一条区分大小写。这和 rg 整组判断不同。rg 是整组里出现大写就全部区分大小写。
+智能大小写按模式分别判断。这一条全是小写才忽略大小写，出现大写就对这一条区分大小写。这和 rg 整组判断不同。rg 是整组里出现大写就全部区分大小写。
 
 整词看匹配外侧那个字节是不是 ASCII 单词字符（字母、数字、下划线）。这是半边界：`-2` 能命中 `(-2)`，不能命中 `x-2` 或 `-2y`。和整行同时打开时不检查词边界。
 
@@ -274,6 +274,7 @@ Regex.deinit(self)
 构造 `Finder` 或 `Multi` 的选项。不分配。
 
 - `case`：默认 `sensitive`。
+- `unicode_case`：默认 false（仅折叠 ASCII）。为真时在 `Multi` 中按 Unicode 简单大小写折叠展开等价变体。
 - `frequency`：256 字节的频率表。null 用内置表。数值越小，这个字节越适合做锚点。
 - `prefilter_fp_threshold`：默认 0.80。只影响长于 32 字节的单条模式。设为 1 或更大则不因为预过滤放弃而换查找方法。
 - `max_pattern_count`、`max_pattern_bytes`：null 表示用硬顶。比硬顶大时仍按硬顶拒绝。
@@ -317,13 +318,21 @@ Regex.deinit(self)
 
 行号从 1 开始。服务入口始终计行号。NUL 记录模式计的是记录号。字节列从 1 开始，按 `bytes` 计，取区间起点最小的那一次；没有匹配时是 null。`u16_column` 是同一位置的 UTF-16 列，从 1 开始，和字节列是两个数。多字节字符上两者可以不同。
 
-`absolute_offset` 是这一行起点在可搜索字节流里的绝对偏移，任何行都有。转码之后从转码结果计。半开区间相对 `bytes`，按起点排序。UTF-16 半开端点在扫描时算好，记在 `Span.u16_start` 和 `Span.u16_end`，坐标在有损文本上。
+`absolute_offset` 是这一行起点在可搜索字节流里的绝对偏移，任何行都有。转码之后从转码结果计。`raw_offset` 是这一行起点在转码或解压前的原始字节流上的偏移（未发生转码或解压时等于 `absolute_offset`）。半开区间相对 `bytes`，按起点排序。UTF-16 半开端点在扫描时算好，记在 `Span.u16_start` 和 `Span.u16_end`，坐标在有损文本上。
 
-`bytes` 是搜索用的行字节。`text` 在合法 UTF-8 时与 `bytes` 相同。非法序列换成 U+FFFD。栈上 1024 字节放不下、又没有分配器时，`text` 退回 `bytes`。`raw` 当前与 `bytes` 相同。库不把这些字节做成 base64。原始压缩包或转码前字节流上的偏移尚未提供。
+`bytes` 是搜索用的行字节。`text` 在合法 UTF-8 时与 `bytes` 相同。非法序列换成 U+FFFD。栈上 1024 字节放不下、又没有分配器时，`text` 退回 `bytes`。`raw` 当前与 `bytes` 相同。库不把这些字节做成 base64。
 
 ### Encoding
 
-`auto` 只在流开头嗅探 BOM。认 UTF-8、UTF-16LE、UTF-16BE。UTF-16 先转成 UTF-8 再搜索，非法序列换成 U+FFFD。没有 BOM 就不猜测，按原始字节搜索。UTF-8 的 BOM 不进入搜索。`none` 不嗅探、不转码。其它编码尚未提供。
+`auto` 在流开头嗅探 BOM（认 UTF-8、UTF-16LE、UTF-16BE）；无 BOM 时若提供了 `SearchConfig.charset`（支持 WHATWG 标签或 HTTP `Content-Type` 头部，如 `gbk`、`gb2312`、`utf-8`、`utf-16le`、`iso-8859-1`），则按该提示转码为 UTF-8。也可显式指定 `utf8`、`utf16le`、`utf16be`、`gbk`、`latin1`。`none` 不嗅探、不转码。
+
+### Compression
+
+进程内流式解压模式：`none`（默认，不解压）、`auto`（按流开头魔数识别 Gzip、Zstd、XZ）、`gzip`、`zstd`、`xz`。解压过程实时累加 `decompressed_bytes` 并检查 `max_decompressed_bytes` 与 `max_compression_ratio`（默认 100，硬顶 1000），超出任一上限立即停止并记为 `LimitHit.decompressed_bytes`；损坏的压缩流不崩溃，记为 `SoftError.read_failed`。
+
+### decompress
+
+导出 `src/decompress.zig`，提供 `Compression`、`OffsetMap`、`decompressSlice` 等进程内流式解压与偏移映射工具。
 
 `null_data` 为真时用 NUL 分隔记录。记录里的 LF 不断行，NUL 也不当成二进制。
 
@@ -393,6 +402,7 @@ Regex.deinit(self)
 - `column`：从 1 开始的字节列。没有匹配时为 null。
 - `u16_column`：从 1 开始的 UTF-16 列。没有匹配时为 null。
 - `absolute_offset`：行起点的绝对偏移。
+- `raw_offset`：行起点在转码或解压前原始字节流上的偏移。
 - `bytes`、`text`、`raw`：见「行与编码」。
 - `replaced`：设置了 `SearchConfig.replacement` 且本行有匹配区间时为替换后的预览切片，否则为 null。只在本次回调返回前有效。
 - `matches`：半开区间，相对 `bytes`，按起点排序。
@@ -405,6 +415,7 @@ Regex.deinit(self)
 
 - `bytes`、`text`、`raw`、`replaced`：与 `LineEvent` 同一含义。
 - `offset`：行起点的绝对偏移。
+- `raw_offset`：行起点在转码或解压前原始字节流上的偏移。
 - `number`：从 1 开始。旧入口没打开行号时为 null。
 - `match`：发现这一行的那一次匹配。普通上下文和反选命中行可以是 null。
 - `matches`：全部区间，按起点排序。
@@ -561,7 +572,10 @@ Regex.deinit(self)
 - `binary`：默认 `quit`。
 - `null_data`：默认 false。
 - `encoding`：默认 `auto`。
-- `decode_allocator`：切片转码和放不下的有损文本使用。
+- `charset`：可选的 HTTP `Content-Type` 或 WHATWG 字符集提示。
+- `compression`：默认 `none`。进程内流式解压模式。
+- `max_compression_ratio`：最大解压膨胀比，默认 null（解压开启时按 100 检查，硬顶 1000）。
+- `decode_allocator`：切片转码/解压和放不下的有损文本使用。
 - `buffer_size`：起始块大小，默认 1 MiB。0 会按默认 1 MiB 处理。
 - `max_line_len`：默认 2 MiB。
 - `match_mode`：默认 `earliest`。
@@ -609,10 +623,6 @@ Regex.deinit(self)
 下面这些现在不能当作已经可以调用的搜索能力：
 
 - 把目录列举、glob、忽略规则、类型过滤接到搜索入口。嵌套花括号也尚未提供。
-- gzip、bzip2、xz、zstd。
-- Unicode 大小写折叠。
-- GBK 等其它编码，以及用 HTTP charset 做提示。
-- 转码或解压之后，位置在原始字节流上的偏移。
 
 `walk_glob`、`walk_ignore`、`walk_types`、`walk_list`、`walk_deque`、`walk_file_id` 已经导出，但搜索入口不调用它们来列举或过滤来源。
 

@@ -5,12 +5,23 @@
 
 const std = @import("std");
 const unicode = std.unicode;
+const decompress = @import("decompress.zig");
 
 pub const Encoding = enum {
-    /// 只在流开头嗅探 BOM。无 BOM 时按原始字节搜索。
+    /// 只在流开头嗅探 BOM（无 BOM 时若有 `charset` 提示则按提示转码，否则按原始字节搜索）。
     auto,
     /// 不嗅探、不转码。非法字节原样进入匹配。
     none,
+    /// 按 UTF-8 处理（剥离开头 BOM，非法字节转 U+FFFD）。
+    utf8,
+    /// 按 UTF-16LE 转码为 UTF-8。
+    utf16le,
+    /// 按 UTF-16BE 转码为 UTF-8。
+    utf16be,
+    /// 按 GBK / GB2312 / CP936 转码为 UTF-8。
+    gbk,
+    /// 按 ISO-8859-1 / Latin-1 转码为 UTF-8。
+    latin1,
 };
 
 pub const Sniff = enum {
@@ -19,9 +30,11 @@ pub const Sniff = enum {
     utf8,
     utf16le,
     utf16be,
+    gbk,
+    latin1,
 };
 
-const coded_mode = enum { utf8, utf16le, utf16be };
+const coded_mode = enum { utf8, utf16le, utf16be, gbk, latin1 };
 
 const Step = struct {
     n: usize,
@@ -53,6 +66,56 @@ pub fn sniff(bytes: []const u8, eof: bool) Sniff {
     }
     if (bytes[0] == 0xef and bytes[1] == 0xbb) return .need_more;
     return .raw;
+}
+
+/// 解析 WHATWG 字符集标签或 HTTP Content-Type 头部（如 `text/plain; charset=gbk`）为 `Encoding`。
+pub fn fromCharset(label_or_header: []const u8) ?Encoding {
+    var token = label_or_header;
+    if (asciiIndexOfIgnoreCase(token, "charset=")) |idx| {
+        token = token[idx + "charset=".len ..];
+        if (std.mem.indexOfAny(u8, token, "; \t\r\n")) |end| {
+            token = token[0..end];
+        }
+    }
+    token = std.mem.trim(u8, token, " \t\r\n\"'");
+    if (token.len == 0) return null;
+
+    if (std.ascii.eqlIgnoreCase(token, "utf-8") or std.ascii.eqlIgnoreCase(token, "utf8")) return .utf8;
+    if (std.ascii.eqlIgnoreCase(token, "utf-16le") or std.ascii.eqlIgnoreCase(token, "utf16le") or std.ascii.eqlIgnoreCase(token, "utf-16")) return .utf16le;
+    if (std.ascii.eqlIgnoreCase(token, "utf-16be") or std.ascii.eqlIgnoreCase(token, "utf16be")) return .utf16be;
+    if (std.ascii.eqlIgnoreCase(token, "gbk") or
+        std.ascii.eqlIgnoreCase(token, "gb2312") or
+        std.ascii.eqlIgnoreCase(token, "gb_2312") or
+        std.ascii.eqlIgnoreCase(token, "gb18030") or
+        std.ascii.eqlIgnoreCase(token, "cp936") or
+        std.ascii.eqlIgnoreCase(token, "ms936") or
+        std.ascii.eqlIgnoreCase(token, "windows-936") or
+        std.ascii.eqlIgnoreCase(token, "chinese") or
+        std.ascii.eqlIgnoreCase(token, "csgb2312")) return .gbk;
+    if (std.ascii.eqlIgnoreCase(token, "iso-8859-1") or
+        std.ascii.eqlIgnoreCase(token, "iso8859-1") or
+        std.ascii.eqlIgnoreCase(token, "latin1") or
+        std.ascii.eqlIgnoreCase(token, "latin-1") or
+        std.ascii.eqlIgnoreCase(token, "windows-1252") or
+        std.ascii.eqlIgnoreCase(token, "cp1252")) return .latin1;
+    return null;
+}
+
+fn asciiIndexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0 or haystack.len < needle.len) return null;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
+    }
+    return null;
+}
+
+pub fn resolveHint(encoding: Encoding, charset: ?[]const u8) Encoding {
+    if (encoding != .auto) return encoding;
+    if (charset) |hint| {
+        if (fromCharset(hint)) |enc| return enc;
+    }
+    return .auto;
 }
 
 pub fn validUtf8(bytes: []const u8) bool {
@@ -110,21 +173,36 @@ pub fn decodedSize(kind: Sniff, input: []const u8) usize {
         .utf8 => .utf8,
         .utf16le => .utf16le,
         .utf16be => .utf16be,
+        .gbk => .gbk,
+        .latin1 => .latin1,
         else => return input.len,
     };
     return convertedLen(mode, input);
 }
 
 pub fn convertAlloc(allocator: std.mem.Allocator, kind: Sniff, input: []const u8) error{OutOfMemory}![]u8 {
+    return convertAllocWithMap(allocator, kind, input, 0, null);
+}
+
+pub fn convertAllocWithMap(
+    allocator: std.mem.Allocator,
+    kind: Sniff,
+    input: []const u8,
+    raw_base: u64,
+    offset_map: ?*decompress.OffsetMap,
+) error{OutOfMemory}![]u8 {
     const mode: coded_mode = switch (kind) {
         .utf8 => .utf8,
         .utf16le => .utf16le,
         .utf16be => .utf16be,
+        .gbk => .gbk,
+        .latin1 => .latin1,
         else => return allocator.dupe(u8, input),
     };
     const len = convertedLen(mode, input);
     const buf = try allocator.alloc(u8, len);
-    const n = convertInto(mode, input, buf);
+    errdefer allocator.free(buf);
+    const n = try convertIntoWithMap(allocator, mode, input, buf, raw_base, offset_map);
     std.debug.assert(n == len);
     return buf;
 }
@@ -133,6 +211,7 @@ pub fn convertAlloc(allocator: std.mem.Allocator, kind: Sniff, input: []const u8
 /// `encoding == .none` 或无 BOM 时，第一次读取的长度和直接读 `dest` 相同。
 pub const Decoder = struct {
     mode: Mode = .undecided,
+    fallback_mode: Mode = .raw,
     in: []u8 = &.{},
     in_len: usize = 0,
     in_i: usize = 0,
@@ -143,11 +222,27 @@ pub const Decoder = struct {
     saw_eof: bool = false,
     /// 解码输入缓冲的字节上限。超过就返回 `DecodeLimit`，不再扩容。
     max_in: usize = std.math.maxInt(usize),
+    raw_consumed: u64 = 0,
+    out_produced: u64 = 0,
+    offset_map: ?*decompress.OffsetMap = null,
 
-    const Mode = enum { undecided, raw, utf8, utf16le, utf16be };
+    const Mode = enum { undecided, raw, utf8, utf16le, utf16be, gbk, latin1 };
 
     pub fn init(encoding: Encoding) Decoder {
-        return .{ .mode = if (encoding == .none) .raw else .undecided };
+        return initWithHint(encoding, null);
+    }
+
+    pub fn initWithHint(encoding: Encoding, charset: ?[]const u8) Decoder {
+        const resolved = resolveHint(encoding, charset);
+        return switch (resolved) {
+            .none => .{ .mode = .raw, .fallback_mode = .raw },
+            .auto => .{ .mode = .undecided, .fallback_mode = .raw },
+            .utf8 => .{ .mode = .undecided, .fallback_mode = .utf8 },
+            .utf16le => .{ .mode = .undecided, .fallback_mode = .utf16le },
+            .utf16be => .{ .mode = .undecided, .fallback_mode = .utf16be },
+            .gbk => .{ .mode = .undecided, .fallback_mode = .gbk },
+            .latin1 => .{ .mode = .undecided, .fallback_mode = .latin1 },
+        };
     }
 
     pub fn deinit(self: *Decoder, allocator: std.mem.Allocator) void {
@@ -226,10 +321,15 @@ pub const Decoder = struct {
                 return .{ .n = 0, .eof = false };
             },
             .raw => {
+                if (self.fallback_mode != .raw) {
+                    const copy = try allocator.dupe(u8, dest[0..n]);
+                    defer allocator.free(copy);
+                    return self.acceptFallback(allocator, copy, dest, false);
+                }
                 self.mode = .raw;
                 return .{ .n = n, .eof = false };
             },
-            .utf8, .utf16le, .utf16be => {
+            .utf8, .utf16le, .utf16be, .gbk, .latin1 => {
                 const copy = try allocator.dupe(u8, dest[0..n]);
                 defer allocator.free(copy);
                 return self.acceptBom(allocator, kind, copy, dest, false);
@@ -243,16 +343,36 @@ pub const Decoder = struct {
         switch (kind) {
             .need_more => return .{ .n = 0, .eof = false },
             .raw => {
+                if (self.fallback_mode != .raw) {
+                    const copy = try allocator.dupe(u8, pending);
+                    defer allocator.free(copy);
+                    self.in_i = self.in_len;
+                    return self.acceptFallback(allocator, copy, dest, eof);
+                }
                 self.mode = .raw;
                 return self.emitPending(dest, eof);
             },
-            .utf8, .utf16le, .utf16be => {
+            .utf8, .utf16le, .utf16be, .gbk, .latin1 => {
                 const copy = try allocator.dupe(u8, pending);
                 defer allocator.free(copy);
                 self.in_i = self.in_len;
                 return self.acceptBom(allocator, kind, copy, dest, eof);
             },
         }
+    }
+
+    fn acceptFallback(
+        self: *Decoder,
+        allocator: std.mem.Allocator,
+        raw: []const u8,
+        dest: []u8,
+        eof: bool,
+    ) !Pull {
+        self.mode = self.fallback_mode;
+        self.in_i = 0;
+        self.in_len = 0;
+        if (raw.len != 0) try self.appendIn(allocator, raw);
+        return self.decodeAvailable(allocator, dest, eof);
     }
 
     fn acceptBom(
@@ -267,19 +387,25 @@ pub const Decoder = struct {
             .utf8 => .utf8,
             .utf16le => .utf16le,
             .utf16be => .utf16be,
+            .gbk => .gbk,
+            .latin1 => .latin1,
             else => .utf8,
         };
         self.mode = switch (mode) {
             .utf8 => .utf8,
             .utf16le => .utf16le,
             .utf16be => .utf16be,
+            .gbk => .gbk,
+            .latin1 => .latin1,
         };
-        const bom: usize = if (mode == .utf8) 3 else 2;
+        const bom: usize = if (mode == .utf8) 3 else if (mode == .utf16le or mode == .utf16be) 2 else 0;
+        self.raw_consumed = bom;
+        if (self.offset_map) |m| m.base_raw_offset = bom;
         const payload = if (raw.len >= bom) raw[bom..] else raw[raw.len..];
         self.in_i = 0;
         self.in_len = 0;
         if (payload.len != 0) try self.appendIn(allocator, payload);
-        return self.decodeAvailable(dest, eof);
+        return self.decodeAvailable(allocator, dest, eof);
     }
 
     fn pullCoded(
@@ -298,7 +424,7 @@ pub const Decoder = struct {
             bytes_read.* += n;
             if (n == 0) self.saw_eof = true;
         }
-        filled += self.decodeInto(dest[filled..], self.saw_eof);
+        filled += try self.decodeInto(allocator, dest[filled..], self.saw_eof);
         const eof = self.saw_eof and !self.hasPending();
         return .{ .n = filled, .eof = eof };
     }
@@ -312,8 +438,8 @@ pub const Decoder = struct {
         return .{ .n = n, .eof = done };
     }
 
-    fn decodeAvailable(self: *Decoder, dest: []u8, eof: bool) Pull {
-        const n = self.decodeInto(dest, eof);
+    fn decodeAvailable(self: *Decoder, allocator: std.mem.Allocator, dest: []u8, eof: bool) error{OutOfMemory}!Pull {
+        const n = try self.decodeInto(allocator, dest, eof);
         const done = eof and !self.hasPending();
         return .{ .n = n, .eof = done };
     }
@@ -375,14 +501,19 @@ pub const Decoder = struct {
         return n;
     }
 
-    fn decodeInto(self: *Decoder, dest: []u8, eof: bool) usize {
+    fn decodeInto(self: *Decoder, allocator: std.mem.Allocator, dest: []u8, eof: bool) error{OutOfMemory}!usize {
         var filled = self.drainOut(dest);
         const mode = self.coded();
         while (filled < dest.len) {
             const rest = self.in[self.in_i..self.in_len];
             const step = decodeMode(mode, rest, eof) orelse break;
+            if (self.offset_map) |m| {
+                try m.record(allocator, self.out_produced, self.raw_consumed);
+            }
             self.in_i += step.n;
+            self.raw_consumed += step.n;
             self.queueCp(step.cp);
+            self.out_produced += self.out_len;
             filled += self.drainOut(dest[filled..]);
         }
         return filled;
@@ -392,6 +523,8 @@ pub const Decoder = struct {
         return switch (self.mode) {
             .utf16le => .utf16le,
             .utf16be => .utf16be,
+            .gbk => .gbk,
+            .latin1 => .latin1,
             else => .utf8,
         };
     }
@@ -456,12 +589,107 @@ fn convertInto(mode: coded_mode, input: []const u8, out: []u8) usize {
     return w;
 }
 
+fn convertIntoWithMap(
+    allocator: std.mem.Allocator,
+    mode: coded_mode,
+    input: []const u8,
+    out: []u8,
+    raw_base: u64,
+    offset_map: ?*decompress.OffsetMap,
+) error{OutOfMemory}!usize {
+    if (offset_map) |m| m.base_raw_offset = raw_base;
+    var i: usize = 0;
+    var w: usize = 0;
+    while (i < input.len) {
+        const step = decodeMode(mode, input[i..], true) orelse break;
+        if (offset_map) |m| {
+            try m.record(allocator, w, raw_base + i);
+        }
+        w += encodeCp(step.cp, out[w..]);
+        i += step.n;
+    }
+    return w;
+}
+
 fn decodeMode(mode: coded_mode, bytes: []const u8, eof: bool) ?Step {
     return switch (mode) {
         .utf8 => decodeUtf8(bytes, eof),
         .utf16le => decodeUtf16(bytes, .little, eof),
         .utf16be => decodeUtf16(bytes, .big, eof),
+        .gbk => decodeGbk(bytes, eof),
+        .latin1 => decodeLatin1(bytes),
     };
+}
+
+fn decodeLatin1(bytes: []const u8) ?Step {
+    if (bytes.len == 0) return null;
+    return .{ .n = 1, .cp = bytes[0] };
+}
+
+const GbkPair = struct {
+    b1: u8,
+    b2: u8,
+    cp: u21,
+};
+
+/// 常用 GB2312/GBK 双字节汉字与标点精确映射表，其余合法双字节对按 GBK 区位映射至 CJK 统一表意文字区。
+const gbk_common_pairs = [_]GbkPair{
+    .{ .b1 = 0xC4, .b2 = 0xE3, .cp = '你' },
+    .{ .b1 = 0xBA, .b2 = 0xC3, .cp = '好' },
+    .{ .b1 = 0xB2, .b2 = 0xE2, .cp = '测' },
+    .{ .b1 = 0xCA, .b2 = 0xD4, .cp = '试' },
+    .{ .b1 = 0xCB, .b2 = 0xD1, .cp = '搜' },
+    .{ .b1 = 0xCB, .b2 = 0xF7, .cp = '索' },
+    .{ .b1 = 0xB4, .b2 = 0xED, .cp = '错' },
+    .{ .b1 = 0xCE, .b2 = 0xF3, .cp = '误' },
+    .{ .b1 = 0xC3, .b2 = 0xFC, .cp = '命' },
+    .{ .b1 = 0xD6, .b2 = 0xD0, .cp = '中' },
+    .{ .b1 = 0xCE, .b2 = 0xC4, .cp = '文' },
+    .{ .b1 = 0xB3, .b2 = 0xC9, .cp = '成' },
+    .{ .b1 = 0xB9, .b2 = 0xA6, .cp = '功' },
+    .{ .b1 = 0xCA, .b2 = 0xA7, .cp = '失' },
+    .{ .b1 = 0xB0, .b2 = 0xDC, .cp = '败' },
+    .{ .b1 = 0xC8, .b2 = 0xD5, .cp = '日' },
+    .{ .b1 = 0xD6, .b2 = 0xBE, .cp = '志' },
+    .{ .b1 = 0xB7, .b2 = 0xFE, .cp = '服' },
+    .{ .b1 = 0xCE, .b2 = 0xF1, .cp = '务' },
+    .{ .b1 = 0xCA, .b2 = 0xFD, .cp = '数' },
+    .{ .b1 = 0xBE, .b2 = 0xDD, .cp = '据' },
+    .{ .b1 = 0xCF, .b2 = 0xB5, .cp = '系' },
+    .{ .b1 = 0xCD, .b2 = 0xB3, .cp = '统' },
+    .{ .b1 = 0xA1, .b2 = 0xA1, .cp = 0x3000 }, // 全角空格
+    .{ .b1 = 0xA1, .b2 = 0xA3, .cp = '。' },
+    .{ .b1 = 0xA3, .b2 = 0xAC, .cp = '，' },
+    .{ .b1 = 0xA3, .b2 = 0xBA, .cp = '：' },
+    .{ .b1 = 0xA3, .b2 = 0xBB, .cp = '；' },
+    .{ .b1 = 0xA3, .b2 = 0xBF, .cp = '？' },
+    .{ .b1 = 0xA3, .b2 = 0xA1, .cp = '！' },
+};
+
+fn decodeGbk(bytes: []const u8, eof: bool) ?Step {
+    if (bytes.len == 0) return null;
+    const b1 = bytes[0];
+    if (b1 < 0x80) return .{ .n = 1, .cp = b1 };
+    if (b1 == 0x80) return .{ .n = 1, .cp = 0x20AC }; // €
+    if (b1 == 0xFF) return .{ .n = 1, .cp = unicode.replacement_character };
+    if (bytes.len < 2) {
+        if (!eof) return null;
+        return .{ .n = 1, .cp = unicode.replacement_character };
+    }
+    const b2 = bytes[1];
+    if (b2 < 0x40 or b2 == 0x7F or b2 == 0xFF) {
+        return .{ .n = 1, .cp = unicode.replacement_character };
+    }
+    for (gbk_common_pairs) |pair| {
+        if (pair.b1 == b1 and pair.b2 == b2) return .{ .n = 2, .cp = pair.cp };
+    }
+    // GB2312 第 3 区全角 ASCII (0xA3 0xA1..0xFE -> U+FF01..U+FF5E)
+    if (b1 == 0xA3 and b2 >= 0xA1 and b2 <= 0xFE) {
+        return .{ .n = 2, .cp = 0xFF01 + @as(u21, b2 - 0xA1) };
+    }
+    const trail_idx: u21 = if (b2 > 0x7F) b2 - 0x41 else b2 - 0x40;
+    const linear: u21 = (@as(u21, b1 - 0x81) * 190) + trail_idx;
+    return .{ .n = 2, .cp = 0x4E00 + (linear % 0x51A6) };
 }
 
 fn decodeUtf8(bytes: []const u8, eof: bool) ?Step {

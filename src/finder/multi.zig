@@ -20,6 +20,7 @@ const byteset = @import("byteset.zig");
 const matcher = @import("../matcher.zig");
 const memchr = @import("memchr.zig");
 const pairs = @import("pairs.zig");
+const unicode_fold = @import("unicode_fold.zig");
 
 const teddy_on = build_options.teddy != .off;
 const teddy_mod = if (teddy_on) @import("teddy.zig") else struct {
@@ -33,6 +34,7 @@ pub const Multi = struct {
     /// 调用方持有。整行比较和整词的逐条确认用它，不另外复制模式字节。
     patterns: []const []const u8,
     owned_patterns: ?[][]const u8 = null,
+    owned_variant_bytes: ?[][]u8 = null,
     patterns_alloc: ?std.mem.Allocator = null,
 
     const Mixed = struct {
@@ -57,6 +59,9 @@ pub const Multi = struct {
         try matcher.checkPatternLimits(patterns, options);
         for (patterns) |pat| {
             if (std.mem.findScalar(u8, pat, '\n') != null) return error.PatternHasNewline;
+        }
+        if (options.unicode_case and options.case != .sensitive and anyNeedsUnicodeFold(patterns, options)) {
+            return initUnicodeFolded(allocator, patterns, options);
         }
         if (uniformIgnore(patterns, options.case)) |ignore| {
             if (allSingleByte(patterns)) {
@@ -143,8 +148,12 @@ pub const Multi = struct {
             pos = if (nl < text.len) nl + 1 else text.len;
         }
         var self = try init(allocator, list, options);
-        self.owned_patterns = list;
-        self.patterns_alloc = allocator;
+        if (self.owned_patterns != null) {
+            allocator.free(list);
+        } else {
+            self.owned_patterns = list;
+            self.patterns_alloc = allocator;
+        }
         return self;
     }
 
@@ -157,6 +166,12 @@ pub const Multi = struct {
                 if (comptime teddy_on) engine.deinit();
             },
             .mixed => |*mixed| mixed.allocator.free(mixed.ignore),
+        }
+        if (self.owned_variant_bytes) |variants| {
+            if (self.patterns_alloc) |alloc| {
+                for (variants) |v| alloc.free(v);
+                alloc.free(variants);
+            }
         }
         if (self.owned_patterns) |list| {
             if (self.patterns_alloc) |alloc| alloc.free(list);
@@ -307,6 +322,97 @@ pub fn patternIgnoresCase(pattern: []const u8, mode: matcher.CaseMode) bool {
         .sensitive => false,
         .insensitive => true,
         .smart => !ascii.patternHasUpper(pattern),
+    };
+}
+
+pub fn patternIgnoresCaseUnicode(pattern: []const u8, mode: matcher.CaseMode) bool {
+    return switch (mode) {
+        .sensitive => false,
+        .insensitive => true,
+        .smart => !unicode_fold.patternHasUnicodeUpper(pattern),
+    };
+}
+
+fn anyNeedsUnicodeFold(patterns: []const []const u8, options: matcher.FindOptions) bool {
+    for (patterns) |pat| {
+        if (unicode_fold.needsUnicodeExpansion(pat) or unicode_fold.patternHasUnicodeUpper(pat)) return true;
+    }
+    _ = options;
+    return false;
+}
+
+fn initUnicodeFolded(
+    allocator: std.mem.Allocator,
+    patterns: []const []const u8,
+    options: matcher.FindOptions,
+) (matcher.LimitError || error{ PatternHasNewline, OutOfMemory })!Multi {
+    var variant_bytes = std.ArrayList([]u8).empty;
+    errdefer {
+        for (variant_bytes.items) |v| allocator.free(v);
+        variant_bytes.deinit(allocator);
+    }
+    var variant_flags = std.ArrayList(bool).empty;
+    defer variant_flags.deinit(allocator);
+
+    for (patterns) |pat| {
+        const ig = patternIgnoresCaseUnicode(pat, options.case);
+        if (ig and unicode_fold.needsUnicodeExpansion(pat)) {
+            const before = variant_bytes.items.len;
+            try unicode_fold.expandPatternVariants(allocator, pat, &variant_bytes, 32);
+            const added = variant_bytes.items.len - before;
+            try variant_flags.appendNTimes(allocator, true, added);
+        } else {
+            const copy = try allocator.dupe(u8, pat);
+            errdefer allocator.free(copy);
+            try variant_bytes.append(allocator, copy);
+            try variant_flags.append(allocator, ig);
+        }
+    }
+
+    const owned_slices = try allocator.alloc([]const u8, variant_bytes.items.len);
+    errdefer allocator.free(owned_slices);
+    for (variant_bytes.items, 0..) |v, i| owned_slices[i] = v;
+
+    try matcher.checkPatternLimits(owned_slices, options);
+
+    const owned_variants = try variant_bytes.toOwnedSlice(allocator);
+    errdefer {
+        for (owned_variants) |v| allocator.free(v);
+        allocator.free(owned_variants);
+    }
+
+    var all_same = true;
+    const first_flag = if (variant_flags.items.len > 0) variant_flags.items[0] else true;
+    for (variant_flags.items) |fl| {
+        if (fl != first_flag) {
+            all_same = false;
+            break;
+        }
+    }
+
+    if (all_same) {
+        var plain_opts = options;
+        plain_opts.unicode_case = false;
+        plain_opts.case = if (first_flag) .insensitive else .sensitive;
+        var res = try Multi.init(allocator, owned_slices, plain_opts);
+        res.owned_patterns = owned_slices;
+        res.owned_variant_bytes = owned_variants;
+        res.patterns_alloc = allocator;
+        return res;
+    }
+
+    const flags = try allocator.dupe(bool, variant_flags.items);
+    return .{
+        .kind = .{ .mixed = .{
+            .ignore = flags,
+            .allocator = allocator,
+        } },
+        .ignore_case = false,
+        .empty_only = false,
+        .patterns = owned_slices,
+        .owned_patterns = owned_slices,
+        .owned_variant_bytes = owned_variants,
+        .patterns_alloc = allocator,
     };
 }
 
@@ -778,6 +884,31 @@ test "A03 空行模式匹配所有行且超限在构造前拒绝" {
         Multi.initFromText(fail_alloc.allocator(), "abcd\nefgh\n", .{ .max_pattern_bytes = 6 }),
     );
     try std.testing.expectEqual(@as(usize, 0), fail_alloc.allocations);
+}
+
+test "B05 Unicode 折叠按单条模式智能大小写生效" {
+    // 1. 同一组 Multi 中："Δelta" 含大写希腊字母 Δ，按 smart 保持区分大小写；
+    //    "σigma" 全小写，按 smart 自动折叠匹配 Σigma / σigma / ςigma。
+    var smart_uni = try Multi.init(std.testing.allocator, &.{ "Δelta", "σigma" }, .{
+        .case = .smart,
+        .unicode_case = true,
+    });
+    defer smart_uni.deinit();
+
+    try std.testing.expect(smart_uni.find("δelta", 0, .earliest) == null);
+    try std.testing.expectEqual(@as(usize, 0), smart_uni.find("Δelta", 0, .earliest).?.start);
+    try std.testing.expectEqual(@as(usize, 0), smart_uni.find("ΣIGMA", 0, .earliest).?.start);
+    try std.testing.expectEqual(@as(usize, 0), smart_uni.find("ςigma", 0, .earliest).?.start);
+
+    // 2. 全小写 Unicode 模式组直接走高性能 SIMD 引擎（非 mixed），并支持跨 ASCII 折叠（如 Kelvin K U+212A <-> k）
+    var all_lower = try Multi.init(std.testing.allocator, &.{ "δelta", "kelvin" }, .{
+        .case = .smart,
+        .unicode_case = true,
+    });
+    defer all_lower.deinit();
+    try std.testing.expect(!std.mem.eql(u8, "mixed", all_lower.engineName()));
+    try std.testing.expectEqual(@as(usize, 0), all_lower.find("ΔELTA", 0, .earliest).?.start);
+    try std.testing.expectEqual(@as(usize, 0), all_lower.find("\u{212A}ELVIN", 0, .earliest).?.start);
 }
 
 fn fuzzMulti(_: void, smith: *std.testing.Smith) !void {

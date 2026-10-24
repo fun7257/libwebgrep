@@ -124,7 +124,7 @@ zig build check -Dtarget=aarch64-linux-musl
 
 ## 文档导航
 
-- [**API 参考手册 (`docs/API.md`)**](docs/API.md) — 公共导出符号、事件结构与多租户预算完整说明。
+- [**API 参考手册 (`docs/API.zh-CN.md`)**](docs/API.zh-CN.md) ([English (`docs/API.md`)](docs/API.md)) — 公共导出符号、事件结构与多租户预算完整说明。
 - [**架构与设计说明 (`DESIGN.md`)**](DESIGN.md) — SIMD 查找内核、Thompson NFA 正则引擎、流式防爆解压与工作窃取调度详解。
 - [**性能基准报告 (`BENCHMARKS.md`)**](BENCHMARKS.md) — 微基准测试方法与吞吐数据解析。
 - [**功能矩阵与安全边界 (`docs/FEATURES.md`)**](docs/FEATURES.md) — 核心能力全景与安全红线说明。

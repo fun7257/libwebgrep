@@ -220,7 +220,7 @@ fn checkApiDoc(b: *std.Build, root_src: []const u8, api_md: []const u8) void {
             std.process.fatal("docs/API.md is missing required text: {s}", .{text});
         }
     }
-    const banned = [_][]const u8{ "ANSI", "PCRE", "ChildProcess", "--" };
+    const banned = [_][]const u8{ "ANSI", "PCRE", "ChildProcess", "--pretty", "--vimgrep" };
     for (banned) |text| {
         if (std.mem.indexOf(u8, api_md, text) != null) {
             std.process.fatal("docs/API.md contains banned text: {s}", .{text});

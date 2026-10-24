@@ -15,5 +15,6 @@
         "DESIGN.md",
         "BENCHMARKS.md",
         "docs/API.md",
+        "docs/API.zh-CN.md",
     },
 }

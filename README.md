@@ -151,7 +151,7 @@ zig build check -Dtarget=aarch64-linux-musl
 
 ## Documentation
 
-- [**API Reference (`docs/API.md`)**](docs/API.md) — Complete specification of all exported types, functions, events, and multi-tenant budgets.
+- [**API Reference (`docs/API.md`)**](docs/API.md) ([简体中文 (`docs/API.zh-CN.md`)](docs/API.zh-CN.md)) — Complete specification of all exported types, functions, events, and multi-tenant budgets.
 - [**Architecture & Design (`DESIGN.md`)**](DESIGN.md) — Deep dive into the SIMD kernels, Thompson NFA regex engine, streaming decompression, and work-stealing scheduler.
 - [**Benchmarks (`BENCHMARKS.md`)**](BENCHMARKS.md) — Reproducible microbenchmark suite and throughput analysis.
 - [**Feature Matrix (`docs/FEATURES.md`)**](docs/FEATURES.md) — Overview of implemented capabilities and security boundaries.

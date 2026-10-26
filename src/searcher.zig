@@ -253,6 +253,7 @@ const State = struct {
     text_buf: []u8 = &.{},
     replace_buf: []u8 = &.{},
     offset_map: ?*const decompress.OffsetMap = null,
+    decompress_map: ?*const decompress.OffsetMap = null,
     /// Source name used in diagnostic logs; never included in returned errors.
     label: []const u8 = "",
     started_ns: i128 = 0,
@@ -287,13 +288,17 @@ const Prepared = struct {
     owned: []u8 = &.{},
     alloc: ?std.mem.Allocator = null,
     offset_map: decompress.OffsetMap = .{},
+    decompress_map: decompress.OffsetMap = .{},
     decompressed_bytes: u64 = 0,
     decompress_limit_hit: bool = false,
     corrupt_stream: bool = false,
 
     fn deinit(self: *Prepared) void {
         if (self.owned.len != 0) if (self.alloc) |alloc| alloc.free(self.owned);
-        if (self.alloc) |alloc| self.offset_map.deinit(alloc);
+        if (self.alloc) |alloc| {
+            self.offset_map.deinit(alloc);
+            self.decompress_map.deinit(alloc);
+        }
     }
 };
 
@@ -319,7 +324,7 @@ fn materialize(haystack: []const u8, config: SearchConfig) SliceError!Prepared {
                 max_dec,
                 config.max_compression_ratio,
                 &prep.decompressed_bytes,
-                &prep.offset_map,
+                &prep.decompress_map,
             )) |maybe_dec| {
                 if (maybe_dec) |dec_buf| {
                     prep.owned = dec_buf;
@@ -361,8 +366,7 @@ fn materialize(haystack: []const u8, config: SearchConfig) SliceError!Prepared {
             if (encoding.decodedSize(target, current) > cap) return error.DecodeLimit;
             const alloc = config.decode_allocator orelse return error.OutOfMemory;
             prep.alloc = alloc;
-            const map_ptr: ?*decompress.OffsetMap = if (prep.offset_map.active) null else &prep.offset_map;
-            const owned = try encoding.convertAllocWithMap(alloc, target, current, 0, map_ptr);
+            const owned = try encoding.convertAllocWithMap(alloc, target, current, 0, &prep.offset_map);
             if (prep.owned.len != 0) alloc.free(prep.owned);
             prep.owned = owned;
             prep.bytes = owned;
@@ -370,7 +374,7 @@ fn materialize(haystack: []const u8, config: SearchConfig) SliceError!Prepared {
         },
         .utf8 => {
             const rest = if (current.len >= 3) current[3..] else current[0..0];
-            if (!prep.offset_map.active) prep.offset_map.base_raw_offset = 3;
+            prep.offset_map.base_raw_offset = 3;
             if (encoding.validUtf8(rest)) {
                 prep.bytes = rest;
                 return prep;
@@ -378,8 +382,7 @@ fn materialize(haystack: []const u8, config: SearchConfig) SliceError!Prepared {
             if (encoding.decodedSize(.utf8, rest) > cap) return error.DecodeLimit;
             const alloc = config.decode_allocator orelse return error.OutOfMemory;
             prep.alloc = alloc;
-            const map_ptr: ?*decompress.OffsetMap = if (prep.offset_map.active) null else &prep.offset_map;
-            const owned = try encoding.convertAllocWithMap(alloc, .utf8, rest, 3, map_ptr);
+            const owned = try encoding.convertAllocWithMap(alloc, .utf8, rest, 3, &prep.offset_map);
             if (prep.owned.len != 0) alloc.free(prep.owned);
             prep.owned = owned;
             prep.bytes = owned;
@@ -392,8 +395,7 @@ fn materialize(haystack: []const u8, config: SearchConfig) SliceError!Prepared {
             }
             const alloc = config.decode_allocator orelse return error.OutOfMemory;
             prep.alloc = alloc;
-            const map_ptr: ?*decompress.OffsetMap = if (prep.offset_map.active) null else &prep.offset_map;
-            const owned = try encoding.convertAllocWithMap(alloc, kind, payload, 2, map_ptr);
+            const owned = try encoding.convertAllocWithMap(alloc, kind, payload, 2, &prep.offset_map);
             if (prep.owned.len != 0) alloc.free(prep.owned);
             prep.owned = owned;
             prep.bytes = owned;
@@ -440,6 +442,7 @@ fn searchPrepared(
     state.label = name;
     state.decompressed_bytes = prepared.decompressed_bytes;
     state.offset_map = &prepared.offset_map;
+    state.decompress_map = &prepared.decompress_map;
     armClock(&state, config);
     state.text_alloc = config.decode_allocator;
     defer if (state.text_buf.len != 0) if (state.text_alloc) |alloc| alloc.free(state.text_buf);
@@ -781,11 +784,25 @@ pub const PullEvent = struct {
     source_id: []u8,
     line_number: u64 = 0,
     column: ?u64 = null,
+    u16_column: ?u64 = null,
     absolute_offset: u64 = 0,
+    raw_offset: u64 = 0,
     bytes: []u8 = &.{},
+    replaced: ?[]u8 = null,
     spans: []Span = &.{},
+    truncated: bool = false,
+    line_len: u64 = 0,
+    window_start: u64 = 0,
+    binary_status: BinaryStatus = .none,
+    binary_offset: ?u64 = null,
+    outcome: Outcome = .complete,
+    limit_hit: sink_mod.LimitHit = .none,
+    partial: bool = false,
+    resume_at: ?u64 = null,
+    soft_error: ?sink_mod.SoftError = null,
     matched_lines: u64 = 0,
     matches: u64 = 0,
+    bytes_read: u64 = 0,
     bytes_searched: u64 = 0,
     elapsed: u64 = 0,
     searches: u64 = 0,
@@ -797,6 +814,7 @@ pub const PullEvent = struct {
     pub fn deinit(self: *PullEvent, allocator: std.mem.Allocator) void {
         if (self.source_id.len != 0) allocator.free(self.source_id);
         if (self.bytes.len != 0) allocator.free(self.bytes);
+        if (self.replaced) |r| if (r.len != 0) allocator.free(r);
         if (self.spans.len != 0) allocator.free(self.spans);
     }
 };
@@ -895,8 +913,16 @@ fn copyPull(allocator: std.mem.Allocator, ev: Event) !PullEvent {
         .end => |e| return .{
             .kind = .end,
             .source_id = try allocator.dupe(u8, e.source_id),
+            .binary_status = e.binary_status,
+            .binary_offset = e.binary_offset,
             .matched_lines = e.matched_lines,
             .matches = e.matches,
+            .bytes_read = e.bytes_read,
+            .outcome = e.outcome,
+            .limit_hit = e.limit_hit,
+            .partial = e.partial,
+            .resume_at = e.resume_at,
+            .soft_error = e.soft_error,
         },
         .summary => |s| return .{
             .kind = .summary,
@@ -917,6 +943,9 @@ fn copyPull(allocator: std.mem.Allocator, ev: Event) !PullEvent {
             var bytes: []u8 = &.{};
             errdefer if (bytes.len != 0) allocator.free(bytes);
             if (line.bytes.len != 0) bytes = try allocator.dupe(u8, line.bytes);
+            var replaced: ?[]u8 = null;
+            errdefer if (replaced) |r| if (r.len != 0) allocator.free(r);
+            if (line.replaced) |r| replaced = try allocator.dupe(u8, r);
             var spans: []Span = &.{};
             errdefer if (spans.len != 0) allocator.free(spans);
             if (line.matches.len != 0) spans = try allocator.dupe(Span, line.matches);
@@ -925,9 +954,16 @@ fn copyPull(allocator: std.mem.Allocator, ev: Event) !PullEvent {
                 .source_id = id,
                 .line_number = line.line_number,
                 .column = line.column,
+                .u16_column = line.u16_column,
                 .absolute_offset = line.absolute_offset,
+                .raw_offset = line.raw_offset,
                 .bytes = bytes,
+                .replaced = replaced,
                 .spans = spans,
+                .truncated = line.truncated,
+                .line_len = line.line_len,
+                .window_start = line.window_start,
+                .binary_status = line.binary_status,
                 .matched_lines = 0,
                 .matches = @intCast(line.matches.len),
             };
@@ -1028,7 +1064,10 @@ fn drive(
     var filled: usize = 0;
     var offset_map = decompress.OffsetMap{};
     defer offset_map.deinit(allocator);
+    var decompress_map = decompress.OffsetMap{};
+    defer decompress_map.deinit(allocator);
     state.offset_map = &offset_map;
+    state.decompress_map = &decompress_map;
     var decoder = encoding.Decoder.initWithHint(config.encoding, config.charset);
     decoder.max_in = decodeCap(config);
     decoder.offset_map = &offset_map;
@@ -1081,7 +1120,7 @@ fn drive(
             max_dec,
             config.max_compression_ratio,
             &state.decompressed_bytes,
-            &offset_map,
+            &decompress_map,
         )) |maybe_dec| {
             if (maybe_dec) |dec_buf| {
                 decompressed_stream = dec_buf;
@@ -1968,6 +2007,7 @@ fn gatherSpans(
     line: Range,
     preview: Preview,
     known: ?BufMatch,
+    state: *State,
     config: SearchConfig,
 ) SliceError![]Span {
     if (known == null) return inline_buf[0..0];
@@ -1985,6 +2025,7 @@ fn gatherSpans(
     const win_hi = preview.end;
     var pos = line.start;
     while (pos <= content_end and pos <= buf.len) {
+        if (stopInMatch(state, config)) break;
         const found = nextMatch(matcher, buf, pos, config) orelse break;
         if (found.start < pos or found.start > buf.len or found.start > content_end) break;
         if (found.start == content_end and found.end > content_end) break;
@@ -2062,10 +2103,12 @@ fn buildLine(
     replacement: ?[]const u8,
 ) Line {
     const text = lossyText(state, scratch, bytes);
+    var cursor_byte: usize = 0;
+    var cursor_units: usize = 0;
     for (matches) |*item| {
         const from = @min(item.start, bytes.len);
         const to = @min(@max(item.end, from), bytes.len);
-        const units = encoding.utf16Span(bytes, from, to);
+        const units = advanceUtf16Span(bytes, &cursor_byte, &cursor_units, from, to);
         item.u16_start = units.start;
         item.u16_end = units.end;
         item.replacement = replacement;
@@ -2075,7 +2118,10 @@ fn buildLine(
     if (span) |found| {
         const from = @min(found.start, bytes.len);
         const to = @min(@max(found.end, from), bytes.len);
-        const units = encoding.utf16Span(bytes, from, to);
+        const units: encoding.Utf16Span = if (matches.len > 0 and matches[0].start == found.start and matches[0].end == found.end)
+            .{ .start = matches[0].u16_start, .end = matches[0].u16_end }
+        else
+            encoding.utf16Span(bytes, from, to);
         match = .{
             .start = found.start,
             .end = found.end,
@@ -2090,7 +2136,8 @@ fn buildLine(
     else
         null;
     const column: ?u64 = if (matches.len > 0) @as(u64, matches[0].start) + 1 else null;
-    const raw_offset: u64 = if (state.offset_map) |m| m.map(offset) else offset;
+    const mid_offset: u64 = if (state.offset_map) |m| m.map(offset) else offset;
+    const raw_offset: u64 = if (state.decompress_map) |dm| dm.map(mid_offset) else mid_offset;
     return .{
         .bytes = bytes,
         .text = text,
@@ -2108,6 +2155,29 @@ fn buildLine(
         .line_len = line_len,
         .window_start = window_start,
     };
+}
+
+fn advanceUtf16Span(
+    bytes: []const u8,
+    cursor_byte: *usize,
+    cursor_units: *usize,
+    from: usize,
+    to: usize,
+) encoding.Utf16Span {
+    if (from < cursor_byte.*) {
+        cursor_byte.* = 0;
+        cursor_units.* = 0;
+    }
+    const delta_start = encoding.utf16Span(bytes[cursor_byte.*..], 0, from - cursor_byte.*).end;
+    const u16_start = cursor_units.* + delta_start;
+    cursor_byte.* = from;
+    cursor_units.* = u16_start;
+
+    const delta_end = encoding.utf16Span(bytes[from..], 0, to - from).end;
+    const u16_end = u16_start + delta_end;
+    cursor_byte.* = to;
+    cursor_units.* = u16_end;
+    return .{ .start = u16_start, .end = u16_end };
 }
 
 fn buildReplaced(
@@ -2236,6 +2306,7 @@ fn sinkMatched(
         line,
         preview,
         known,
+        state,
         config,
     );
     if (!try guardLine(state, config, bytes.len)) return false;
@@ -2305,6 +2376,7 @@ fn sinkContext(
         line,
         preview,
         known,
+        state,
         config,
     );
     if (!try guardLine(state, config, bytes.len)) return false;

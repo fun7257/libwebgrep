@@ -172,7 +172,7 @@ pub const Regex = struct {
             .ignore_case = ignore_case,
             .multiline = options.multiline,
             .dot_all = options.dot_all,
-            .anchored_start = std.mem.startsWith(u8, pattern, "\\A") or (!options.multiline and std.mem.startsWith(u8, pattern, "^") and std.mem.indexOfScalar(u8, pattern, '|') == null),
+            .anchored_start = std.mem.startsWith(u8, pattern, "\\A") and !hasTopLevelAlt(pattern),
             .max_multiline_window = options.max_multiline_window,
         };
         errdefer self.deinit();
@@ -229,9 +229,15 @@ pub const Regex = struct {
         if (self.req_is_prefix) {
             if (self.prefilter) |*pf| {
                 var pos = start;
+                var cached_win_end: usize = 0;
                 while (pos <= haystack.len) {
                     const hit = pf.find(haystack, pos, .earliest) orelse return null;
-                    const win_end = self.windowLimit(haystack, hit.start);
+                    if (!self.multiline and hit.start <= cached_win_end) {
+                        // Reuse cached line end
+                    } else {
+                        cached_win_end = self.windowLimit(haystack, hit.start);
+                    }
+                    const win_end = cached_win_end;
                     if (self.tail_finder) |*tf| {
                         // If a trailing required literal exists, verify it appears within the candidate window first
                         const tail_hit = tf.find(haystack[0..win_end], hit.end, .earliest) orelse {
@@ -245,10 +251,14 @@ pub const Regex = struct {
                         };
                         _ = tail_hit;
                     }
-                    if (self.runAnchored(haystack, hit.start, win_end, mode)) |m| {
+                    if (self.runWindow(haystack, hit.start, win_end, win_end, mode)) |m| {
                         return m;
                     }
-                    pos = hit.start + 1;
+                    if (!self.multiline) {
+                        pos = @min(haystack.len + 1, win_end + 1);
+                    } else {
+                        pos = hit.start + 1;
+                    }
                 }
                 return null;
             }
@@ -257,17 +267,30 @@ pub const Regex = struct {
         // Fast path 3: has an interior required literal (e.g., `[0-9]+ERROR`)
         if (self.prefilter) |*pf| {
             var pos = start;
+            var min_start = start;
+            var cached_win_end: usize = 0;
             while (pos <= haystack.len) {
                 const hit = pf.find(haystack, pos, .earliest) orelse return null;
                 const search_from = if (!self.multiline)
-                    @max(start, lineStartAt(haystack, hit.start))
+                    @max(min_start, lineStartAt(haystack, hit.start))
                 else
-                    @max(start, hit.start -| self.max_multiline_window);
-                const win_end = self.windowLimit(haystack, hit.start);
-                if (self.runWindow(haystack, search_from, hit.start, win_end, mode)) |m| {
+                    @max(min_start, hit.start -| self.max_multiline_window);
+                if (!self.multiline and hit.start <= cached_win_end) {
+                    // Reuse cached line end
+                } else {
+                    cached_win_end = self.windowLimit(haystack, hit.start);
+                }
+                const win_end = cached_win_end;
+                if (self.runWindow(haystack, search_from, win_end, win_end, mode)) |m| {
                     return m;
                 }
-                pos = hit.start + 1;
+                if (!self.multiline) {
+                    pos = @min(haystack.len + 1, win_end + 1);
+                    min_start = pos;
+                } else {
+                    pos = hit.start + 1;
+                    min_start = hit.start + 1;
+                }
             }
             return null;
         }
@@ -301,6 +324,10 @@ pub const Regex = struct {
         while (pos <= haystack.len) {
             const hit = self.find(haystack, pos, mode) orelse return null;
             if (allow(haystack, hit.start, hit.end)) return hit;
+            const win_end = self.windowLimit(haystack, hit.start);
+            if (self.runRangeAllowed(haystack, hit.start, hit.start, win_end, mode, allow)) |alt| {
+                return alt;
+            }
             pos = hit.start + 1;
         }
         return null;
@@ -309,7 +336,7 @@ pub const Regex = struct {
     pub fn acceptsSpan(self: *Regex, haystack: []const u8, start: usize, end: usize) bool {
         if (end < start or end > haystack.len) return false;
         const slice = haystack[start..end];
-        if (self.runAnchored(slice, 0, slice.len, .leftmost_first)) |m| {
+        if (self.runRangeAllowed(slice, 0, 0, slice.len, .leftmost_first, allowExactLen)) |m| {
             return m.start == 0 and m.end == slice.len;
         }
         return false;
@@ -347,6 +374,18 @@ pub const Regex = struct {
         start_hi: usize,
         limit: usize,
         mode: MatchMode,
+    ) ?Match {
+        return self.runRangeAllowed(haystack, start_lo, start_hi, limit, mode, allowAnySpan);
+    }
+
+    fn runRangeAllowed(
+        self: *Regex,
+        haystack: []const u8,
+        start_lo: usize,
+        start_hi: usize,
+        limit: usize,
+        mode: MatchMode,
+        comptime allow: fn ([]const u8, usize, usize) bool,
     ) ?Match {
         const n_inst = self.insts.len;
         if (n_inst == 0 or start_lo > limit) return null;
@@ -411,11 +450,12 @@ pub const Regex = struct {
 
             for (curr[0..curr_len]) |th| {
                 // Bounded multiline window check: drop this thread immediately if its distance from start exceeds the window limit
-                if (pos - th.start > self.max_multiline_window) continue;
+                if (self.multiline and (pos - th.start > self.max_multiline_window)) continue;
 
                 const inst = self.insts[th.pc];
                 switch (inst) {
                     .match => {
+                        if (!allow(haystack, th.start, pos)) continue;
                         if (best == null or th.start < best.?.start or (th.start == best.?.start and pos > best.?.end)) {
                             best = .{ .start = th.start, .end = pos };
                         }
@@ -430,7 +470,7 @@ pub const Regex = struct {
                             std.ascii.toLower(b) == std.ascii.toLower(by.b)
                         else
                             b == by.b;
-                        if (ok and (pos + 1 - th.start <= self.max_multiline_window)) {
+                        if (ok and (!self.multiline or pos + 1 - th.start <= self.max_multiline_window)) {
                             self.addThread(next, &next_len, gen_table, gen, by.out, th.start, haystack, pos + 1);
                         }
                     },
@@ -439,14 +479,14 @@ pub const Regex = struct {
                         if ((!an.allow_nl or !self.multiline) and (is_nl or (!self.multiline and b == '\r' and pos + 1 < haystack.len and haystack[pos + 1] == '\n'))) {
                             continue;
                         }
-                        if (pos + 1 - th.start <= self.max_multiline_window) {
+                        if (!self.multiline or pos + 1 - th.start <= self.max_multiline_window) {
                             self.addThread(next, &next_len, gen_table, gen, an.out, th.start, haystack, pos + 1);
                         }
                     },
                     .class => |cl| {
                         if (!has_byte) continue;
                         if (!self.multiline and is_nl) continue;
-                        if (cl.set.contains(b) and (pos + 1 - th.start <= self.max_multiline_window)) {
+                        if (cl.set.contains(b) and (!self.multiline or pos + 1 - th.start <= self.max_multiline_window)) {
                             self.addThread(next, &next_len, gen_table, gen, cl.out, th.start, haystack, pos + 1);
                         }
                     },
@@ -466,7 +506,6 @@ pub const Regex = struct {
                 curr_len = next_len;
             }
             pos += 1;
-            gen +%= 1;
         }
 
         return best;
@@ -701,6 +740,44 @@ pub const Regex = struct {
     }
 };
 
+fn allowAnySpan(haystack: []const u8, start: usize, end: usize) bool {
+    _ = haystack;
+    _ = start;
+    _ = end;
+    return true;
+}
+
+fn allowExactLen(haystack: []const u8, start: usize, end: usize) bool {
+    return start == 0 and end == haystack.len;
+}
+
+fn hasTopLevelAlt(pattern: []const u8) bool {
+    var depth: usize = 0;
+    var in_class = false;
+    var i: usize = 0;
+    while (i < pattern.len) : (i += 1) {
+        const c = pattern[i];
+        if (c == '\\') {
+            i += 1;
+            continue;
+        }
+        if (in_class) {
+            if (c == ']') in_class = false;
+            continue;
+        }
+        switch (c) {
+            '[' => in_class = true,
+            '(' => depth += 1,
+            ')' => if (depth > 0) {
+                depth -= 1;
+            },
+            '|' => if (depth == 0) return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
 fn lineStartAt(haystack: []const u8, pos: usize) usize {
     if (pos == 0) return 0;
     if (memchr.findLast(memchr.native_width, haystack, 0, pos, '\n')) |nl| return nl + 1;
@@ -820,10 +897,13 @@ const Compiler = struct {
         var atom = try self.parseAtom();
         const atom_end_pos = self.pos;
 
+        var had_quantifier = false;
         while (self.pos < self.pattern.len) {
             const c = self.pattern[self.pos];
             switch (c) {
                 '*', '+', '?' => {
+                    if (had_quantifier) return error.RegexSyntax;
+                    had_quantifier = true;
                     self.pos += 1;
                     var lazy = false;
                     if (self.pos < self.pattern.len and self.pattern[self.pos] == '?') {
@@ -833,6 +913,8 @@ const Compiler = struct {
                     atom = try self.applyQuantifier(atom, c, lazy);
                 },
                 '{' => {
+                    if (had_quantifier) return error.RegexSyntax;
+                    had_quantifier = true;
                     const bounds = try self.parseBraces();
                     var lazy = false;
                     if (self.pos < self.pattern.len and self.pattern[self.pos] == '?') {
@@ -1218,3 +1300,39 @@ test "bounded multiline window matches within limit and fails immediately when e
     const long_hay = "BEGIN\n" ++ filler ++ "\nEND\n";
     try std.testing.expect(re.find(long_hay, 0, .leftmost_first) == null);
 }
+
+test "caret start-of-line anchor matches on subsequent lines and with start > 0" {
+    var re = try Regex.init(std.testing.allocator, "^ERROR", .{});
+    defer re.deinit();
+
+    const hay = "INFO ok\nERROR failed\n";
+    const hit1 = re.find(hay, 0, .leftmost_first).?;
+    try std.testing.expectEqual(@as(usize, 8), hit1.start);
+    try std.testing.expectEqual(@as(usize, 13), hit1.end);
+
+    const hit2 = re.find(hay, 4, .leftmost_first).?;
+    try std.testing.expectEqual(@as(usize, 8), hit2.start);
+    try std.testing.expectEqual(@as(usize, 13), hit2.end);
+}
+
+test "acceptsSpan and findAllowed respect lower-priority alternation branches" {
+    var re_whole = try Regex.init(std.testing.allocator, "a|ab", .{});
+    defer re_whole.deinit();
+    try std.testing.expect(re_whole.acceptsSpan("ab", 0, 2));
+    try std.testing.expect(re_whole.acceptsSpan("a", 0, 1));
+    try std.testing.expect(!re_whole.acceptsSpan("abc", 0, 3));
+
+    var re_word = try Regex.init(std.testing.allocator, "foo|foobar", .{});
+    defer re_word.deinit();
+    const WordCheck = struct {
+        fn allow(h: []const u8, s: usize, e: usize) bool {
+            const left = s > 0 and isWordChar(h[s - 1]);
+            const right = e < h.len and isWordChar(h[e]);
+            return !left and !right;
+        }
+    };
+    const hit = re_word.findAllowed("foobar", 0, .leftmost_first, WordCheck.allow).?;
+    try std.testing.expectEqual(@as(usize, 0), hit.start);
+    try std.testing.expectEqual(@as(usize, 6), hit.end);
+}
+

@@ -472,9 +472,21 @@ fn onFile(ctx: *anyopaque, visit: walker.Visit) anyerror!walker.Control {
     };
     defer file.close(shared.io);
     searchOpen(worker, file, visit.path) catch |err| {
-        requestStop(shared);
         shared.note(visit.path, err);
-        return .stop;
+        switch (err) {
+            error.OutOfMemory, error.ContextLinesExceeded, error.BudgetExceeded => {
+                requestStop(shared);
+                return .stop;
+            },
+            else => {
+                _ = shared.emitEvent(.{ .end = .{
+                    .source_id = visit.path,
+                    .outcome = .complete,
+                    .soft_error = .read_failed,
+                } });
+                return .cont;
+            },
+        }
     };
     if (shared.stop.load(.acquire)) return .stop;
     return .cont;

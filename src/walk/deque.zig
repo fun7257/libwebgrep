@@ -64,7 +64,7 @@ pub fn Deque(comptime T: type) type {
             if (t <= b) {
                 var item = buf.slots[@as(usize, @intCast(b)) & buf.mask].load(.unordered);
                 if (t == b) {
-                    if (self.top.cmpxchgWeak(t, t +% 1, .seq_cst, .monotonic) != null) item = null;
+                    if (self.top.cmpxchgStrong(t, t +% 1, .seq_cst, .monotonic) != null) item = null;
                     self.bottom.store(t +% 1, .monotonic);
                 }
                 return item;

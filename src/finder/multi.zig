@@ -240,7 +240,38 @@ pub const Multi = struct {
         mode: matcher.MatchMode,
         comptime allow: fn ([]const u8, usize, usize) bool,
     ) ?matcher.Match {
-        return self.scan(haystack, start, mode, allow);
+        if (self.kind == .mixed) return self.scan(haystack, start, mode, allow);
+        var pos = start;
+        while (pos <= haystack.len) {
+            const hit = self.find(haystack, pos, mode) orelse return null;
+            if (allow(haystack, hit.start, hit.end)) return hit;
+            if (self.checkAllowedAt(haystack, hit.start, mode, allow)) |alt| {
+                return alt;
+            }
+            pos = hit.start + 1;
+        }
+        return null;
+    }
+
+    fn checkAllowedAt(
+        self: *const Multi,
+        haystack: []const u8,
+        at: usize,
+        mode: matcher.MatchMode,
+        comptime allow: fn ([]const u8, usize, usize) bool,
+    ) ?matcher.Match {
+        var best: ?Naive = null;
+        for (self.patterns, 0..) |pat, id_usize| {
+            if (at + pat.len > haystack.len) continue;
+            if (!ascii.eql(pat, haystack[at..][0..pat.len], self.ignore_case)) continue;
+            if (!allow(haystack, at, at + pat.len)) continue;
+            const cand = Naive{ .start = at, .end = at + pat.len, .id = @intCast(id_usize) };
+            if (best) |cur| {
+                if (better(cand, cur, mode)) best = cand;
+            } else best = cand;
+        }
+        if (best) |found| return .{ .start = found.start, .end = found.end };
+        return null;
     }
 
     fn foldOf(self: *const Multi, index: usize) bool {
@@ -916,6 +947,17 @@ test "Unicode case folding applies smart case per pattern" {
     try std.testing.expect(!std.mem.eql(u8, "mixed", all_lower.engineName()));
     try std.testing.expectEqual(@as(usize, 0), all_lower.find("ΔELTA", 0, .earliest).?.start);
     try std.testing.expectEqual(@as(usize, 0), all_lower.find("\u{212A}ELVIN", 0, .earliest).?.start);
+
+    // 3. Per-pattern variant expansion limit does not drop Unicode patterns placed after >32 preceding patterns.
+    var many_pats: [40][]const u8 = undefined;
+    for (0..39) |i| many_pats[i] = if (i % 2 == 0) "alpha" else "bravo";
+    many_pats[39] = "straße";
+    var many_uni = try Multi.init(std.testing.allocator, &many_pats, .{
+        .case = .insensitive,
+        .unicode_case = true,
+    });
+    defer many_uni.deinit();
+    try std.testing.expectEqual(@as(usize, 0), many_uni.find("STRA\u{1E9E}E", 0, .earliest).?.start);
 }
 
 fn fuzzMulti(_: void, smith: *std.testing.Smith) !void {

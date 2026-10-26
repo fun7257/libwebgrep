@@ -195,7 +195,8 @@ pub fn expandPatternVariants(
     const include_cross_ascii = countBranches(pattern, true) <= max_variants;
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
-    try expandRecursive(allocator, pattern, 0, include_cross_ascii, &buf, out_list, max_variants);
+    const limit = out_list.items.len +| max_variants;
+    try expandRecursive(allocator, pattern, 0, include_cross_ascii, &buf, out_list, limit);
 }
 
 fn countBranches(pattern: []const u8, include_cross_ascii: bool) usize {

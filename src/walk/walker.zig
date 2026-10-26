@@ -317,6 +317,8 @@ fn handleEntry(host: *Host, job: *Job, entry: std.Io.Dir.Entry, batch: *FileBatc
 
     switch (entry.kind) {
         .directory => {
+            if (job.depth >= host.config.effectiveMaxDepth()) return;
+            if (ignore.isIgnored(job.ignore, rel, true, &scratch) or blockDirectory(host, rel)) return;
             const child_dir = job.dir.openDir(
                 host.io,
                 name,
@@ -325,7 +327,7 @@ fn handleEntry(host: *Host, job: *Job, entry: std.Io.Dir.Entry, batch: *FileBatc
                 report(host, job, name, err);
                 return;
             };
-            descend(host, job, name, rel, &scratch, child_dir);
+            descend(host, job, name, rel, child_dir);
         },
         .file => {
             if (ignore.isIgnored(job.ignore, rel, false, &scratch)) return;
@@ -354,7 +356,6 @@ fn descend(
     job: *Job,
     name: []const u8,
     rel: []const u8,
-    scratch: []u8,
     child_dir: std.Io.Dir,
 ) void {
     if (host.config.one_file_system and job.dev != 0) {
@@ -364,14 +365,6 @@ fn descend(
                 return;
             }
         }
-    }
-    if (ignore.isIgnored(job.ignore, rel, true, scratch) or blockDirectory(host, rel)) {
-        child_dir.close(host.io);
-        return;
-    }
-    if (job.depth >= host.config.effectiveMaxDepth()) {
-        child_dir.close(host.io);
-        return;
     }
     const child = createJob(host, child_dir, job.root, rel, job.ignore, job.depth + 1) catch |err| {
         child_dir.close(host.io);

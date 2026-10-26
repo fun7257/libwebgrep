@@ -60,13 +60,28 @@ pub const OffsetMap = struct {
 
     pub fn record(self: *OffsetMap, allocator: std.mem.Allocator, out_offset: u64, raw_offset: u64) error{OutOfMemory}!void {
         self.active = true;
-        if (self.anchors.items.len > 0) {
-            const last = &self.anchors.items[self.anchors.items.len - 1];
+        const len = self.anchors.items.len;
+        if (len > 0) {
+            const last = &self.anchors.items[len - 1];
             if (last.out_offset == out_offset) {
                 last.raw_offset = raw_offset;
                 return;
             }
             if (out_offset < last.out_offset) return;
+            if (len >= 2) {
+                const prev = self.anchors.items[len - 2];
+                const d_out1 = last.out_offset - prev.out_offset;
+                const d_raw1 = last.raw_offset -| prev.raw_offset;
+                const d_out2 = out_offset - last.out_offset;
+                const d_raw2 = raw_offset -| last.raw_offset;
+                if (d_out1 > 0 and d_out2 > 0 and last.raw_offset >= prev.raw_offset and raw_offset >= last.raw_offset) {
+                    if (@as(u128, d_raw1) * @as(u128, d_out2) == @as(u128, d_raw2) * @as(u128, d_out1)) {
+                        last.out_offset = out_offset;
+                        last.raw_offset = raw_offset;
+                        return;
+                    }
+                }
+            }
         }
         try self.anchors.append(allocator, .{
             .out_offset = out_offset,
@@ -218,6 +233,7 @@ fn pumpDecompress(
     offset_map: *OffsetMap,
 ) Error!void {
     var chunk: [16384]u8 = undefined;
+    var local_decompressed: u64 = 0;
     while (true) {
         const raw_before: u64 = @intCast(@min(raw_reader.seek, total_raw_len));
         const n = dec_reader.readSliceShort(&chunk) catch {
@@ -228,19 +244,23 @@ fn pumpDecompress(
         const out_before: u64 = @intCast(out_list.items.len);
         try offset_map.record(allocator, out_before, raw_before);
 
+        local_decompressed = std.math.add(u64, local_decompressed, n) catch return error.DecompressLimit;
         total_decompressed.* = std.math.add(u64, total_decompressed.*, n) catch return error.DecompressLimit;
         if (max_decompressed_bytes) |cap| {
             if (total_decompressed.* > cap) return error.DecompressLimit;
         }
 
         const raw_consumed: u64 = @max(1, @as(u64, @intCast(@min(raw_reader.seek, total_raw_len))));
-        if (total_decompressed.* >= ratio_check_min_bytes) {
+        if (local_decompressed >= ratio_check_min_bytes) {
             const max_allowed = std.math.mul(u64, raw_consumed, ratio_cap) catch std.math.maxInt(u64);
-            if (total_decompressed.* > max_allowed) return error.DecompressLimit;
+            if (local_decompressed > max_allowed) return error.DecompressLimit;
         }
 
         try out_list.appendSlice(allocator, chunk[0..n]);
     }
+    const final_out: u64 = @intCast(out_list.items.len);
+    const final_raw: u64 = @intCast(@min(raw_reader.seek, total_raw_len));
+    try offset_map.record(allocator, final_out, final_raw);
 }
 
 /// Helper to generate a valid Gzip byte stream (using Stored Deflate blocks + CRC32 + ISIZE) for unit tests constructing normal compressed streams and high-ratio bombs.

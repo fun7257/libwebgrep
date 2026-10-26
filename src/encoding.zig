@@ -507,14 +507,22 @@ pub const Decoder = struct {
         while (filled < dest.len) {
             const rest = self.in[self.in_i..self.in_len];
             const step = decodeMode(mode, rest, eof) orelse break;
-            if (self.offset_map) |m| {
-                try m.record(allocator, self.out_produced, self.raw_consumed);
+            this_out: {
+                const start_out = self.out_produced;
+                const start_raw = self.raw_consumed;
+                if (self.offset_map) |m| {
+                    try m.record(allocator, start_out, start_raw);
+                }
+                self.in_i += step.n;
+                self.raw_consumed += step.n;
+                self.queueCp(step.cp);
+                self.out_produced += self.out_len;
+                if (self.offset_map) |m| {
+                    try m.record(allocator, self.out_produced, self.raw_consumed);
+                }
+                filled += self.drainOut(dest[filled..]);
+                break :this_out;
             }
-            self.in_i += step.n;
-            self.raw_consumed += step.n;
-            self.queueCp(step.cp);
-            self.out_produced += self.out_len;
-            filled += self.drainOut(dest[filled..]);
         }
         return filled;
     }
@@ -607,6 +615,9 @@ fn convertIntoWithMap(
         }
         w += encodeCp(step.cp, out[w..]);
         i += step.n;
+    }
+    if (offset_map) |m| {
+        try m.record(allocator, w, raw_base + i);
     }
     return w;
 }

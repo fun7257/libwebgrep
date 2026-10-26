@@ -337,48 +337,87 @@ pub fn matchTextCase(pattern: []const u8, text: []const u8, case_insensitive: bo
 }
 
 fn matchFrom(pat: []const u8, text: []const u8, case_insensitive: bool) bool {
+    return matchSegment(pat, text, case_insensitive);
+}
+
+fn matchSegment(pat: []const u8, text: []const u8, case_insensitive: bool) bool {
     var pi: usize = 0;
     var ti: usize = 0;
-    while (pi < pat.len) {
-        if (isDoubleStar(pat, pi)) {
+    var star_pi: ?usize = null;
+    var star_ti: usize = 0;
+    var dstar_pi: ?usize = null;
+    var dstar_ti: usize = 0;
+
+    while (true) {
+        if (pi < pat.len and isDoubleStar(pat, pi)) {
             var rest = pi + 2;
             if (rest < pat.len and pat[rest] == '/') rest += 1;
             if (rest == pat.len) return true;
-            var k = ti;
-            while (true) {
-                if (matchFrom(pat[rest..], text[k..], case_insensitive)) return true;
-                if (k >= text.len) return false;
-                k += 1;
-            }
-        }
-        if (pat[pi] == '*') {
-            pi += 1;
-            var k = ti;
-            while (true) {
-                if (matchFrom(pat[pi..], text[k..], case_insensitive)) return true;
-                if (k >= text.len or text[k] == '/') return false;
-                k += 1;
-            }
-        }
-        if (ti >= text.len) return false;
-        if (pat[pi] == '?') {
-            if (text[ti] == '/') return false;
-            pi += 1;
-            ti += 1;
+            dstar_pi = rest;
+            dstar_ti = ti;
+            star_pi = null;
+            pi = rest;
             continue;
         }
-        if (pat[pi] == '[') {
-            const close = std.mem.indexOfScalarPos(u8, pat, pi + 1, ']') orelse return false;
-            if (!classMatch(pat[pi + 1 .. close], text[ti], case_insensitive)) return false;
-            pi = close + 1;
-            ti += 1;
+        if (pi < pat.len and pat[pi] == '*') {
+            while (pi < pat.len and pat[pi] == '*' and !isDoubleStar(pat, pi)) : (pi += 1) {}
+            star_pi = pi;
+            star_ti = ti;
             continue;
         }
-        if (!byteEqual(pat[pi], text[ti], case_insensitive)) return false;
-        pi += 1;
-        ti += 1;
+        if (pi < pat.len and ti < text.len) {
+            if (pat[pi] == '?') {
+                if (text[ti] != '/') {
+                    pi += 1;
+                    ti += 1;
+                    continue;
+                }
+            } else if (pat[pi] == '[') {
+                if (std.mem.indexOfScalarPos(u8, pat, pi + 1, ']')) |close| {
+                    if (classMatch(pat[pi + 1 .. close], text[ti], case_insensitive)) {
+                        pi = close + 1;
+                        ti += 1;
+                        continue;
+                    }
+                }
+            } else if (byteEqual(pat[pi], text[ti], case_insensitive)) {
+                pi += 1;
+                ti += 1;
+                continue;
+            }
+        }
+        if (pi == pat.len and ti == text.len) return true;
+
+        // Backtrack to the most recent single `*` within the current path segment
+        if (star_pi) |spi| {
+            if (star_ti < text.len and text[star_ti] != '/') {
+                star_ti += 1;
+                ti = star_ti;
+                pi = spi;
+                continue;
+            }
+        }
+        // Otherwise backtrack to the most recent `**` across path segments
+        if (dstar_pi) |dspi| {
+            if (dstar_ti < text.len) {
+                if (pat[dspi - 1] == '/') {
+                    // `**/` must resume at a segment boundary
+                    if (std.mem.indexOfScalarPos(u8, text, dstar_ti, '/')) |slash| {
+                        dstar_ti = slash + 1;
+                    } else {
+                        return false;
+                    }
+                } else {
+                    dstar_ti += 1;
+                }
+                ti = dstar_ti;
+                pi = dspi;
+                star_pi = null;
+                continue;
+            }
+        }
+        return false;
     }
-    return ti == text.len;
 }
 
 fn byteEqual(a: u8, b: u8, case_insensitive: bool) bool {
@@ -528,3 +567,11 @@ test "case-insensitive glob matching" {
     try std.testing.expect(matchGlobs(globs, "unit_test.D", "unit_test.D", false));
     try std.testing.expect(!matchGlobs(globs, "src/skip.ZIG", "skip.ZIG", false));
 }
+
+test "pathological wildcard pattern runs in linear time without exponential blowup" {
+    const pat = "a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b";
+    const hay: [256]u8 = @splat('a');
+    try std.testing.expect(!matchText(pat, &hay));
+    try std.testing.expect(!matchText("**/a/**/a/**/a/**/b", "a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/c"));
+}
+

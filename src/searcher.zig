@@ -1298,6 +1298,11 @@ fn drive(
                 if (eof and state.pos >= view_end and !state.output_blocked) state.scanned_all = true;
                 break;
             }
+        } else if (skip_match) {
+            if (!maybeProgress(S, sink, &state, config)) {
+                state.stopped = true;
+                break;
+            }
         }
 
         if (is_ml and isStartAnchoredMatcher(matcher) and state.abs_base + filled >= ml_win) {
@@ -2021,12 +2026,13 @@ fn gatherSpans(
         return store[0..n];
     }
     const content_end = contentEnd(buf, line, config);
+    const line_buf = if (isMultilineMatcher(matcher)) buf else buf[0..@min(content_end, buf.len)];
     const win_lo = preview.start;
     const win_hi = preview.end;
     var pos = line.start;
-    while (pos <= content_end and pos <= buf.len) {
+    while (pos <= content_end and pos <= line_buf.len) {
         if (stopInMatch(state, config)) break;
-        const found = nextMatch(matcher, buf, pos, config) orelse break;
+        const found = nextMatch(matcher, line_buf, pos, config) orelse break;
         if (found.start < pos or found.start > buf.len or found.start > content_end) break;
         if (found.start == content_end and found.end > content_end) break;
         const mend = @min(found.end, content_end);
@@ -2433,7 +2439,8 @@ fn matchInLine(matcher: anytype, buf: []const u8, line: Range, config: SearchCon
         if (!acceptsWholeLine(matcher, buf, line.start, end)) return null;
         return .{ .start = line.start, .end = end };
     }
-    const found = nextMatch(matcher, buf, line.start, config) orelse return null;
+    const line_buf = if (isMultilineMatcher(matcher)) buf else buf[0..@min(end, buf.len)];
+    const found = nextMatch(matcher, line_buf, line.start, config) orelse return null;
     // An empty line's content end equals its start; an empty pattern still counts as a match here.
     if (found.start < line.start or found.start > end or found.end > line.end) return null;
     if (found.start == end and found.end > end) return null;

@@ -426,9 +426,26 @@ pub const Regex = struct {
                 gen = 1;
             }
 
+            if (curr_len == 0 and best == null and pos > start_lo and pos <= start_hi and self.req_is_prefix) {
+                if (self.prefilter) |*pf| {
+                    const next_hit = pf.find(haystack[0..limit], pos, .earliest) orelse break;
+                    if (next_hit.start > start_hi) break;
+                    pos = next_hit.start;
+                }
+            }
+
             // If no match has been found yet and the current position is still within the allowed start range, spawn a new start thread
             if (best == null and pos <= start_hi and (!self.anchored_start or pos == 0)) {
-                self.addThread(curr, &curr_len, gen_table, gen, self.start_pc, pos, haystack, pos);
+                const can_start = if (self.req_is_prefix and self.req_literal_bytes.len > 0)
+                    (pos < limit and (if (self.ignore_case)
+                        std.ascii.toLower(haystack[pos]) == std.ascii.toLower(self.req_literal_bytes[0])
+                    else
+                        haystack[pos] == self.req_literal_bytes[0]))
+                else
+                    true;
+                if (can_start) {
+                    self.addThread(curr, &curr_len, gen_table, gen, self.start_pc, pos, haystack, pos);
+                }
             }
 
             if (curr_len == 0) {
@@ -718,7 +735,7 @@ pub const Regex = struct {
             .case = if (self.ignore_case) .insensitive else case_mode,
         };
 
-        if (first_lit.items.len >= 2 or (first_lit.items.len >= 1 and exact_only)) {
+        if (first_lit.items.len >= 2 or (first_lit.items.len == 1 and best_lit.items.len < 2)) {
             self.req_literal_bytes = try self.allocator.dupe(u8, first_lit.items);
             self.req_literal_offset = 0;
             self.req_is_prefix = true;

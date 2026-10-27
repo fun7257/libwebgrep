@@ -23,6 +23,7 @@ const decompress = @import("decompress.zig");
 const encoding = @import("encoding.zig");
 const matcher_mod = @import("matcher.zig");
 const memchr = @import("finder/memchr.zig");
+const regex_mod = @import("regex.zig");
 const sink_mod = @import("sink.zig");
 
 pub const Encoding = encoding.Encoding;
@@ -83,10 +84,18 @@ pub const SearchConfig = struct {
     whole_word: bool = false,
     /// Whole-line matching. After stripping LF and a single preceding CR, the entire line content must match one of the patterns.
     whole_line: bool = false,
-    /// Every byte slice listed here must appear in the line content for the line to be emitted (exact byte comparison, no case folding). Empty means no extra requirement.
+    /// Every byte slice listed here must appear in the line content for the line to be emitted (exact byte comparison unless `filter_case_insensitive` is set). Empty means no extra requirement.
     contains: []const []const u8 = &.{},
-    /// None of the byte slices listed here may appear in the line content (exact byte comparison). Independent of `invert`.
+    /// None of the byte slices listed here may appear in the line content (exact byte comparison unless `filter_case_insensitive` is set). Independent of `invert`.
     excludes: []const []const u8 = &.{},
+    /// When true, `contains` and `excludes` match using ASCII case-insensitive comparison.
+    filter_case_insensitive: bool = false,
+    /// When true, each filter in `contains` and `excludes` uses smart-case (case-insensitive unless the filter itself contains an ASCII uppercase byte).
+    filter_smart_case: bool = false,
+    /// Compiled regular expressions that must all match within the line content for the line to be emitted.
+    contains_regexes: []const regex_mod.Regex = &.{},
+    /// Compiled regular expressions that must not match within the line content.
+    excludes_regexes: []const regex_mod.Regex = &.{},
     /// Invoked when `max_count` matching lines are reached to close the upstream source. Omitted if null.
     close_input: ?*const fn (?*anyopaque) void = null,
     close_ctx: ?*anyopaque = null,
@@ -1661,7 +1670,7 @@ fn canFuse(matcher: anytype, config: SearchConfig, state: *const State) bool {
     if (config.passthru or config.stop_on_nonmatch) return false;
     if (state.prefer_prepass or state.nul_offset != null) return false;
     if (config.binary == .none or config.invert or beforeCount(config) != 0 or afterCount(config) != 0) return false;
-    if (config.whole_word or config.whole_line or config.contains.len != 0 or config.excludes.len != 0) return false;
+    if (config.whole_word or config.whole_line or config.contains.len != 0 or config.excludes.len != 0 or config.contains_regexes.len != 0 or config.excludes_regexes.len != 0) return false;
     return @hasDecl(@TypeOf(matcher.*), "findWatched");
 }
 
@@ -1828,15 +1837,93 @@ fn acceptsWholeLine(matcher: anytype, buf: []const u8, start: usize, end: usize)
     return found.start == 0 and found.end == end - start;
 }
 
+inline fn hasFilterAsciiUpper(s: []const u8) bool {
+    for (s) |c| {
+        if (c >= 'A' and c <= 'Z') return true;
+    }
+    return false;
+}
+
+inline fn sliceContainsFilter(haystack: []const u8, needle: []const u8, case_insensitive: bool, smart_case: bool) bool {
+    if (needle.len == 0) return true;
+    if (haystack.len < needle.len) return false;
+    const effective_ci = if (smart_case) !hasFilterAsciiUpper(needle) else case_insensitive;
+    const limit = haystack.len - needle.len;
+    const head_haystack = haystack[0 .. limit + 1];
+    if (effective_ci) {
+        const b0_lo = std.ascii.toLower(needle[0]);
+        const b0_hi = std.ascii.toUpper(needle[0]);
+        if (needle.len == 1) {
+            return if (b0_lo == b0_hi)
+                memchr.find(memchr.native_width, haystack, 0, b0_lo) != null
+            else
+                memchr.findEither(memchr.native_width, haystack, 0, b0_lo, b0_hi) != null;
+        }
+        const blast_lo = std.ascii.toLower(needle[needle.len - 1]);
+        const mid_needle = needle[1 .. needle.len - 1];
+        var pos: usize = 0;
+        while (pos <= limit) {
+            const at = (if (b0_lo == b0_hi)
+                memchr.find(memchr.native_width, head_haystack, pos, b0_lo)
+            else
+                memchr.findEither(memchr.native_width, head_haystack, pos, b0_lo, b0_hi)) orelse return false;
+            if (std.ascii.toLower(haystack[at + needle.len - 1]) == blast_lo and
+                std.ascii.eqlIgnoreCase(haystack[at + 1 .. at + needle.len - 1], mid_needle))
+            {
+                return true;
+            }
+            pos = at + 1;
+        }
+        return false;
+    }
+    const b0 = needle[0];
+    if (needle.len == 1) {
+        return memchr.find(memchr.native_width, haystack, 0, b0) != null;
+    }
+    const blast = needle[needle.len - 1];
+    const mid_needle = needle[1 .. needle.len - 1];
+    var pos: usize = 0;
+    while (pos <= limit) {
+        const at = memchr.find(memchr.native_width, head_haystack, pos, b0) orelse return false;
+        if (haystack[at + needle.len - 1] == blast and
+            std.mem.eql(u8, haystack[at + 1 .. at + needle.len - 1], mid_needle))
+        {
+            return true;
+        }
+        pos = at + 1;
+    }
+    return false;
+}
+
 fn linePassesFilters(buf: []const u8, start: usize, end: usize, config: SearchConfig) bool {
-    if (config.contains.len == 0 and config.excludes.len == 0) return true;
+    if (config.contains.len == 0 and config.excludes.len == 0 and config.contains_regexes.len == 0 and config.excludes_regexes.len == 0) return true;
     if (end < start or end > buf.len) return false;
     const text = buf[start..end];
     for (config.contains) |pat| {
-        if (std.mem.indexOf(u8, text, pat) == null) return false;
+        if (!sliceContainsFilter(text, pat, config.filter_case_insensitive, config.filter_smart_case)) return false;
     }
     for (config.excludes) |pat| {
-        if (std.mem.indexOf(u8, text, pat) != null) return false;
+        if (sliceContainsFilter(text, pat, config.filter_case_insensitive, config.filter_smart_case)) return false;
+    }
+    if (config.contains_regexes.len > 0) {
+        const use_whole_word = config.whole_word and !config.whole_line;
+        for (config.contains_regexes) |*re| {
+            const found = if (use_whole_word)
+                re.findAllowedReadOnly(text, 0, .earliest, wordBounded)
+            else
+                re.findReadOnly(text, 0, .earliest);
+            if (found == null) return false;
+        }
+    }
+    if (config.excludes_regexes.len > 0) {
+        const use_whole_word = config.whole_word and !config.whole_line;
+        for (config.excludes_regexes) |*re| {
+            const found = if (use_whole_word)
+                re.findAllowedReadOnly(text, 0, .earliest, wordBounded)
+            else
+                re.findReadOnly(text, 0, .earliest);
+            if (found != null) return false;
+        }
     }
     return true;
 }
@@ -2054,6 +2141,34 @@ fn gatherSpans(
         if (empty or found.end <= pos) break;
         pos = found.end;
     }
+    if (config.replacement == null and config.contains_regexes.len > 0) {
+        const use_whole_word = config.whole_word and !config.whole_line;
+        for (config.contains_regexes) |*re| {
+            var rpos = line.start;
+            while (rpos <= content_end and rpos <= line_buf.len) {
+                if (stopInMatch(state, config)) break;
+                const rfound = if (use_whole_word)
+                    re.findAllowedReadOnly(line_buf, rpos, config.match_mode, wordBounded)
+                else
+                    re.findReadOnly(line_buf, rpos, config.match_mode);
+                const hit = rfound orelse break;
+                if (hit.start < rpos or hit.start > buf.len or hit.start > content_end) break;
+                if (hit.start == content_end and hit.end > content_end) break;
+                const mend = @min(hit.end, content_end);
+                const empty = hit.start == mend;
+                if (!empty and hit.start >= win_lo and hit.start < win_hi) {
+                    if (n == store.len) store = try growSpans(alloc, store, heap, n);
+                    store[n] = .{
+                        .start = hit.start - win_lo,
+                        .end = @min(mend, win_hi) - win_lo,
+                    };
+                    n += 1;
+                }
+                if (empty or hit.end <= rpos) break;
+                rpos = hit.end;
+            }
+        }
+    }
     if (n == 0) {
         if (preview.span) |span| {
             if (store.len == 0) store = try growSpans(alloc, store, heap, 0);
@@ -2062,6 +2177,22 @@ fn gatherSpans(
         }
     }
     std.mem.sort(Span, store[0..n], {}, spanBefore);
+    if (config.contains_regexes.len > 0 and n > 1) {
+        var out_idx: usize = 0;
+        for (store[1..n]) |sp| {
+            if (sp.start < store[out_idx].end) {
+                if (sp.end > store[out_idx].end) {
+                    store[out_idx].end = sp.end;
+                }
+            } else if (sp.start == store[out_idx].start and sp.end == store[out_idx].end) {
+                // Skip duplicate span
+            } else {
+                out_idx += 1;
+                store[out_idx] = sp;
+            }
+        }
+        n = out_idx + 1;
+    }
     return store[0..n];
 }
 
@@ -2888,9 +3019,10 @@ fn overlapKeep(matcher: anytype, config: SearchConfig) usize {
 }
 
 fn containsDone(seen: []const bool, config: SearchConfig) bool {
-    if (config.contains.len == 0) return true;
-    if (seen.len < config.contains.len) return false;
-    for (seen[0..config.contains.len]) |ok| if (!ok) return false;
+    const total = config.contains.len + config.contains_regexes.len;
+    if (total == 0) return true;
+    if (seen.len < total) return false;
+    for (seen[0..total]) |ok| if (!ok) return false;
     return true;
 }
 
@@ -2927,15 +3059,42 @@ fn noteLong(
 ) error{OutOfMemory}!void {
     if (!state.long_excluded) {
         for (config.excludes) |pat| {
-            if (std.mem.indexOf(u8, bytes, pat) != null) {
+            if (sliceContainsFilter(bytes, pat, config.filter_case_insensitive, config.filter_smart_case)) {
                 state.long_excluded = true;
                 break;
             }
         }
+        if (!state.long_excluded and config.excludes_regexes.len > 0) {
+            const use_whole_word = config.whole_word and !config.whole_line;
+            for (config.excludes_regexes) |*re| {
+                const found = if (use_whole_word)
+                    re.findAllowedReadOnly(bytes, 0, .earliest, wordBounded)
+                else
+                    re.findReadOnly(bytes, 0, .earliest);
+                if (found != null) {
+                    state.long_excluded = true;
+                    break;
+                }
+            }
+        }
     }
-    if (seen.len >= config.contains.len) {
+    const total_contains = config.contains.len + config.contains_regexes.len;
+    if (seen.len >= total_contains) {
         for (config.contains, 0..) |pat, i| {
-            if (!seen.*[i] and std.mem.indexOf(u8, bytes, pat) != null) seen.*[i] = true;
+            if (!seen.*[i] and sliceContainsFilter(bytes, pat, config.filter_case_insensitive, config.filter_smart_case)) seen.*[i] = true;
+        }
+        if (config.contains_regexes.len > 0) {
+            const use_whole_word = config.whole_word and !config.whole_line;
+            for (config.contains_regexes, 0..) |*re, i| {
+                const idx = config.contains.len + i;
+                if (!seen.*[idx]) {
+                    const found = if (use_whole_word)
+                        re.findAllowedReadOnly(bytes, 0, .earliest, wordBounded)
+                    else
+                        re.findReadOnly(bytes, 0, .earliest);
+                    if (found != null) seen.*[idx] = true;
+                }
+            }
         }
     }
     if (state.long_has_match or config.whole_line) return;
@@ -3130,9 +3289,10 @@ fn beginLong(
     state.long_hold_len = 0;
     state.long_window_start = 0;
     state.long_number = state.line_number;
-    if (config.contains.len > seen.len) {
+    const total_contains = config.contains.len + config.contains_regexes.len;
+    if (total_contains > seen.len) {
         if (seen.len != 0) allocator.free(seen.*);
-        seen.* = try allocator.alloc(bool, config.contains.len);
+        seen.* = try allocator.alloc(bool, total_contains);
     }
     if (seen.len > 0) @memset(seen.*, false);
     const bytes = buf.*[0..filled.*];
@@ -6464,4 +6624,56 @@ test "preserves raw byte stream offsets after transcoding and decompression" {
     try testing.expectEqual(@as(u64, 1), res.matched_lines);
     try testing.expectEqual(@as(u64, 3), sink.abs_off);
     try testing.expectEqual(@as(u64, 8), sink.raw_off);
+}
+
+test "filter_smart_case, contains_regexes, excludes_regexes, and non-overlapping span merge" {
+    var finder = try Finder.init("ERROR", .{});
+    var re_must = try regex_mod.Regex.init(testing.allocator, "code=[0-9]+", .{});
+    defer re_must.deinit();
+    var re_overlap = try regex_mod.Regex.init(testing.allocator, "ERROR_[0-9]+", .{});
+    defer re_overlap.deinit();
+    var re_excl = try regex_mod.Regex.init(testing.allocator, "ignore_[a-z]+", .{});
+    defer re_excl.deinit();
+
+    const SpanCheckSink = struct {
+        matched_lines: u32 = 0,
+        span_count: usize = 0,
+        first_span: Span = .{ .start = 0, .end = 0 },
+        second_span: Span = .{ .start = 0, .end = 0 },
+
+        pub fn event(self: *@This(), ev: Event) bool {
+            if (ev == .match) {
+                self.matched_lines += 1;
+                self.span_count = ev.match.matches.len;
+                if (ev.match.matches.len >= 1) self.first_span = ev.match.matches[0];
+                if (ev.match.matches.len >= 2) self.second_span = ev.match.matches[1];
+            }
+            return true;
+        }
+    };
+
+    const input =
+        "ERROR_500 service=Auth code=500\n" ++
+        "ERROR_500 service=auth code=500\n" ++
+        "ERROR_500 service=Auth code=500 ignore_me\n" ++
+        "ERROR_500 service=Auth no_code\n";
+
+    var sink = SpanCheckSink{};
+    // Smart-case filter: "auth" (all lowercase -> case-insensitive, matches both Auth and auth),
+    // "Auth" (has uppercase -> case-sensitive, matches only Auth).
+    const res = try searchSourceSlice(SpanCheckSink, &sink, "filter-regex", input, &finder, .{
+        .contains = &.{ "auth", "Auth" },
+        .filter_smart_case = true,
+        .contains_regexes = &.{ re_must, re_overlap },
+        .excludes_regexes = &.{re_excl},
+    });
+    try testing.expectEqual(@as(u64, 1), res.matched_lines);
+    try testing.expectEqual(@as(u32, 1), sink.matched_lines);
+    // "ERROR" [0..5) and "ERROR_500" [0..9) overlap and must be merged into a single [0..9) span,
+    // followed by "code=500" at [23..31).
+    try testing.expectEqual(@as(usize, 2), sink.span_count);
+    try testing.expectEqual(@as(usize, 0), sink.first_span.start);
+    try testing.expectEqual(@as(usize, 9), sink.first_span.end);
+    try testing.expectEqual(@as(usize, 23), sink.second_span.start);
+    try testing.expectEqual(@as(usize, 31), sink.second_span.end);
 }

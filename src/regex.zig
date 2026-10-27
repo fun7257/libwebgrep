@@ -6,6 +6,7 @@
 //! 3. Automatically extract a required literal (`RequiredLiteral`) from the regex syntax tree and attach a SIMD `Finder` prefilter so regexes with literal anchors sustain 20+ GB/s throughput.
 //! 4. Multiline matching (`multiline`) is strictly constrained by a bounded window (`max_multiline_window`); if the window is exhausted before closing the match, it immediately fails.
 
+const builtin = @import("builtin");
 const std = @import("std");
 const matcher = @import("matcher.zig");
 const Finder = @import("finder/finder.zig").Finder;
@@ -215,13 +216,23 @@ pub const Regex = struct {
     }
 
     pub fn find(self: *Regex, haystack: []const u8, start: usize, mode: MatchMode) ?Match {
+        const steps: ?*u64 = if (comptime builtin.is_test) &self.steps else null;
+        return self.findInternal(haystack, start, mode, steps);
+    }
+
+    /// Read-only search over `haystack` that accepts `*const Regex` without copying or mutating state.
+    pub fn findReadOnly(self: *const Regex, haystack: []const u8, start: usize, mode: MatchMode) ?Match {
+        return self.findInternal(haystack, start, mode, null);
+    }
+
+    fn findInternal(self: *const Regex, haystack: []const u8, start: usize, mode: MatchMode, steps: ?*u64) ?Match {
         if (start > haystack.len) return null;
         if (self.anchored_start and start > 0) return null;
 
         // Fast path 1: the entire regex is a pure literal
         if (self.req_is_exact) {
             if (self.prefilter) |*pf| {
-                return pf.find(haystack, start, mode);
+                return pf.findReadOnly(haystack, start, mode);
             }
         }
 
@@ -229,18 +240,19 @@ pub const Regex = struct {
         if (self.req_is_prefix) {
             if (self.prefilter) |*pf| {
                 var pos = start;
-                var cached_win_end: usize = 0;
+                var cached_win_end: usize = std.math.maxInt(usize);
                 while (pos <= haystack.len) {
-                    const hit = pf.find(haystack, pos, .earliest) orelse return null;
-                    if (!self.multiline and hit.start <= cached_win_end) {
-                        // Reuse cached line end
-                    } else {
-                        cached_win_end = self.windowLimit(haystack, hit.start);
-                    }
-                    const win_end = cached_win_end;
+                    const hit = pf.findReadOnly(haystack, pos, .earliest) orelse return null;
+                    const win_end = if (!self.multiline and cached_win_end != std.math.maxInt(usize) and hit.start <= cached_win_end)
+                        cached_win_end
+                    else blk: {
+                        const w = self.windowLimit(haystack, hit.start);
+                        cached_win_end = w;
+                        break :blk w;
+                    };
                     if (self.tail_finder) |*tf| {
                         // If a trailing required literal exists, verify it appears within the candidate window first
-                        const tail_hit = tf.find(haystack[0..win_end], hit.end, .earliest) orelse {
+                        const tail_hit = tf.findReadOnly(haystack[0..win_end], hit.end, .earliest) orelse {
                             if (!self.multiline) {
                                 // In single-line mode, if the trailing literal is absent on this line, skip past the end of the line
                                 pos = @min(haystack.len + 1, win_end + 1);
@@ -251,7 +263,7 @@ pub const Regex = struct {
                         };
                         _ = tail_hit;
                     }
-                    if (self.runWindow(haystack, hit.start, win_end, win_end, mode)) |m| {
+                    if (self.runWindow(haystack, hit.start, win_end, win_end, mode, steps)) |m| {
                         return m;
                     }
                     if (!self.multiline) {
@@ -268,20 +280,21 @@ pub const Regex = struct {
         if (self.prefilter) |*pf| {
             var pos = start;
             var min_start = start;
-            var cached_win_end: usize = 0;
+            var cached_win_end: usize = std.math.maxInt(usize);
             while (pos <= haystack.len) {
-                const hit = pf.find(haystack, pos, .earliest) orelse return null;
+                const hit = pf.findReadOnly(haystack, pos, .earliest) orelse return null;
                 const search_from = if (!self.multiline)
                     @max(min_start, lineStartAt(haystack, hit.start))
                 else
                     @max(min_start, hit.start -| self.max_multiline_window);
-                if (!self.multiline and hit.start <= cached_win_end) {
-                    // Reuse cached line end
-                } else {
-                    cached_win_end = self.windowLimit(haystack, hit.start);
-                }
-                const win_end = cached_win_end;
-                if (self.runWindow(haystack, search_from, win_end, win_end, mode)) |m| {
+                const win_end = if (!self.multiline and cached_win_end != std.math.maxInt(usize) and hit.start <= cached_win_end)
+                    cached_win_end
+                else blk: {
+                    const w = self.windowLimit(haystack, hit.start);
+                    cached_win_end = w;
+                    break :blk w;
+                };
+                if (self.runWindow(haystack, search_from, win_end, win_end, mode, steps)) |m| {
                     return m;
                 }
                 if (!self.multiline) {
@@ -296,7 +309,7 @@ pub const Regex = struct {
         }
 
         // General path: run linear-time PikeVM when no fixed literal is available
-        return self.runUnanchored(haystack, start, haystack.len, mode);
+        return self.runUnanchored(haystack, start, haystack.len, mode, steps);
     }
 
     pub fn findWatched(self: *Regex, haystack: []const u8, start: usize, nul: *?usize) ?Match {
@@ -320,12 +333,35 @@ pub const Regex = struct {
         mode: MatchMode,
         comptime allow: fn ([]const u8, usize, usize) bool,
     ) ?Match {
+        const steps: ?*u64 = if (comptime builtin.is_test) &self.steps else null;
+        return self.findAllowedInternal(haystack, start, mode, allow, steps);
+    }
+
+    /// Read-only variant of `findAllowed` that accepts `*const Regex` without copying or mutating state.
+    pub fn findAllowedReadOnly(
+        self: *const Regex,
+        haystack: []const u8,
+        start: usize,
+        mode: MatchMode,
+        comptime allow: fn ([]const u8, usize, usize) bool,
+    ) ?Match {
+        return self.findAllowedInternal(haystack, start, mode, allow, null);
+    }
+
+    fn findAllowedInternal(
+        self: *const Regex,
+        haystack: []const u8,
+        start: usize,
+        mode: MatchMode,
+        comptime allow: fn ([]const u8, usize, usize) bool,
+        steps: ?*u64,
+    ) ?Match {
         var pos = start;
         while (pos <= haystack.len) {
-            const hit = self.find(haystack, pos, mode) orelse return null;
+            const hit = self.findInternal(haystack, pos, mode, steps) orelse return null;
             if (allow(haystack, hit.start, hit.end)) return hit;
             const win_end = self.windowLimit(haystack, hit.start);
-            if (self.runRangeAllowed(haystack, hit.start, hit.start, win_end, mode, allow)) |alt| {
+            if (self.runRangeAllowed(haystack, hit.start, hit.start, win_end, mode, allow, steps)) |alt| {
                 return alt;
             }
             pos = hit.start + 1;
@@ -333,10 +369,10 @@ pub const Regex = struct {
         return null;
     }
 
-    pub fn acceptsSpan(self: *Regex, haystack: []const u8, start: usize, end: usize) bool {
+    pub fn acceptsSpan(self: *const Regex, haystack: []const u8, start: usize, end: usize) bool {
         if (end < start or end > haystack.len) return false;
         const slice = haystack[start..end];
-        if (self.runRangeAllowed(slice, 0, 0, slice.len, .leftmost_first, allowExactLen)) |m| {
+        if (self.runRangeAllowed(slice, 0, 0, slice.len, .leftmost_first, allowExactLen, null)) |m| {
             return m.start == 0 and m.end == slice.len;
         }
         return false;
@@ -354,38 +390,40 @@ pub const Regex = struct {
     }
 
     /// Run Thompson NFA anchored at `anchor_pos`, scanning no further than `limit`.
-    fn runAnchored(self: *Regex, haystack: []const u8, anchor_pos: usize, limit: usize, mode: MatchMode) ?Match {
-        return self.runRange(haystack, anchor_pos, anchor_pos, limit, mode);
+    fn runAnchored(self: *const Regex, haystack: []const u8, anchor_pos: usize, limit: usize, mode: MatchMode, steps: ?*u64) ?Match {
+        return self.runRange(haystack, anchor_pos, anchor_pos, limit, mode, steps);
     }
 
     /// Search for a match start in `[from .. max_start]`, scanning no further than `limit`.
-    fn runWindow(self: *Regex, haystack: []const u8, from: usize, max_start: usize, limit: usize, mode: MatchMode) ?Match {
-        return self.runRange(haystack, from, max_start, limit, mode);
+    fn runWindow(self: *const Regex, haystack: []const u8, from: usize, max_start: usize, limit: usize, mode: MatchMode, steps: ?*u64) ?Match {
+        return self.runRange(haystack, from, max_start, limit, mode, steps);
     }
 
-    fn runUnanchored(self: *Regex, haystack: []const u8, start: usize, limit: usize, mode: MatchMode) ?Match {
-        return self.runRange(haystack, start, limit, limit, mode);
+    fn runUnanchored(self: *const Regex, haystack: []const u8, start: usize, limit: usize, mode: MatchMode, steps: ?*u64) ?Match {
+        return self.runRange(haystack, start, limit, limit, mode, steps);
     }
 
     fn runRange(
-        self: *Regex,
+        self: *const Regex,
         haystack: []const u8,
         start_lo: usize,
         start_hi: usize,
         limit: usize,
         mode: MatchMode,
+        steps: ?*u64,
     ) ?Match {
-        return self.runRangeAllowed(haystack, start_lo, start_hi, limit, mode, allowAnySpan);
+        return self.runRangeAllowed(haystack, start_lo, start_hi, limit, mode, allowAnySpan, steps);
     }
 
     fn runRangeAllowed(
-        self: *Regex,
+        self: *const Regex,
         haystack: []const u8,
         start_lo: usize,
         start_hi: usize,
         limit: usize,
         mode: MatchMode,
         comptime allow: fn ([]const u8, usize, usize) bool,
+        steps: ?*u64,
     ) ?Match {
         const n_inst = self.insts.len;
         if (n_inst == 0 or start_lo > limit) return null;
@@ -428,7 +466,7 @@ pub const Regex = struct {
 
             if (curr_len == 0 and best == null and pos > start_lo and pos <= start_hi and self.req_is_prefix) {
                 if (self.prefilter) |*pf| {
-                    const next_hit = pf.find(haystack[0..limit], pos, .earliest) orelse break;
+                    const next_hit = pf.findReadOnly(haystack[0..limit], pos, .earliest) orelse break;
                     if (next_hit.start > start_hi) break;
                     pos = next_hit.start;
                 }
@@ -444,7 +482,7 @@ pub const Regex = struct {
                 else
                     true;
                 if (can_start) {
-                    self.addThread(curr, &curr_len, gen_table, gen, self.start_pc, pos, haystack, pos);
+                    self.addThread(curr, &curr_len, gen_table, gen, self.start_pc, pos, haystack, pos, steps);
                 }
             }
 
@@ -488,7 +526,7 @@ pub const Regex = struct {
                         else
                             b == by.b;
                         if (ok and (!self.multiline or pos + 1 - th.start <= self.max_multiline_window)) {
-                            self.addThread(next, &next_len, gen_table, gen, by.out, th.start, haystack, pos + 1);
+                            self.addThread(next, &next_len, gen_table, gen, by.out, th.start, haystack, pos + 1, steps);
                         }
                     },
                     .any => |an| {
@@ -497,14 +535,14 @@ pub const Regex = struct {
                             continue;
                         }
                         if (!self.multiline or pos + 1 - th.start <= self.max_multiline_window) {
-                            self.addThread(next, &next_len, gen_table, gen, an.out, th.start, haystack, pos + 1);
+                            self.addThread(next, &next_len, gen_table, gen, an.out, th.start, haystack, pos + 1, steps);
                         }
                     },
                     .class => |cl| {
                         if (!has_byte) continue;
                         if (!self.multiline and is_nl) continue;
                         if (cl.set.contains(b) and (!self.multiline or pos + 1 - th.start <= self.max_multiline_window)) {
-                            self.addThread(next, &next_len, gen_table, gen, cl.out, th.start, haystack, pos + 1);
+                            self.addThread(next, &next_len, gen_table, gen, cl.out, th.start, haystack, pos + 1, steps);
                         }
                     },
                     .split, .jmp, .assert => {},
@@ -529,7 +567,7 @@ pub const Regex = struct {
     }
 
     fn addThread(
-        self: *Regex,
+        self: *const Regex,
         list: []Thread,
         list_len: *usize,
         gen_table: []u32,
@@ -538,22 +576,25 @@ pub const Regex = struct {
         start: usize,
         haystack: []const u8,
         pos: usize,
+        steps: ?*u64,
     ) void {
         if (gen_table[pc] == gen) return;
         gen_table[pc] = gen;
-        self.steps += 1;
+        if (comptime builtin.is_test) {
+            if (steps) |s| s.* += 1;
+        }
 
         switch (self.insts[pc]) {
             .jmp => |target| {
-                self.addThread(list, list_len, gen_table, gen, target, start, haystack, pos);
+                self.addThread(list, list_len, gen_table, gen, target, start, haystack, pos, steps);
             },
             .split => |sp| {
-                self.addThread(list, list_len, gen_table, gen, sp.out1, start, haystack, pos);
-                self.addThread(list, list_len, gen_table, gen, sp.out2, start, haystack, pos);
+                self.addThread(list, list_len, gen_table, gen, sp.out1, start, haystack, pos, steps);
+                self.addThread(list, list_len, gen_table, gen, sp.out2, start, haystack, pos, steps);
             },
             .assert => |as| {
                 if (checkAssert(as.kind, haystack, pos)) {
-                    self.addThread(list, list_len, gen_table, gen, as.out, start, haystack, pos);
+                    self.addThread(list, list_len, gen_table, gen, as.out, start, haystack, pos, steps);
                 }
             },
             else => {

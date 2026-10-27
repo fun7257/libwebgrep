@@ -542,6 +542,10 @@ All multi-tenant budgets are configured via `SearchConfig` and enforced determin
 | `whole_line` | `bool` | `false` | `false` | Requires entire line content to match |
 | `contains` | `[]const []const u8` | `&.{}` | `&.{}` | Every listed literal must appear on the line (AND) |
 | `excludes` | `[]const []const u8` | `&.{}` | `&.{}` | None of the listed literals may appear on the line (NOT) |
+| `filter_case_insensitive` | `bool` | `false` | `false` | Enables ASCII case-insensitive matching for `contains` and `excludes` |
+| `filter_smart_case` | `bool` | `false` | `false` | Enables per-filter smart-case matching for `contains` and `excludes` |
+| `contains_regexes` | `[]const Regex` | `&.{}` | `&.{}` | Compiled regexes that must all match within the line (AND) |
+| `excludes_regexes` | `[]const Regex` | `&.{}` | `&.{}` | Compiled regexes that must not match within the line (NOT) |
 | `context` | `u32` | `0` | Hard cap `10` | Symmetric before/after context lines |
 | `before` / `after` | `?u32` | `null` | Hard cap `10` | Asymmetric before/after context lines |
 | `max_context_lines` | `?u32` | `null` | Hard cap `10` | Lowers maximum allowed context lines |

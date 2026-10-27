@@ -77,6 +77,39 @@ pub const Finder = struct {
         }
     }
 
+    /// Read-only variant of `find` that accepts `*const Finder` without mutating telemetry fields.
+    pub fn findReadOnly(self: *const Finder, haystack: []const u8, start: usize, mode: matcher.MatchMode) ?matcher.Match {
+        _ = mode;
+        switch (self.kind) {
+            .empty => {
+                if (start <= haystack.len) return .{ .start = start, .end = start };
+                return null;
+            },
+            .byte => |needle| {
+                const at = if (self.ignore_case) blk: {
+                    const forms = ascii.caseVariants(needle);
+                    break :blk memchr.findEither(memchr.native_width, haystack, start, forms[0], forms[1]);
+                } else memchr.find(memchr.native_width, haystack, start, needle);
+                const i = at orelse return null;
+                return .{ .start = i, .end = i + 1 };
+            },
+            .pair => |*pair| {
+                const m = pair.pattern.len;
+                if (self.use_two_way) return self.findLinear(haystack, start, m);
+                if (m > haystack.len or start > haystack.len - m) return null;
+                var guard: packed_pair.Guard = .{};
+                const watch = m > packed_pair.owns_search_max_len and self.fp_threshold < 1;
+                if (pair.find(memchr.native_width, haystack, start, if (watch) &guard else null)) |pos| {
+                    return .{ .start = pos, .end = pos + m };
+                }
+                if (guard.gave_up) {
+                    return self.findLinear(haystack, guard.restart, m);
+                }
+                return null;
+            },
+        }
+    }
+
     /// Same as `find`, additionally writing the first NUL within the scanned span to `nul`.
     /// When returning a match, only guarantees no NUL precedes the match start.
     pub fn findWatched(self: *Finder, haystack: []const u8, start: usize, nul: *?usize) ?matcher.Match {
@@ -118,7 +151,7 @@ pub const Finder = struct {
     }
 
     fn findPair(self: *Finder, haystack: []const u8, start: usize) ?matcher.Match {
-        const pair = self.kind.pair;
+        const pair = &self.kind.pair;
         const m = pair.pattern.len;
         if (self.use_two_way) return self.findLinear(haystack, start, m);
         if (m > haystack.len or start > haystack.len - m) return null;
@@ -141,7 +174,7 @@ pub const Finder = struct {
     }
 
     fn findPairWatched(self: *Finder, haystack: []const u8, start: usize, nul: *?usize) ?matcher.Match {
-        const pair = self.kind.pair;
+        const pair = &self.kind.pair;
         const m = pair.pattern.len;
         if (self.use_two_way) {
             if (memchr.find(memchr.native_width, haystack, start, 0)) |at| {
@@ -177,7 +210,7 @@ pub const Finder = struct {
         return null;
     }
 
-    fn findLinear(self: *Finder, haystack: []const u8, start: usize, m: usize) ?matcher.Match {
+    fn findLinear(self: *const Finder, haystack: []const u8, start: usize, m: usize) ?matcher.Match {
         const at = self.two_way.find(haystack, start) orelse return null;
         return .{ .start = at, .end = at + m };
     }

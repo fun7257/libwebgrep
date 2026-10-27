@@ -104,6 +104,10 @@ pub fn find(self: *Regex, haystack: []const u8, start: usize, mode: MatchMode) ?
 | `whole_line` | `bool` | `false` | `false` | 整行匹配（优先于 `whole_word`） |
 | `contains` | `[]const []const u8` | `&.{}` | `&.{}` | 链式包含过滤（AND：行内必须同时包含全部所列字节串） |
 | `excludes` | `[]const []const u8` | `&.{}` | `&.{}` | 链式排除过滤（NOT：行内不得包含任一所列字节串） |
+| `filter_case_insensitive` | `bool` | `false` | `false` | `contains` 与 `excludes` 启用 ASCII 忽略大小写匹配 |
+| `filter_smart_case` | `bool` | `false` | `false` | `contains` 与 `excludes` 按每条过滤词独立评估智能大小写 |
+| `contains_regexes` | `[]const Regex` | `&.{}` | `&.{}` | 行内必须全部命中的已编译正则列表（AND） |
+| `excludes_regexes` | `[]const Regex` | `&.{}` | `&.{}` | 行内不得命中的已编译正则列表（NOT） |
 | `context` | `u32` | `0` | 硬顶 `10` 行 | 对称的前后上下文行数 |
 | `before` / `after` | `?u32` | `null` | 硬顶 `10` 行 | 单独指定前置 / 后置上下文行数 |
 | `passthru` | `bool` | `false` | `false` | 全文高亮模式：未命中行作为 `context` 交出，受 `max_output_bytes` 约束 |

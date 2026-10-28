@@ -1905,25 +1905,11 @@ fn linePassesFilters(buf: []const u8, start: usize, end: usize, config: SearchCo
     for (config.excludes) |pat| {
         if (sliceContainsFilter(text, pat, config.filter_case_insensitive, config.filter_smart_case)) return false;
     }
-    if (config.contains_regexes.len > 0) {
-        const use_whole_word = config.whole_word and !config.whole_line;
-        for (config.contains_regexes) |*re| {
-            const found = if (use_whole_word)
-                re.findAllowedReadOnly(text, 0, .earliest, wordBounded)
-            else
-                re.findReadOnly(text, 0, .earliest);
-            if (found == null) return false;
-        }
+    for (config.contains_regexes) |*re| {
+        if (re.findReadOnly(text, 0, .earliest) == null) return false;
     }
-    if (config.excludes_regexes.len > 0) {
-        const use_whole_word = config.whole_word and !config.whole_line;
-        for (config.excludes_regexes) |*re| {
-            const found = if (use_whole_word)
-                re.findAllowedReadOnly(text, 0, .earliest, wordBounded)
-            else
-                re.findReadOnly(text, 0, .earliest);
-            if (found != null) return false;
-        }
+    for (config.excludes_regexes) |*re| {
+        if (re.findReadOnly(text, 0, .earliest) != null) return false;
     }
     return true;
 }
@@ -2141,34 +2127,6 @@ fn gatherSpans(
         if (empty or found.end <= pos) break;
         pos = found.end;
     }
-    if (config.replacement == null and config.contains_regexes.len > 0) {
-        const use_whole_word = config.whole_word and !config.whole_line;
-        for (config.contains_regexes) |*re| {
-            var rpos = line.start;
-            while (rpos <= content_end and rpos <= line_buf.len) {
-                if (stopInMatch(state, config)) break;
-                const rfound = if (use_whole_word)
-                    re.findAllowedReadOnly(line_buf, rpos, config.match_mode, wordBounded)
-                else
-                    re.findReadOnly(line_buf, rpos, config.match_mode);
-                const hit = rfound orelse break;
-                if (hit.start < rpos or hit.start > buf.len or hit.start > content_end) break;
-                if (hit.start == content_end and hit.end > content_end) break;
-                const mend = @min(hit.end, content_end);
-                const empty = hit.start == mend;
-                if (!empty and hit.start >= win_lo and hit.start < win_hi) {
-                    if (n == store.len) store = try growSpans(alloc, store, heap, n);
-                    store[n] = .{
-                        .start = hit.start - win_lo,
-                        .end = @min(mend, win_hi) - win_lo,
-                    };
-                    n += 1;
-                }
-                if (empty or hit.end <= rpos) break;
-                rpos = hit.end;
-            }
-        }
-    }
     if (n == 0) {
         if (preview.span) |span| {
             if (store.len == 0) store = try growSpans(alloc, store, heap, 0);
@@ -2177,22 +2135,6 @@ fn gatherSpans(
         }
     }
     std.mem.sort(Span, store[0..n], {}, spanBefore);
-    if (config.contains_regexes.len > 0 and n > 1) {
-        var out_idx: usize = 0;
-        for (store[1..n]) |sp| {
-            if (sp.start < store[out_idx].end) {
-                if (sp.end > store[out_idx].end) {
-                    store[out_idx].end = sp.end;
-                }
-            } else if (sp.start == store[out_idx].start and sp.end == store[out_idx].end) {
-                // Skip duplicate span
-            } else {
-                out_idx += 1;
-                store[out_idx] = sp;
-            }
-        }
-        n = out_idx + 1;
-    }
     return store[0..n];
 }
 
@@ -3012,6 +2954,14 @@ fn overlapKeep(matcher: anytype, config: SearchConfig) usize {
     var n = needleLen(matcher);
     for (config.contains) |pat| n = @max(n, pat.len);
     for (config.excludes) |pat| n = @max(n, pat.len);
+    for (config.contains_regexes) |*re| {
+        const req_len = if (re.requiredLiteral()) |lit| lit.bytes.len + lit.offset_in_match else 256;
+        n = @max(n, @max(req_len, 256));
+    }
+    for (config.excludes_regexes) |*re| {
+        const req_len = if (re.requiredLiteral()) |lit| lit.bytes.len + lit.offset_in_match else 256;
+        n = @max(n, @max(req_len, 256));
+    }
     if (config.whole_word) n += 1;
     if (n == 0) n = 1;
     const cap = if (config.max_line_len == 0) 1 else config.max_line_len;
@@ -3065,13 +3015,8 @@ fn noteLong(
             }
         }
         if (!state.long_excluded and config.excludes_regexes.len > 0) {
-            const use_whole_word = config.whole_word and !config.whole_line;
             for (config.excludes_regexes) |*re| {
-                const found = if (use_whole_word)
-                    re.findAllowedReadOnly(bytes, 0, .earliest, wordBounded)
-                else
-                    re.findReadOnly(bytes, 0, .earliest);
-                if (found != null) {
+                if (re.findReadOnly(bytes, 0, .earliest) != null) {
                     state.long_excluded = true;
                     break;
                 }
@@ -3079,21 +3024,14 @@ fn noteLong(
         }
     }
     const total_contains = config.contains.len + config.contains_regexes.len;
-    if (seen.len >= total_contains) {
+    if (!state.long_excluded and seen.len >= total_contains) {
         for (config.contains, 0..) |pat, i| {
             if (!seen.*[i] and sliceContainsFilter(bytes, pat, config.filter_case_insensitive, config.filter_smart_case)) seen.*[i] = true;
         }
-        if (config.contains_regexes.len > 0) {
-            const use_whole_word = config.whole_word and !config.whole_line;
-            for (config.contains_regexes, 0..) |*re, i| {
-                const idx = config.contains.len + i;
-                if (!seen.*[idx]) {
-                    const found = if (use_whole_word)
-                        re.findAllowedReadOnly(bytes, 0, .earliest, wordBounded)
-                    else
-                        re.findReadOnly(bytes, 0, .earliest);
-                    if (found != null) seen.*[idx] = true;
-                }
+        for (config.contains_regexes, 0..) |*re, i| {
+            const idx = config.contains.len + i;
+            if (!seen.*[idx] and re.findReadOnly(bytes, 0, .earliest) != null) {
+                seen.*[idx] = true;
             }
         }
     }
@@ -6626,7 +6564,7 @@ test "preserves raw byte stream offsets after transcoding and decompression" {
     try testing.expectEqual(@as(u64, 8), sink.raw_off);
 }
 
-test "filter_smart_case, contains_regexes, excludes_regexes, and non-overlapping span merge" {
+test "filter_smart_case, contains_regexes, and excludes_regexes" {
     var finder = try Finder.init("ERROR", .{});
     var re_must = try regex_mod.Regex.init(testing.allocator, "code=[0-9]+", .{});
     defer re_must.deinit();
@@ -6639,14 +6577,12 @@ test "filter_smart_case, contains_regexes, excludes_regexes, and non-overlapping
         matched_lines: u32 = 0,
         span_count: usize = 0,
         first_span: Span = .{ .start = 0, .end = 0 },
-        second_span: Span = .{ .start = 0, .end = 0 },
 
         pub fn event(self: *@This(), ev: Event) bool {
             if (ev == .match) {
                 self.matched_lines += 1;
                 self.span_count = ev.match.matches.len;
                 if (ev.match.matches.len >= 1) self.first_span = ev.match.matches[0];
-                if (ev.match.matches.len >= 2) self.second_span = ev.match.matches[1];
             }
             return true;
         }
@@ -6669,11 +6605,8 @@ test "filter_smart_case, contains_regexes, excludes_regexes, and non-overlapping
     });
     try testing.expectEqual(@as(u64, 1), res.matched_lines);
     try testing.expectEqual(@as(u32, 1), sink.matched_lines);
-    // "ERROR" [0..5) and "ERROR_500" [0..9) overlap and must be merged into a single [0..9) span,
-    // followed by "code=500" at [23..31).
-    try testing.expectEqual(@as(usize, 2), sink.span_count);
+    // Primary matcher (`finder` = "ERROR") span [0..5) is reported cleanly without contains_regexes pollution.
+    try testing.expectEqual(@as(usize, 1), sink.span_count);
     try testing.expectEqual(@as(usize, 0), sink.first_span.start);
-    try testing.expectEqual(@as(usize, 9), sink.first_span.end);
-    try testing.expectEqual(@as(usize, 23), sink.second_span.start);
-    try testing.expectEqual(@as(usize, 31), sink.second_span.end);
+    try testing.expectEqual(@as(usize, 5), sink.first_span.end);
 }

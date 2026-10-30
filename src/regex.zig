@@ -488,6 +488,11 @@ pub const Regex = struct {
 
             if (curr_len == 0) {
                 if (best != null or pos >= start_hi or pos >= limit or (self.anchored_start and pos > 0)) break;
+                gen +%= 1;
+                if (gen == 0) {
+                    @memset(gen_table, 0);
+                    gen = 1;
+                }
                 pos += 1;
                 continue;
             }
@@ -1394,3 +1399,31 @@ test "acceptsSpan and findAllowed respect lower-priority alternation branches" {
     try std.testing.expectEqual(@as(usize, 6), hit.end);
 }
 
+test "patterns starting with \\b or \\B match on indented lines and after non-word prefixes" {
+    var re_lit = try Regex.init(std.testing.allocator, "\\bErrorCode\\b", .{});
+    defer re_lit.deinit();
+    const indented = "    if (err == ErrorCode) return;\n";
+    const hit_lit = re_lit.find(indented, 0, .leftmost_first).?;
+    try std.testing.expectEqualStrings("ErrorCode", indented[hit_lit.start..hit_lit.end]);
+    const hit_ro = re_lit.findReadOnly(indented, 0, .leftmost_first).?;
+    try std.testing.expectEqual(hit_lit, hit_ro);
+
+    var re_short = try Regex.init(std.testing.allocator, "\\bid\\b", .{});
+    defer re_short.deinit();
+    const tab_line = "\tconst my_id = id;\n";
+    const hit_short = re_short.find(tab_line, 0, .leftmost_first).?;
+    try std.testing.expectEqual(@as(usize, 15), hit_short.start);
+    try std.testing.expectEqual(@as(usize, 17), hit_short.end);
+
+    var re_digits = try Regex.init(std.testing.allocator, "\\b\\d{4}\\b", .{});
+    defer re_digits.deinit();
+    const punct_line = "  [status: 2026]\n";
+    const hit_digits = re_digits.find(punct_line, 0, .leftmost_first).?;
+    try std.testing.expectEqualStrings("2026", punct_line[hit_digits.start..hit_digits.end]);
+
+    var re_non_wb = try Regex.init(std.testing.allocator, "\\BCode\\b", .{});
+    defer re_non_wb.deinit();
+    const word_start_line = "ErrorCode = 1;\n";
+    const hit_non_wb = re_non_wb.find(word_start_line, 0, .leftmost_first).?;
+    try std.testing.expectEqualStrings("Code", word_start_line[hit_non_wb.start..hit_non_wb.end]);
+}

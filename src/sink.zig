@@ -15,6 +15,7 @@ const matcher = @import("matcher.zig");
 pub const Span = struct {
     start: usize,
     end: usize,
+    pattern_id: ?u32 = null,
     u16_start: usize = 0,
     u16_end: usize = 0,
     /// Attached replacement text when `SearchConfig.replacement` is non-null. Valid only during the current callback.
@@ -265,6 +266,25 @@ pub const AnySink = struct {
         finish: *const fn (*anyopaque, Result) bool,
     };
 
+    pub fn init(comptime S: type, ptr: anytype) AnySink {
+        const Base = switch (@typeInfo(S)) {
+            .pointer => |p| p.child,
+            else => S,
+        };
+        if (Base == AnySink) return ptr.*;
+        const Holder = struct {
+            const vtable = anyVtable(Base);
+        };
+        return .{
+            .ctx = @ptrCast(@constCast(ptr)),
+            .vtable = &Holder.vtable,
+        };
+    }
+
+    pub fn from(ptr: anytype) AnySink {
+        return init(@TypeOf(ptr), ptr);
+    }
+
     pub fn begin(self: *AnySink, path: []const u8) bool {
         return self.vtable.begin(self.ctx, path);
     }
@@ -287,6 +307,43 @@ pub const AnySink = struct {
 
     pub fn finish(self: *AnySink, result: Result) bool {
         return self.vtable.finish(self.ctx, result);
+    }
+};
+
+/// Runtime-polymorphic Event sink for the service entry point (`Event` -> `Flow`).
+pub const AnyEventSink = struct {
+    ctx: *anyopaque,
+    event_fn: *const fn (ctx: *anyopaque, ev: Event) Flow,
+
+    pub fn init(comptime S: type, ptr: anytype) AnyEventSink {
+        const Base = switch (@typeInfo(S)) {
+            .pointer => |p| p.child,
+            else => S,
+        };
+        if (Base == AnyEventSink) return ptr.*;
+        const gen = struct {
+            fn call(ctx: *anyopaque, ev: Event) Flow {
+                const self: *Base = @ptrCast(@alignCast(ctx));
+                const ret = self.event(ev);
+                return switch (@TypeOf(ret)) {
+                    bool => if (ret) .cont else .stop,
+                    Flow => ret,
+                    else => @compileError("Event sink .event(ev) must return bool or Flow"),
+                };
+            }
+        };
+        return .{
+            .ctx = @ptrCast(@constCast(ptr)),
+            .event_fn = &gen.call,
+        };
+    }
+
+    pub fn from(ptr: anytype) AnyEventSink {
+        return init(@TypeOf(ptr), ptr);
+    }
+
+    pub fn event(self: *AnyEventSink, ev: Event) Flow {
+        return self.event_fn(self.ctx, ev);
     }
 };
 
@@ -361,6 +418,10 @@ pub fn SliceIter(comptime M: type) type {
 
         const Iter = @This();
 
+        pub fn init(haystack: []const u8, m: M) Iter {
+            return .{ .haystack = haystack, .matcher = m };
+        }
+
         pub fn next(self: *Iter) ?Line {
             if (self.done or self.pos > self.haystack.len) return null;
             const found = self.matcher.find(self.haystack, self.pos, self.mode) orelse {
@@ -399,6 +460,7 @@ pub fn SliceIter(comptime M: type) type {
                 .match = .{
                     .start = mstart,
                     .end = mend,
+                    .pattern_id = found.pattern_id,
                     .u16_start = units.start,
                     .u16_end = units.end,
                 },
@@ -454,16 +516,15 @@ const testing = std.testing;
 
 test "AnySink default methods continue searching" {
     const Bare = struct {};
-    const vt = anyVtable(Bare);
     var bare: Bare = .{};
-    var any: AnySink = .{ .ctx = @ptrCast(&bare), .vtable = &vt };
+    var any = AnySink.init(Bare, &bare);
     try testing.expect(any.begin(""));
     try testing.expect(any.contextBreak());
     try testing.expect(any.binary(0));
     try testing.expect(any.finish(.{}));
 }
 
-test "AnySink forwards calls to concrete type" {
+test "AnySink and AnyEventSink forward calls to concrete type" {
     const Rec = struct {
         hits: u32 = 0,
         path: []const u8 = "",
@@ -478,9 +539,8 @@ test "AnySink forwards calls to concrete type" {
     };
     const T = SinkTraits(Rec);
     try testing.expect(T.has_begin and T.has_matched and !T.has_event);
-    const vt = anyVtable(Rec);
     var rec: Rec = .{};
-    var any: AnySink = .{ .ctx = @ptrCast(&rec), .vtable = &vt };
+    var any = AnySink.init(Rec, &rec);
     try testing.expect(any.begin("a.txt"));
     try testing.expect(!any.matched(.{
         .bytes = "ab",
@@ -490,4 +550,19 @@ test "AnySink forwards calls to concrete type" {
     }));
     try testing.expectEqualStrings("a.txt", rec.path);
     try testing.expectEqual(@as(u32, 2), rec.hits);
+
+    const EvCollector = struct {
+        begins: u32 = 0,
+        pub fn event(self: *@This(), ev: Event) Flow {
+            switch (ev) {
+                .begin => self.begins += 1,
+                else => {},
+            }
+            return .cont;
+        }
+    };
+    var evc: EvCollector = .{};
+    var any_ev = AnyEventSink.init(EvCollector, &evc);
+    try testing.expectEqual(Flow.cont, any_ev.event(.{ .begin = .{ .source_id = "s" } }));
+    try testing.expectEqual(@as(u32, 1), evc.begins);
 }

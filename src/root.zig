@@ -23,8 +23,10 @@ pub const RequiredLiteral = matcher.RequiredLiteral;
 pub const CaseMode = matcher.CaseMode;
 /// Options for constructing `Finder` or `Multi`. Pattern count and byte limits can only be lowered below hard caps.
 pub const FindOptions = matcher.FindOptions;
+/// Runtime-polymorphic immutable matcher wrapper for `Finder`, `Multi`, `Regex`, `RegexSet`, or custom matchers.
+pub const AnyMatcher = matcher.AnyMatcher;
 
-/// Half-open byte span within a line, carrying precomputed UTF-16 code-unit endpoints.
+/// Half-open byte span within a line, carrying precomputed UTF-16 code-unit endpoints and `pattern_id`.
 pub const Span = sink_mod.Span;
 /// A matched or context line on legacy callbacks. `bytes`, `text`, `raw`, and `matches` are valid only until the callback returns.
 pub const Line = sink_mod.Line;
@@ -40,6 +42,8 @@ pub const EndEvent = sink_mod.EndEvent;
 pub const AnySink = sink_mod.AnySink;
 /// Builds a vtable for a legacy sink type `S` without heap allocation.
 pub const anyVtable = sink_mod.anyVtable;
+/// Runtime-polymorphic service event sink wrapper (`Event` -> `Flow`).
+pub const AnyEventSink = sink_mod.AnyEventSink;
 /// Context-free pull iterator over a slice. `Line.bytes` borrows directly from `haystack`.
 pub const SliceIter = sink_mod.SliceIter;
 /// Search result returned on completion. Distinguishes matches, no matches, and per-source soft errors from fatal errors.
@@ -71,6 +75,8 @@ pub const Compression = searcher.Compression;
 pub const decompress = @import("codec/decompress.zig");
 /// Search configuration. Service entry points populate default multi-tenant budgets when left null.
 pub const SearchConfig = searcher.SearchConfig;
+/// Reusable per-worker scratch buffer pool for zero steady-state allocations across slice and streaming searches.
+pub const Scratch = searcher.Scratch;
 /// Legacy callback entry point for searching an in-memory slice without default service budgets.
 pub const searchSlice = searcher.searchSlice;
 /// Legacy callback entry point for searching a `std.Io.Reader`. Prefer `searchSource` for service workloads.
@@ -83,8 +89,16 @@ pub const resumeSource = searcher.resumeSource;
 pub const searchSourceSlice = searcher.searchSourceSlice;
 /// Resumes searching the same slice from a previous `Flow.pause` state without re-emitting `begin`.
 pub const resumeSourceSlice = searcher.resumeSourceSlice;
+/// Owned event structure yielded by `SourcePull.next()` and `ReaderPull.next()`.
+pub const PullEvent = searcher.PullEvent;
+/// Pull-based iterator type over service events for an in-memory slice.
+pub const SourcePull = searcher.SourcePull;
 /// Pull-based iterator over service events for an in-memory slice.
 pub const openSourcePull = searcher.openSourcePull;
+/// True streaming pull-based state machine type over a `*std.Io.Reader`.
+pub const ReaderPull = searcher.ReaderPull;
+/// Opens a true streaming pull-based iterator (`ReaderPull`) over a `*std.Io.Reader`.
+pub const openReaderPull = searcher.openReaderPull;
 
 test "default search configuration" {
     const cfg: SearchConfig = .{};
@@ -126,6 +140,10 @@ test "public search entry points accept no filesystem handles or paths" {
     try checkSearchFn(@TypeOf(searchSourceSlice));
     try checkSearchFn(@TypeOf(resumeSourceSlice));
     try checkSearchFn(@TypeOf(openSourcePull));
+    try checkSearchFn(@TypeOf(openReaderPull));
+    try checkSearchFn(@TypeOf(searchTree));
+    try checkSearchFn(@TypeOf(searchArchiveSlice));
+    try checkSearchFn(@TypeOf(searchArchive));
 
     const Collect = struct {
         left: bool = false,
@@ -155,7 +173,7 @@ test "public search entry points accept no filesystem handles or paths" {
     try std.testing.expectEqual(@as(u32, 2), found.matches);
 }
 
-/// Vectorized single-byte search (`find`, `findEither`, `findAny`, `findLast`, `count`). Zero allocation; width is 16 or 32.
+/// Vectorized single-byte search (`find`, `findEither`, `findAny`, `findLast`, `count`). Zero allocation; width is 16, 32, or 64.
 pub const memchr = @import("finder/memchr.zig");
 /// `Finder` definition module for single-literal SIMD search.
 pub const finder = @import("finder/finder.zig");
@@ -165,24 +183,40 @@ pub const Finder = finder.Finder;
 pub const multi = @import("finder/multi.zig");
 /// Multi-literal OR search engine (`ByteSet`, `RarePair`, `Teddy`, `AhoCorasick`).
 pub const Multi = multi.Multi;
-/// `Regex` definition module for linear-time Thompson NFA search with SIMD literal prefiltering.
+/// `Regex` definition module for linear-time Thompson NFA & Hybrid Lazy DFA search with SIMD literal prefiltering.
 pub const regex = @import("regex.zig");
 /// Linear-time regular expression matcher with compile size hard caps and bounded multiline windows.
 pub const Regex = regex.Regex;
-/// Options for constructing `Regex`: case mode, bounded multiline, `dot_all`, and instruction caps.
+/// Options for constructing `Regex` and `RegexSet`: case mode, bounded multiline, `dot_all`, and instruction caps.
 pub const RegexOptions = regex.RegexOptions;
 /// Regex submatch capture result holding full match (`match`) and numbered groups `$1`..`$9` (`groups[0..8]`).
 pub const Captures = regex.Captures;
+/// Reusable per-thread scratch space for `Regex.findWithScratch` and 256-state `HeapDfa`.
+pub const RegexScratch = regex.RegexScratch;
+/// Multi-regex engine evaluating up to 1,024 regular expressions simultaneously in a single pass.
+pub const RegexSet = regex.RegexSet;
+/// Structured error classification enum for `CompileDiagnostic`.
+pub const DiagnosticCode = regex.DiagnosticCode;
+/// Structured regex compilation error diagnostic reporting exact byte offset, 1-based line/column, and error code.
+pub const CompileDiagnostic = regex.CompileDiagnostic;
 
 test {
     _ = @import("codec/offset_map.zig");
     _ = @import("codec/decompress.zig");
     _ = @import("codec/encoding.zig");
+    _ = @import("codec/archive.zig");
+    _ = @import("codec/archive_adversarial_tests.zig");
     _ = @import("tables/unicode_case_table.zig");
+    _ = @import("tables/unicode_prop_table.zig");
     _ = @import("matcher.zig");
     _ = @import("sink.zig");
     _ = @import("searcher.zig");
+    _ = @import("search/tree.zig");
+    _ = @import("search/challenger_test.zig");
     _ = @import("regex.zig");
+    _ = @import("regex/dfa.zig");
+    _ = @import("regex/set.zig");
+    _ = @import("regex/adversarial_tests.zig");
     _ = @import("ndjson_fixture.zig");
     _ = @import("finder/memchr.zig");
     _ = @import("finder/two_way.zig");
@@ -211,6 +245,26 @@ pub const two_way = @import("finder/two_way.zig");
 
 /// Abstract in-memory tree source interface for archive or virtual tree inputs.
 pub const source = @import("source.zig");
+/// Zero-disk-landing in-memory archive unpacking module (`.tar`, `.tar.gz`, `.tar.zst`, `.tar.xz`, `.zip`).
+pub const archive = @import("codec/archive.zig");
+/// Archive container format selector (`auto`, `tar`, `tar_gz`, `tar_zst`, `tar_xz`, `zip`).
+pub const ArchiveFormat = archive.ArchiveFormat;
+/// Safety and resource limits for in-memory archive unpacking.
+pub const ArchiveOptions = archive.ArchiveOptions;
+/// Error set returned when unpacking an archive fails or violates safety caps.
+pub const ArchiveError = archive.ArchiveError;
+/// Arena-backed virtual file tree unpacked in memory from an archive slice or stream.
+pub const ArchiveTree = archive.ArchiveTree;
+/// Virtual tree and archive search module (`TreeConfig`, `searchTree`, `searchArchiveSlice`, `searchArchive`).
+pub const tree = @import("search/tree.zig");
+/// Configuration for `searchTree`, `searchArchiveSlice`, and `searchArchive`.
+pub const TreeConfig = tree.TreeConfig;
+/// Searches a virtual `source.Source` hierarchy with `.gitignore`/`.ignore`/`.rgignore`, globs, and file types.
+pub const searchTree = tree.searchTree;
+/// Unpacks an archive byte slice in memory and searches its virtual tree without touching disk.
+pub const searchArchiveSlice = tree.searchArchiveSlice;
+/// Unpacks an archive stream from `*std.Io.Reader` in memory and searches its virtual tree without touching disk.
+pub const searchArchive = tree.searchArchive;
 /// Byte-oriented glob matcher supporting nested brace expansion, rule caps, and ASCII case insensitivity.
 pub const walk_glob = @import("walk/glob.zig");
 /// In-memory gitignore/ignore rule parser and hierarchical matcher with fine-grained switches.
@@ -234,5 +288,9 @@ test {
     _ = @import("walk/list_dir.zig");
     _ = @import("walk/walker.zig");
     _ = @import("parallel.zig");
+    _ = @import("c_api.zig");
     _ = @import("fuzz.zig");
+    _ = @import("e2e_tests.zig");
+    _ = @import("adversarial_probe_m5.zig");
 }
+

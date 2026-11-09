@@ -191,6 +191,66 @@ pub fn anyVtable(comptime S: type) AnySink.VTable
 
 Constructs a `VTable` for legacy sink type `S` at comptime without heap allocation. Missing methods default to continuing the search.
 
+### AnyEventSink
+
+Runtime-polymorphic wrapper for service event sinks (`ctx: *anyopaque` and `vtable: *const AnyEventSink.VTable`), allowing heterogeneous `Event` sinks (`searchSourceSlice`, `searchSource`, `searchTree`, `searchArchiveSlice`) to share a single monomorphized pipeline instance (`AnyEventSink.init(S, &sink)`).
+
+### anyEventSinkVtable
+
+```zig
+pub fn anyEventSinkVtable(comptime S: type) *const AnyEventSink.VTable
+```
+
+Constructs a static comptime `VTable` for a service sink type `S` implementing `pub fn event(self: *S, ev: Event) Flow` (or `bool`).
+
+### PullEvent
+
+Owned event structure yielded by `SourcePull.next()` and `ReaderPull.next()`. Holds `kind` (`begin`, `match`, `context`, `context_break`, `progress`, `heartbeat`, `end`, `summary`), `source_id`, `line_number`, `column`, `u16_column`, `absolute_offset`, `raw_offset`, `bytes`, `replaced`, `spans` (carrying `pattern_id`), and completion metadata. All slices remain valid until `deinit()` on the pull iterator.
+
+### SourcePull
+
+```zig
+pub fn SourcePull(comptime M: type) type
+```
+
+Pull-based iterator over service events for an in-memory slice, created via `openSourcePull`.
+
+### ReaderPull
+
+```zig
+pub fn ReaderPull(comptime M: type) type
+```
+
+True streaming pull-based state machine over a `*std.Io.Reader`, created via `openReaderPull`. Reads chunks on demand as `next()` is called, supporting in-process streaming decompression (`gzip`, `zstd`, `xz`, `auto`), BOM/charset transcoding, and bounded context without buffering the entire stream in memory.
+
+### openReaderPull
+
+```zig
+pub fn openReaderPull(
+    allocator: std.mem.Allocator,
+    matcher: anytype,
+    source_id: []const u8,
+    reader: *std.Io.Reader,
+    config: SearchConfig,
+) ReadError!ReaderPull(@TypeOf(matcher))
+```
+
+Opens a streaming pull iterator (`ReaderPull`) over `reader`. Each call to `pull.next()` advances the streaming state machine until the next `PullEvent` is produced or EOF is reached (`null`). Call `pull.deinit()` to release all streaming and event buffers.
+
+### Scratch
+
+```zig
+pub const Scratch = struct {
+    allocator: std.mem.Allocator,
+    // ...
+    pub fn init(allocator: std.mem.Allocator) Scratch
+    pub fn deinit(self: *Scratch) void
+    pub fn reset(self: *Scratch) void
+};
+```
+
+Reusable per-worker scratch buffer pool (`SearchConfig.scratch_pool`). Retains allocated capacities for rolling stream buffers, UTF-8 transcoding buffers, replacement preview buffers, match span arrays, and before-context ring buffers across searches so steady-state multi-source or multi-request workers perform zero heap allocations.
+
 ### SliceIter
 
 ```zig
@@ -199,7 +259,7 @@ pub fn SliceIter(comptime M: type) type
 
 Zero-allocation, context-free pull iterator over matched lines in a single slice:
 ```zig
-var iter = libwebgrep.SliceIter(*libwebgrep.Finder){
+var iter = libwebgrep.SliceIter(*const libwebgrep.Finder){
     .matcher = &finder,
     .haystack = haystack,
     .mode = .earliest,
@@ -216,19 +276,115 @@ while (iter.next()) |line| {
 
 `source_id` is an opaque identifier assigned by the caller. `libwebgrep` never interprets it as a filesystem path and never frees it.
 
-Borrowed slices are valid only until the callback returns. This applies to `bytes`, `text`, `raw`, `replaced`, `matches`, and `source_id`. If you need to retain line data after `event` returns, copy it inside the callback (or use `openSourcePull`).
+Borrowed slices are valid only until the callback returns. This applies to `bytes`, `text`, `raw`, `replaced`, `matches`, and `source_id`. If you need to retain line data after `event` returns, copy it inside the callback (or use `openSourcePull` / `openReaderPull`).
 
 Sources with zero matches still emit begin and end (`matched_lines = 0`, `matches = 0`, no `match` events), followed by `summary` when the request completes.
 
 ### source
 
-Re-exports `src/source.zig`, an abstract virtual/in-memory tree interface (`Kind`, `Entry`, `VTable`, `Source`, `Node`, `Memory`) for testing and non-filesystem tree inputs. Public search entry points do not open or traverse `Source` automatically.
+Re-exports `src/source.zig`, an abstract virtual/in-memory tree interface (`Kind`, `Entry`, `VTable`, `Source`, `Node`, `Memory`) for virtual trees and unpacked archives. `Memory` maintains per-handle read/list cursors, supports slot reuse on `close`, and rejects `..` path traversal.
+
+### archive
+
+Re-exports `src/codec/archive.zig`, providing zero-disk-landing in-memory archive unpacking (`ArchiveFormat`, `ArchiveOptions`, `ArchiveError`, `ArchiveTree`) for `.tar` (USTAR, GNU `@LongLink`, PAX `path=`/`size=`), `.tar.gz`/`.tgz`, `.tar.zst`, `.tar.xz`, and `.zip` (Store & Deflate).
+
+### ArchiveFormat
+
+```zig
+pub const ArchiveFormat = enum { auto, tar, tar_gz, tar_zst, tar_xz, zip };
+```
+
+Archive container format selector (`auto` sniffs magic bytes for `.zip`, `.tar.gz`, `.tar.zst`, `.tar.xz`, and `.tar`).
+
+### ArchiveOptions
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `format` | `ArchiveFormat` | `.auto` | Container format or automatic magic-byte detection |
+| `max_entries` | `usize` | `10_000` | Maximum files/directories allowed (`error.ArchiveLimit`) |
+| `max_entry_bytes` | `u64` | `64 MiB` | Maximum uncompressed bytes for a single entry (`error.ArchiveLimit`) |
+| `max_total_bytes` | `u64` | `256 MiB` | Maximum total uncompressed bytes across the archive (`error.ArchiveLimit`) |
+| `max_compression_ratio` | `u64` | `100` | Maximum decompression expansion ratio (`error.ArchiveLimit`) |
+
+### ArchiveError
+
+`error{ UnsupportedFormat, CorruptArchive, ArchiveLimit, PathTraversal, OutOfMemory }`. Any entry containing `..` components, backslashes `\`, Windows drive prefixes (`C:`), or NUL bytes is rejected with `error.PathTraversal` (Zip-Slip defense). Symlink, hardlink, FIFO, and device entries are safely skipped.
+
+### ArchiveTree
+
+```zig
+pub const ArchiveTree = struct {
+    pub fn initFromSlice(allocator: std.mem.Allocator, bytes: []const u8, options: ArchiveOptions) ArchiveError!ArchiveTree
+    pub fn initFromReader(allocator: std.mem.Allocator, reader: *std.Io.Reader, options: ArchiveOptions) ArchiveError!ArchiveTree
+    pub fn deinit(self: *ArchiveTree) void
+    pub fn source(self: *ArchiveTree) source.Source
+};
+```
+
+Unpacks an archive from a slice or stream into an arena-backed `source.Memory` virtual tree without touching the host disk. Call `tree.source()` to obtain a `source.Source` handle for `searchTree`.
+
+### tree
+
+Re-exports `src/search/tree.zig`, providing `TreeConfig`, `searchTree`, `searchArchiveSlice`, and `searchArchive`.
+
+### TreeConfig
+
+Configures virtual tree and archive search (`search: SearchConfig`, `archive: ArchiveOptions`, `globs`, `iglobs`, `iglob`, `types`, `types_not`, `custom_types`, `ignore_texts`, `respect_gitignore`, `respect_ignore`, `respect_rgignore`, `hidden`, `skip_git`, `max_depth`, `max_entries`, `max_filesize`, `max_concurrency`, and `files`).
+
+### searchTree
+
+```zig
+pub fn searchTree(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    sink: *S,
+    src: source.Source,
+    root_path: []const u8,
+    matcher_ptr: anytype,
+    config: TreeConfig,
+) !Summary
+```
+
+Searches a virtual `source.Source` tree starting at `root_path`, hierarchical `.gitignore`/`.ignore`/`.rgignore` files inside the virtual tree, glob/type filters, and aggregate request budgets (`max_results`, `max_request_bytes`, `max_decompressed_bytes`, `time_budget_ns`). Does not accept `std.Io.File` or `std.Io.Dir`.
+
+### searchArchiveSlice
+
+```zig
+pub fn searchArchiveSlice(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    sink: *S,
+    archive_bytes: []const u8,
+    matcher_ptr: anytype,
+    config: TreeConfig,
+) !Summary
+```
+
+Unpacks `archive_bytes` into an in-memory `ArchiveTree` and searches all matching entries via `searchTree` with zero disk landing.
+
+### searchArchive
+
+```zig
+pub fn searchArchive(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    sink: *S,
+    reader: *std.Io.Reader,
+    matcher_ptr: anytype,
+    config: TreeConfig,
+) !Summary
+```
+
+Unpacks an archive stream from `reader` into an in-memory `ArchiveTree` and searches all matching entries via `searchTree`.
 
 ---
 
 ## Matching
 
-`libwebgrep` provides three interchangeable matcher types (`Finder`, `Multi`, and `Regex`), all sharing the same matcher protocol.
+`libwebgrep` provides four interchangeable matcher types (`Finder`, `Multi`, `Regex`, and `RegexSet`) plus the type-erased `AnyMatcher`, all sharing the same lock-free `*const` matcher protocol.
 
 Literal patterns (`Finder` and `Multi`) cannot contain `\n` (returning `error.PatternHasNewline` before scanning). An empty literal pattern `""` produces a zero-width match `[0, 0)` once per line.
 
@@ -244,14 +400,14 @@ Single-literal SIMD finder (`src/finder/finder.zig`).
 
 ```zig
 pub fn init(pattern: []const u8, options: FindOptions) !Finder
-pub fn find(self: *Finder, haystack: []const u8, start: usize, mode: MatchMode) ?Match
-pub fn findWatched(self: *Finder, haystack: []const u8, start: usize, mode: MatchMode, nul_at: *?usize) ?Match
+pub fn find(self: *const Finder, haystack: []const u8, start: usize, mode: MatchMode) ?Match
+pub fn findWatched(self: *const Finder, haystack: []const u8, start: usize, mode: MatchMode, nul_at: *?usize) ?Match
 pub fn acceptsSpan(self: *const Finder, span: []const u8) bool
 pub fn requiredLiteral(self: *const Finder) ?RequiredLiteral
-pub fn resetStats(self: *Finder) void
+pub fn resetStats(self: *const Finder) void
 ```
 
-Zero heap allocation. `pattern` is borrowed from the caller and must outlive `Finder`. Combines frequency-ranked `PackedPair` 4-window SIMD filtering with worst-case linear-time `TwoWay` fallback, fused single-pass NUL detection (`findWatched`), and zero-allocation BMP Unicode Simple Case Folding when `options.unicode_case` is `true`.
+Zero heap allocation and 100% immutable (`*const Finder`). `pattern` is borrowed from the caller and must outlive `Finder`. Combines frequency-ranked `PackedPair` 4-window SIMD filtering with worst-case linear-time `TwoWay` fallback, fused single-pass NUL detection (`findWatched`), and zero-allocation BMP Unicode Simple Case Folding when `options.unicode_case` is `true`.
 
 ### finder
 
@@ -265,11 +421,11 @@ Multi-literal OR SIMD search engine (`src/finder/multi.zig`).
 pub fn init(allocator: std.mem.Allocator, patterns: []const []const u8, options: FindOptions) !Multi
 pub fn initFromText(allocator: std.mem.Allocator, text: []const u8, options: FindOptions) !Multi
 pub fn deinit(self: *Multi) void
-pub fn find(self: *Multi, haystack: []const u8, start: usize, mode: MatchMode) ?Match
+pub fn find(self: *const Multi, haystack: []const u8, start: usize, mode: MatchMode) ?Match
 pub fn acceptsSpan(self: *const Multi, span: []const u8) bool
 pub fn isEmpty(self: *const Multi) bool
 pub fn engineName(self: *const Multi) []const u8
-pub fn resetStats(self: *Multi) void
+pub fn resetStats(self: *const Multi) void
 ```
 
 Automatically dispatches across four SIMD-accelerated engines based on pattern characteristics:
@@ -278,7 +434,7 @@ Automatically dispatches across four SIMD-accelerated engines based on pattern c
 3. `Teddy`: 8-bucket Slim Teddy nibble-mask SIMD lookup (`vtbl` / `pshufb` / `vpshufb`) with 2-phase fingerprint verification (`<= 32` patterns).
 4. `AhoCorasick`: Byte-equivalence-compressed dense DFA with 64-byte high-nibble bucket bitmap SIMD skip loop at `state == 0`.
 
-`Multi.initFromText` splits newline-delimited pattern text (supporting both LF and CRLF, treating empty lines as empty pattern `""`) and validates count and byte limits before allocating tables. Once constructed, `Multi` is immutable and thread-safe to share across concurrent searches.
+Every `Match` returned by `Multi.find` carries the exact 0-based `pattern_id: u32` of the winning pattern (breaking ties by smaller `pattern_id`). Once constructed, `Multi` is completely immutable (`*const Multi`) and lock-free to share across concurrent threads.
 
 ### multi
 
@@ -286,38 +442,86 @@ Re-exports `src/finder/multi.zig`, the definition module for `Multi`.
 
 ### Regex
 
-Linear-time regular expression matcher (`src/regex.zig`).
+Linear-time Hybrid Lazy DFA + Thompson NFA / PikeVM regular expression matcher (`src/regex.zig`).
 
 ```zig
 pub fn init(allocator: std.mem.Allocator, pattern: []const u8, options: RegexOptions) !Regex
+pub fn initDiagnostic(allocator: std.mem.Allocator, pattern: []const u8, options: RegexOptions, diag: ?*CompileDiagnostic) !Regex
 pub fn deinit(self: *Regex) void
-pub fn find(self: *Regex, haystack: []const u8, start: usize, mode: MatchMode) ?Match
-pub fn findWatched(self: *Regex, haystack: []const u8, start: usize, mode: MatchMode, nul_at: *?usize) ?Match
+pub fn find(self: *const Regex, haystack: []const u8, start: usize, mode: MatchMode) ?Match
+pub fn findWithScratch(self: *const Regex, haystack: []const u8, start: usize, mode: MatchMode, scratch: ?*RegexScratch) ?Match
+pub fn findWatched(self: *const Regex, haystack: []const u8, start: usize, mode: MatchMode, nul_at: *?usize) ?Match
 pub fn findCaptures(self: *const Regex, haystack: []const u8, start: usize, mode: MatchMode) ?Captures
 pub fn extractCaptures(self: *const Regex, haystack: []const u8, match_span: Match) Captures
-pub fn acceptsSpan(self: *Regex, span: []const u8) bool
+pub fn acceptsSpan(self: *const Regex, span: []const u8) bool
 pub fn requiredLiteral(self: *const Regex) ?RequiredLiteral
-pub fn resetStats(self: *Regex) void
+pub fn resetStats(self: *const Regex) void
 ```
 
 Supported regular expression syntax:
-- Literals and escapes: `\d`, `\D`, `\w`, `\W`, `\s`, `\S`, `\b`, `\B`, `\A`, `\z`, `\n`, `\r`, `\t`, `\xHH`, and escaped metacharacters.
-- Wildcard and anchors: `.` (any UTF-8 codepoint except `\n`, or including `\n` when `dot_all = true` and `multiline = true`), `^` (start of line/input), `$` (end of line/input).
-- Character classes: `[a-z0-9_]`, multi-byte UTF-8 classes `[你好α-ω]`, negated `[^a-z]` or `[!a-z]`, and shorthand classes inside brackets.
-- Quantifiers: `*`, `+`, `?`, `{m}`, `{m,}`, `{m,n}` (greedy, operating on complete UTF-8 codepoints).
+- Literals and escapes: `\d`, `\D`, `\w`, `\W`, `\s`, `\S`, `\b`, `\B` (UAX #29 Unicode word boundaries when `unicode_case = true`), `\A`, `\z`, `\n`, `\r`, `\t`, `\xHH`, `\u{HHHH}`, and escaped metacharacters.
+- Unicode General Category & Script properties: `\p{L}`, `\p{Lu}`, `\p{Ll}`, `\p{N}`, `\p{Nd}`, `\p{P}`, `\p{S}`, `\p{Sc}`, `\p{Z}`, `\p{ASCII}`, `\p{Han}`, `\p{Hiragana}`, `\p{Katakana}`, `\p{Greek}`, `\p{Cyrillic}`, `\p{Latin}`, and negated `\P{...}` (`src/tables/unicode_prop_table.zig`).
+- Wildcard and anchors: `.` (any valid UTF-8 codepoint except `\n`, or including `\n` when `dot_all = true` and `multiline = true`), `^` (start of line/input), `$` (end of line/input).
+- Character classes: `[a-z0-9_]`, multi-byte UTF-8 classes `[你好α-ω]`, negated `[^a-z]` or `[!a-z]`, and shorthand/property classes inside brackets.
+- Quantifiers: `*`, `+`, `?`, `{m}`, `{m,}`, `{m,n}` (greedy and lazy `*?`, `+?`, `??`, `{m,n}?`, operating on complete UTF-8 codepoints).
 - Alternation, grouping, and inline flags: `a|b`, `(expr)` (numbered capture groups `$1`..`$9`), `(?:expr)`, `(?i)`, `(?m)`, `(?s)`, `(?-i)`, `(?i:expr)`.
 
-Executes lockstep Thompson NFA / PikeVM simulation where each NFA instruction is activated at most once per input byte, guaranteeing worst-case $O(n)$ time complexity and immunity to catastrophic backtracking (ReDoS). Enforces a server compile size hard cap (`inst_count_hard_cap = 4096`) and bounded multiline window cap (`multiline_window_hard_cap = 8 MiB`), returning `error.RegexTooLarge` before scanning if exceeded. Automatically extracts a `RequiredLiteral` from the AST and attaches a SIMD `Finder` prefilter.
+Executes a bounded Hybrid Lazy DFA for eligible patterns with lockstep Thompson NFA / PikeVM fallback, guaranteeing worst-case $O(n)$ time complexity, immunity to catastrophic backtracking (ReDoS), and lock-free `*const Regex` concurrency.
+
+### RegexScratch
+
+```zig
+pub const RegexScratch = struct {
+    pub fn init(allocator: std.mem.Allocator) RegexScratch
+    pub fn deinit(self: *RegexScratch) void
+};
+```
+
+Optional per-thread reusable scratch space for `Regex.findWithScratch`, caching the bounded `HeapDfa` transition table (up to 256 states) and NFA thread queues across invocations with zero steady-state allocations.
+
+### RegexSet
+
+Multi-pattern simultaneous regular expression engine (`src/regex/set.zig`).
+
+```zig
+pub fn init(allocator: std.mem.Allocator, patterns: []const []const u8, options: RegexOptions) !RegexSet
+pub fn initDiagnostic(allocator: std.mem.Allocator, patterns: []const []const u8, options: RegexOptions, diag: ?*CompileDiagnostic) !RegexSet
+pub fn deinit(self: *RegexSet) void
+pub fn isMatch(self: *const RegexSet, haystack: []const u8) bool
+pub fn find(self: *const RegexSet, haystack: []const u8, start: usize, mode: MatchMode) ?Match
+pub fn matches(self: *const RegexSet, haystack: []const u8, out_ids: []u32) usize
+```
+
+Compiles up to `1,024` regular expressions into a combined Thompson NFA with `match_id` accepting states and an automatic `Multi` SIMD prefix prefilter when all patterns have extractable literal prefixes. Evaluates all patterns in a single pass, reporting the winning `Match.pattern_id` in `find()` or writing all matching 0-based pattern IDs in ascending order into `out_ids` via `matches()`.
+
+### DiagnosticCode
+
+Structured error classification enum for `CompileDiagnostic` (`none`, `unexpected_end_of_pattern`, `invalid_escape`, `invalid_hex_escape`, `invalid_unicode_escape`, `unknown_unicode_property`, `unclosed_group`, `unmatched_close_paren`, `unclosed_char_class`, `invalid_char_range`, `dangling_quantifier`, `invalid_repeat_quantifier`, `repeat_quantifier_too_large`, `unrecognized_inline_flag`, `invalid_utf8`, `pattern_has_newline`, `recursion_depth_exceeded`, `instruction_limit_exceeded`, `multiline_window_exceeded`, `pattern_count_exceeded`, `pattern_bytes_exceeded`, `out_of_memory`).
+
+### CompileDiagnostic
+
+```zig
+pub const CompileDiagnostic = struct {
+    code: DiagnosticCode = .none,
+    offset: usize = 0,
+    line: usize = 1,
+    column: usize = 1,
+    message: []const u8 = "",
+    pattern_index: ?usize = null,
+};
+```
+
+Populated by `Regex.initDiagnostic` and `RegexSet.initDiagnostic` when compilation fails, providing exact 0-based byte `offset`, 1-based `line` and `column`, static human-readable `message`, and `pattern_index` (for `RegexSet`).
 
 ### RegexOptions
 
 | Field | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `case` | `CaseMode` | `.sensitive` | Case folding mode |
-| `unicode_case` | `bool` | `true` | Enables BMP Unicode Simple Case Folding when `case` is `.insensitive` or `.smart` |
+| `unicode_case` | `bool` | `true` | Enables BMP Unicode Simple Case Folding and UAX #29 word boundaries |
 | `multiline` | `bool` | `false` | Allows matches to span across `\n` within `max_multiline_window`, and makes `^`/`$` match line boundaries |
 | `dot_all` | `bool` | `false` | When `true` alongside `multiline`, allows `.` to match `\n` |
-| `max_inst` | `?usize` | `null` | Compiled NFA instruction cap (`null` uses hard cap `4096`) |
+| `max_inst` | `?usize` | `null` | Compiled NFA instruction cap (`null` uses default `2048`, hard cap `4096`) |
 | `max_multiline_window` | `usize` | `64 * 1024` | Maximum byte span for a multiline match (`64 KiB` default, `8 MiB` hard cap) |
 
 ### Captures
@@ -336,16 +540,36 @@ Holds the full match (`match`) and numbered submatch capture groups `$1`..`$9` (
 
 ### regex
 
-Re-exports `src/regex.zig`, the definition module for `Regex`, `RegexOptions`, and `Captures`.
+Re-exports `src/regex.zig`, the definition module for `Regex`, `RegexScratch`, `RegexSet`, `RegexOptions`, `Captures`, `DiagnosticCode`, and `CompileDiagnostic`.
+
+### AnyMatcher
+
+```zig
+pub const AnyMatcher = struct {
+    ctx: *const anyopaque,
+    vtable: *const VTable,
+    pub fn init(comptime M: type, matcher_ptr: anytype) AnyMatcher
+};
+```
+
+Runtime-polymorphic, immutable (`*const anyopaque`) matcher wrapper for `Finder`, `Multi`, `Regex`, `RegexSet`, or custom matchers. Reduces compile-time monomorphization bloat by allowing all search entry points to compile once against `AnyMatcher`.
+
+### anyMatcherVtable
+
+```zig
+pub fn anyMatcherVtable(comptime M: type) *const AnyMatcher.VTable
+```
+
+Builds the static comptime `AnyMatcher.VTable` for matcher type `M` without heap allocation.
 
 ### MatchMode
 
-- `.earliest`: Selects the match that finishes at the smallest `end` offset (breaking ties by smaller `start`, then earlier pattern index). Default mode.
-- `.leftmost_first`: Selects the match with the smallest `start` offset (breaking ties by earlier pattern index). Matches `rg -F` submatch ordering.
+- `.earliest`: Selects the match that finishes at the smallest `end` offset (breaking ties by smaller `start`, then smaller `pattern_id`). Default mode.
+- `.leftmost_first`: Selects the match with the smallest `start` offset (breaking ties by smaller `pattern_id`). Matches `rg -F` submatch ordering.
 
 ### Match
 
-Half-open byte range `{ start: usize, end: usize }` relative to the `haystack` slice passed to `find`.
+Half-open byte range `{ start: usize, end: usize, pattern_id: u32 = 0 }` relative to the `haystack` slice passed to `find`. `pattern_id` identifies the 0-based index of the matching pattern in `Multi` and `RegexSet` (`0` for single-pattern `Finder` and `Regex`).
 
 ### CaseMode
 
@@ -356,7 +580,7 @@ Half-open byte range `{ start: usize, end: usize }` relative to the `haystack` s
 | Field | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `case` | `CaseMode` | `.sensitive` | Case sensitivity mode (`sensitive`, `insensitive`, `smart`) |
-| `unicode_case` | `bool` | `false` | Enables Unicode Simple Case Folding expansion in `Multi` |
+| `unicode_case` | `bool` | `false` | Enables Unicode Simple Case Folding expansion in `Finder` and `Multi` |
 | `frequency` | `?*const [256]u8` | `null` | Optional custom byte frequency rank table for anchor selection |
 | `prefilter_fp_threshold` | `f32` | `0.80` | Threshold (`< 1.0` enables adaptive fallback to `TwoWay` on patterns `> 32` bytes) |
 | `max_pattern_count` | `?usize` | `null` | Optional pattern count cap (clamped to hard cap `1024`) |
@@ -364,7 +588,7 @@ Half-open byte range `{ start: usize, end: usize }` relative to the `haystack` s
 
 ### matcher
 
-Re-exports `src/matcher.zig`, defining `MatchMode`, `Match`, `RequiredLiteral`, `CaseMode`, `FindOptions`, `pattern_count_hard_cap` (`1024`), `pattern_bytes_hard_cap` (`256 KiB`), and `checkPatternLimits`.
+Re-exports `src/matcher.zig`, defining `MatchMode`, `Match`, `RequiredLiteral`, `CaseMode`, `FindOptions`, `AnyMatcher`, `anyMatcherVtable`, `pattern_count_hard_cap` (`1024`), `pattern_bytes_hard_cap` (`256 KiB`), and `checkPatternLimits`.
 
 ### RequiredLiteral
 
@@ -411,7 +635,7 @@ Enforces both `max_decompressed_bytes` and `max_compression_ratio` (default `100
 
 ### decompress
 
-Re-exports `src/decompress.zig`, providing `Compression`, `OffsetMap`, `DecompressResult`, and `decompressSlice` for in-process bomb-safe streaming decompression and raw offset mapping.
+Re-exports `src/codec/decompress.zig`, providing `Compression`, `OffsetMap`, `DecompressResult`, and `decompressSlice` for in-process bomb-safe streaming decompression and raw offset mapping.
 
 ---
 
@@ -494,6 +718,7 @@ Legacy callback line struct (`searchSlice` / `searchReader`), carrying `bytes`, 
 | `end` | `usize` | Exclusive 0-based end byte offset relative to `bytes` |
 | `u16_start` | `usize` | Inclusive 0-based UTF-16 code-unit start offset on `text` |
 | `u16_end` | `usize` | Exclusive 0-based UTF-16 code-unit end offset on `text` |
+| `pattern_id` | `u32` | 0-based pattern index that produced this match (`Multi` / `RegexSet`, `0` for single pattern) |
 | `replacement` | `?[]const u8` | Replacement template slice when `SearchConfig.replacement != null` |
 
 ### EndEvent
@@ -572,7 +797,7 @@ All multi-tenant budgets are configured via `SearchConfig` and enforced determin
 | :--- | :--- | :--- | :--- | :--- |
 | `line_numbers` | `bool` | `false` | Forced `true` on service entry | Enables 1-based line numbers |
 | `invert` | `bool` | `false` | `false` | Emits lines that do not match |
-| `whole_word` | `bool` | `false` | `false` | Half-boundary ASCII word check (`[0-9A-Za-z_]`) |
+| `whole_word` | `bool` | `false` | `false` | Half-boundary word check (ASCII + Unicode word characters) |
 | `whole_line` | `bool` | `false` | `false` | Requires entire line content to match |
 | `contains` | `[]const []const u8` | `&.{}` | `&.{}` | Every listed literal must appear on the line (AND) |
 | `excludes` | `[]const []const u8` | `&.{}` | `&.{}` | None of the listed literals may appear on the line (NOT) |
@@ -584,7 +809,7 @@ All multi-tenant budgets are configured via `SearchConfig` and enforced determin
 | `before` / `after` | `?u32` | `null` | Hard cap `10` | Asymmetric before/after context lines |
 | `max_context_lines` | `?u32` | `null` | Hard cap `10` | Lowers maximum allowed context lines |
 | `passthru` | `bool` | `false` | `false` | Emits all lines (`match` and `context`), bounded by `max_output_bytes` |
-| `replacement` | `?[]const u8` | `null` | `null` | Read-only replacement preview template |
+| `replacement` | `?[]const u8` | `null` | `null` | Read-only replacement preview template (`$0`, `$&`, `$1`..`$9`, `$$`) |
 | `max_count` | `?u64` | `null` | Unbounded | Per-source matched line limit (`Outcome.stopped`) |
 | `max_results` | `?u64` | `null` | Unbounded | Request-level matched line limit (populates `resume_at`) |
 | `resume_from` | `u64` | `0` | `0` | Searchable byte offset to start/resume scanning from |
@@ -599,11 +824,13 @@ All multi-tenant budgets are configured via `SearchConfig` and enforced determin
 | `max_compression_ratio` | `?u64` | `null` | Default `100`, Hard cap `1000` | Maximum decompression expansion ratio (`decompressed / raw`) |
 | `decompressed_bytes` | `u64` | `0` | `0` | Prior decompressed bytes charged to this request |
 | `max_decompressed_bytes` | `?u64` | `null` | Default `64 MiB` when compressed | Maximum decompressed bytes (`LimitHit.decompressed_bytes`) |
-| `decode_allocator` | `?Allocator` | `null` | `null` | Allocator for slice transcoding/decompression/replacement preview |
+| `allocator` | `?Allocator` | `null` | `null` | Unified allocator for slice transcoding, decompression, and replacement preview |
+| `decode_allocator` | `?Allocator` | `null` | `null` | Legacy alias for `allocator` (deprecated in favor of `allocator` / `scratch_pool`) |
 | `buffer_size` | `usize` | `1 MiB` | `1 MiB` | Rolling stream read buffer size |
 | `max_line_len` | `usize` | `2 MiB` | Hard cap `8 MiB` | Sliding window cap for ultra-long lines |
 | `match_mode` | `MatchMode` | `.earliest` | `.earliest` | `.earliest` or `.leftmost_first` |
-| `scratch` | `?*[]u8` | `null` | `null` | Reusable buffer pointer across streaming calls |
+| `scratch` | `?*[]u8` | `null` | `null` | Reusable raw byte buffer pointer across streaming calls |
+| `scratch_pool` | `?*Scratch` | `null` | `null` | Reusable `Scratch` pool eliminating steady-state heap allocations |
 | `max_source_bytes` | `?u64` | `null` | Default `16 MiB`, Hard cap `64 MiB` | Max bytes scanned per source (`LimitHit.max_bytes`) |
 | `max_request_bytes` | `?u64` | `null` | Default `16 MiB`, Hard cap `64 MiB` | Max bytes scanned per request (`LimitHit.max_bytes`) |
 | `max_output_bytes` | `?u64` | `null` | Default `1 MiB`, Hard cap `8 MiB` | Max cumulative bytes emitted in line events |
@@ -626,7 +853,7 @@ All multi-tenant budgets are configured via `SearchConfig` and enforced determin
 
 ## Defaults
 
-Service entry points (`searchSourceSlice`, `searchSource`, `resumeSourceSlice`, `openSourcePull`) populate safe multi-tenant defaults whenever budget fields are `null`:
+Service entry points (`searchSourceSlice`, `searchSource`, `resumeSourceSlice`, `openSourcePull`, `openReaderPull`) populate safe multi-tenant defaults whenever budget fields are `null`:
 - `line_numbers`: `true`
 - `binary`: `BinaryPolicy.quit` (Binary inputs are skipped by default)
 - `max_source_bytes` / `max_request_bytes`: `16 MiB` (hard cap `64 MiB`)
@@ -646,11 +873,11 @@ To keep the core engine safe for multi-tenant server embedding:
 
 ### sink_mod
 
-Re-exports `src/sink.zig`, containing all event, line, and result definitions.
+Re-exports `src/sink.zig`, containing all event, line, `AnySink`, `AnyEventSink`, and result definitions.
 
 ### searcher
 
-Re-exports `src/searcher.zig`, containing `SearchConfig`, `SliceError`, `ReadError`, `PullEvent`, `SourcePull`, and the search entry points.
+Re-exports `src/searcher.zig`, containing `SearchConfig`, `Scratch`, `SliceError`, `ReadError`, `PullEvent`, `SourcePull`, `ReaderPull`, `openReaderPull`, and the search entry points.
 
 ### walk_glob
 
@@ -678,13 +905,24 @@ Re-exports `src/walk/list_dir.zig`. Batched directory entry iterator (`Lister`) 
 
 ---
 
+## C ABI (`include/webgrep.h`)
+
+When built with `-Dc-lib=true` (`zig build -Dc-lib=true -Doptimize=ReleaseFast`), `libwebgrep` produces static (`libwebgrep.a`) and shared (`libwebgrep.so` / `.dylib`) libraries exposing the zero-libc C ABI declared in `include/webgrep.h`:
+- `wg_version()`
+- `wg_matcher_create_literal`, `wg_matcher_create_multi`, `wg_matcher_create_regex`, `wg_matcher_destroy`, `wg_matcher_find`
+- `wg_regex_set_create`, `wg_regex_set_destroy`, `wg_regex_set_matches`
+- `wg_scratch_create`, `wg_scratch_destroy`
+- `wg_search_slice`
+
+---
+
 ## Example
 
 The code block below demonstrates:
 1. Single-literal smart-case search with UTF-16 span inspection (`searchSourceSlice`).
-2. Multi-literal OR search from newline-delimited pattern text (`Multi.initFromText`) and cursor pagination (`Flow.pause` + `resumeSourceSlice`).
-3. Linear-time `Regex` search with read-only replacement preview (`SearchConfig.replacement`).
-4. Streaming `*std.Io.Reader` search (`searchSource`) and pull-based iteration (`openSourcePull`).
+2. Multi-literal OR search from newline-delimited pattern text (`Multi.initFromText`), `pattern_id` attribution, and cursor pagination (`Flow.pause` + `resumeSourceSlice`).
+3. Linear-time `Regex` search with Unicode properties (`\p{Han}`), `RegexSet` simultaneous matching, and read-only replacement preview (`SearchConfig.replacement`).
+4. Streaming `*std.Io.Reader` search (`searchSource`), slice pull iteration (`openSourcePull`), and true streaming pull iteration (`openReaderPull`).
 5. Glob nested brace expansion (`walk_glob.compileGlobs`) and in-memory ignore rule matching (`walk_ignore`).
 
 `build.zig` extracts this exact block and compiles and runs it during `zig build test`.
@@ -699,6 +937,7 @@ const Recorder = struct {
     saw_summary: bool = false,
     matched_lines: usize = 0,
     first_u16_end: usize = 0,
+    last_pattern_id: u32 = 0,
     last_replaced: [64]u8 = undefined,
     last_replaced_len: usize = 0,
     pause_after_first: bool = false,
@@ -712,6 +951,7 @@ const Recorder = struct {
                 self.matched_lines += 1;
                 if (m.matches.len > 0) {
                     self.first_u16_end = m.matches[0].u16_end;
+                    self.last_pattern_id = m.matches[0].pattern_id orelse 0;
                 }
                 if (m.replaced) |rep| {
                     const n = @min(rep.len, self.last_replaced.len);
@@ -737,8 +977,8 @@ const Recorder = struct {
 test "API documentation example" {
     const allocator = std.testing.allocator;
 
-    // 1. Single-literal smart-case search on a slice
-    var finder = try libwebgrep.Finder.init("needle", .{ .case = .smart });
+    // 1. Single-literal smart-case search on a slice (*const Finder)
+    const finder = try libwebgrep.Finder.init("needle", .{ .case = .smart });
     var recorder = Recorder{};
     const input = "first line\nhello NEEDLE world\nlast line\n";
     const result = try libwebgrep.searchSourceSlice(
@@ -759,7 +999,7 @@ test "API documentation example" {
     try std.testing.expectEqual(@as(usize, 1), recorder.matched_lines);
     try std.testing.expectEqual(@as(usize, 12), recorder.first_u16_end);
 
-    // 2. Multi-literal OR search + pause & resume pagination
+    // 2. Multi-literal OR search + pattern_id + pause & resume pagination
     var many = try libwebgrep.Multi.initFromText(allocator, "WARN\nERROR\n", .{});
     defer many.deinit();
     var paged_sink = Recorder{ .pause_after_first = true };
@@ -774,6 +1014,7 @@ test "API documentation example" {
     );
     try std.testing.expect(first_page.paused);
     try std.testing.expectEqual(@as(usize, 1), paged_sink.matched_lines);
+    try std.testing.expectEqual(@as(u32, 0), paged_sink.last_pattern_id);
 
     paged_sink.pause_after_first = false;
     const second_page = try libwebgrep.resumeSourceSlice(
@@ -787,8 +1028,9 @@ test "API documentation example" {
     );
     try std.testing.expect(!second_page.paused);
     try std.testing.expectEqual(@as(u64, 2), second_page.matched_lines);
+    try std.testing.expectEqual(@as(u32, 1), paged_sink.last_pattern_id);
 
-    // 3. Linear-time Regex search + read-only replacement preview
+    // 3. Linear-time Regex search + RegexSet + read-only replacement preview
     var re = try libwebgrep.Regex.init(allocator, "ERR_[0-9]+", .{});
     defer re.deinit();
     var regex_sink = Recorder{};
@@ -800,7 +1042,7 @@ test "API documentation example" {
         &re,
         .{
             .replacement = "REDACTED",
-            .decode_allocator = allocator,
+            .allocator = allocator,
         },
     );
     try std.testing.expectEqualStrings(
@@ -808,7 +1050,13 @@ test "API documentation example" {
         regex_sink.last_replaced[0..regex_sink.last_replaced_len],
     );
 
-    // 4. Streaming Reader search + Pull iterator
+    var re_set = try libwebgrep.regex.RegexSet.init(allocator, &.{ "ALPHA", "ERR_[0-9]+" }, .{});
+    defer re_set.deinit();
+    var set_ids: [4]u32 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), re_set.matches("code=ERR_404", &set_ids));
+    try std.testing.expectEqual(@as(u32, 1), set_ids[0]);
+
+    // 4. Streaming Reader search + Slice & Streaming Pull iterators
     var reader = std.Io.Reader.fixed("stream NEEDLE line\n");
     var stream_sink = Recorder{};
     const stream_res = try libwebgrep.searchSource(
@@ -830,6 +1078,15 @@ test "API documentation example" {
     }
     try std.testing.expectEqual(@as(usize, 1), pull_matches);
 
+    var pull_reader_in = std.Io.Reader.fixed("chunk NEEDLE 1\nchunk NEEDLE 2\n");
+    var rpull = try libwebgrep.searcher.openReaderPull(allocator, &finder, "rpull-1", &pull_reader_in, .{});
+    defer rpull.deinit();
+    var rpull_matches: usize = 0;
+    while (try rpull.next()) |ev| {
+        if (ev.kind == .match) rpull_matches += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), rpull_matches);
+
     // 5. Glob nested brace expansion & in-memory ignore rules
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -843,3 +1100,4 @@ test "API documentation example" {
     try std.testing.expect(!libwebgrep.walk_glob.matchGlobs(globs, "src/generated.c", "generated.c", false));
 }
 ```
+

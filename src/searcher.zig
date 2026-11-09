@@ -26,6 +26,7 @@ pub const Encoding = config_mod.Encoding;
 pub const Compression = config_mod.Compression;
 pub const BinaryPolicy = config_mod.BinaryPolicy;
 pub const SearchConfig = config_mod.SearchConfig;
+pub const Scratch = config_mod.Scratch;
 pub const Outcome = config_mod.Outcome;
 pub const Result = config_mod.Result;
 pub const Line = config_mod.Line;
@@ -44,6 +45,8 @@ pub const ReadError = config_mod.ReadError;
 pub const PullEvent = pull_mod.PullEvent;
 pub const SourcePull = pull_mod.SourcePull;
 pub const openSourcePull = pull_mod.openSourcePull;
+pub const ReaderPull = pull_mod.ReaderPull;
+pub const openReaderPull = pull_mod.openReaderPull;
 
 const serviceConfig = config_mod.serviceConfig;
 const bufferWindow = config_mod.bufferWindow;
@@ -68,7 +71,7 @@ pub fn searchSlice(
     var prepared = try materialize(haystack, config);
     defer prepared.deinit();
     var result = try searchPrepared(S, sink, &prepared, name, matcher, config);
-    if (prepared.owned.len != 0) result.bytes_read = haystack.len;
+    if (prepared.owned.len != 0 or prepared.transformed) result.bytes_read = haystack.len;
     return result;
 }
 

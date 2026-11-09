@@ -10,6 +10,7 @@
 const std = @import("std");
 const decompress = @import("../codec/decompress.zig");
 const encoding = @import("../codec/encoding.zig");
+const matcher_mod = @import("../matcher.zig");
 const memchr = @import("../finder/memchr.zig");
 const regex_mod = @import("../regex.zig");
 const sink_mod = @import("../sink.zig");
@@ -32,6 +33,7 @@ const beforeCount = cfg_mod.beforeCount;
 const beforeContextCapacity = cfg_mod.beforeContextCapacity;
 const bufferWindow = cfg_mod.bufferWindow;
 const watchesBinary = cfg_mod.watchesBinary;
+const effectiveAllocator = cfg_mod.effectiveAllocator;
 const State = state_mod.State;
 const resetStats = state_mod.resetStats;
 const lineStart = state_mod.lineStart;
@@ -76,6 +78,7 @@ const compactBuf = long_line_mod.compactBuf;
 pub const Prepared = struct {
     bytes: []const u8,
     owned: []u8 = &.{},
+    transformed: bool = false,
     alloc: ?std.mem.Allocator = null,
     base_searchable_offset: u64 = 0,
     offset_map: decompress.OffsetMap = .{},
@@ -93,6 +96,25 @@ pub const Prepared = struct {
     }
 };
 
+fn stashDecompressedInScratch(prep: *Prepared, config: SearchConfig) error{OutOfMemory}!void {
+    if (config.scratch_pool) |sp| {
+        if (prep.owned.len != 0) {
+            const dec = prep.owned;
+            if (sp.decode_buf.len < dec.len) {
+                if (sp.decode_buf.len == 0) {
+                    sp.decode_buf = try sp.allocator.alloc(u8, dec.len);
+                } else {
+                    sp.decode_buf = try sp.allocator.realloc(sp.decode_buf, dec.len);
+                }
+            }
+            @memcpy(sp.decode_buf[0..dec.len], dec);
+            if (prep.alloc) |alloc| alloc.free(dec);
+            prep.owned = &.{};
+            prep.bytes = sp.decode_buf[0..dec.len];
+        }
+    }
+}
+
 pub fn materialize(haystack: []const u8, config: SearchConfig) SliceError!Prepared {
     var prep = Prepared{
         .bytes = haystack,
@@ -105,7 +127,7 @@ pub fn materialize(haystack: []const u8, config: SearchConfig) SliceError!Prepar
     if (config.compression != .none) {
         const det = if (config.compression == .auto) decompress.sniff(haystack, true) else .gzip;
         if (det != .raw and det != .need_more) {
-            const alloc = config.decode_allocator orelse return error.OutOfMemory;
+            const alloc = effectiveAllocator(config) orelse return error.OutOfMemory;
             prep.alloc = alloc;
             const max_dec = config.max_decompressed_bytes orelse config.max_source_bytes;
             if (decompress.decompressSlice(
@@ -120,6 +142,7 @@ pub fn materialize(haystack: []const u8, config: SearchConfig) SliceError!Prepar
             )) |maybe_dec| {
                 if (maybe_dec) |dec_buf| {
                     prep.owned = dec_buf;
+                    prep.transformed = true;
                     prep.bytes = dec_buf;
                     current = dec_buf;
                     was_decompressed = true;
@@ -141,7 +164,10 @@ pub fn materialize(haystack: []const u8, config: SearchConfig) SliceError!Prepar
     }
 
     const resolved = encoding.resolveHint(config.encoding, config.charset);
-    if (resolved == .none) return prep;
+    if (resolved == .none) {
+        if (was_decompressed) try stashDecompressedInScratch(&prep, config);
+        return prep;
+    }
 
     const resume_raw: ?usize = if (!was_decompressed and config.resume_from > 0 and config.continuation != null) blk: {
         const rr = config.continuation.?.raw_resume_at;
@@ -154,9 +180,18 @@ pub fn materialize(haystack: []const u8, config: SearchConfig) SliceError!Prepar
     switch (bom_kind) {
         .raw, .need_more => {
             const target: encoding.Sniff = switch (resolved) {
-                .auto => return prep,
-                .none => return prep,
-                .utf8 => if (encoding.validUtf8(current)) return prep else .utf8,
+                .auto => {
+                    if (was_decompressed) try stashDecompressedInScratch(&prep, config);
+                    return prep;
+                },
+                .none => {
+                    if (was_decompressed) try stashDecompressedInScratch(&prep, config);
+                    return prep;
+                },
+                .utf8 => if (encoding.validUtf8(current)) {
+                    if (was_decompressed) try stashDecompressedInScratch(&prep, config);
+                    return prep;
+                } else .utf8,
                 .utf16le => .utf16le,
                 .utf16be => .utf16be,
                 .gbk => .gbk,
@@ -165,12 +200,22 @@ pub fn materialize(haystack: []const u8, config: SearchConfig) SliceError!Prepar
             const src_slice = if (resume_raw) |rr| current[rr..] else current;
             const init_raw: u64 = if (resume_raw) |rr| @intCast(rr) else 0;
             if (encoding.decodedSize(target, src_slice) > cap) return error.DecodeLimit;
-            const alloc = config.decode_allocator orelse return error.OutOfMemory;
+            const alloc = effectiveAllocator(config) orelse return error.OutOfMemory;
             prep.alloc = alloc;
-            const owned = try encoding.convertAllocWithMap(alloc, target, src_slice, init_raw, &prep.offset_map);
-            if (prep.owned.len != 0) alloc.free(prep.owned);
-            prep.owned = owned;
-            prep.bytes = owned;
+            prep.transformed = true;
+            if (config.scratch_pool) |sp| {
+                const decoded = try encoding.convertScratchWithMap(sp.allocator, &sp.decode_buf, alloc, target, src_slice, init_raw, &prep.offset_map);
+                if (prep.owned.len != 0) {
+                    alloc.free(prep.owned);
+                    prep.owned = &.{};
+                }
+                prep.bytes = decoded;
+            } else {
+                const owned = try encoding.convertAllocWithMap(alloc, target, src_slice, init_raw, &prep.offset_map);
+                if (prep.owned.len != 0) alloc.free(prep.owned);
+                prep.owned = owned;
+                prep.bytes = owned;
+            }
             if (resume_raw != null) prep.base_searchable_offset = config.resume_from;
             return prep;
         },
@@ -178,18 +223,33 @@ pub fn materialize(haystack: []const u8, config: SearchConfig) SliceError!Prepar
             const rest = if (current.len >= 3) current[3..] else current[0..0];
             prep.offset_map.base_raw_offset = 3;
             if (encoding.validUtf8(rest)) {
-                prep.bytes = rest;
+                if (was_decompressed) {
+                    try stashDecompressedInScratch(&prep, config);
+                    prep.bytes = if (prep.bytes.len >= 3) prep.bytes[3..] else prep.bytes[0..0];
+                } else {
+                    prep.bytes = rest;
+                }
                 return prep;
             }
             const src_slice = if (resume_raw) |rr| (if (rr >= 3) current[rr..] else rest) else rest;
             const init_raw: u64 = if (resume_raw) |rr| (if (rr >= 3) @intCast(rr) else 3) else 3;
             if (encoding.decodedSize(.utf8, src_slice) > cap) return error.DecodeLimit;
-            const alloc = config.decode_allocator orelse return error.OutOfMemory;
+            const alloc = effectiveAllocator(config) orelse return error.OutOfMemory;
             prep.alloc = alloc;
-            const owned = try encoding.convertAllocWithMap(alloc, .utf8, src_slice, init_raw, &prep.offset_map);
-            if (prep.owned.len != 0) alloc.free(prep.owned);
-            prep.owned = owned;
-            prep.bytes = owned;
+            prep.transformed = true;
+            if (config.scratch_pool) |sp| {
+                const decoded = try encoding.convertScratchWithMap(sp.allocator, &sp.decode_buf, alloc, .utf8, src_slice, init_raw, &prep.offset_map);
+                if (prep.owned.len != 0) {
+                    alloc.free(prep.owned);
+                    prep.owned = &.{};
+                }
+                prep.bytes = decoded;
+            } else {
+                const owned = try encoding.convertAllocWithMap(alloc, .utf8, src_slice, init_raw, &prep.offset_map);
+                if (prep.owned.len != 0) alloc.free(prep.owned);
+                prep.owned = owned;
+                prep.bytes = owned;
+            }
             if (resume_raw != null and resume_raw.? >= 3) prep.base_searchable_offset = config.resume_from;
             return prep;
         },
@@ -200,12 +260,22 @@ pub fn materialize(haystack: []const u8, config: SearchConfig) SliceError!Prepar
             if (encoding.decodedSize(kind, src_slice) > cap) {
                 return error.DecodeLimit;
             }
-            const alloc = config.decode_allocator orelse return error.OutOfMemory;
+            const alloc = effectiveAllocator(config) orelse return error.OutOfMemory;
             prep.alloc = alloc;
-            const owned = try encoding.convertAllocWithMap(alloc, kind, src_slice, init_raw, &prep.offset_map);
-            if (prep.owned.len != 0) alloc.free(prep.owned);
-            prep.owned = owned;
-            prep.bytes = owned;
+            prep.transformed = true;
+            if (config.scratch_pool) |sp| {
+                const decoded = try encoding.convertScratchWithMap(sp.allocator, &sp.decode_buf, alloc, kind, src_slice, init_raw, &prep.offset_map);
+                if (prep.owned.len != 0) {
+                    alloc.free(prep.owned);
+                    prep.owned = &.{};
+                }
+                prep.bytes = decoded;
+            } else {
+                const owned = try encoding.convertAllocWithMap(alloc, kind, src_slice, init_raw, &prep.offset_map);
+                if (prep.owned.len != 0) alloc.free(prep.owned);
+                prep.owned = owned;
+                prep.bytes = owned;
+            }
             if (resume_raw != null and resume_raw.? >= 2) prep.base_searchable_offset = config.resume_from;
             return prep;
         },
@@ -215,6 +285,17 @@ pub fn materialize(haystack: []const u8, config: SearchConfig) SliceError!Prepar
 
 /// Legacy callback entry point that searches `haystack`. Line slices point directly into `haystack` when no BOM or transcoding is involved.
 /// `name` is passed only to legacy `begin`. The service entry point is `searchSourceSlice`.
+
+fn isAnyMatcherRegex(any_m: matcher_mod.AnyMatcher) bool {
+    if (any_m.vtable.is_capture_regex) return true;
+    var dummy: regex_mod.Regex = undefined;
+    const ptr_mut: *regex_mod.Regex = &dummy;
+    const ptr_const: *const regex_mod.Regex = &dummy;
+    return any_m.vtable == matcher_mod.AnyMatcher.init(regex_mod.Regex, ptr_mut).vtable or
+        any_m.vtable == matcher_mod.AnyMatcher.init(regex_mod.Regex, ptr_const).vtable or
+        any_m.vtable == matcher_mod.AnyMatcher.init(*regex_mod.Regex, ptr_mut).vtable or
+        any_m.vtable == matcher_mod.AnyMatcher.init(*const regex_mod.Regex, ptr_const).vtable;
+}
 
 pub fn searchPrepared(
     comptime S: type,
@@ -231,16 +312,39 @@ pub fn searchPrepared(
     };
     resetStats(matcher);
     var state = State{};
-    if (@TypeOf(matcher.*) == regex_mod.Regex) state.capture_regex = matcher;
+    const MChild = state_mod.MatcherType(@TypeOf(matcher));
+    if (MChild == regex_mod.Regex) {
+        state.capture_regex = if (@typeInfo(@TypeOf(matcher)) == .pointer) matcher else &matcher;
+    } else if (MChild == matcher_mod.AnyMatcher) {
+        const any_m: matcher_mod.AnyMatcher = if (@typeInfo(@TypeOf(matcher)) == .pointer) matcher.* else matcher;
+        if (isAnyMatcherRegex(any_m)) {
+            state.capture_regex = @ptrCast(@alignCast(any_m.ctx));
+        }
+    }
     state.label = name;
     state.decompressed_bytes = prepared.decompressed_bytes;
     state.offset_map = &prepared.offset_map;
     state.offset_map_base = prepared.base_searchable_offset;
     state.decompress_map = &prepared.decompress_map;
     armClock(&state, config);
-    state.text_alloc = config.decode_allocator;
-    defer if (state.text_buf.len != 0) if (state.text_alloc) |alloc| alloc.free(state.text_buf);
-    defer if (state.replace_buf.len != 0) if (state.text_alloc) |alloc| alloc.free(state.replace_buf);
+    const pool_alloc = if (config.scratch_pool) |sp| sp.allocator else effectiveAllocator(config);
+    state.text_alloc = pool_alloc;
+    if (config.scratch_pool) |sp| {
+        state.text_buf = sp.text_buf;
+        state.replace_buf = sp.replace_buf;
+        state.span_buf = sp.span_buf;
+    }
+    defer {
+        if (config.scratch_pool) |sp| {
+            sp.text_buf = state.text_buf;
+            sp.replace_buf = state.replace_buf;
+            sp.span_buf = state.span_buf;
+        } else if (state.text_alloc) |alloc| {
+            if (state.text_buf.len != 0) alloc.free(state.text_buf);
+            if (state.replace_buf.len != 0) alloc.free(state.replace_buf);
+            if (state.span_buf.len != 0) alloc.free(state.span_buf);
+        }
+    }
     state.ring.cap = beforeCount(config);
     state.ring.stride = config.max_line_len;
     if (config.line_numbers) state.line_number = 1;
@@ -271,7 +375,7 @@ pub fn searchPrepared(
     if (watchesBinary(config)) {
         var nul_at: ?usize = null;
         if (view.len > 0 and canFuse(matcher, config, &state)) {
-            const found = matcher.findWatched(view, 0, &nul_at);
+            const found = if (comptime @hasDecl(state_mod.MatcherType(@TypeOf(matcher)), "findWatched")) matcher.findWatched(view, 0, &nul_at) else unreachable;
             if (nul_at == null) {
                 if (found) |hit| {
                     if (memchr.find(width, view[hit.start..], 0, 0)) |rel| {
@@ -335,27 +439,75 @@ pub fn drive(
         logDetail(config, name, err);
         return err;
     };
+    const pool_alloc = if (config.scratch_pool) |sp| sp.allocator else (effectiveAllocator(config) orelse allocator);
+    const stream_alloc = if (config.scratch == null and config.scratch_pool != null)
+        config.scratch_pool.?.allocator
+    else
+        allocator;
+
     var state = State{};
-    if (@TypeOf(matcher.*) == regex_mod.Regex) state.capture_regex = matcher;
+    const MChild = state_mod.MatcherType(@TypeOf(matcher));
+    if (MChild == regex_mod.Regex) {
+        state.capture_regex = if (@typeInfo(@TypeOf(matcher)) == .pointer) matcher else &matcher;
+    } else if (MChild == matcher_mod.AnyMatcher) {
+        const any_m: matcher_mod.AnyMatcher = if (@typeInfo(@TypeOf(matcher)) == .pointer) matcher.* else matcher;
+        if (isAnyMatcherRegex(any_m)) {
+            state.capture_regex = @ptrCast(@alignCast(any_m.ctx));
+        }
+    }
     state.label = name;
     state.decompressed_bytes = config.decompressed_bytes;
     armClock(&state, config);
     state.from_reader = true;
-    state.text_alloc = allocator;
-    defer if (state.text_buf.len != 0) allocator.free(state.text_buf);
-    defer if (state.replace_buf.len != 0) allocator.free(state.replace_buf);
+    state.text_alloc = pool_alloc;
+    if (config.scratch_pool) |sp| {
+        state.text_buf = sp.text_buf;
+        state.replace_buf = sp.replace_buf;
+        state.span_buf = sp.span_buf;
+    }
+    defer {
+        if (config.scratch_pool) |sp| {
+            sp.text_buf = state.text_buf;
+            sp.replace_buf = state.replace_buf;
+            sp.span_buf = state.span_buf;
+        } else {
+            if (state.text_buf.len != 0) pool_alloc.free(state.text_buf);
+            if (state.replace_buf.len != 0) pool_alloc.free(state.replace_buf);
+            if (state.span_buf.len != 0) pool_alloc.free(state.span_buf);
+        }
+    }
     state.ring.cap = beforeCount(config);
     state.ring.stride = config.max_line_len;
     if (state.ring.cap > 0) {
         const bytes = beforeContextCapacity(config);
-        if (bytes > 0) state.ring.storage = try allocator.alloc(u8, bytes);
+        if (bytes > 0) {
+            if (config.scratch_pool) |sp| {
+                if (sp.ring_storage.len < bytes) {
+                    if (sp.ring_storage.len == 0) {
+                        sp.ring_storage = try sp.allocator.alloc(u8, bytes);
+                    } else {
+                        sp.ring_storage = try sp.allocator.realloc(sp.ring_storage, bytes);
+                    }
+                }
+                state.ring.storage = sp.ring_storage[0..bytes];
+            } else {
+                state.ring.storage = try pool_alloc.alloc(u8, bytes);
+            }
+        }
         state.ring.owned = true;
     }
-    defer if (state.ring.storage.len != 0) allocator.free(state.ring.storage);
-    var hold: []u8 = &.{};
-    defer if (hold.len != 0) allocator.free(hold);
-    var seen: []bool = &.{};
-    defer if (seen.len != 0) allocator.free(seen);
+    defer if (config.scratch_pool == null and state.ring.storage.len != 0) pool_alloc.free(state.ring.storage);
+    var hold: []u8 = if (config.scratch_pool) |sp| sp.long_hold else &.{};
+    var seen: []bool = if (config.scratch_pool) |sp| sp.long_seen else &.{};
+    defer {
+        if (config.scratch_pool) |sp| {
+            sp.long_hold = hold;
+            sp.long_seen = seen;
+        } else {
+            if (hold.len != 0) pool_alloc.free(hold);
+            if (seen.len != 0) pool_alloc.free(seen);
+        }
+    }
     if (config.line_numbers) state.line_number = 1;
     restoreCounters(&state, config);
     if (!callOpt(S, "begin", sink, .{name})) {
@@ -373,24 +525,35 @@ pub fn drive(
     else
         bufferWindow(config);
     const cap0 = @max(initial, 1);
-    const borrowed = config.scratch != null;
+    const stream_slot: ?*[]u8 = if (config.scratch_pool) |sp|
+        &sp.stream_buf
+    else if (config.scratch) |slot|
+        slot
+    else
+        null;
     var buf: []u8 = undefined;
-    if (config.scratch) |slot| {
+    if (stream_slot) |slot| {
         if (slot.len < cap0) {
             if (slot.len == 0) {
-                slot.* = try allocator.alloc(u8, cap0);
+                slot.* = try stream_alloc.alloc(u8, cap0);
             } else {
-                slot.* = try allocator.realloc(slot.*, cap0);
+                slot.* = try stream_alloc.realloc(slot.*, cap0);
             }
         }
         buf = slot.*;
     } else {
-        buf = try allocator.alloc(u8, cap0);
+        buf = try stream_alloc.alloc(u8, cap0);
     }
-    defer if (!borrowed) allocator.free(buf);
+    defer {
+        if (stream_slot) |slot| {
+            slot.* = buf;
+        } else {
+            stream_alloc.free(buf);
+        }
+    }
     var filled: usize = 0;
     var offset_map = decompress.OffsetMap{};
-    defer offset_map.deinit(allocator);
+    defer offset_map.deinit(pool_alloc);
     var decompress_map = decompress.OffsetMap{};
     defer decompress_map.deinit(allocator);
     state.offset_map = &offset_map;
@@ -398,7 +561,16 @@ pub fn drive(
     var decoder = encoding.Decoder.initWithHint(config.encoding, config.charset);
     decoder.max_in = decodeCap(config);
     decoder.offset_map = &offset_map;
-    defer decoder.deinit(allocator);
+    if (config.scratch_pool) |sp| {
+        decoder.raw_buf = sp.decode_buf;
+    }
+    defer {
+        if (config.scratch_pool) |sp| {
+            sp.decode_buf = decoder.raw_buf;
+            decoder.raw_buf = &.{};
+        }
+        decoder.deinit(pool_alloc);
+    }
     var upstream = Upstream{
         .inner = read_ctx,
         .state = &state,
@@ -521,13 +693,13 @@ pub fn drive(
         }
         if (stopForBudget(&state, config)) break;
         if (filled == buf.len) {
-            if (try grow(allocator, buf, config)) |next| {
+            if (try grow(stream_alloc, buf, config)) |next| {
                 buf = next;
-                if (config.scratch) |slot| slot.* = buf;
-            } else if (!try makeRoom(S, allocator, sink, matcher, &buf, &filled, &hold, &seen, &state, config)) {
+                if (stream_slot) |slot| slot.* = buf;
+            } else if (!try makeRoom(S, pool_alloc, sink, matcher, &buf, &filled, &hold, &seen, &state, config)) {
                 state.stopped = true;
                 break;
-            } else if (config.scratch) |slot| slot.* = buf;
+            } else if (stream_slot) |slot| slot.* = buf;
         }
         var dest = buf[filled..];
         if (scanRemaining(&state, config)) |left| {
@@ -552,12 +724,12 @@ pub fn drive(
                 }
             };
             var sctx = SliceCtx{ .data = ds, .pos = &decompressed_pos };
-            break :blk decoder.pull(allocator, SliceCtx.read, &sctx, bufferWindow(config), dest, &raw_read_sink) catch |err| {
+            break :blk decoder.pull(pool_alloc, SliceCtx.read, &sctx, bufferWindow(config), dest, &raw_read_sink) catch |err| {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 if (err == error.DecodeLimit) return error.DecodeLimit;
                 unreachable;
             };
-        } else decoder.pull(allocator, struct {
+        } else decoder.pull(pool_alloc, struct {
             fn read(ctx: *anyopaque, out: []u8) readRet(readFn) {
                 return readUpstream(S, readFn, ctx, out);
             }
@@ -577,7 +749,7 @@ pub fn drive(
         if (state.long_active or longTail(buf[0..filled], eof, config)) {
             const cont = try pumpLong(
                 S,
-                allocator,
+                pool_alloc,
                 sink,
                 matcher,
                 &buf,
@@ -589,7 +761,7 @@ pub fn drive(
                 &state,
                 config,
             );
-            if (config.scratch) |slot| slot.* = buf;
+            if (stream_slot) |slot| slot.* = buf;
             if (!cont) {
                 state.stopped = true;
                 break;
@@ -609,7 +781,7 @@ pub fn drive(
         var skip_match = false;
         if (fuse) {
             var nul_rel: ?usize = null;
-            const found = matcher.findWatched(buf[0..search_end], state.pos, &nul_rel);
+            const found = if (comptime @hasDecl(state_mod.MatcherType(@TypeOf(matcher)), "findWatched")) matcher.findWatched(buf[0..search_end], state.pos, &nul_rel) else unreachable;
             if (nul_rel == null and search_end < filled) {
                 if (memchr.find(width, buf[search_end..filled], 0, 0)) |rel| nul_rel = search_end + rel;
             }

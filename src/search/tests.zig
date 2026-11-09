@@ -3457,3 +3457,766 @@ test "Unicode whole_word, Unicode filter_smart_case, and streaming compression=.
     try testing.expect(res_auto.bytes_read < 512);
 }
 
+test "AnyMatcher, AnyEventSink, AnySink.init, and pattern_id propagation in search pipeline" {
+    const EventRecorder = struct {
+        matches: u32 = 0,
+        last_pids: [8]?u32 = @splat(null),
+        last_pids_len: usize = 0,
+        replaced_buf: [64]u8 = undefined,
+        replaced_len: usize = 0,
+
+        pub fn event(self: *@This(), ev: Event) Flow {
+            if (ev == .match) {
+                self.matches += 1;
+                const n = @min(ev.match.matches.len, self.last_pids.len);
+                for (0..n) |i| self.last_pids[i] = ev.match.matches[i].pattern_id;
+                self.last_pids_len = n;
+                if (ev.match.replaced) |r| {
+                    const rn = @min(r.len, self.replaced_buf.len);
+                    @memcpy(self.replaced_buf[0..rn], r[0..rn]);
+                    self.replaced_len = rn;
+                }
+            }
+            return .cont;
+        }
+    };
+
+    const Multi = @import("../finder/multi.zig").Multi;
+    var multi = try Multi.init(testing.allocator, &.{ "alpha", "beta", "gamma" }, .{});
+    defer multi.deinit();
+    const any_multi = matcher_mod.AnyMatcher.init(Multi, &multi);
+
+    var rec = EventRecorder{};
+    var any_ev_sink = sink_mod.AnyEventSink.init(EventRecorder, &rec);
+    const res_m = try searchSourceSlice(sink_mod.AnyEventSink, &any_ev_sink, "poly-multi", "beta and gamma and alpha\n", &any_multi, .{});
+    try testing.expectEqual(@as(u64, 1), res_m.matched_lines);
+    try testing.expectEqual(@as(usize, 3), rec.last_pids_len);
+    try testing.expectEqual(@as(?u32, 1), rec.last_pids[0]);
+    try testing.expectEqual(@as(?u32, 2), rec.last_pids[1]);
+    try testing.expectEqual(@as(?u32, 0), rec.last_pids[2]);
+
+    // Whole-line match with Multi and AnyMatcher preserves pattern_id
+    rec = .{};
+    _ = try searchSourceSlice(sink_mod.AnyEventSink, &any_ev_sink, "poly-wl", "alpha\ngamma\n", &any_multi, .{
+        .whole_line = true,
+    });
+    try testing.expectEqual(@as(u32, 2), rec.matches);
+    try testing.expectEqual(@as(?u32, 2), rec.last_pids[0]);
+
+    // Regex wrapped in AnyMatcher preserves $1 capture group replacement preview
+    var re = try regex_mod.Regex.init(testing.allocator, "user=([a-z]+)", .{});
+    defer re.deinit();
+    const any_re = matcher_mod.AnyMatcher.init(regex_mod.Regex, &re);
+    rec = .{};
+    _ = try searchSourceSlice(sink_mod.AnyEventSink, &any_ev_sink, "poly-re", "id: user=alice ok\n", &any_re, .{
+        .replacement = "[$1]",
+    });
+    try testing.expectEqualStrings("id: [alice] ok", rec.replaced_buf[0..rec.replaced_len]);
+
+    // Legacy AnySink.init helper
+    const LegacyCollector = struct {
+        lines: u32 = 0,
+        last_pid: ?u32 = null,
+        pub fn matched(self: *@This(), line: Line) bool {
+            self.lines += 1;
+            if (line.match) |m| self.last_pid = m.pattern_id;
+            return true;
+        }
+    };
+    var leg = LegacyCollector{};
+    var any_leg = sink_mod.AnySink.init(LegacyCollector, &leg);
+    _ = try searchSlice(sink_mod.AnySink, &any_leg, "xxgammayy\n", "leg", &any_multi, .{});
+    try testing.expectEqual(@as(u32, 1), leg.lines);
+    try testing.expectEqual(@as(?u32, 2), leg.last_pid);
+}
+
+test "Scratch pool achieves zero steady-state allocations across slice and reader searches" {
+    var scratch = searcher.Scratch.init(testing.allocator);
+    defer scratch.deinit();
+
+    var finder = try Finder.init("HIT", .{});
+    const NoopSink = struct {
+        hits: usize = 0,
+        pub fn event(self: *@This(), ev: Event) bool {
+            if (ev == .match) self.hits += 1;
+            return true;
+        }
+    };
+
+    // Build a line with >32 matches to force heap span buffer growth on warm-up
+    var many_hits_line: [512]u8 = undefined;
+    var pos: usize = 0;
+    for (0..40) |_| {
+        @memcpy(many_hits_line[pos .. pos + 4], "HIT ");
+        pos += 4;
+    }
+    many_hits_line[pos] = '\n';
+    pos += 1;
+    const payload = many_hits_line[0..pos];
+
+    var sink = NoopSink{};
+    var r1 = std.Io.Reader.fixed(payload);
+    _ = try searchSource(NoopSink, testing.allocator, &sink, &r1, "warm-1", &finder, .{
+        .before = 2,
+        .buffer_size = 64,
+        .max_line_len = 256,
+        .scratch_pool = &scratch,
+    });
+    try testing.expectEqual(@as(usize, 1), sink.hits);
+
+    // Second streaming search with FailingAllocator as the call allocator must succeed with 0 new allocations
+    var fail_alloc = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var r2 = std.Io.Reader.fixed(payload);
+    _ = try searchSource(NoopSink, fail_alloc.allocator(), &sink, &r2, "warm-2", &finder, .{
+        .before = 2,
+        .buffer_size = 64,
+        .max_line_len = 256,
+        .scratch_pool = &scratch,
+    });
+    try testing.expectEqual(@as(usize, 2), sink.hits);
+    try testing.expectEqual(@as(usize, 0), fail_alloc.allocations);
+
+    // Slice search with >32 spans on a single line reuses scratch.span_buf with 0 new allocations
+    _ = try searchSourceSlice(NoopSink, &sink, "slice-warm", payload, &finder, .{
+        .scratch_pool = &scratch,
+    });
+    try testing.expectEqual(@as(usize, 3), sink.hits);
+}
+
+test "regression: >64 spans on a line and Scratch.span_buf growth preserve all spans without Use-After-Free" {
+    const Multi = @import("../finder/multi.zig").Multi;
+    var multi = try Multi.init(testing.allocator, &.{ "AA", "BB", "CC" }, .{});
+    defer multi.deinit();
+
+    var line = std.ArrayList(u8).empty;
+    defer line.deinit(testing.allocator);
+    for (0..45) |_| try line.appendSlice(testing.allocator, "AA BB ");
+    try line.appendSlice(testing.allocator, "CC\n"); // 91 matches total (> 64)
+
+    const VerifySink = struct {
+        count: usize = 0,
+        first_pid: ?u32 = null,
+        second_pid: ?u32 = null,
+        last_pid: ?u32 = null,
+        pub fn event(self: *@This(), ev: Event) bool {
+            if (ev == .match) {
+                self.count = ev.match.matches.len;
+                if (ev.match.matches.len >= 2) {
+                    self.first_pid = ev.match.matches[0].pattern_id;
+                    self.second_pid = ev.match.matches[1].pattern_id;
+                    self.last_pid = ev.match.matches[ev.match.matches.len - 1].pattern_id;
+                }
+            }
+            return true;
+        }
+    };
+
+    var sink = VerifySink{};
+    _ = try searchSourceSlice(VerifySink, &sink, "repro-1a", line.items, &multi, .{
+        .allocator = testing.allocator,
+    });
+    try testing.expectEqual(@as(usize, 91), sink.count);
+    try testing.expectEqual(@as(?u32, 0), sink.first_pid);
+    try testing.expectEqual(@as(?u32, 1), sink.second_pid);
+    try testing.expectEqual(@as(?u32, 2), sink.last_pid);
+
+    // Also test Scratch.span_buf growing from 64 (40 matches) to 128 (91 matches)
+    var scratch = searcher.Scratch.init(testing.allocator);
+    defer scratch.deinit();
+    var line40 = std.ArrayList(u8).empty;
+    defer line40.deinit(testing.allocator);
+    for (0..20) |_| try line40.appendSlice(testing.allocator, "AA BB ");
+    try line40.appendSlice(testing.allocator, "\n");
+
+    sink = .{};
+    _ = try searchSourceSlice(VerifySink, &sink, "repro-1b-warm", line40.items, &multi, .{
+        .scratch_pool = &scratch,
+    });
+    try testing.expectEqual(@as(usize, 40), sink.count);
+
+    sink = .{};
+    _ = try searchSourceSlice(VerifySink, &sink, "repro-1b-grow", line.items, &multi, .{
+        .scratch_pool = &scratch,
+    });
+    try testing.expectEqual(@as(usize, 91), sink.count);
+    try testing.expectEqual(@as(?u32, 0), sink.first_pid);
+    try testing.expectEqual(@as(?u32, 1), sink.second_pid);
+    try testing.expectEqual(@as(?u32, 2), sink.last_pid);
+}
+
+test "regression: beginLong OOM when growing Scratch.long_seen does not double-free" {
+    var fail_alloc = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var scratch = searcher.Scratch.init(fail_alloc.allocator());
+    defer scratch.deinit();
+
+    var finder = try Finder.init("HIT", .{});
+    const NoopSink = struct {
+        pub fn event(_: *@This(), _: Event) bool {
+            return true;
+        }
+    };
+    var sink = NoopSink{};
+    const long_input = "zzzzzzzzzzzzzzzzzzzzzzzzHITzzzzzzzzzzzzzzzzzzzzzzzz\n";
+
+    var r1 = std.Io.Reader.fixed(long_input);
+    _ = try searchSource(NoopSink, fail_alloc.allocator(), &sink, &r1, "l1", &finder, .{
+        .buffer_size = 8,
+        .max_line_len = 16,
+        .contains = &.{"z"},
+        .scratch_pool = &scratch,
+    });
+
+    var fail_next = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    scratch.allocator = fail_next.allocator();
+    defer scratch.allocator = fail_alloc.allocator();
+
+    var r2 = std.Io.Reader.fixed(long_input);
+    try testing.expectError(error.OutOfMemory, searchSource(NoopSink, fail_next.allocator(), &sink, &r2, "l2", &finder, .{
+        .buffer_size = 8,
+        .max_line_len = 16,
+        .contains = &.{ "z", "H" },
+        .scratch_pool = &scratch,
+    }));
+}
+
+test "regression: pipeline.drive offset_map uses pool_alloc when Scratch allocator and call allocator differ" {
+    var scratch_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch_arena.deinit();
+    var scratch = searcher.Scratch.init(scratch_arena.allocator());
+    defer scratch.deinit();
+
+    const utf16le_data = [_]u8{ 0xFF, 0xFE, 'H', 0, 'I', 0, 'T', 0, '\n', 0 };
+    const NoopSink = struct {
+        pub fn event(_: *@This(), _: Event) bool {
+            return true;
+        }
+    };
+    var finder = try Finder.init("HIT", .{});
+    var sink = NoopSink{};
+    var r1 = std.Io.Reader.fixed(&utf16le_data);
+    const res = try searchSource(NoopSink, testing.allocator, &sink, &r1, "u16-drive", &finder, .{
+        .scratch_pool = &scratch,
+    });
+    try testing.expectEqual(@as(u64, 1), res.matched_lines);
+}
+
+test "regression: pipeline.materialize offset_map uses prep.alloc when Scratch allocator and SearchConfig.allocator differ" {
+    var scratch_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch_arena.deinit();
+    var scratch = searcher.Scratch.init(scratch_arena.allocator());
+    defer scratch.deinit();
+
+    const utf16le_data = [_]u8{ 0xFF, 0xFE, 'H', 0, 'I', 0, 'T', 0, '\n', 0 };
+    const NoopSink = struct {
+        pub fn event(_: *@This(), _: Event) bool {
+            return true;
+        }
+    };
+    var finder = try Finder.init("HIT", .{});
+    var sink = NoopSink{};
+    const res_u16 = try searchSourceSlice(NoopSink, &sink, "u16-slice", &utf16le_data, &finder, .{
+        .allocator = testing.allocator,
+        .scratch_pool = &scratch,
+    });
+    try testing.expectEqual(@as(u64, 1), res_u16.matched_lines);
+
+    const gbk_data = "HIT\xd6\xd0\n";
+    const res_gbk = try searchSourceSlice(NoopSink, &sink, "gbk-slice", gbk_data, &finder, .{
+        .encoding = .gbk,
+        .allocator = testing.allocator,
+        .scratch_pool = &scratch,
+    });
+    try testing.expectEqual(@as(u64, 1), res_gbk.matched_lines);
+
+    const utf8_bom_invalid = [_]u8{ 0xEF, 0xBB, 0xBF, 'H', 'I', 'T', 0xFF, '\n' };
+    const res_bom = try searchSourceSlice(NoopSink, &sink, "bom-slice", &utf8_bom_invalid, &finder, .{
+        .allocator = testing.allocator,
+        .scratch_pool = &scratch,
+    });
+    try testing.expectEqual(@as(u64, 1), res_bom.matched_lines);
+}
+
+// ============================================================================
+// EMPIRICAL CHALLENGER VERIFICATION TESTS (challenger_m1_2_gen2)
+// ============================================================================
+
+test "empirical: Bug 1 (Bug 5) - growSpans extreme scale and multiple grow/shrink cycles without span corruption" {
+    const Multi = @import("../finder/multi.zig").Multi;
+    var multi = try Multi.init(testing.allocator, &.{ "P0", "P1", "P2" }, .{});
+    defer multi.deinit();
+
+    var scratch = searcher.Scratch.init(testing.allocator);
+    defer scratch.deinit();
+
+    const SpanCollector = struct {
+        count: usize = 0,
+        valid: bool = true,
+        bad_idx: usize = 0,
+        pub fn event(self: *@This(), ev: Event) bool {
+            if (ev == .match) {
+                self.count = ev.match.matches.len;
+                for (ev.match.matches, 0..) |s, i| {
+                    if (s.pattern_id) |pid| {
+                        if (pid > 2) {
+                            self.valid = false;
+                            self.bad_idx = i;
+                            return false;
+                        }
+                    } else {
+                        self.valid = false;
+                        self.bad_idx = i;
+                        return false;
+                    }
+                    if (s.start >= 1_000_000 or s.end >= 1_000_000 or s.start > s.end) {
+                        self.valid = false;
+                        self.bad_idx = i;
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+    };
+
+    // Cycle through various match counts: 10, 45, 90, 180, 360, 15, 450
+    const counts = [_]usize{ 10, 45, 90, 180, 360, 15, 450 };
+    for (counts) |target_matches| {
+        var line = std.ArrayList(u8).empty;
+        defer line.deinit(testing.allocator);
+        for (0..target_matches) |i| {
+            const pat = switch (i % 3) {
+                0 => "P0 ",
+                1 => "P1 ",
+                2 => "P2 ",
+                else => unreachable,
+            };
+            try line.appendSlice(testing.allocator, pat);
+        }
+        try line.appendSlice(testing.allocator, "\n");
+
+        var collector = SpanCollector{};
+        _ = try searchSourceSlice(SpanCollector, &collector, "empirical-spans", line.items, &multi, .{
+            .scratch_pool = &scratch,
+        });
+        try testing.expect(collector.valid);
+        try testing.expectEqual(target_matches, collector.count);
+    }
+}
+
+test "empirical: Bug 2 (Bug 6) - beginLong OOM safety across all FailingAllocator indices during Scratch.long_seen resize" {
+    for (0..8) |fail_idx| {
+        var fail_alloc = std.testing.FailingAllocator.init(testing.allocator, .{});
+        var scratch = searcher.Scratch.init(fail_alloc.allocator());
+        defer scratch.deinit();
+
+        var finder = try Finder.init("NEEDLE", .{});
+        const NoopSink = struct {
+            pub fn event(_: *@This(), _: Event) bool {
+                return true;
+            }
+        };
+        var sink = NoopSink{};
+        const long_line_bytes = "------------------------NEEDLE------------------------\n";
+
+        // Step 1: Initial search with 1 contains pattern to allocate Scratch.long_seen with len = 1
+        var r1 = std.Io.Reader.fixed(long_line_bytes);
+        _ = try searchSource(NoopSink, fail_alloc.allocator(), &sink, &r1, "pre-alloc", &finder, .{
+            .buffer_size = 16,
+            .max_line_len = 32,
+            .contains = &.{"-"},
+            .scratch_pool = &scratch,
+        });
+
+        // Step 2: Injected failure on allocator during resize to total_contains = 4
+        var fail_next = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_idx });
+        scratch.allocator = fail_next.allocator();
+        defer scratch.allocator = fail_alloc.allocator();
+
+        var r2 = std.Io.Reader.fixed(long_line_bytes);
+        _ = searchSource(NoopSink, fail_next.allocator(), &sink, &r2, "oom-step", &finder, .{
+            .buffer_size = 16,
+            .max_line_len = 32,
+            .contains = &.{ "-", "N", "E", "D" },
+            .scratch_pool = &scratch,
+        }) catch |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+        };
+    }
+}
+
+test "empirical: Bug 3 (Bug 7) - pipeline.drive offset_map deinit with distinct allocators across encodings" {
+    var scratch_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch_arena.deinit();
+    var scratch = searcher.Scratch.init(scratch_arena.allocator());
+    defer scratch.deinit();
+
+    var finder = try Finder.init("TEST", .{});
+    const NoopSink = struct {
+        pub fn event(_: *@This(), _: Event) bool {
+            return true;
+        }
+    };
+    var sink = NoopSink{};
+
+    // 1. UTF-16LE streaming
+    const utf16le_data = [_]u8{ 0xFF, 0xFE, 'T', 0, 'E', 0, 'S', 0, 'T', 0, '\n', 0 };
+    var r_le = std.Io.Reader.fixed(&utf16le_data);
+    const res_le = try searchSource(NoopSink, testing.allocator, &sink, &r_le, "u16le-stream", &finder, .{
+        .scratch_pool = &scratch,
+    });
+    try testing.expectEqual(@as(u64, 1), res_le.matched_lines);
+
+    // 2. UTF-16BE streaming
+    const utf16be_data = [_]u8{ 0xFE, 0xFF, 0, 'T', 0, 'E', 0, 'S', 0, 'T', 0, '\n' };
+    var r_be = std.Io.Reader.fixed(&utf16be_data);
+    const res_be = try searchSource(NoopSink, testing.allocator, &sink, &r_be, "u16be-stream", &finder, .{
+        .scratch_pool = &scratch,
+    });
+    try testing.expectEqual(@as(u64, 1), res_be.matched_lines);
+
+    // 3. UTF-8 BOM with invalid tail byte streaming
+    const utf8_bom_data = [_]u8{ 0xEF, 0xBB, 0xBF, 'T', 'E', 'S', 'T', 0xFF, '\n' };
+    var r_bom = std.Io.Reader.fixed(&utf8_bom_data);
+    const res_bom = try searchSource(NoopSink, testing.allocator, &sink, &r_bom, "utf8bom-stream", &finder, .{
+        .scratch_pool = &scratch,
+    });
+    try testing.expectEqual(@as(u64, 1), res_bom.matched_lines);
+
+    // 4. GBK streaming
+    const gbk_data = "TEST\xd6\xd0\n";
+    var r_gbk = std.Io.Reader.fixed(gbk_data);
+    const res_gbk = try searchSource(NoopSink, testing.allocator, &sink, &r_gbk, "gbk-stream", &finder, .{
+        .encoding = .gbk,
+        .scratch_pool = &scratch,
+    });
+    try testing.expectEqual(@as(u64, 1), res_gbk.matched_lines);
+
+    // 5. Latin-1 streaming
+    const latin1_data = "TEST\xe9\n";
+    var r_lat = std.Io.Reader.fixed(latin1_data);
+    const res_lat = try searchSource(NoopSink, testing.allocator, &sink, &r_lat, "latin1-stream", &finder, .{
+        .encoding = .latin1,
+        .scratch_pool = &scratch,
+    });
+    try testing.expectEqual(@as(u64, 1), res_lat.matched_lines);
+}
+
+test "empirical: Bug 4 (Bug 8) - pipeline.materialize offset_map deinit with distinct allocators across encodings" {
+    var scratch_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch_arena.deinit();
+    var scratch = searcher.Scratch.init(scratch_arena.allocator());
+    defer scratch.deinit();
+
+    var finder = try Finder.init("DATA", .{});
+    const NoopSink = struct {
+        pub fn event(_: *@This(), _: Event) bool {
+            return true;
+        }
+    };
+    var sink = NoopSink{};
+
+    // 1. UTF-16LE slice
+    const utf16le_data = [_]u8{ 0xFF, 0xFE, 'D', 0, 'A', 0, 'T', 0, 'A', 0, '\n', 0 };
+    const res_le = try searchSourceSlice(NoopSink, &sink, "u16le-mat", &utf16le_data, &finder, .{
+        .allocator = testing.allocator,
+        .scratch_pool = &scratch,
+    });
+    try testing.expectEqual(@as(u64, 1), res_le.matched_lines);
+
+    // 2. UTF-16BE slice
+    const utf16be_data = [_]u8{ 0xFE, 0xFF, 0, 'D', 0, 'A', 0, 'T', 0, 'A', 0, '\n' };
+    const res_be = try searchSourceSlice(NoopSink, &sink, "u16be-mat", &utf16be_data, &finder, .{
+        .allocator = testing.allocator,
+        .scratch_pool = &scratch,
+    });
+    try testing.expectEqual(@as(u64, 1), res_be.matched_lines);
+
+    // 3. UTF-8 BOM slice
+    const utf8_bom_data = [_]u8{ 0xEF, 0xBB, 0xBF, 'D', 'A', 'T', 'A', 0xFF, '\n' };
+    const res_bom = try searchSourceSlice(NoopSink, &sink, "utf8bom-mat", &utf8_bom_data, &finder, .{
+        .allocator = testing.allocator,
+        .scratch_pool = &scratch,
+    });
+    try testing.expectEqual(@as(u64, 1), res_bom.matched_lines);
+
+    // 4. GBK slice
+    const gbk_data = "DATA\xd6\xd0\n";
+    const res_gbk = try searchSourceSlice(NoopSink, &sink, "gbk-mat", gbk_data, &finder, .{
+        .encoding = .gbk,
+        .allocator = testing.allocator,
+        .scratch_pool = &scratch,
+    });
+    try testing.expectEqual(@as(u64, 1), res_gbk.matched_lines);
+
+    // 5. Latin-1 slice
+    const latin1_data = "DATA\xe9\n";
+    const res_lat = try searchSourceSlice(NoopSink, &sink, "latin1-mat", latin1_data, &finder, .{
+        .encoding = .latin1,
+        .allocator = testing.allocator,
+        .scratch_pool = &scratch,
+    });
+    try testing.expectEqual(@as(u64, 1), res_lat.matched_lines);
+}
+
+test "empirical: Scratch pool stress test across 5,000 iterations asserting zero steady-state allocations" {
+    const CountingAllocator = struct {
+        parent: std.mem.Allocator,
+        alloc_count: usize = 0,
+        realloc_count: usize = 0,
+        free_count: usize = 0,
+
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            } };
+        }
+
+        fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.alloc_count += 1;
+            return self.parent.rawAlloc(len, alignment, ret_addr);
+        }
+
+        fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (new_len > memory.len) self.realloc_count += 1;
+            return self.parent.rawResize(memory, alignment, new_len, ret_addr);
+        }
+
+        fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.realloc_count += 1;
+            return self.parent.rawRemap(memory, alignment, new_len, ret_addr);
+        }
+
+        fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.free_count += 1;
+            self.parent.rawFree(memory, alignment, ret_addr);
+        }
+    };
+
+    var counting = CountingAllocator{ .parent = testing.allocator };
+    var scratch = searcher.Scratch.init(counting.allocator());
+    defer scratch.deinit();
+
+    var finder = try Finder.init("TOKEN", .{});
+    const Multi = @import("../finder/multi.zig").Multi;
+    var multi = try Multi.init(testing.allocator, &.{ "TOKEN", "ALPHA", "BETA" }, .{});
+    defer multi.deinit();
+
+    const NoopSink = struct {
+        hits: usize = 0,
+        pub fn event(self: *@This(), ev: Event) bool {
+            if (ev == .match) self.hits += 1;
+            return true;
+        }
+    };
+    var sink = NoopSink{};
+
+    // --- WARM UP PHASE: Pre-size all internal Scratch buffers ---
+    // 1. Long stream with before/after context
+    const stream_warm = "line1\nline2\nTOKEN\nline4\nline5\n";
+    var r_warm = std.Io.Reader.fixed(stream_warm);
+    _ = try searchSource(NoopSink, counting.allocator(), &sink, &r_warm, "warm-stream", &finder, .{
+        .before = 2,
+        .after = 2,
+        .buffer_size = 64,
+        .scratch_pool = &scratch,
+    });
+
+    // 2. Long line exceeding max_line_len to size long_hold and long_seen
+    const long_line_warm = "========================TOKEN========================\n";
+    var r_long_warm = std.Io.Reader.fixed(long_line_warm);
+    _ = try searchSource(NoopSink, counting.allocator(), &sink, &r_long_warm, "warm-long", &finder, .{
+        .buffer_size = 16,
+        .max_line_len = 32,
+        .contains = &.{ "=", "T" },
+        .scratch_pool = &scratch,
+    });
+
+    // 3. Line with >32 spans to size span_buf
+    var span_line: [512]u8 = undefined;
+    var sp_len: usize = 0;
+    for (0..40) |_| {
+        @memcpy(span_line[sp_len .. sp_len + 6], "TOKEN ");
+        sp_len += 6;
+    }
+    span_line[sp_len] = '\n';
+    sp_len += 1;
+    _ = try searchSourceSlice(NoopSink, &sink, "warm-spans", span_line[0..sp_len], &finder, .{
+        .scratch_pool = &scratch,
+    });
+
+    // 4. Replacement to size text_buf and replace_buf
+    _ = try searchSourceSlice(NoopSink, &sink, "warm-replace", "here is TOKEN and TOKEN\n", &finder, .{
+        .replacement = "[REPLACED_TOKEN]",
+        .scratch_pool = &scratch,
+    });
+
+    // 5. Transcoding to size decode_buf
+    const utf16_warm = [_]u8{ 0xFF, 0xFE, 'T', 0, 'O', 0, 'K', 0, 'E', 0, 'N', 0, '\n', 0 };
+    _ = try searchSourceSlice(NoopSink, &sink, "warm-transcode", &utf16_warm, &finder, .{
+        .allocator = counting.allocator(),
+        .scratch_pool = &scratch,
+    });
+
+    // Record steady-state counts after warm-up
+    const steady_allocs = counting.alloc_count;
+    const steady_reallocs = counting.realloc_count;
+    try testing.expect(steady_allocs > 0);
+
+    // --- STRESS PHASE: 5,000 searches across slice, stream, context, replacements ---
+    var fail_call_alloc = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const call_alloc = fail_call_alloc.allocator();
+
+    for (0..5000) |i| {
+        switch (i % 5) {
+            0 => {
+                _ = try searchSourceSlice(NoopSink, &sink, "s-slice", "BETA and ALPHA and TOKEN\n", &multi, .{
+                    .scratch_pool = &scratch,
+                });
+            },
+            1 => {
+                const doc = "start\nmiddle with TOKEN\nend\n";
+                var r = std.Io.Reader.fixed(doc);
+                _ = try searchSource(NoopSink, call_alloc, &sink, &r, "s-stream", &finder, .{
+                    .before = 1,
+                    .after = 1,
+                    .buffer_size = 64,
+                    .scratch_pool = &scratch,
+                });
+            },
+            2 => {
+                _ = try searchSourceSlice(NoopSink, &sink, "s-replace", "prefix TOKEN suffix\n", &finder, .{
+                    .replacement = "REPL",
+                    .scratch_pool = &scratch,
+                });
+            },
+            3 => {
+                _ = try searchSourceSlice(NoopSink, &sink, "s-spans", span_line[0 .. 30 * 6 + 1], &finder, .{
+                    .scratch_pool = &scratch,
+                });
+            },
+            4 => {
+                var r_l = std.Io.Reader.fixed(long_line_warm);
+                _ = try searchSource(NoopSink, call_alloc, &sink, &r_l, "s-overlong", &finder, .{
+                    .buffer_size = 16,
+                    .max_line_len = 32,
+                    .contains = &.{"="},
+                    .scratch_pool = &scratch,
+                });
+            },
+            else => unreachable,
+        }
+    }
+
+    try testing.expectEqual(steady_allocs, counting.alloc_count);
+    try testing.expectEqual(steady_reallocs, counting.realloc_count);
+    try testing.expectEqual(@as(usize, 0), fail_call_alloc.allocations);
+}
+
+test "empirical: AnyEventSink flow control (cont, pause, stop, resume) and AnyMatcher polymorphism" {
+    const FlowSink = struct {
+        matches_seen: usize = 0,
+        heartbeats_seen: usize = 0,
+        ends_seen: usize = 0,
+        stop_at: ?usize = null,
+        pause_at: ?usize = null,
+
+        pub fn event(self: *@This(), ev: Event) Flow {
+            switch (ev) {
+                .match => {
+                    self.matches_seen += 1;
+                    if (self.stop_at) |s| {
+                        if (self.matches_seen >= s) return .stop;
+                    }
+                    if (self.pause_at) |p| {
+                        if (self.matches_seen >= p) return .pause;
+                    }
+                    return .cont;
+                },
+                .heartbeat => {
+                    self.heartbeats_seen += 1;
+                    return .cont;
+                },
+                .end => {
+                    self.ends_seen += 1;
+                    return .cont;
+                },
+                else => return .cont,
+            }
+        }
+    };
+
+    const Multi = @import("../finder/multi.zig").Multi;
+    var multi = try Multi.init(testing.allocator, &.{ "one", "two", "three" }, .{});
+    defer multi.deinit();
+    const any_multi = matcher_mod.AnyMatcher.init(Multi, &multi);
+
+    var finder = try Finder.init("match", .{});
+    const any_finder = matcher_mod.AnyMatcher.init(Finder, &finder);
+
+    var re = try regex_mod.Regex.init(testing.allocator, "[0-9]+", .{});
+    defer re.deinit();
+    const any_re = matcher_mod.AnyMatcher.init(regex_mod.Regex, &re);
+
+    // 1. AnyEventSink with .stop stops immediately after target match count
+    var flow_sink = FlowSink{ .stop_at = 2 };
+    var any_sink = sink_mod.AnyEventSink.init(FlowSink, &flow_sink);
+    const corpus = "one\ntwo\nthree\none\n";
+    const res_stop = try searchSourceSlice(sink_mod.AnyEventSink, &any_sink, "stop-test", corpus, &any_multi, .{});
+    try testing.expectEqual(Outcome.stopped, res_stop.outcome);
+    try testing.expectEqual(@as(usize, 2), flow_sink.matches_seen);
+
+    // 2. AnyEventSink with .pause and resumeSourceSlice
+    flow_sink = FlowSink{ .pause_at = 1 };
+    any_sink = sink_mod.AnyEventSink.init(FlowSink, &flow_sink);
+    const res_pause = try searchSourceSlice(sink_mod.AnyEventSink, &any_sink, "pause-test", corpus, &any_multi, .{});
+    try testing.expect(res_pause.paused);
+    try testing.expectEqual(@as(usize, 1), flow_sink.matches_seen);
+
+    // Resume from paused result
+    flow_sink.pause_at = null;
+    const res_resumed = try resumeSourceSlice(sink_mod.AnyEventSink, &any_sink, "pause-test", corpus, &any_multi, .{}, res_pause);
+    try testing.expectEqual(Outcome.complete, res_resumed.outcome);
+    try testing.expect(!res_resumed.paused);
+    try testing.expectEqual(@as(usize, 4), flow_sink.matches_seen);
+
+    // 3. AnyMatcher with match modes and word boundary
+    const word_corpus = "oneword one two\n";
+    flow_sink = FlowSink{};
+    any_sink = sink_mod.AnyEventSink.init(FlowSink, &flow_sink);
+    _ = try searchSourceSlice(sink_mod.AnyEventSink, &any_sink, "word-test", word_corpus, &any_multi, .{
+        .whole_word = true,
+    });
+    try testing.expectEqual(@as(usize, 1), flow_sink.matches_seen);
+
+    // 4. AnyMatcher findWatched with NUL detection
+    var nul_pos: ?usize = null;
+    const nul_hay = "abc\x00def match";
+    const m_watch = any_finder.findWatched(nul_hay, 0, &nul_pos);
+    try testing.expect(m_watch == null);
+    try testing.expectEqual(@as(?usize, 3), nul_pos);
+
+    // Without NUL, match is returned
+    var no_nul_pos: ?usize = null;
+    const no_nul_hay = "abc def match";
+    const m_no_watch = any_finder.findWatched(no_nul_hay, 0, &no_nul_pos);
+    try testing.expect(m_no_watch != null);
+    try testing.expectEqual(@as(?usize, null), no_nul_pos);
+
+    // 5. AnyMatcher wrapping Regex
+    flow_sink = FlowSink{};
+    any_sink = sink_mod.AnyEventSink.init(FlowSink, &flow_sink);
+    _ = try searchSourceSlice(sink_mod.AnyEventSink, &any_sink, "re-test", "val: 12345 and 678\n", &any_re, .{});
+    try testing.expectEqual(@as(usize, 1), flow_sink.matches_seen);
+}
+
+test {
+    _ = @import("challenger_test.zig");
+}
+

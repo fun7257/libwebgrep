@@ -166,22 +166,22 @@ pub fn find(self: *Regex, haystack: []const u8, start: usize, mode: MatchMode) ?
 
 ---
 
-## 七、`src/root.zig` 导出符号完整索引（55 项）
+## 七、`src/root.zig` 导出符号完整索引
 
 ### matcher
-重导出 `src/matcher.zig`，定义字面量与正则共用的匹配模式、区间结构、大小写策略与模式配额上限校验函数 `checkPatternLimits`。
+重导出 `src/matcher.zig`，定义字面量与正则共用的匹配模式、区间结构、大小写策略、类型擦除包装器 `AnyMatcher` 与模式配额上限校验函数 `checkPatternLimits`。
 
 ### sink_mod
-重导出 `src/sink.zig`，包含所有服务事件（`Event`）、行结果（`LineEvent` / `Line`）、流控（`Flow`）与完成状态（`Result`）定义。
+重导出 `src/sink.zig`，包含所有服务事件（`Event`）、行结果（`LineEvent` / `Line`）、流控（`Flow`）、`AnySink`、`AnyEventSink` 与完成状态（`Result`）定义。
 
 ### searcher
-重导出 `src/searcher.zig`，包含 `SearchConfig`、`SliceError`、`ReadError`、`PullEvent`、`SourcePull` 及全部搜索入口实现。
+重导出 `src/searcher.zig`，包含 `SearchConfig`、`Scratch`、`SliceError`、`ReadError`、`PullEvent`、`SourcePull`、`ReaderPull`、`openReaderPull` 及全部搜索入口实现。
 
 ### MatchMode
 匹配选择模式枚举：`.earliest`（选择最早结束的匹配，默认）或 `.leftmost_first`（选择最左起点的匹配，与 `rg -F` 一致）。
 
 ### Match
-半开字节区间 `struct { start: usize, end: usize }`，相对于传入 `find` 的 `haystack` 切片。
+半开字节区间 `struct { start: usize, end: usize, pattern_id: u32 = 0 }`，相对于传入 `find` 的 `haystack` 切片，并携带命中模式的 0 起始索引 `pattern_id`。
 
 ### RequiredLiteral
 `struct { bytes: []const u8, offset_in_match: usize }`，从匹配器提取的必需字面量锚点，供 `Searcher` 执行 SIMD 预过滤。
@@ -192,8 +192,14 @@ pub fn find(self: *Regex, haystack: []const u8, start: usize, mode: MatchMode) ?
 ### FindOptions
 构造 `Finder` 或 `Multi` 的配置项（`case`、`unicode_case`、`frequency`、`prefilter_fp_threshold`、`max_pattern_count`、`max_pattern_bytes`）。
 
+### AnyMatcher
+面向 `*const Finder`、`*const Multi`、`*const Regex`、`*const RegexSet` 及自定义匹配器的零分配运行时多态擦除包装器（`ctx: *const anyopaque` + `vtable`），支持无锁多线程共享与减少编译期单态化膨胀。
+
+### anyMatcherVtable
+在编译期为任意匹配器类型 `M` 生成静态 `AnyMatcher.VTable`，零堆内存分配。
+
 ### Span
-行内匹配的半开字节区间（`start`、`end`）及预计算的 UTF-16 码元端点（`u16_start`、`u16_end`）与可选只读替换切片（`replacement`）。
+行内匹配的半开字节区间（`start`、`end`）、预计算的 UTF-16 码元端点（`u16_start`、`u16_end`）、0 起始命中模式 ID（`pattern_id: u32`）与可选只读替换切片（`replacement`）。
 
 ### Line
 旧版回调入口（`searchSlice` / `searchReader`）交付的匹配行或上下文行结构，切片仅在回调返回前有效。
@@ -215,6 +221,12 @@ pub fn find(self: *Regex, haystack: []const u8, start: usize, mode: MatchMode) ?
 
 ### anyVtable
 在编译期为任意旧版接收器类型 `S` 生成 `AnySink.VTable`，零堆内存分配。
+
+### AnyEventSink
+服务级 `Event` 接收器的运行时多态擦除包装器（`ctx` + `vtable`），允许异构接收器复用同一套单态化搜索管线。
+
+### anyEventSinkVtable
+在编译期为实现 `event(self: *S, ev: Event)` 的服务接收器类型 `S` 生成静态 `AnyEventSink.VTable`。
 
 ### SliceIter
 面向单个内存切片的无上下文、零分配拉式匹配行迭代器（`SliceIter(M)`）。
@@ -256,10 +268,22 @@ pub fn find(self: *Regex, haystack: []const u8, start: usize, mode: MatchMode) ?
 进程内流式解压格式枚举：`none`（默认）、`auto`（自动识别 Gzip/Zstd/XZ 魔数，非压缩流保持零缓冲流式扫描）、`gzip`、`zstd`、`xz`。
 
 ### decompress
-重导出 `src/decompress.zig`，提供防压缩炸弹的进程内流式解压与原始字节偏移映射表 `OffsetMap`。
+重导出 `src/codec/decompress.zig`，提供防压缩炸弹的进程内流式解压与原始字节偏移映射表 `OffsetMap`。
 
 ### SearchConfig
-搜索行为与多租户预算配置结构；服务入口在预算字段为 `null` 时自动填充安全默认值并强制校验硬顶。
+搜索行为与多租户预算配置结构（含统一 `allocator` 与零分配复用池 `scratch_pool`）；服务入口在预算字段为 `null` 时自动填充安全默认值并强制校验硬顶。
+
+### Scratch
+跨请求/跨来源复用的工作线程内存缓冲池（`SearchConfig.scratch_pool`），复用流式读缓冲、转码缓冲、替换预览缓冲与前文环形缓冲，实现稳态零堆分配。
+
+### PullEvent
+拉式迭代器（`SourcePull` 与 `ReaderPull`）产出的单条事件结构，其内部切片在调用迭代器 `deinit()` 前始终有效。
+
+### SourcePull
+面向内存切片的拉式服务事件迭代器类型（`SourcePull(M)`）。
+
+### ReaderPull
+面向 `*std.Io.Reader` 的增量流式拉模式状态机（`ReaderPull(M)`），按需分块读取、流式解压与转码，不将整个流预加载至内存。
 
 ### searchSlice
 旧版内存切片回调搜索入口（不自动填充服务默认预算）。
@@ -280,7 +304,10 @@ pub fn find(self: *Regex, haystack: []const u8, start: usize, mode: MatchMode) ?
 从前一次 `Flow.pause` 返回的 `Result` 断点处继续搜索同一切片（转码场景仅对 `raw_resume_at` 之后的未扫描尾部转码），不重复发出 `begin` 事件。
 
 ### openSourcePull
-基于拉式迭代器的服务事件搜索入口（返回 `searcher.SourcePull`）。
+基于拉式迭代器的切片服务事件搜索入口（返回 `searcher.SourcePull`）。
+
+### openReaderPull
+基于增量流式拉模式状态机的 `*std.Io.Reader` 服务事件搜索入口（返回 `ReadError!ReaderPull(@TypeOf(matcher))`）。
 
 ### memchr
 重导出 `src/finder/memchr.zig`，提供 16/32 字节宽度的向量化单字节查找（`find`、`findEither`、`findAny`、`findLast`、`count`）。
@@ -289,22 +316,34 @@ pub fn find(self: *Regex, haystack: []const u8, start: usize, mode: MatchMode) ?
 重导出 `src/finder/finder.zig`，即单字面量 SIMD 查找器 `Finder` 的定义模块。
 
 ### Finder
-单字面量 SIMD 查找器（`PackedPair` 4 窗口 SIMD + `TwoWay` 线性回退，支持 `unicode_case` 零分配 BMP Unicode 大小写折叠），零堆内存分配。
+单字面量 SIMD 查找器（`*const Finder` 无锁只读，采用 `PackedPair` 4 窗口 SIMD + `TwoWay` 线性回退，支持 `unicode_case` 零分配 BMP Unicode 大小写折叠），零堆内存分配。
 
 ### multi
 重导出 `src/finder/multi.zig`，即多字面量 OR 引擎 `Multi` 的定义模块。
 
 ### Multi
-多字面量 OR 自动分级检索引擎（`ByteSet` / `RarePair` / `Teddy` / `AhoCorasick`，支持 BMP 全区段 `unicode_case` 展开与超限自动回退）。
+多字面量 OR 自动分级检索引擎（`*const Multi` 无锁只读，`ByteSet` / `RarePair` / `Teddy` / `AhoCorasick`，精确返回获胜模式的 `pattern_id`）。
 
 ### regex
-重导出 `src/regex.zig`，即线性时间正则引擎 `Regex`、`RegexOptions` 与 `Captures` 的定义模块。
+重导出 `src/regex.zig`，即线性时间正则引擎 `Regex`、`RegexScratch`、`RegexSet`、`RegexOptions`、`Captures`、`DiagnosticCode` 与 `CompileDiagnostic` 的定义模块。
 
 ### Regex
-基于锁步 Thompson NFA / PikeVM 与 `RequiredLiteral` SIMD 预过滤的线性时间正则表达式引擎（支持 UTF-8 多字节字符类/量词、`(?i)` 内联标志、`\b`/`\B`/`\A`/`\z` 锚点及 `$1`..`$9` 捕获组）。
+基于有界混合惰性 DFA（Hybrid Lazy DFA）+ 锁步 Thompson NFA / PikeVM 与 SIMD 预过滤的线性时间正则表达式引擎（`*const Regex` 无锁只读，支持 `\p{...}` Unicode 属性、UAX #29 Unicode 单词边界 `\b`/`\B`、非贪婪量词及 `$1`..`$9` 捕获组）。
+
+### RegexScratch
+供 `Regex.findWithScratch` 复用的线程本地 DFA 状态缓存与 NFA 队列缓冲池，实现稳态零分配正则匹配。
+
+### RegexSet
+多正则单遍同时匹配引擎（最多 `1,024` 条正则编译为合并 Thompson NFA 并自动挂载 `Multi` SIMD 前缀预过滤，支持 `isMatch`、`find` 与单遍获取全部命中模式 ID 的 `matches`）。
+
+### DiagnosticCode
+正则编译诊断错误码枚举（精确标识未闭合括号、未闭合字符类、未知 Unicode 属性、非法量词、递归深度超限、指令数超限等）。
+
+### CompileDiagnostic
+由 `Regex.initDiagnostic` 与 `RegexSet.initDiagnostic` 填充的结构化编译错误诊断信息（含字节偏移 `offset`、1 起始 `line`/`column`、错误描述 `message` 与模式索引 `pattern_index`）。
 
 ### RegexOptions
-构造 `Regex` 的配置项：大小写模式（`case` / `unicode_case`）、有界跨行匹配（`multiline` / `max_multiline_window`）、`dot_all` 及指令数上限（`max_inst`）。
+构造 `Regex` 与 `RegexSet` 的配置项：大小写模式（`case` / `unicode_case`）、有界跨行匹配（`multiline` / `max_multiline_window`）、`dot_all` 及指令数上限（`max_inst`）。
 
 ### Captures
 正则子匹配捕获组结构，保存完整匹配（`match`）与编号捕获组 `$1`..`$9`（`groups[0..8]`），供 `Regex.findCaptures`、`Regex.extractCaptures` 及 `SearchConfig.replacement` 替换模板（`$0`/`$&`/`$1`..`$9`/`${1}`..`${9}`/`$$`）使用。
@@ -313,7 +352,37 @@ pub fn find(self: *Regex, haystack: []const u8, start: usize, mode: MatchMode) ?
 重导出 `src/finder/two_way.zig`，提供最坏时间复杂度严格 $O(n)$、零堆分配的 Crochemore-Perrin Two-Way 子串查找器。
 
 ### source
-重导出 `src/source.zig`，提供面向归档或内存虚拟目录树的抽象接口（`Source`、`Memory`）。
+重导出 `src/source.zig`，提供面向归档或内存虚拟目录树的抽象接口（`Source`、`Memory`，支持分块读取/枚举游标、句柄关闭复用及 `..` 路径穿越拦截）。
+
+### archive
+重导出 `src/codec/archive.zig`，提供零落盘内存归档解包引擎（支持 `.tar`、`.tar.gz`/`.tgz`、`.tar.zst`、`.tar.xz` 与 `.zip`）。
+
+### ArchiveFormat
+归档容器格式枚举：`auto`（自动魔数嗅探）、`tar`、`tar_gz`、`tar_zst`、`tar_xz`、`zip`。
+
+### ArchiveOptions
+归档解包安全配额选项（`format`、`max_entries`、`max_entry_bytes`、`max_total_bytes`、`max_compression_ratio`）。
+
+### ArchiveError
+归档解包错误集（`UnsupportedFormat`、`CorruptArchive`、`ArchiveLimit`、`PathTraversal`、`OutOfMemory`），内置严密的 Zip-Slip 路径穿越防御。
+
+### ArchiveTree
+零落盘内存归档树结构（`initFromSlice`、`initFromReader`、`deinit`、`source`），解包后直接生成虚拟 `source.Source` 供 `searchTree` 检索。
+
+### tree
+重导出 `src/search/tree.zig`，提供面向虚拟目录树与内存归档的检索编排入口（`TreeConfig`、`searchTree`、`searchArchiveSlice`、`searchArchive`）。
+
+### TreeConfig
+虚拟树与归档检索配置（聚合 `SearchConfig`、`ArchiveOptions`、Glob/文件类型过滤、内存与分层 `.gitignore`/`.ignore`/`.rgignore` 开关及目录深度/文件数配额）。
+
+### searchTree
+在虚拟 `source.Source` 目录树上执行分层 `.gitignore` 过滤、Glob/类型筛选与多租户预算受控检索（绝不接收物理文件句柄 `std.Io.File` 或 `std.Io.Dir`）。
+
+### searchArchiveSlice
+直接对内存中的归档字节切片（`.tar` / `.tar.gz` / `.tar.zst` / `.tar.xz` / `.zip`）执行零落盘解包与多文件检索。
+
+### searchArchive
+直接对 `*std.Io.Reader` 归档字节流执行零落盘解包与多文件检索。
 
 ### walk_glob
 重导出 `src/walk/glob.zig`，提供支持嵌套花括号展开、条数/长度硬顶与忽略大小写的字节级 Glob 匹配器。
@@ -338,10 +407,10 @@ pub fn find(self: *Regex, haystack: []const u8, start: usize, mode: MatchMode) ?
 ## 八、全场景实战代码示例
 
 以下代码块完整演示了 5 个高频实战场景，并由 `build.zig` 自动抽取编译执行：
-1. **单字面量智能大小写搜索与 UTF-16 码元区间读取**（`searchSourceSlice`）
-2. **多模式文本解析（`Multi.initFromText`）与无状态分页暂停/续查**（`Flow.pause` + `resumeSourceSlice`）
-3. **线性时间正则匹配（`Regex`）与只读替换预览**（`SearchConfig.replacement`）
-4. **流式 `*std.Io.Reader` 搜索（`searchSource`）与拉式事件迭代器（`openSourcePull`）**
+1. **单字面量智能大小写搜索与 UTF-16 码元区间读取**（`searchSourceSlice` + `*const Finder`）
+2. **多模式文本解析（`Multi.initFromText`）、`pattern_id` 归因与无状态分页暂停/续查**（`Flow.pause` + `resumeSourceSlice`）
+3. **线性时间正则匹配（`Regex`）、多正则集合（`RegexSet`）与只读替换预览**（`SearchConfig.replacement`）
+4. **流式 `*std.Io.Reader` 搜索（`searchSource`）、切片拉式迭代（`openSourcePull`）与增量流式拉模式迭代（`openReaderPull`）**
 5. **Glob 嵌套花括号展开与忽略大小写过滤**（`walk_glob.compileGlobs` + `matchGlobs`）
 
 ```zig
@@ -354,6 +423,7 @@ const Recorder = struct {
     saw_summary: bool = false,
     matched_lines: usize = 0,
     first_u16_end: usize = 0,
+    last_pattern_id: u32 = 0,
     last_replaced: [64]u8 = undefined,
     last_replaced_len: usize = 0,
     pause_after_first: bool = false,
@@ -367,6 +437,7 @@ const Recorder = struct {
                 self.matched_lines += 1;
                 if (m.matches.len > 0) {
                     self.first_u16_end = m.matches[0].u16_end;
+                    self.last_pattern_id = m.matches[0].pattern_id orelse 0;
                 }
                 if (m.replaced) |rep| {
                     const n = @min(rep.len, self.last_replaced.len);
@@ -392,8 +463,8 @@ const Recorder = struct {
 test "API documentation example" {
     const allocator = std.testing.allocator;
 
-    // 1. 单字面量智能大小写切片搜索 + UTF-16 区间读取
-    var finder = try libwebgrep.Finder.init("needle", .{ .case = .smart });
+    // 1. 单字面量智能大小写切片搜索 (*const Finder) + UTF-16 区间读取
+    const finder = try libwebgrep.Finder.init("needle", .{ .case = .smart });
     var recorder = Recorder{};
     const input = "first line\nhello NEEDLE world\nlast line\n";
     const result = try libwebgrep.searchSourceSlice(
@@ -414,7 +485,7 @@ test "API documentation example" {
     try std.testing.expectEqual(@as(usize, 1), recorder.matched_lines);
     try std.testing.expectEqual(@as(usize, 12), recorder.first_u16_end);
 
-    // 2. 多字面量 OR 文本解析 + 暂停与无状态游标续查
+    // 2. 多字面量 OR 文本解析 + pattern_id + 暂停与无状态游标续查
     var many = try libwebgrep.Multi.initFromText(allocator, "WARN\nERROR\n", .{});
     defer many.deinit();
     var paged_sink = Recorder{ .pause_after_first = true };
@@ -429,6 +500,7 @@ test "API documentation example" {
     );
     try std.testing.expect(first_page.paused);
     try std.testing.expectEqual(@as(usize, 1), paged_sink.matched_lines);
+    try std.testing.expectEqual(@as(u32, 0), paged_sink.last_pattern_id);
 
     paged_sink.pause_after_first = false;
     const second_page = try libwebgrep.resumeSourceSlice(
@@ -442,8 +514,9 @@ test "API documentation example" {
     );
     try std.testing.expect(!second_page.paused);
     try std.testing.expectEqual(@as(u64, 2), second_page.matched_lines);
+    try std.testing.expectEqual(@as(u32, 1), paged_sink.last_pattern_id);
 
-    // 3. 线性时间正则搜索 + 只读替换预览
+    // 3. 线性时间正则搜索 + RegexSet + 只读替换预览
     var re = try libwebgrep.Regex.init(allocator, "ERR_[0-9]+", .{});
     defer re.deinit();
     var regex_sink = Recorder{};
@@ -455,7 +528,7 @@ test "API documentation example" {
         &re,
         .{
             .replacement = "REDACTED",
-            .decode_allocator = allocator,
+            .allocator = allocator,
         },
     );
     try std.testing.expectEqualStrings(
@@ -463,7 +536,13 @@ test "API documentation example" {
         regex_sink.last_replaced[0..regex_sink.last_replaced_len],
     );
 
-    // 4. 流式 Reader 搜索 + 拉式事件迭代器（SourcePull）
+    var re_set = try libwebgrep.regex.RegexSet.init(allocator, &.{ "ALPHA", "ERR_[0-9]+" }, .{});
+    defer re_set.deinit();
+    var set_ids: [4]u32 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), re_set.matches("code=ERR_404", &set_ids));
+    try std.testing.expectEqual(@as(u32, 1), set_ids[0]);
+
+    // 4. 流式 Reader 搜索 + 切片拉式迭代 (SourcePull) + 增量流式拉模式迭代 (ReaderPull)
     var reader = std.Io.Reader.fixed("stream NEEDLE line\n");
     var stream_sink = Recorder{};
     const stream_res = try libwebgrep.searchSource(
@@ -484,6 +563,15 @@ test "API documentation example" {
         if (ev.kind == .match) pull_matches += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), pull_matches);
+
+    var pull_reader_in = std.Io.Reader.fixed("chunk NEEDLE 1\nchunk NEEDLE 2\n");
+    var rpull = try libwebgrep.searcher.openReaderPull(allocator, &finder, "rpull-1", &pull_reader_in, .{});
+    defer rpull.deinit();
+    var rpull_matches: usize = 0;
+    while (try rpull.next()) |ev| {
+        if (ev.kind == .match) rpull_matches += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), rpull_matches);
 
     // 5. Glob 嵌套花括号展开与忽略大小写匹配
     var arena_state = std.heap.ArenaAllocator.init(allocator);

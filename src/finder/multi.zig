@@ -39,6 +39,7 @@ pub const Multi = struct {
     patterns: []const []const u8,
     owned_patterns: ?[][]const u8 = null,
     owned_variant_bytes: ?[][]u8 = null,
+    owned_pattern_ids: ?[]u32 = null,
     patterns_alloc: ?std.mem.Allocator = null,
 
     const Mixed = struct {
@@ -53,6 +54,12 @@ pub const Multi = struct {
         teddy: if (teddy_on) teddy_mod.Engine else void,
         mixed: Mixed,
     };
+
+    pub const scenario_bytes: []const []const u8 = &.{ "Q", "Z" };
+    pub const scenario_pairs: []const []const u8 = &.{ "NEEDLE", "ZXZQ" };
+    pub const scenario_teddy: []const []const u8 = digram_pats[0..17];
+    pub const scenario_ac: []const []const u8 = &digram_pats;
+    pub const fillScenarioText = @import("multi.zig").fillScenarioText;
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -184,6 +191,9 @@ pub const Multi = struct {
                 alloc.free(variants);
             }
         }
+        if (self.owned_pattern_ids) |ids| {
+            if (self.patterns_alloc) |alloc| alloc.free(ids);
+        }
         if (self.owned_patterns) |list| {
             if (self.patterns_alloc) |alloc| alloc.free(list);
         }
@@ -205,8 +215,27 @@ pub const Multi = struct {
         };
     }
 
-    pub fn resetStats(self: *Multi) void {
+    pub fn resetStats(self: *const Multi) void {
         _ = self;
+    }
+
+    inline fn mapPatternId(self: *const Multi, raw_id: ?u32) ?u32 {
+        const id = raw_id orelse return null;
+        if (self.owned_pattern_ids) |ids| {
+            if (id < ids.len) return ids[id];
+        }
+        return id;
+    }
+
+    inline fn withMappedId(self: *const Multi, hit: ?matcher.Match) ?matcher.Match {
+        var m = hit orelse return null;
+        m.pattern_id = self.mapPatternId(m.pattern_id);
+        return m;
+    }
+
+    inline fn bytePatternId(self: *const Multi, set: *const byteset.Set, byte: u8) ?u32 {
+        const raw = if (self.ignore_case) set.id_of[ascii.fold(byte)] else set.id_of[byte];
+        return self.mapPatternId(raw);
     }
 
     pub fn find(self: *const Multi, haystack: []const u8, start: usize, mode: matcher.MatchMode) ?matcher.Match {
@@ -214,53 +243,104 @@ pub const Multi = struct {
         switch (self.kind) {
             .bytes => |*set| {
                 const at = set.find(haystack, start) orelse return null;
-                return .{ .start = at, .end = at + 1 };
+                return .{ .start = at, .end = at + 1, .pattern_id = self.bytePatternId(set, haystack[at]) };
             },
-            .pairs => |*engine| return engine.find(haystack, start, mode),
-            .ac => |*ac| return ac.find(haystack, start, mode),
+            .pairs => |*engine| return self.withMappedId(engine.find(haystack, start, mode)),
+            .ac => |*ac| return self.withMappedId(ac.find(haystack, start, mode)),
             .teddy => |*engine| {
-                if (comptime teddy_on) return engine.find(haystack, start, mode);
+                if (comptime teddy_on) return self.withMappedId(engine.find(haystack, start, mode));
                 unreachable;
             },
             .mixed => unreachable,
         }
     }
 
-    /// Whether the line span equals any pattern, using each pattern's own case-folding rule.
-    pub fn acceptsSpan(self: *const Multi, haystack: []const u8, start: usize, end: usize) bool {
-        if (start > end or end > haystack.len) return false;
-        const span = haystack[start..end];
+    pub fn findReadOnly(self: *const Multi, haystack: []const u8, start: usize, mode: matcher.MatchMode) ?matcher.Match {
+        return self.find(haystack, start, mode);
+    }
+
+    /// Returns the full-span match (including `pattern_id`) if `span` equals any pattern.
+    pub fn matchSpan(self: *const Multi, span: []const u8, mode: matcher.MatchMode) ?matcher.Match {
+        var best: ?Naive = null;
         for (self.patterns, 0..) |pat, i| {
             const fold = self.foldOf(i);
             const matched = if (self.unicode_case and fold)
                 unicode_fold.eqlFolded(pat, span)
             else
                 ascii.eql(pat, span, fold);
-            if (matched) return true;
+            if (!matched) continue;
+            const pid = self.mapPatternId(@intCast(i)) orelse @as(u32, @intCast(i));
+            const cand = Naive{ .start = 0, .end = span.len, .id = pid };
+            if (best) |cur| {
+                if (better(cand, cur, mode)) best = cand;
+            } else best = cand;
         }
-        return false;
+        const found = best orelse return null;
+        return .{ .start = 0, .end = span.len, .pattern_id = found.id };
     }
 
-    /// Verifies each pattern individually so another pattern at the same start position can still pass `allow`.
-    /// Required for whole-word matching: an engine returns only one match per position, so if a shorter
-    /// pattern is rejected by a word boundary, a longer pattern at the same start may still succeed.
+    /// Whether the line span equals any pattern, using each pattern's own case-folding rule.
+    pub fn acceptsSpan(self: *const Multi, span: []const u8, mode: matcher.MatchMode) bool {
+        return self.matchSpan(span, mode) != null;
+    }
+
+    /// Verifies each pattern individually so another pattern at the same start position (or an overlapping
+    /// earlier-ending pattern in `.earliest` mode) can still pass `allow`.
     pub fn findAllowed(
-        self: *Multi,
+        self: *const Multi,
         haystack: []const u8,
         start: usize,
         mode: matcher.MatchMode,
-        comptime allow: fn ([]const u8, usize, usize) bool,
+        allow: anytype,
     ) ?matcher.Match {
         if (self.kind == .mixed) return self.scan(haystack, start, mode, allow);
+        if (start > haystack.len) return null;
+
+        // Fast path: if the primary engine match is allowed, it is already optimal for `mode`.
+        const first = self.find(haystack, start, mode) orelse return null;
+        if (callAllowAny(allow, haystack, first.start, first.end)) return first;
+
+        if (mode == .leftmost_first) {
+            if (self.checkAllowedAt(haystack, first.start, .leftmost_first, allow)) |alt| return alt;
+            if (first.start >= haystack.len) return null;
+            var pos = first.start + 1;
+            while (pos <= haystack.len) {
+                const hit = self.find(haystack, pos, .leftmost_first) orelse return null;
+                if (callAllowAny(allow, haystack, hit.start, hit.end)) return hit;
+                if (self.checkAllowedAt(haystack, hit.start, .leftmost_first, allow)) |alt| return alt;
+                if (hit.start >= haystack.len) return null;
+                pos = hit.start + 1;
+            }
+            return null;
+        }
+
+        // In `.earliest` mode, `first` may have started > `start` because a shorter pattern at `first.start`
+        // ended earlier than a longer (but allowed) pattern starting in `start .. first.start`.
+        // Step through leftmost candidate start positions until no future start can beat `best.end`.
+        var best: ?Naive = null;
         var pos = start;
         while (pos <= haystack.len) {
-            const hit = self.find(haystack, pos, mode) orelse return null;
-            if (allow(haystack, hit.start, hit.end)) return hit;
-            if (self.checkAllowedAt(haystack, hit.start, mode, allow)) |alt| {
-                return alt;
+            if (best) |cur| {
+                if (pos > cur.end) break;
             }
-            pos = hit.start + 1;
+            const l_hit = self.find(haystack, pos, .leftmost_first) orelse break;
+            if (best) |cur| {
+                if (l_hit.start > cur.end) break;
+            }
+            if (self.checkAllowedAt(haystack, l_hit.start, .earliest, allow)) |alt| {
+                const cand = Naive{
+                    .start = alt.start,
+                    .end = alt.end,
+                    .id = alt.pattern_id orelse 0,
+                };
+                if (best) |cur| {
+                    if (better(cand, cur, .earliest)) best = cand;
+                } else best = cand;
+            }
+            if (l_hit.start >= haystack.len) break;
+            pos = l_hit.start + 1;
         }
+        if (best) |found| return .{ .start = found.start, .end = found.end, .pattern_id = found.id };
         return null;
     }
 
@@ -269,15 +349,16 @@ pub const Multi = struct {
         haystack: []const u8,
         at: usize,
         mode: matcher.MatchMode,
-        comptime allow: fn ([]const u8, usize, usize) bool,
+        allow: anytype,
     ) ?matcher.Match {
         var best: ?Naive = null;
         for (self.patterns, 0..) |pat, id_usize| {
+            const pid = self.mapPatternId(@intCast(id_usize)) orelse @as(u32, @intCast(id_usize));
             const fold = self.foldOf(id_usize);
             if (self.unicode_case and fold) {
                 if (unicode_fold.matchFoldedPrefix(pat, haystack[at..])) |match_len| {
-                    if (allow(haystack, at, at + match_len)) {
-                        const cand = Naive{ .start = at, .end = at + match_len, .id = @intCast(id_usize) };
+                    if (callAllowAny(allow, haystack, at, at + match_len)) {
+                        const cand = Naive{ .start = at, .end = at + match_len, .id = pid };
                         if (best) |cur| {
                             if (better(cand, cur, mode)) best = cand;
                         } else best = cand;
@@ -287,13 +368,13 @@ pub const Multi = struct {
             }
             if (at + pat.len > haystack.len) continue;
             if (!ascii.eql(pat, haystack[at..][0..pat.len], fold)) continue;
-            if (!allow(haystack, at, at + pat.len)) continue;
-            const cand = Naive{ .start = at, .end = at + pat.len, .id = @intCast(id_usize) };
+            if (!callAllowAny(allow, haystack, at, at + pat.len)) continue;
+            const cand = Naive{ .start = at, .end = at + pat.len, .id = pid };
             if (best) |cur| {
                 if (better(cand, cur, mode)) best = cand;
             } else best = cand;
         }
-        if (best) |found| return .{ .start = found.start, .end = found.end };
+        if (best) |found| return .{ .start = found.start, .end = found.end, .pattern_id = found.id };
         return null;
     }
 
@@ -309,7 +390,7 @@ pub const Multi = struct {
         haystack: []const u8,
         start: usize,
         mode: matcher.MatchMode,
-        comptime allow: fn ([]const u8, usize, usize) bool,
+        allow: anytype,
     ) ?matcher.Match {
         if (start > haystack.len) return null;
         const flags: ?[]const bool = switch (self.kind) {
@@ -320,11 +401,12 @@ pub const Multi = struct {
         var i = start;
         while (i <= haystack.len) : (i += 1) {
             for (self.patterns, 0..) |pat, id_usize| {
+                const pid = self.mapPatternId(@intCast(id_usize)) orelse @as(u32, @intCast(id_usize));
                 const fold = if (flags) |list| list[id_usize] else self.ignore_case;
                 if (self.unicode_case and fold) {
                     if (unicode_fold.matchFoldedPrefix(pat, haystack[i..])) |match_len| {
-                        if (allow(haystack, i, i + match_len)) {
-                            const cand = Naive{ .start = i, .end = i + match_len, .id = @intCast(id_usize) };
+                        if (callAllowAny(allow, haystack, i, i + match_len)) {
+                            const cand = Naive{ .start = i, .end = i + match_len, .id = pid };
                             if (best) |cur| {
                                 if (better(cand, cur, mode)) best = cand;
                             } else best = cand;
@@ -334,43 +416,41 @@ pub const Multi = struct {
                 }
                 if (i + pat.len > haystack.len) continue;
                 if (!ascii.eql(pat, haystack[i..][0..pat.len], fold)) continue;
-                if (!allow(haystack, i, i + pat.len)) continue;
-                const cand = Naive{ .start = i, .end = i + pat.len, .id = @intCast(id_usize) };
+                if (!callAllowAny(allow, haystack, i, i + pat.len)) continue;
+                const cand = Naive{ .start = i, .end = i + pat.len, .id = pid };
                 if (best) |cur| {
                     if (better(cand, cur, mode)) best = cand;
                 } else best = cand;
             }
             if (mode == .leftmost_first) {
-                if (best) |cand| return .{ .start = cand.start, .end = cand.end };
+                if (best) |cand| return .{ .start = cand.start, .end = cand.end, .pattern_id = cand.id };
             } else if (best) |cand| {
-                if (i >= cand.end) return .{ .start = cand.start, .end = cand.end };
+                if (i >= cand.end) return .{ .start = cand.start, .end = cand.end, .pattern_id = cand.id };
             }
         }
         const found = best orelse return null;
-        return .{ .start = found.start, .end = found.end };
+        return .{ .start = found.start, .end = found.end, .pattern_id = found.id };
     }
 
-    pub fn findWatched(self: *Multi, haystack: []const u8, start: usize, nul: *?usize) ?matcher.Match {
+    pub fn findWatched(self: *const Multi, haystack: []const u8, start: usize, nul: *?usize) ?matcher.Match {
         switch (self.kind) {
             .bytes => |*set| {
                 const at = set.findWatchingNul(haystack, start, nul) orelse return null;
-                return .{ .start = at, .end = at + 1 };
+                return .{ .start = at, .end = at + 1, .pattern_id = self.bytePatternId(set, haystack[at]) };
             },
-            .pairs => |*engine| return engine.findWatchingNul(haystack, start, .earliest, nul),
-            .ac => |*ac| return ac.findWatchingNul(haystack, start, .earliest, nul),
+            .pairs => |*engine| return self.withMappedId(engine.findWatchingNul(haystack, start, .earliest, nul)),
+            .ac => |*ac| return self.withMappedId(ac.findWatchingNul(haystack, start, .earliest, nul)),
             .teddy => |*engine| {
-                if (comptime teddy_on) return engine.findWatchingNul(haystack, start, .earliest, nul);
+                if (comptime teddy_on) return self.withMappedId(engine.findWatchingNul(haystack, start, .earliest, nul));
                 unreachable;
             },
             .mixed => {
                 const hit = self.scan(haystack, start, .earliest, allowAll);
-                const limit = if (hit) |item| item.start else haystack.len;
+                const limit = if (hit) |item| @min(haystack.len, @max(start, item.end)) else haystack.len;
                 if (start < limit) {
-                    if (memchr.find(memchr.native_width, haystack, start, 0)) |at| {
-                        if (at < limit) {
-                            nul.* = at;
-                            return null;
-                        }
+                    if (memchr.find(memchr.native_width, haystack[0..limit], start, 0)) |at| {
+                        nul.* = at;
+                        return null;
                     }
                 }
                 return hit;
@@ -378,6 +458,14 @@ pub const Multi = struct {
         }
     }
 };
+
+inline fn callAllowAny(allow: anytype, haystack: []const u8, start: usize, end: usize) bool {
+    const T = @TypeOf(allow);
+    if (@typeInfo(T) == .@"fn" or (@typeInfo(T) == .pointer and @typeInfo(@typeInfo(T).pointer.child) == .@"fn")) {
+        return allow(haystack, start, end);
+    }
+    return matcher.callAllow(allow, haystack, start, end);
+}
 
 fn allowAll(haystack: []const u8, start: usize, end: usize) bool {
     _ = haystack;
@@ -435,38 +523,63 @@ fn initUnicodeFolded(
     }
     var variant_flags = std.ArrayList(bool).empty;
     defer variant_flags.deinit(allocator);
+    var variant_ids = std.ArrayList(u32).empty;
+    errdefer variant_ids.deinit(allocator);
 
-    for (patterns) |pat| {
+    for (patterns, 0..) |pat, orig_idx| {
+        const orig_id: u32 = @intCast(orig_idx);
         const ig = patternIgnoresCaseUnicode(pat, options.case);
         if (ig and unicode_fold.needsUnicodeExpansion(pat)) {
             const before = variant_bytes.items.len;
             try unicode_fold.expandPatternVariants(allocator, pat, &variant_bytes, max_variants_per_pattern);
             const added = variant_bytes.items.len - before;
             try variant_flags.appendNTimes(allocator, true, added);
+            try variant_ids.appendNTimes(allocator, orig_id, added);
         } else {
             const copy = try allocator.dupe(u8, pat);
             errdefer allocator.free(copy);
             try variant_bytes.append(allocator, copy);
             try variant_flags.append(allocator, ig);
+            try variant_ids.append(allocator, orig_id);
         }
+    }
+
+    // Check pattern count and byte limits on the expanded variants BEFORE allocating owned slices.
+    var within_limits = variant_bytes.items.len <= matcher.patternCountLimit(options);
+    if (within_limits) {
+        const byte_limit = matcher.patternBytesLimit(options);
+        var total: usize = 0;
+        for (variant_bytes.items) |v| {
+            total = std.math.add(usize, total, v.len) catch {
+                within_limits = false;
+                break;
+            };
+            if (total > byte_limit) {
+                within_limits = false;
+                break;
+            }
+        }
+    }
+    if (!within_limits) {
+        for (variant_bytes.items) |v| allocator.free(v);
+        variant_bytes.deinit(allocator);
+        variant_bytes = .empty;
+        variant_ids.deinit(allocator);
+        variant_ids = .empty;
+        return initUnicodeFallback(allocator, patterns, options);
     }
 
     const owned_slices = try allocator.alloc([]const u8, variant_bytes.items.len);
     errdefer allocator.free(owned_slices);
     for (variant_bytes.items, 0..) |v, i| owned_slices[i] = v;
 
-    matcher.checkPatternLimits(owned_slices, options) catch {
-        allocator.free(owned_slices);
-        for (variant_bytes.items) |v| allocator.free(v);
-        variant_bytes.deinit(allocator);
-        return initUnicodeFallback(allocator, patterns, options);
-    };
-
     const owned_variants = try variant_bytes.toOwnedSlice(allocator);
     errdefer {
         for (owned_variants) |v| allocator.free(v);
         allocator.free(owned_variants);
     }
+    const owned_ids = try variant_ids.toOwnedSlice(allocator);
+    errdefer allocator.free(owned_ids);
 
     var all_same = true;
     const first_flag = if (variant_flags.items.len > 0) variant_flags.items[0] else true;
@@ -485,6 +598,7 @@ fn initUnicodeFolded(
         res.unicode_case = true;
         res.owned_patterns = owned_slices;
         res.owned_variant_bytes = owned_variants;
+        res.owned_pattern_ids = owned_ids;
         res.patterns_alloc = allocator;
         return res;
     }
@@ -501,6 +615,7 @@ fn initUnicodeFolded(
         .patterns = owned_slices,
         .owned_patterns = owned_slices,
         .owned_variant_bytes = owned_variants,
+        .owned_pattern_ids = owned_ids,
         .patterns_alloc = allocator,
     };
 }
@@ -626,7 +741,7 @@ fn naive(
         }
     }
     const found = best orelse return null;
-    return .{ .start = found.start, .end = found.end };
+    return .{ .start = found.start, .end = found.end, .pattern_id = found.id };
 }
 
 fn better(a: Naive, b: Naive, mode: matcher.MatchMode) bool {
@@ -1039,7 +1154,68 @@ test "Unicode case folding applies smart case per pattern" {
     });
     defer deep_uni.deinit();
     try std.testing.expectEqual(@as(usize, 2), deep_uni.find("xxΑΒΓΔΕΖΗyy", 0, .earliest).?.start);
-    try std.testing.expect(deep_uni.acceptsSpan("ΑβΓδΕζΗ", 0, "ΑβΓδΕζΗ".len));
+    try std.testing.expect(deep_uni.acceptsSpan("ΑβΓδΕζΗ", .earliest));
+}
+
+test "Multi pattern_id attribution and Challenger bug regressions" {
+    // 1. Challenger Bug 1: findAllowed in .earliest mode with overlapping/co-starting patterns
+    var allow_multi = try Multi.init(std.testing.allocator, &.{ "foobar", "foo" }, .{});
+    defer allow_multi.deinit();
+    const RejectLong = struct {
+        pub fn allow(_: @This(), _: []const u8, s: usize, e: usize) bool {
+            return (e - s) == 3;
+        }
+    };
+    const allowed_hit = allow_multi.findAllowed("foobar", 0, .earliest, RejectLong{}).?;
+    try std.testing.expectEqual(@as(usize, 0), allowed_hit.start);
+    try std.testing.expectEqual(@as(usize, 3), allowed_hit.end);
+    try std.testing.expectEqual(@as(?u32, 1), allowed_hit.pattern_id);
+
+    // 2. Challenger Bug 2: pairs >8 digram hash buckets NUL watching before vs after match
+    const nine_pats = [_][]const u8{
+        "p0_aa", "p1_bb", "p2_cc", "p3_dd", "p4_ee",
+        "p5_ff", "p6_gg", "p7_hh", "p8_ii",
+    };
+    var nine_multi = try Multi.init(std.testing.allocator, &nine_pats, .{});
+    defer nine_multi.deinit();
+    var nul_before: ?usize = null;
+    try std.testing.expect(nine_multi.findWatched("xx\x00yy p8_ii", 0, &nul_before) == null);
+    try std.testing.expectEqual(@as(?usize, 2), nul_before);
+
+    var nul_after: ?usize = null;
+    const hit_after = nine_multi.findWatched("p8_ii\x00zz", 0, &nul_after).?;
+    try std.testing.expectEqual(@as(usize, 0), hit_after.start);
+    try std.testing.expectEqual(@as(usize, 5), hit_after.end);
+    try std.testing.expectEqual(@as(?u32, 8), hit_after.pattern_id);
+
+    // 3. Challenger Bug 3: Aho-Corasick NUL inside 16-byte scalar step window before 64-byte SIMD skip
+    var ac_pats: [35][]const u8 = undefined;
+    var ac_bufs: [35][6]u8 = undefined;
+    for (0..35) |i| {
+        _ = try std.fmt.bufPrint(&ac_bufs[i], "pat{d:0>2}x", .{i});
+        ac_pats[i] = &ac_bufs[i];
+    }
+    var ac_multi = try Multi.init(std.testing.allocator, &ac_pats, .{});
+    defer ac_multi.deinit();
+    var ac_hay: [96]u8 = @splat('p');
+    ac_hay[5] = 0; // NUL inside the 16-byte scalar window triggered by 'p' prefix
+    var ac_nul: ?usize = null;
+    try std.testing.expect(ac_multi.findWatched(&ac_hay, 0, &ac_nul) == null);
+    try std.testing.expectEqual(@as(?usize, 5), ac_nul);
+
+    // 4. Challenger Bug 4: initUnicodeFolded OOM safety without double-free
+    var fail_idx: usize = 0;
+    while (fail_idx < 16) : (fail_idx += 1) {
+        var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_idx });
+        if (Multi.init(fa.allocator(), &.{ "δelta", "σigma", "αβγδεζη" }, .{
+            .case = .insensitive,
+            .unicode_case = true,
+        })) |*m| {
+            var mut_m = m.*;
+            mut_m.deinit();
+            break;
+        } else |_| {}
+    }
 }
 
 fn fuzzMulti(_: void, smith: *std.testing.Smith) !void {

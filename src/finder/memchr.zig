@@ -126,8 +126,28 @@ pub fn count(comptime width: comptime_int, haystack: []const u8, start: usize, e
     return total;
 }
 
+pub fn findWithWidth(comptime width: comptime_int, haystack: []const u8, start: usize, needle: u8) ?usize {
+    return find(width, haystack, start, needle);
+}
+
+pub fn findEitherWithWidth(comptime width: comptime_int, haystack: []const u8, start: usize, a: u8, b: u8) ?usize {
+    return findEither(width, haystack, start, a, b);
+}
+
+pub fn findLastWithWidth(comptime width: comptime_int, haystack: []const u8, start: usize, end: usize, needle: u8) ?usize {
+    return findLast(width, haystack, start, end, needle);
+}
+
+pub fn countWithWidth(comptime width: comptime_int, haystack: []const u8, start: usize, end: usize, needle: u8) usize {
+    return count(width, haystack, start, end, needle);
+}
+
+pub fn findAnyWithWidth(comptime width: comptime_int, haystack: []const u8, start: usize, a: u8, b: u8, c: u8) ?AnyHit {
+    return findAny(width, haystack, start, a, b, c);
+}
+
 fn checkWidth(comptime width: comptime_int) void {
-    if (width != 16 and width != 32) @compileError("memchr width must be 16 or 32");
+    if (width != 16 and width != 32 and width != 64) @compileError("memchr width must be 16, 32, or 64");
 }
 
 pub const AnyHit = struct { index: usize, byte: u8 };
@@ -224,6 +244,13 @@ fn scalarEither(haystack: []const u8, start: usize, end: usize, a: u8, b: u8) ?u
 }
 
 fn firstIn(comptime width: comptime_int, block: @Vector(width, u8), a: u8, b: u8) ?usize {
+    if (width == 64) {
+        const quarters: [4]@Vector(16, u8) = @bitCast(block);
+        inline for (0..4) |q| {
+            if (indexFromMask(mask16(quarters[q], a, b))) |rel| return q * 16 + rel;
+        }
+        return null;
+    }
     if (width == 32) {
         const halves: [2]@Vector(16, u8) = @bitCast(block);
         if (indexFromMask(mask16(halves[0], a, b))) |rel| return rel;
@@ -234,6 +261,14 @@ fn firstIn(comptime width: comptime_int, block: @Vector(width, u8), a: u8, b: u8
 }
 
 fn lastIn(comptime width: comptime_int, block: @Vector(width, u8), needle: u8) ?usize {
+    if (width == 64) {
+        const quarters: [4]@Vector(16, u8) = @bitCast(block);
+        if (lastFromMask(mask16(quarters[3], needle, needle))) |rel| return 48 + rel;
+        if (lastFromMask(mask16(quarters[2], needle, needle))) |rel| return 32 + rel;
+        if (lastFromMask(mask16(quarters[1], needle, needle))) |rel| return 16 + rel;
+        if (lastFromMask(mask16(quarters[0], needle, needle))) |rel| return rel;
+        return null;
+    }
     if (width == 32) {
         const halves: [2]@Vector(16, u8) = @bitCast(block);
         if (lastFromMask(mask16(halves[1], needle, needle))) |rel| return 16 + rel;
@@ -244,6 +279,13 @@ fn lastIn(comptime width: comptime_int, block: @Vector(width, u8), needle: u8) ?
 }
 
 fn countIn(comptime width: comptime_int, block: @Vector(width, u8), needle: u8) usize {
+    if (width == 64) {
+        const quarters: [4]@Vector(16, u8) = @bitCast(block);
+        return countMask(mask16(quarters[0], needle, needle)) +
+            countMask(mask16(quarters[1], needle, needle)) +
+            countMask(mask16(quarters[2], needle, needle)) +
+            countMask(mask16(quarters[3], needle, needle));
+    }
     if (width == 32) {
         const halves: [2]@Vector(16, u8) = @bitCast(block);
         return countMask(mask16(halves[0], needle, needle)) + countMask(mask16(halves[1], needle, needle));
@@ -321,7 +363,7 @@ fn scalarCount(haystack: []const u8, start: usize, end: usize, needle: u8) usize
 }
 
 test "empty input and out-of-bounds start" {
-    inline for (.{ 16, 32 }) |w| {
+    inline for (.{ 16, 32, 64 }) |w| {
         try std.testing.expectEqual(@as(?usize, null), find(w, "", 0, 'a'));
         try std.testing.expectEqual(@as(?usize, null), find(w, "abc", 3, 'a'));
         try std.testing.expectEqual(@as(?usize, null), find(w, "abc", 4, 'a'));
@@ -331,9 +373,9 @@ test "empty input and out-of-bounds start" {
 }
 
 test "finds and counts accurately at every offset" {
-    var buf: [96]u8 = undefined;
+    var buf: [192]u8 = undefined;
     @memset(&buf, '.');
-    inline for (.{ 16, 32 }) |w| {
+    inline for (.{ 16, 32, 64 }) |w| {
         for (0..buf.len) |at| {
             buf[at] = 'Q';
             try std.testing.expectEqual(@as(?usize, at), find(w, &buf, 0, 'Q'));
@@ -348,14 +390,14 @@ test "finds and counts accurately at every offset" {
 }
 
 test "multiple hits within the same vector" {
-    var buf: [32]u8 = undefined;
+    var buf: [64]u8 = undefined;
     @memset(&buf, 0);
-    const hits = [_]usize{ 0, 1, 7, 8, 15, 16, 31 };
+    const hits = [_]usize{ 0, 1, 7, 8, 15, 16, 31, 32, 63 };
     for (hits) |at| buf[at] = 1;
-    inline for (.{ 16, 32 }) |w| {
+    inline for (.{ 16, 32, 64 }) |w| {
         try std.testing.expectEqual(@as(?usize, 0), find(w, &buf, 0, 1));
         try std.testing.expectEqual(@as(?usize, 1), find(w, &buf, 1, 1));
-        try std.testing.expectEqual(@as(?usize, 31), findLast(w, &buf, 0, buf.len, 1));
+        try std.testing.expectEqual(@as(?usize, 63), findLast(w, &buf, 0, buf.len, 1));
         try std.testing.expectEqual(@as(?usize, 15), findLast(w, &buf, 0, 16, 1));
         try std.testing.expectEqual(hits.len, count(w, &buf, 0, buf.len, 1));
         try std.testing.expectEqual(@as(usize, 5), count(w, &buf, 0, 16, 1));
@@ -363,29 +405,29 @@ test "multiple hits within the same vector" {
 }
 
 test "three candidate bytes: earliest occurrence wins" {
-    var buf: [80]u8 = undefined;
+    var buf: [160]u8 = undefined;
     @memset(&buf, 'a');
     buf[5] = 0;
-    buf[40] = 'Z';
-    inline for (.{ 16, 32 }) |w| {
+    buf[80] = 'Z';
+    inline for (.{ 16, 32, 64 }) |w| {
         const nul = findAny(w, &buf, 0, 'Z', 0, 0).?;
         try std.testing.expectEqual(@as(usize, 5), nul.index);
         try std.testing.expectEqual(@as(u8, 0), nul.byte);
         const later = findAny(w, &buf, 6, 'Z', 0, 'Q').?;
-        try std.testing.expectEqual(@as(usize, 40), later.index);
+        try std.testing.expectEqual(@as(usize, 80), later.index);
         try std.testing.expectEqual(@as(u8, 'Z'), later.byte);
-        try std.testing.expect(findAny(w, &buf, 41, 'Z', 0, 'Q') == null);
+        try std.testing.expect(findAny(w, &buf, 81, 'Z', 0, 'Q') == null);
     }
 }
 
 test "two candidate bytes" {
-    var buf: [40]u8 = undefined;
+    var buf: [140]u8 = undefined;
     @memset(&buf, 'a');
     buf[3] = 'B';
-    buf[20] = 'b';
-    inline for (.{ 16, 32 }) |w| {
+    buf[70] = 'b';
+    inline for (.{ 16, 32, 64 }) |w| {
         try std.testing.expectEqual(@as(?usize, 3), findEither(w, &buf, 0, 'b', 'B'));
-        try std.testing.expectEqual(@as(?usize, 20), findEither(w, &buf, 4, 'b', 'B'));
+        try std.testing.expectEqual(@as(?usize, 70), findEither(w, &buf, 4, 'b', 'B'));
         try std.testing.expectEqual(@as(?usize, null), findEither(w, &buf, 0, 'z', 'Z'));
     }
 }
@@ -399,7 +441,7 @@ test "matches scalar and std.mem.findScalarPos" {
         const needle = random.int(u8);
         const start = random.intRangeAtMost(usize, 0, buf.len);
         const end = random.intRangeAtMost(usize, start, buf.len);
-        inline for (.{ 16, 32 }) |w| {
+        inline for (.{ 16, 32, 64 }) |w| {
             try std.testing.expectEqual(scalarFind(&buf, start, needle), find(w, &buf, start, needle));
             try std.testing.expectEqual(std.mem.findScalarPos(u8, &buf, start, needle), find(w, &buf, start, needle));
             try std.testing.expectEqual(scalarCount(&buf, start, end, needle), count(w, &buf, start, end, needle));
@@ -424,7 +466,7 @@ fn fuzzMemchr(_: void, smith: *std.testing.Smith) !void {
     const needle = smith.value(u8);
     const start: usize = if (n == 0) 0 else smith.valueRangeAtMost(u32, 0, @intCast(n));
     const end: usize = if (start == n) n else smith.valueRangeAtMost(u32, @intCast(start), @intCast(n));
-    inline for (.{ 16, 32 }) |w| {
+    inline for (.{ 16, 32, 64 }) |w| {
         try std.testing.expectEqual(scalarFind(hay, start, needle), find(w, hay, start, needle));
         try std.testing.expectEqual(scalarCount(hay, start, end, needle), count(w, hay, start, end, needle));
     }

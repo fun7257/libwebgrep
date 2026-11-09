@@ -303,6 +303,7 @@ fn benchRegex(gpa: std.mem.Allocator, tracker: *BenchTracker, buf: []u8) !void {
         "regex_utf8_class",
         "regex_captures",
         "regex_replace_template",
+        "regex_set_matches",
     })) return;
 
     fillAlphabet(buf);
@@ -338,6 +339,31 @@ fn benchRegex(gpa: std.mem.Allocator, tracker: *BenchTracker, buf: []u8) !void {
         var ctx = RegexReplaceCtx{ .gpa = gpa, .data = buf, .re = &re_rep };
         try report(tracker, "regex_replace_template", buf.len, 1, regexReplaceRun, &ctx);
     }
+
+    if (tracker.wants("regex_set_matches")) {
+        var re_set = try internal.RegexSet.init(gpa, &.{
+            "ALPHA_TOKEN",
+            "BETA_TOKEN",
+            "libwebcore[0-9]{2}grep",
+        }, .{});
+        defer re_set.deinit();
+        var ctx = RegexSetCtx{ .data = buf, .set = &re_set };
+        try report(tracker, "regex_set_matches", buf.len, 1, regexSetRun, &ctx);
+    }
+}
+
+const RegexSetCtx = struct {
+    data: []u8,
+    set: *internal.RegexSet,
+};
+
+fn regexSetRun(ctx: *RegexSetCtx) !usize {
+    ctx.data[0] ^= 1;
+    defer ctx.data[0] ^= 1;
+    var ids: [4]u32 = undefined;
+    const n = ctx.set.matches(ctx.data, &ids);
+    if (n != 1 or ids[0] != 2) return error.UnexpectedMatch;
+    return n;
 }
 
 const RegexCapCtx = struct {
@@ -498,7 +524,12 @@ fn resumeUtf16Run(ctx: *ResumeUtf16Ctx) !usize {
 }
 
 fn benchStreaming(gpa: std.mem.Allocator, tracker: *BenchTracker, buf: []u8) !void {
-    if (!tracker.wantsAny(&.{ "stream_auto_sniff", "service_ndjson_filter" })) return;
+    if (!tracker.wantsAny(&.{
+        "stream_auto_sniff",
+        "service_ndjson_filter",
+        "pull_reader_stream",
+        "archive_search_slice",
+    })) return;
 
     internal.multi.fillScenarioText(buf);
     var finder = try internal.Finder.init("NEEDLE", .{});
@@ -511,6 +542,23 @@ fn benchStreaming(gpa: std.mem.Allocator, tracker: *BenchTracker, buf: []u8) !vo
     if (tracker.wants("service_ndjson_filter")) {
         var ctx = ServiceJsonCtx{ .data = buf, .finder = &finder };
         try report(tracker, "service_ndjson_filter", buf.len, 1, serviceJsonRun, &ctx);
+    }
+
+    if (tracker.wants("pull_reader_stream")) {
+        var ctx = StreamAutoCtx{ .gpa = gpa, .data = buf, .finder = &finder };
+        try report(tracker, "pull_reader_stream", buf.len, 1, pullReaderRun, &ctx);
+    }
+
+    if (tracker.wants("archive_search_slice")) {
+        const tar_bytes = try buildBenchTarAlloc(gpa);
+        defer gpa.free(tar_bytes);
+        var ctx = ArchiveSliceCtx{
+            .gpa = gpa,
+            .io = tracker.io,
+            .tar_bytes = tar_bytes,
+            .finder = &finder,
+        };
+        try report(tracker, "archive_search_slice", tar_bytes.len, 1, archiveSliceRun, &ctx);
     }
 }
 
@@ -541,6 +589,74 @@ fn streamAutoRun(ctx: *StreamAutoCtx) !usize {
     );
     if (result.matched_lines != 1) return error.UnexpectedMatch;
     return 1;
+}
+
+fn pullReaderRun(ctx: *StreamAutoCtx) !usize {
+    ctx.data[0] ^= 1;
+    defer ctx.data[0] ^= 1;
+    var reader = std.Io.Reader.fixed(ctx.data);
+    var pull = try internal.openReaderPull(
+        ctx.gpa,
+        ctx.finder,
+        "pull.txt",
+        &reader,
+        .{
+            .buffer_size = 256 * 1024,
+            .max_source_bytes = bytes_64m,
+            .max_request_bytes = bytes_64m,
+        },
+    );
+    defer pull.deinit();
+    var matches: usize = 0;
+    while (try pull.next()) |ev| {
+        if (ev.kind == .match) matches += 1;
+    }
+    if (matches != 1) return error.UnexpectedMatch;
+    return matches;
+}
+
+const ArchiveSliceCtx = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    tar_bytes: []const u8,
+    finder: *internal.Finder,
+};
+
+fn archiveSliceRun(ctx: *ArchiveSliceCtx) !usize {
+    var sink = ServiceNopSink{};
+    const summary = try internal.searchArchiveSlice(
+        ServiceNopSink,
+        ctx.gpa,
+        ctx.io,
+        &sink,
+        ctx.tar_bytes,
+        ctx.finder,
+        .{},
+    );
+    if (summary.matched_lines != 1) return error.UnexpectedMatch;
+    return 1;
+}
+
+fn buildBenchTarAlloc(gpa: std.mem.Allocator) ![]u8 {
+    const file_count = 64;
+    const file_size = 16 * 1024;
+    var entries: [file_count]internal.archive.TestArchiveEntry = undefined;
+    var names: [file_count][16]u8 = undefined;
+    var body_normal: [file_size]u8 = undefined;
+    @memset(&body_normal, 'a');
+    var at: usize = 63;
+    while (at < body_normal.len) : (at += 64) body_normal[at] = '\n';
+    var body_hit = body_normal;
+    @memcpy(body_hit[body_hit.len - sweep_tail.len ..], sweep_tail);
+
+    for (0..file_count) |i| {
+        const name = try std.fmt.bufPrint(&names[i], "src/f{d:0>2}.txt", .{i});
+        entries[i] = .{
+            .path = name,
+            .data = if (i + 1 == file_count) &body_hit else &body_normal,
+        };
+    }
+    return internal.archive.buildTestTarAlloc(gpa, &entries);
 }
 
 const ServiceJsonCtx = struct {

@@ -62,15 +62,15 @@ pub const Finder = struct {
 
     /// For a single literal, `earliest` and `leftmost_first` produce the same match.
     /// Kept separate from NUL watching so it can be inlined into tight search loops on dense hits.
-    pub fn find(self: *Finder, haystack: []const u8, start: usize, mode: matcher.MatchMode) ?matcher.Match {
+    pub fn find(self: *const Finder, haystack: []const u8, start: usize, mode: matcher.MatchMode) ?matcher.Match {
         _ = mode;
         if (self.unicode_folded) {
             const hit = unicode_fold.findFolded(haystack, self.pattern, start) orelse return null;
-            return .{ .start = hit.start, .end = hit.end };
+            return .{ .start = hit.start, .end = hit.end, .pattern_id = null };
         }
         switch (self.kind) {
             .empty => {
-                if (start <= haystack.len) return .{ .start = start, .end = start };
+                if (start <= haystack.len) return .{ .start = start, .end = start, .pattern_id = null };
                 return null;
             },
             .byte => |needle| {
@@ -79,7 +79,7 @@ pub const Finder = struct {
                     break :blk memchr.findEither(memchr.native_width, haystack, start, forms[0], forms[1]);
                 } else memchr.find(memchr.native_width, haystack, start, needle);
                 const i = at orelse return null;
-                return .{ .start = i, .end = i + 1 };
+                return .{ .start = i, .end = i + 1, .pattern_id = null };
             },
             .pair => return self.findPair(haystack, start),
         }
@@ -87,67 +87,34 @@ pub const Finder = struct {
 
     /// Read-only variant of `find` that accepts `*const Finder` without mutating telemetry fields.
     pub fn findReadOnly(self: *const Finder, haystack: []const u8, start: usize, mode: matcher.MatchMode) ?matcher.Match {
-        _ = mode;
-        if (self.unicode_folded) {
-            const hit = unicode_fold.findFolded(haystack, self.pattern, start) orelse return null;
-            return .{ .start = hit.start, .end = hit.end };
-        }
-        switch (self.kind) {
-            .empty => {
-                if (start <= haystack.len) return .{ .start = start, .end = start };
-                return null;
-            },
-            .byte => |needle| {
-                const at = if (self.ignore_case) blk: {
-                    const forms = ascii.caseVariants(needle);
-                    break :blk memchr.findEither(memchr.native_width, haystack, start, forms[0], forms[1]);
-                } else memchr.find(memchr.native_width, haystack, start, needle);
-                const i = at orelse return null;
-                return .{ .start = i, .end = i + 1 };
-            },
-            .pair => |*pair| {
-                const m = pair.pattern.len;
-                if (@atomicLoad(bool, &self.use_two_way, .monotonic)) return self.findLinear(haystack, start, m);
-                if (m > haystack.len or start > haystack.len - m) return null;
-                var guard: packed_pair.Guard = .{};
-                const watch = m > packed_pair.owns_search_max_len and self.fp_threshold < 1;
-                if (pair.find(memchr.native_width, haystack, start, if (watch) &guard else null)) |pos| {
-                    return .{ .start = pos, .end = pos + m };
-                }
-                if (guard.gave_up) {
-                    return self.findLinear(haystack, guard.restart, m);
-                }
-                return null;
-            },
-        }
+        return self.find(haystack, start, mode);
     }
 
-    /// Same as `find`, additionally writing the first NUL within the scanned span to `nul`.
-    /// When returning a match, only guarantees no NUL precedes the match start.
-    pub fn findWatched(self: *Finder, haystack: []const u8, start: usize, nul: *?usize) ?matcher.Match {
+    /// Same as `find`, additionally writing the first NUL preceding or inside the match (or in the scanned span when no match is found) to `nul`.
+    pub fn findWatched(self: *const Finder, haystack: []const u8, start: usize, nul: *?usize) ?matcher.Match {
         if (self.unicode_folded) {
             const hit = unicode_fold.findFolded(haystack, self.pattern, start);
-            const limit = if (hit) |item| item.start else haystack.len;
+            const limit = if (hit) |item| @min(haystack.len, @max(start, item.end)) else haystack.len;
             if (start < limit) {
-                if (memchr.find(memchr.native_width, haystack, start, 0)) |at| {
-                    if (at < limit) {
-                        nul.* = at;
-                        return null;
-                    }
+                if (memchr.find(memchr.native_width, haystack[0..limit], start, 0)) |at| {
+                    nul.* = at;
+                    return null;
                 }
             }
             const found = hit orelse return null;
-            return .{ .start = found.start, .end = found.end };
+            return .{ .start = found.start, .end = found.end, .pattern_id = null };
         }
         switch (self.kind) {
             .empty => {
-                if (start < haystack.len) {
-                    if (memchr.find(memchr.native_width, haystack, start, 0)) |at| nul.* = at;
-                }
-                if (start <= haystack.len) return .{ .start = start, .end = start };
+                if (start <= haystack.len) return .{ .start = start, .end = start, .pattern_id = null };
                 return null;
             },
             .byte => |needle| {
+                if (needle == 0 and !self.ignore_case) {
+                    const i = memchr.find(memchr.native_width, haystack, start, 0) orelse return null;
+                    nul.* = i;
+                    return null;
+                }
                 const hit = if (self.ignore_case) blk: {
                     const forms = ascii.caseVariants(needle);
                     break :blk memchr.findAny(memchr.native_width, haystack, start, forms[0], forms[1], 0);
@@ -158,7 +125,7 @@ pub const Finder = struct {
                     nul.* = found.index;
                     return null;
                 }
-                return .{ .start = found.index, .end = found.index + 1 };
+                return .{ .start = found.index, .end = found.index + 1, .pattern_id = null };
             },
             .pair => return self.findPairWatched(haystack, start, nul),
         }
@@ -170,20 +137,14 @@ pub const Finder = struct {
         return .{ .bytes = self.pattern, .offset_in_match = 0 };
     }
 
-    /// Called at the start of each new input so false positives from a previous input do not lock this input into Two-Way.
-    pub fn resetStats(self: *Finder) void {
-        @atomicStore(u32, &self.candidates, 0, .monotonic);
-        @atomicStore(u32, &self.confirms, 0, .monotonic);
-        @atomicStore(bool, &self.use_two_way, false, .monotonic);
+    /// Resets any per-input state. Retained as a no-op since `Finder` uses stack-local adaptive guards per search call.
+    pub fn resetStats(self: *const Finder) void {
+        _ = self;
     }
 
-    fn findPair(self: *Finder, haystack: []const u8, start: usize) ?matcher.Match {
+    fn findPair(self: *const Finder, haystack: []const u8, start: usize) ?matcher.Match {
         const pair = &self.kind.pair;
         const m = pair.pattern.len;
-        if (@atomicLoad(bool, &self.use_two_way, .monotonic)) {
-            @branchHint(.cold);
-            return self.findLinear(haystack, start, m);
-        }
         if (m > haystack.len or start > haystack.len - m) return null;
 
         // Short patterns have a constant-factor linear worst case, so they never switch to scalar Two-Way.
@@ -192,30 +153,18 @@ pub const Finder = struct {
         const watch = m > packed_pair.owns_search_max_len and self.fp_threshold < 1;
         const at = pair.find(memchr.native_width, haystack, start, if (watch) &guard else null);
         if (at) |pos| {
-            const prev = @atomicLoad(u32, &self.confirms, .monotonic);
-            @atomicStore(u32, &self.confirms, prev +| 1, .monotonic);
-            return .{ .start = pos, .end = pos + m };
+            return .{ .start = pos, .end = pos + m, .pattern_id = null };
         }
         if (guard.gave_up) {
             @branchHint(.cold);
-            @atomicStore(bool, &self.use_two_way, true, .monotonic);
-            @atomicStore(u32, &self.candidates, guard.candidates, .monotonic);
             return self.findLinear(haystack, guard.restart, m);
         }
         return null;
     }
 
-    fn findPairWatched(self: *Finder, haystack: []const u8, start: usize, nul: *?usize) ?matcher.Match {
+    fn findPairWatched(self: *const Finder, haystack: []const u8, start: usize, nul: *?usize) ?matcher.Match {
         const pair = &self.kind.pair;
         const m = pair.pattern.len;
-        if (@atomicLoad(bool, &self.use_two_way, .monotonic)) {
-            @branchHint(.cold);
-            if (memchr.find(memchr.native_width, haystack, start, 0)) |at| {
-                nul.* = at;
-                return null;
-            }
-            return self.findLinear(haystack, start, m);
-        }
         if (m > haystack.len or start > haystack.len - m) {
             if (start <= haystack.len) {
                 if (memchr.find(memchr.native_width, haystack, start, 0)) |at| nul.* = at;
@@ -231,51 +180,56 @@ pub const Finder = struct {
             return null;
         }
         if (at) |pos| {
-            const prev = @atomicLoad(u32, &self.confirms, .monotonic);
-            @atomicStore(u32, &self.confirms, prev +| 1, .monotonic);
-            return .{ .start = pos, .end = pos + m };
+            return .{ .start = pos, .end = pos + m, .pattern_id = null };
         }
         if (guard.gave_up) {
             @branchHint(.cold);
-            @atomicStore(bool, &self.use_two_way, true, .monotonic);
-            @atomicStore(u32, &self.candidates, guard.candidates, .monotonic);
-            if (memchr.find(memchr.native_width, haystack, guard.restart, 0)) |z| {
-                nul.* = z;
-                return null;
+            const lin = self.findLinear(haystack, guard.restart, m);
+            const limit = if (lin) |hit| @min(haystack.len, @max(guard.restart, hit.end)) else haystack.len;
+            if (guard.restart < limit) {
+                if (memchr.find(memchr.native_width, haystack[0..limit], guard.restart, 0)) |z| {
+                    nul.* = z;
+                    return null;
+                }
             }
-            return self.findLinear(haystack, guard.restart, m);
+            return lin;
         }
         return null;
     }
 
     fn findLinear(self: *const Finder, haystack: []const u8, start: usize, m: usize) ?matcher.Match {
         const at = self.two_way.find(haystack, start) orelse return null;
-        return .{ .start = at, .end = at + m };
+        return .{ .start = at, .end = at + m, .pattern_id = null };
     }
 
-    /// Whether the line content (excluding newline and a trailing CR) equals this pattern.
-    pub fn acceptsSpan(self: *const Finder, haystack: []const u8, start: usize, end: usize) bool {
-        if (start > end or end > haystack.len) return false;
+    /// Whether `span` equals this pattern (`mode` is accepted for `Matcher` contract uniformity).
+    pub fn acceptsSpan(self: *const Finder, span: []const u8, mode: matcher.MatchMode) bool {
+        _ = mode;
         if (self.unicode_folded) {
-            return unicode_fold.eqlFolded(self.pattern, haystack[start..end]);
+            return unicode_fold.eqlFolded(self.pattern, span);
         }
-        return ascii.eql(self.pattern, haystack[start..end], self.ignore_case);
+        return ascii.eql(self.pattern, span, self.ignore_case);
     }
 
     /// Same as `find`, advancing one byte past the match start when `allow` rejects a candidate.
-    /// A single pattern has only one possible length at any given start position.
+    /// `allow` may be a function `fn ([]const u8, usize, usize) bool` or a context with `.allow(haystack, start, end) bool`.
     pub fn findAllowed(
-        self: *Finder,
+        self: *const Finder,
         haystack: []const u8,
         start: usize,
         mode: matcher.MatchMode,
-        comptime allow: fn ([]const u8, usize, usize) bool,
+        allow: anytype,
     ) ?matcher.Match {
         var pos = start;
         while (pos <= haystack.len) {
             const found = self.find(haystack, pos, mode) orelse return null;
             if (found.start < pos) return null;
-            if (allow(haystack, found.start, found.end)) return found;
+            const accepted = if (@typeInfo(@TypeOf(allow)) == .@"fn" or
+                (@typeInfo(@TypeOf(allow)) == .pointer and @typeInfo(@typeInfo(@TypeOf(allow)).pointer.child) == .@"fn"))
+                allow(haystack, found.start, found.end)
+            else
+                matcher.callAllow(allow, haystack, found.start, found.end);
+            if (accepted) return found;
             if (found.start >= haystack.len) return null;
             pos = found.start + 1;
         }
@@ -349,7 +303,7 @@ test "long pattern switches to Two-Way when rare bytes cluster and still finds m
     var pat: [33]u8 = @splat('c');
     pat[0] = 'a';
     pat[1] = 'b';
-    var noisy = try Finder.init(&pat, .{
+    const noisy = try Finder.init(&pat, .{
         .frequency = rank,
         .prefilter_fp_threshold = 0.5,
     });
@@ -359,12 +313,11 @@ test "long pattern switches to Two-Way when rare bytes cluster and still finds m
         hay[i * 2 + 1] = 'b';
     }
     @memcpy(hay[hay.len - pat.len ..], pat[0..]);
-    try std.testing.expectEqual(hay.len - pat.len, noisy.find(&hay, 0, .earliest).?.start);
-    try std.testing.expect(noisy.use_two_way);
+    const hit = noisy.find(&hay, 0, .earliest).?;
+    try std.testing.expectEqual(hay.len - pat.len, hit.start);
+    try std.testing.expectEqual(@as(?u32, null), hit.pattern_id);
 
     noisy.resetStats();
-    try std.testing.expect(!noisy.use_two_way);
-    try std.testing.expectEqual(@as(u32, 0), noisy.candidates);
 }
 
 test "Finder matches naive search" {
@@ -380,7 +333,7 @@ test "Finder matches naive search" {
         random.bytes(pat[0..plen]);
         if (std.mem.findScalar(u8, pat[0..plen], '\n') != null) continue;
         for (cases) |case| {
-            var finder = try Finder.init(pat[0..plen], .{ .case = case });
+            const finder = try Finder.init(pat[0..plen], .{ .case = case });
             const start = if (hlen == 0) 0 else random.intRangeAtMost(usize, 0, hlen);
             const expect = scalarFind(hay[0..hlen], pat[0..plen], start, finder.ignore_case);
             const got = finder.find(hay[0..hlen], start, .earliest);
@@ -395,26 +348,26 @@ test "Finder matches naive search" {
 }
 
 test "required literal" {
-    var finder = try Finder.init("abc", .{});
+    const finder = try Finder.init("abc", .{});
     const lit = finder.requiredLiteral().?;
     try std.testing.expectEqualStrings("abc", lit.bytes);
     try std.testing.expectEqual(@as(usize, 0), lit.offset_in_match);
-    var empty = try Finder.init("", .{});
+    const empty = try Finder.init("", .{});
     try std.testing.expect(empty.requiredLiteral() == null);
 }
 
 test "Finder unicode_case supports Greek, Cyrillic, cross-byte-length ẞ/ß, and smart case" {
-    var f_greek = try Finder.init("σigma", .{ .case = .smart, .unicode_case = true });
+    const f_greek = try Finder.init("σigma", .{ .case = .smart, .unicode_case = true });
     const hit_g = f_greek.find("xxΣIGMAyy", 0, .earliest).?;
     try std.testing.expectEqual(@as(usize, 2), hit_g.start);
     try std.testing.expectEqual(@as(usize, 2 + "ΣIGMA".len), hit_g.end);
-    try std.testing.expect(f_greek.acceptsSpan("ςigma", 0, "ςigma".len));
+    try std.testing.expect(f_greek.acceptsSpan("ςigma", .earliest));
 
-    var f_upper = try Finder.init("Δelta", .{ .case = .smart, .unicode_case = true });
+    const f_upper = try Finder.init("Δelta", .{ .case = .smart, .unicode_case = true });
     try std.testing.expect(f_upper.find("δelta", 0, .earliest) == null);
     try std.testing.expect(f_upper.find("Δelta", 0, .earliest) != null);
 
-    var f_sharp = try Finder.init("straße", .{ .case = .insensitive, .unicode_case = true });
+    const f_sharp = try Finder.init("straße", .{ .case = .insensitive, .unicode_case = true });
     var nul_at: ?usize = null;
     const hit_s = f_sharp.findWatched("aSTRA\u{1E9E}Eb", 0, &nul_at).?;
     try std.testing.expect(nul_at == null);

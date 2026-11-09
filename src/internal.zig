@@ -25,4 +25,11 @@ pub const FindOptions = @import("matcher.zig").FindOptions;
 pub const multi = @import("finder/multi.zig");
 pub const Multi = multi.Multi;
 pub const Regex = @import("regex.zig").Regex;
+pub const RegexSet = @import("regex.zig").RegexSet;
 pub const Captures = @import("regex.zig").Captures;
+pub const openSourcePull = searcher.openSourcePull;
+pub const openReaderPull = searcher.openReaderPull;
+pub const archive = @import("codec/archive.zig");
+pub const tree = @import("search/tree.zig");
+pub const searchArchiveSlice = tree.searchArchiveSlice;
+

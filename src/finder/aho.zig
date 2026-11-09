@@ -206,7 +206,7 @@ pub const Ac = struct {
                 return null;
             }
         }
-        return .{ .start = chosen.start, .end = chosen.end };
+        return .{ .start = chosen.start, .end = chosen.end, .pattern_id = chosen.id };
     }
 
     noinline fn findAnchored(
@@ -267,7 +267,7 @@ pub const Ac = struct {
                 if (best) |chosen| {
                     if (chosen.start <= nul_at) {
                         nul_out.* = null;
-                        return .{ .start = chosen.start, .end = chosen.end };
+                        return .{ .start = chosen.start, .end = chosen.end, .pattern_id = chosen.id };
                     }
                 }
                 return null;
@@ -285,7 +285,7 @@ pub const Ac = struct {
                 return null;
             }
         }
-        return .{ .start = chosen.start, .end = chosen.end };
+        return .{ .start = chosen.start, .end = chosen.end, .pattern_id = chosen.id };
     }
 
     fn noteAnchor(
@@ -547,7 +547,7 @@ fn prefer(a: Cand, b: Cand, mode: matcher.MatchMode) bool {
 
 fn toMatch(best: ?Cand) ?matcher.Match {
     const cand = best orelse return null;
-    return .{ .start = cand.start, .end = cand.end };
+    return .{ .start = cand.start, .end = cand.end, .pattern_id = cand.id };
 }
 
 fn equalAt(pat: []const u8, hay: []const u8, ignore: bool) bool {
@@ -692,7 +692,7 @@ fn scalarAc(hay: []const u8, start: usize, pats: []const []const u8, mode: match
         }
     }
     const chosen = best orelse return null;
-    return .{ .start = chosen.start, .end = chosen.end };
+    return .{ .start = chosen.start, .end = chosen.end, .pattern_id = chosen.id };
 }
 
 test "anchor prefilter skips first stride and matches naive search on second stride" {

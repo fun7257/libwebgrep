@@ -16,6 +16,7 @@ const cfg_mod = @import("config.zig");
 const ring_mod = @import("context_ring.zig");
 
 pub const SearchConfig = cfg_mod.SearchConfig;
+pub const Scratch = cfg_mod.Scratch;
 pub const SliceError = cfg_mod.SliceError;
 pub const ReadError = cfg_mod.ReadError;
 pub const Result = cfg_mod.Result;
@@ -40,6 +41,7 @@ pub const Range = struct {
 pub const BufMatch = struct {
     start: usize,
     end: usize,
+    pattern_id: ?u32 = null,
 };
 
 pub const State = struct {
@@ -76,6 +78,7 @@ pub const State = struct {
     long_line_len: u64 = 0,
     long_match_start: usize = 0,
     long_match_end: usize = 0,
+    long_match_pid: ?u32 = null,
     /// 0: no window held, 1: line-prefix window, 2: match window.
     long_hold_kind: u2 = 0,
     /// An early match occurred in the current chunk; subsequent chunks revert to pre-scanning for NUL to avoid scanning dense chunks twice.
@@ -84,6 +87,7 @@ pub const State = struct {
     text_alloc: ?std.mem.Allocator = null,
     text_buf: []u8 = &.{},
     replace_buf: []u8 = &.{},
+    span_buf: []Span = &.{},
     capture_regex: ?*const regex_mod.Regex = null,
     offset_map: ?*const decompress.OffsetMap = null,
     offset_map_base: u64 = 0,
@@ -343,20 +347,27 @@ pub fn grow(allocator: std.mem.Allocator, buf: []u8, config: SearchConfig) error
     return try allocator.realloc(buf, next);
 }
 
+pub fn MatcherType(comptime M: type) type {
+    return switch (@typeInfo(M)) {
+        .pointer => |p| p.child,
+        else => M,
+    };
+}
+
 pub fn isMultilineMatcher(matcher: anytype) bool {
-    const T = @TypeOf(matcher.*);
+    const T = MatcherType(@TypeOf(matcher));
     if (@hasDecl(T, "isMultiline")) return matcher.isMultiline();
     return false;
 }
 
 pub fn isStartAnchoredMatcher(matcher: anytype) bool {
-    const T = @TypeOf(matcher.*);
+    const T = MatcherType(@TypeOf(matcher));
     if (@hasDecl(T, "isStartAnchored")) return matcher.isStartAnchored();
     return false;
 }
 
 pub fn multilineWindow(matcher: anytype, config: SearchConfig) usize {
-    const T = @TypeOf(matcher.*);
+    const T = MatcherType(@TypeOf(matcher));
     const cap = if (config.max_line_len == 0) 1 else config.max_line_len;
     if (@hasDecl(T, "multilineWindow")) return @min(matcher.multilineWindow(), cap);
     return cap;
@@ -369,7 +380,7 @@ pub fn canFuse(matcher: anytype, config: SearchConfig, state: *const State) bool
     if (state.prefer_prepass or state.nul_offset != null) return false;
     if (config.binary == .none or config.invert or beforeCount(config) != 0 or afterCount(config) != 0) return false;
     if (config.whole_word or config.whole_line or config.contains.len != 0 or config.excludes.len != 0 or config.contains_regexes.len != 0 or config.excludes_regexes.len != 0) return false;
-    return @hasDecl(@TypeOf(matcher.*), "findWatched");
+    return @hasDecl(MatcherType(@TypeOf(matcher)), "findWatched");
 }
 
 
@@ -554,11 +565,30 @@ pub fn elapsedOf(state: *const State, config: SearchConfig) u64 {
 
 pub fn resetStats(matcher: anytype) void {
     const T = @TypeOf(matcher);
-    const Child = switch (@typeInfo(T)) {
-        .pointer => |p| if (p.size == .one) p.child else return,
-        else => return,
-    };
-    if (@hasDecl(Child, "resetStats")) matcher.resetStats();
+    switch (@typeInfo(T)) {
+        .pointer => |p| {
+            if (p.size != .one) return;
+            if (@hasDecl(p.child, "resetStats")) {
+                if (T == *p.child) {
+                    matcher.resetStats();
+                } else {
+                    const FnInfo = @typeInfo(@TypeOf(@field(p.child, "resetStats"))).@"fn";
+                    if (FnInfo.param_types.len == 1 and (FnInfo.param_types[0] == p.child or FnInfo.param_types[0] == *const p.child)) {
+                        matcher.resetStats();
+                    }
+                }
+            }
+        },
+        .@"struct" => {
+            if (@hasDecl(T, "resetStats")) {
+                const FnInfo = @typeInfo(@TypeOf(@field(T, "resetStats"))).@"fn";
+                if (FnInfo.param_types.len == 1 and (FnInfo.param_types[0] == T or FnInfo.param_types[0] == *const T)) {
+                    matcher.resetStats();
+                }
+            }
+        },
+        else => {},
+    }
 }
 
 pub fn callOpt(comptime S: type, comptime name: []const u8, sink: *S, args: anytype) bool {
@@ -568,7 +598,7 @@ pub fn callOpt(comptime S: type, comptime name: []const u8, sink: *S, args: anyt
 
 
 pub fn needleLen(matcher: anytype) usize {
-    const T = @TypeOf(matcher.*);
+    const T = MatcherType(@TypeOf(matcher));
     if (@hasField(T, "pattern")) return matcher.pattern.len;
     if (@hasField(T, "patterns")) {
         var max: usize = 0;

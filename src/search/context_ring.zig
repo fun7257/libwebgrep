@@ -88,6 +88,7 @@ pub fn previewLine(buf: []const u8, line: Range, known: ?BufMatch, config: Searc
             span = .{
                 .start = m.start - abs_s,
                 .end = @min(m.end, abs_e) - abs_s,
+                .pattern_id = m.pattern_id,
             };
         }
     }
@@ -111,6 +112,7 @@ pub const RingSlot = struct {
     window_start: u64 = 0,
     mstart: u32 = 0,
     mend: u32 = 0,
+    mpid: ?u32 = null,
     has_match: bool = false,
     src_start: usize = 0,
     src_end: usize = 0,
@@ -155,6 +157,7 @@ pub const BeforeRing = struct {
             .has_match = preview.span != null,
             .mstart = if (preview.span) |s| std.math.cast(u32, s.start) orelse 0 else 0,
             .mend = if (preview.span) |s| std.math.cast(u32, s.end) orelse 0 else 0,
+            .mpid = if (preview.span) |s| s.pattern_id else null,
             .src_start = preview.start,
             .src_end = preview.end,
         };
@@ -221,6 +224,7 @@ pub fn emitRing(
         const span: ?Span = if (withheld or !slot.has_match) null else .{
             .start = slot.mstart,
             .end = slot.mend,
+            .pattern_id = slot.mpid,
         };
         var none: [0]Span = .{};
         const shown = if (withheld) raw[0..0] else raw;

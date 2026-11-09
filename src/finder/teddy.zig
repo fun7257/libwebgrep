@@ -191,7 +191,7 @@ pub const Engine = struct {
                 return null;
             }
         }
-        return .{ .start = chosen.start, .end = chosen.end };
+        return .{ .start = chosen.start, .end = chosen.end, .pattern_id = chosen.id };
     }
 
     inline fn evalRefine(
@@ -340,7 +340,7 @@ pub const Engine = struct {
 
 fn toMatch(best: ?Cand) ?matcher.Match {
     const chosen = best orelse return null;
-    return .{ .start = chosen.start, .end = chosen.end };
+    return .{ .start = chosen.start, .end = chosen.end, .pattern_id = chosen.id };
 }
 
 fn expandTable(table: *const [16]u8) Vec {

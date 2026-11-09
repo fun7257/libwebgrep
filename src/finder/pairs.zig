@@ -160,9 +160,9 @@ pub const Engine = struct {
         if (watch_nul) {
             if (nul_out.*) |nul_at| {
                 if (best) |chosen| {
-                    if (chosen.start <= nul_at) {
+                    if (chosen.end <= nul_at) {
                         nul_out.* = null;
-                        return .{ .start = chosen.start, .end = chosen.end };
+                        return .{ .start = chosen.start, .end = chosen.end, .pattern_id = chosen.id };
                     }
                 }
                 return null;
@@ -174,13 +174,14 @@ pub const Engine = struct {
             }
             return null;
         };
-        if (watch_nul and nul_checked < chosen.start) {
-            if (memchr.find(width, haystack[0..chosen.start], nul_checked, 0)) |at| {
+        if (watch_nul and nul_checked < chosen.end) {
+            const check_end = @min(haystack.len, chosen.end);
+            if (memchr.find(width, haystack[0..check_end], nul_checked, 0)) |at| {
                 nul_out.* = at;
                 return null;
             }
         }
-        return .{ .start = chosen.start, .end = chosen.end };
+        return .{ .start = chosen.start, .end = chosen.end, .pattern_id = chosen.id };
     }
 
     /// Scans to the end of the text before any hit is found; once a match exists, bounds how far right an anchor can still improve the result.
@@ -222,16 +223,20 @@ pub const Engine = struct {
     ) ?usize {
         const end = @min(limit, hay.len);
         if (pos >= end) return null;
-        const back: usize = if (self.nneg != 0) 1 else 0;
         const fwd: usize = if (self.npos != 0) 1 else 0;
         var i = pos;
-        while (i < back and i < end) : (i += 1) {
+        if (self.nneg != 0 and i > 0 and i < end) {
             if (watch_nul and hay[i] == 0) {
+                if (nul_checked.* < i) {
+                    if (memchr.find(width, hay[0..i], nul_checked.*, 0)) |earlier| {
+                        nul_out.* = earlier;
+                        return null;
+                    }
+                }
                 nul_out.* = i;
                 return null;
             }
-            if (self.hitScalar(hay, i)) {
-                if (watch_nul and i + 1 > nul_checked.*) nul_checked.* = i + 1;
+            if (sideHit(self.neg_rules[0..self.nneg], hay, i, hay[i], -1)) {
                 return i;
             }
         }
@@ -239,15 +244,20 @@ pub const Engine = struct {
         if (watch_nul and nul_out.* != null) return null;
         while (i < end) : (i += 1) {
             if (watch_nul and hay[i] == 0) {
+                if (nul_checked.* < i) {
+                    if (memchr.find(width, hay[0..i], nul_checked.*, 0)) |earlier| {
+                        nul_out.* = earlier;
+                        return null;
+                    }
+                }
                 nul_out.* = i;
                 return null;
             }
+            if (watch_nul and nul_checked.* == i) nul_checked.* = i + 1;
             if (self.hitScalar(hay, i)) {
-                if (watch_nul and i + 1 > nul_checked.*) nul_checked.* = i + 1;
                 return i;
             }
         }
-        if (watch_nul and end > nul_checked.*) nul_checked.* = end;
         return null;
     }
 
@@ -274,6 +284,15 @@ pub const Engine = struct {
                 inline 1...8 => |n| return self.scanBuckets(hay, i, end, &pack.bytes, n, watch_nul, nul_checked, nul_out),
                 else => {},
             }
+        }
+        if (self.nneg != 0 and i.* == 0 and i.* < end) {
+            if (watch_nul and hay[0] == 0) {
+                nul_out.* = 0;
+                return null;
+            }
+            if (watch_nul and nul_checked.* == 0) nul_checked.* = 1;
+            if (self.hitScalar(hay, 0)) return 0;
+            i.* = 1;
         }
         @setEvalBranchQuota(4000);
         switch (self.npos) {

@@ -83,7 +83,7 @@ pub fn matchBuffer(
                 if (!try beforeContext(S, sink, matcher, buf, line.start, state, config)) return false;
             }
             state.pos = line.end;
-            const known = BufMatch{ .start = line.mstart, .end = line.mend };
+            const known = BufMatch{ .start = line.mstart, .end = line.mend, .pattern_id = line.mpid };
             if (!try sinkMatched(S, sink, matcher, buf, line.range(), known, state, config)) return false;
         } else {
             if (config.stop_on_nonmatch and state.matched_lines > 0) {
@@ -113,6 +113,7 @@ pub const FoundLine = struct {
     end: usize,
     mstart: usize,
     mend: usize,
+    mpid: ?u32 = null,
 
     pub fn range(self: FoundLine) Range {
         return .{ .start = self.start, .end = self.end };
@@ -140,9 +141,13 @@ pub fn findLine(matcher: anytype, buf: []const u8, state: *State, config: Search
             continue;
         }
         const content_end = contentEnd(buf, .{ .start = start, .end = end }, config);
-        if (config.whole_line and !acceptsWholeLine(matcher, buf, start, content_end)) {
-            pos = end;
-            continue;
+        var wl_pid: ?u32 = hit.pattern_id;
+        if (config.whole_line) {
+            const wl = matchWholeLine(matcher, buf, start, content_end, config) orelse {
+                pos = end;
+                continue;
+            };
+            wl_pid = wl.pattern_id;
         }
         if (!linePassesFilters(buf, start, content_end, config)) {
             pos = end;
@@ -153,22 +158,67 @@ pub fn findLine(matcher: anytype, buf: []const u8, state: *State, config: Search
             .end = end,
             .mstart = if (config.whole_line) start else hit.start,
             .mend = if (config.whole_line) content_end else hit.end,
+            .mpid = if (config.whole_line) wl_pid else hit.pattern_id,
         };
     }
     return null;
 }
 
+const WordBoundedCtx = struct {
+    pub inline fn allow(_: WordBoundedCtx, haystack: []const u8, start: usize, end: usize) bool {
+        return wordBounded(haystack, start, end);
+    }
+};
+
 pub fn nextMatch(matcher: anytype, buf: []const u8, pos: usize, config: SearchConfig) ?matcher_mod.Match {
-    if (config.whole_word and @hasDecl(@TypeOf(matcher.*), "findAllowed")) {
+    const T = state_mod.MatcherType(@TypeOf(matcher));
+    if (config.whole_word and @hasDecl(T, "findAllowed")) {
+        if (T == matcher_mod.AnyMatcher) {
+            return matcher.findAllowed(buf, pos, config.match_mode, WordBoundedCtx{});
+        }
         return matcher.findAllowed(buf, pos, config.match_mode, wordBounded);
     }
     return matcher.find(buf, pos, config.match_mode);
 }
 
+pub fn matchWholeLine(matcher: anytype, buf: []const u8, start: usize, end: usize, config: SearchConfig) ?matcher_mod.Match {
+    if (end < start or end > buf.len) return null;
+    const T = state_mod.MatcherType(@TypeOf(matcher));
+    if (@hasDecl(T, "matchSpan")) {
+        const hit = matcher.matchSpan(buf[start..end], config.match_mode) orelse return null;
+        return .{ .start = start, .end = end, .pattern_id = hit.pattern_id };
+    }
+    if (@hasDecl(T, "acceptsSpan")) {
+        const FnInfo = @typeInfo(@TypeOf(@field(T, "acceptsSpan"))).@"fn";
+        const ok = if (FnInfo.param_types.len == 3)
+            matcher.acceptsSpan(buf[start..end], config.match_mode)
+        else
+            matcher.acceptsSpan(buf, start, end);
+        if (!ok) return null;
+        if (matcher.find(buf[start..end], 0, config.match_mode)) |m| {
+            if (m.start == 0 and m.end == end - start) {
+                return .{ .start = start, .end = end, .pattern_id = m.pattern_id };
+            }
+        }
+        return .{ .start = start, .end = end, .pattern_id = null };
+    }
+    const found = matcher.find(buf[start..end], 0, .leftmost_first) orelse return null;
+    if (found.start == 0 and found.end == end - start) {
+        return .{ .start = start, .end = end, .pattern_id = found.pattern_id };
+    }
+    return null;
+}
+
 pub fn acceptsWholeLine(matcher: anytype, buf: []const u8, start: usize, end: usize) bool {
     if (end < start or end > buf.len) return false;
-    const T = @TypeOf(matcher.*);
-    if (@hasDecl(T, "acceptsSpan")) return matcher.acceptsSpan(buf, start, end);
+    const T = state_mod.MatcherType(@TypeOf(matcher));
+    if (@hasDecl(T, "acceptsSpan")) {
+        const FnInfo = @typeInfo(@TypeOf(@field(T, "acceptsSpan"))).@"fn";
+        return if (FnInfo.param_types.len == 3)
+            matcher.acceptsSpan(buf[start..end], .leftmost_first)
+        else
+            matcher.acceptsSpan(buf, start, end);
+    }
     const found = matcher.find(buf[start..end], 0, .leftmost_first) orelse return false;
     return found.start == 0 and found.end == end - start;
 }
@@ -397,8 +447,8 @@ pub fn lineIsReportedHit(matcher: anytype, buf: []const u8, line: Range, config:
 pub fn matchInLine(matcher: anytype, buf: []const u8, line: Range, config: SearchConfig) ?BufMatch {
     const end = contentEnd(buf, line, config);
     if (config.whole_line) {
-        if (!acceptsWholeLine(matcher, buf, line.start, end)) return null;
-        return .{ .start = line.start, .end = end };
+        const wl = matchWholeLine(matcher, buf, line.start, end, config) orelse return null;
+        return .{ .start = line.start, .end = end, .pattern_id = wl.pattern_id };
     }
     const line_buf = if (isMultilineMatcher(matcher)) buf else buf[0..@min(end, buf.len)];
     const found = nextMatch(matcher, line_buf, line.start, config) orelse return null;
@@ -406,6 +456,6 @@ pub fn matchInLine(matcher: anytype, buf: []const u8, line: Range, config: Searc
     if (found.start < line.start or found.start > end or found.end > line.end) return null;
     if (found.start == end and found.end > end) return null;
     if (found.start >= line.end) return null;
-    return .{ .start = found.start, .end = @min(found.end, end) };
+    return .{ .start = found.start, .end = @min(found.end, end), .pattern_id = found.pattern_id };
 }
 

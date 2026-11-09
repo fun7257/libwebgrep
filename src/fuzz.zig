@@ -73,7 +73,7 @@ fn refFindMultiLeftmostFirst(
     for (patterns, 0..) |pat, idx| {
         if (refFindSingle(haystack, pat, start, options)) |m| {
             if (best == null or m.start < best.?.start or (m.start == best.?.start and idx < best_pat_idx)) {
-                best = m;
+                best = .{ .start = m.start, .end = m.end, .pattern_id = @intCast(idx) };
                 best_pat_idx = idx;
             }
         }
@@ -382,7 +382,13 @@ test "fuzz: Regex structured patterns vs literal/alternation oracles" {
             while (pos <= haystack.len) {
                 const exp = multi.find(haystack, pos, .leftmost_first);
                 const got = re.find(haystack, pos, .leftmost_first);
-                try std.testing.expectEqual(exp, got);
+                if (exp) |e| {
+                    try std.testing.expect(got != null);
+                    try std.testing.expectEqual(e.start, got.?.start);
+                    try std.testing.expectEqual(e.end, got.?.end);
+                } else {
+                    try std.testing.expect(got == null);
+                }
                 pos = if (exp) |m| m.start + 1 else break;
             }
         }

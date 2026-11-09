@@ -163,6 +163,7 @@ pub fn saveMatchWindow(
     state.long_window_start = state.long_dropped + local;
     state.long_match_start = hit.start - local;
     state.long_match_end = @min(hit.end, end) - local;
+    state.long_match_pid = hit.pattern_id;
     state.long_hold_kind = 2;
 }
 
@@ -209,6 +210,7 @@ pub fn emitHold(
     const span: ?Span = if (withheld or state.long_hold_kind != 2) null else .{
         .start = state.long_match_start,
         .end = state.long_match_end,
+        .pattern_id = state.long_match_pid,
     };
     if (!try sinkBreakAt(S, sink, state.long_origin, state, config)) return false;
     const bytes = if (withheld) raw[0..0] else raw;
@@ -278,6 +280,7 @@ pub fn finishLong(
             .span = if (state.long_hold_kind == 2) .{
                 .start = state.long_match_start,
                 .end = state.long_match_end,
+                .pattern_id = state.long_match_pid,
             } else null,
         };
         state.ring.pushBytes(raw, preview, state.long_origin, end_abs, state.long_number);
@@ -290,6 +293,7 @@ pub fn finishLong(
     state.long_active = false;
     state.long_hold_kind = 0;
     state.long_has_match = false;
+    state.long_match_pid = null;
     return !state.stopped;
 }
 
@@ -311,11 +315,15 @@ pub fn beginLong(
     state.long_hold_kind = 0;
     state.long_hold_len = 0;
     state.long_window_start = 0;
+    state.long_match_pid = null;
     state.long_number = state.line_number;
     const total_contains = config.contains.len + config.contains_regexes.len;
     if (total_contains > seen.len) {
-        if (seen.len != 0) allocator.free(seen.*);
-        seen.* = try allocator.alloc(bool, total_contains);
+        if (seen.len == 0) {
+            seen.* = try allocator.alloc(bool, total_contains);
+        } else {
+            seen.* = try allocator.realloc(seen.*, total_contains);
+        }
     }
     if (seen.len > 0) @memset(seen.*, false);
     const bytes = buf.*[0..filled.*];

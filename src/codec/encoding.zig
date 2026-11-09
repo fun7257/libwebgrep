@@ -212,6 +212,46 @@ pub fn convertAllocWithMap(
     return buf;
 }
 
+pub fn convertScratchWithMap(
+    buf_alloc: std.mem.Allocator,
+    decode_buf: *[]u8,
+    map_alloc: std.mem.Allocator,
+    kind: Sniff,
+    input: []const u8,
+    raw_base: u64,
+    offset_map: ?*decompress.OffsetMap,
+) error{OutOfMemory}![]u8 {
+    const mode: coded_mode = switch (kind) {
+        .utf8 => .utf8,
+        .utf16le => .utf16le,
+        .utf16be => .utf16be,
+        .gbk => .gbk,
+        .latin1 => .latin1,
+        else => {
+            if (decode_buf.len < input.len) {
+                if (decode_buf.len == 0) {
+                    decode_buf.* = try buf_alloc.alloc(u8, input.len);
+                } else {
+                    decode_buf.* = try buf_alloc.realloc(decode_buf.*, input.len);
+                }
+            }
+            if (input.len > 0) @memcpy(decode_buf.*[0..input.len], input);
+            return decode_buf.*[0..input.len];
+        },
+    };
+    const len = convertedLen(mode, input);
+    if (decode_buf.len < len) {
+        if (decode_buf.len == 0) {
+            decode_buf.* = try buf_alloc.alloc(u8, len);
+        } else {
+            decode_buf.* = try buf_alloc.realloc(decode_buf.*, len);
+        }
+    }
+    const n = try convertIntoWithMap(map_alloc, mode, input, decode_buf.*[0..len], raw_base, offset_map);
+    std.debug.assert(n == len);
+    return decode_buf.*[0..len];
+}
+
 /// Converts upstream bytes into searchable bytes.
 /// When `encoding == .none` or no BOM is present, the first read length matches reading directly into `dest`.
 pub const Decoder = struct {

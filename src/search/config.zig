@@ -101,11 +101,16 @@ pub const SearchConfig = struct {
     max_compression_ratio: ?u64 = null,
     /// Used when a slice requires transcoding or lossy text does not fit in the stack buffer. Streaming search uses the allocator passed to the function.
     decode_allocator: ?std.mem.Allocator = null,
+    /// General-purpose per-search allocator for slice decompression, transcoding, replacement expansion, and >32 match span overflow.
+    /// Takes precedence over `decode_allocator` and `scratch_pool.allocator`.
+    allocator: ?std.mem.Allocator = null,
     buffer_size: usize = default_buffer_size,
     max_line_len: usize = default_max_line_len,
     match_mode: matcher_mod.MatchMode = .earliest,
     /// When non-null, reuses this buffer across calls and writes back any reallocated slice. When null, allocates and frees internally per call.
     scratch: ?*[]u8 = null,
+    /// Reusable per-thread scratch pool across slice and streaming searches. Eliminates steady-state heap allocations after warm-up.
+    scratch_pool: ?*Scratch = null,
     /// When non-null and set to true, stops before the next chunk begins. Used by directory traversal for early termination.
     /// Not a cancellation token: does not close upstream or set `limit_hit = cancelled`.
     stop: ?*const std.atomic.Value(bool) = null,
@@ -164,6 +169,44 @@ pub const SearchConfig = struct {
     log: ?*const fn (?*anyopaque, []const u8) void = null,
     log_ctx: ?*anyopaque = null,
 };
+
+/// Reusable scratch buffer pool across multiple searches on the same worker thread.
+/// Retains allocated buffers across searches and frees them all in `deinit()`.
+pub const Scratch = struct {
+    allocator: std.mem.Allocator,
+    stream_buf: []u8 = &.{},
+    ring_storage: []u8 = &.{},
+    long_hold: []u8 = &.{},
+    long_seen: []bool = &.{},
+    text_buf: []u8 = &.{},
+    replace_buf: []u8 = &.{},
+    span_buf: []Span = &.{},
+    decode_buf: []u8 = &.{},
+
+    pub fn init(allocator: std.mem.Allocator) Scratch {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn reset(self: *Scratch) void {
+        _ = self;
+    }
+
+    pub fn deinit(self: *Scratch) void {
+        if (self.stream_buf.len != 0) self.allocator.free(self.stream_buf);
+        if (self.ring_storage.len != 0) self.allocator.free(self.ring_storage);
+        if (self.long_hold.len != 0) self.allocator.free(self.long_hold);
+        if (self.long_seen.len != 0) self.allocator.free(self.long_seen);
+        if (self.text_buf.len != 0) self.allocator.free(self.text_buf);
+        if (self.replace_buf.len != 0) self.allocator.free(self.replace_buf);
+        if (self.span_buf.len != 0) self.allocator.free(self.span_buf);
+        if (self.decode_buf.len != 0) self.allocator.free(self.decode_buf);
+        self.* = .{ .allocator = self.allocator };
+    }
+};
+
+pub fn effectiveAllocator(config: SearchConfig) ?std.mem.Allocator {
+    return config.allocator orelse config.decode_allocator orelse if (config.scratch_pool) |sp| sp.allocator else null;
+}
 
 pub const Outcome = sink_mod.Outcome;
 pub const Result = sink_mod.Result;

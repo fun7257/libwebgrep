@@ -11,6 +11,7 @@ flowchart TD
     M2 --> M3["Milestone 4: Bomb-Safe Streaming Decompression & Encodings<br/>In-process Gzip / Zstd / XZ with dual Zip-Bomb caps,<br/>SIMD-prefiltered Unicode Case Folding, GBK / Latin-1 transcoding, raw_offset mapping"]
     M3 --> M4["Milestone 5: Controlled Multi-Source Pipeline<br/>Nested brace globbing with caps, in-memory & layered Ignore rules,<br/>injectable file-type tables, controlled worker concurrency & streaming events"]
     M4 --> M5["Milestone 6: 5-Layer Architecture & Differential Fuzzing<br/>Modular tables/codec/regex/search decomposition, MatcherTraits & SinkTraits,<br/>Zig 0.17.1 Smith + PRNG differential fuzz suite (src/fuzz.zig)"]
+    M5 --> M6["Milestone 7 (v0.3.0): Hybrid Lazy DFA, RegexSet, Streaming Pull, ArchiveTree & C ABI<br/>*const lock-free matchers, pattern_id, Unicode properties & UAX #29 word boundaries,<br/>openReaderPull, Scratch pool, zero-disk ArchiveTree/searchTree, zero-libc C ABI"]
 ```
 
 | Milestone | Focus Area | Key Modules | Status | Verification & Performance Highlights |
@@ -21,3 +22,5 @@ flowchart TD
 | **Milestone 4** | **Streaming Decompression & Extended Encodings** | `src/codec/*`, `src/tables/*`, `src/finder/unicode_fold.zig` | **Completed** | In-process Gzip/Zstd/XZ Zip-Bomb protection (`max_decompressed_bytes` + `max_compression_ratio`); 28.9 GB/s SIMD Unicode case folding; comptime-specialized UTF-16/GBK/Latin-1 & `OffsetMap` |
 | **Milestone 5** | **Controlled Multi-Source Pipeline** | `src/walk/*`, `src/parallel.zig` | **Completed** | Nested `{a,{b,c}}` glob expansion with caps; pure-text & `.gitignore`/`.ignore`/`.rgignore` switches; `expandTypesToGlobs`; strict `max_concurrency` |
 | **Milestone 6** | **5-Layer Co-Development Architecture & Fuzzing** | `src/tables/*`, `src/codec/*`, `src/regex/*`, `src/search/*`, `src/fuzz.zig` | **Completed** | Strict 5-layer acyclic decomposition; `MatcherTraits` & `SinkTraits` compile-time contracts; Zig 0.17.1 `std.testing.fuzz` + multi-seed differential fuzzers |
+| **Milestone 7 (`v0.3.0`)** | **Hybrid Lazy DFA, `RegexSet`, Streaming Pull, `ArchiveTree` & C ABI** | `src/regex/dfa.zig`, `src/regex/set.zig`, `src/codec/archive.zig`, `src/search/tree.zig`, `src/c_api.zig` | **Completed** | `*const` lock-free matchers; `pattern_id`; `\p{...}` Unicode properties & UAX #29 `\b`/`\B`; `CompileDiagnostic`; `openReaderPull`; `Scratch` pool; zero-disk `ArchiveTree` & `searchTree`; C ABI (`include/webgrep.h`) |
+

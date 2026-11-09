@@ -20,11 +20,15 @@ pub fn build(b: *std.Build) void {
         "Map large files in 8 MiB windows before searching (default: false, uses readPositional)",
     ) orelse false;
     const TeddyIsa = enum { off, neon, ssse3, avx2 };
-    const teddy_default: TeddyIsa = if (target.result.cpu.arch == .aarch64) .neon else .off;
+    const teddy_default: TeddyIsa = switch (target.result.cpu.arch) {
+        .aarch64 => .neon,
+        .x86_64 => if (std.Target.x86.featureSetHas(target.result.cpu.features, .avx2)) .avx2 else .ssse3,
+        else => .off,
+    };
     const teddy_request = b.option(
         TeddyIsa,
         "teddy",
-        "Multi-pattern Teddy SIMD engine: off, neon, ssse3, avx2 (default: neon on aarch64, off otherwise)",
+        "Multi-pattern Teddy SIMD engine: off, neon, ssse3, avx2 (default: auto-detected per target)",
     ) orelse teddy_default;
     const teddy_matches = switch (teddy_request) {
         .off => true,
@@ -63,6 +67,31 @@ pub fn build(b: *std.Build) void {
     });
     internal_mod.addOptions("build_options", options);
 
+    const c_api_mod = b.createModule(.{
+        .root_source_file = b.path("src/c_api.zig"),
+        .target = compile_target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+    });
+    c_api_mod.addOptions("build_options", options);
+
+    const webgrep_static = b.addLibrary(.{
+        .linkage = .static,
+        .name = "webgrep",
+        .root_module = c_api_mod,
+        .use_llvm = use_llvm,
+    });
+    webgrep_static.installHeader(b.path("include/webgrep.h"), "webgrep.h");
+    b.installArtifact(webgrep_static);
+
+    const webgrep_shared = b.addLibrary(.{
+        .linkage = .dynamic,
+        .name = "webgrep",
+        .root_module = c_api_mod,
+        .use_llvm = use_llvm,
+    });
+    b.installArtifact(webgrep_shared);
+
     const lib_tests = b.addTest(.{
         .name = "libwebgrep-test",
         .root_module = mod,
@@ -70,6 +99,33 @@ pub fn build(b: *std.Build) void {
         .use_llvm = use_llvm,
     });
     const run_lib_tests = b.addRunArtifact(lib_tests);
+
+    const c_api_tests = b.addTest(.{
+        .name = "libwebgrep-c-api-test",
+        .root_module = c_api_mod,
+        .filters = test_filters,
+        .use_llvm = use_llvm,
+    });
+    const run_c_api_tests = b.addRunArtifact(c_api_tests);
+
+    const c_test_mod = b.createModule(.{
+        .target = compile_target,
+        .optimize = optimize,
+        .link_libc = true,
+        .sanitize_thread = false,
+    });
+    c_test_mod.addIncludePath(b.path("include"));
+    c_test_mod.addCSourceFile(.{
+        .file = b.path("test/c_api_test.c"),
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+    });
+    c_test_mod.linkLibrary(webgrep_static);
+    const c_api_test_exe = b.addExecutable(.{
+        .name = "c-api-test-exe",
+        .root_module = c_test_mod,
+        .use_llvm = use_llvm,
+    });
+    const run_c_api_test_exe = b.addRunArtifact(c_api_test_exe);
 
     // Extract the single canonical code example from docs/API.md and docs/API.zh-CN.md and compile them as tests
     // so the documentation examples can never drift out of sync with the library API.
@@ -116,8 +172,12 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run all unit and documentation tests");
     test_step.dependOn(&run_lib_tests.step);
+    test_step.dependOn(&run_c_api_tests.step);
     test_step.dependOn(&run_example_tests.step);
     test_step.dependOn(&run_example_zh_tests.step);
+    if (fuzz_filter == null) {
+        test_step.dependOn(&run_c_api_test_exe.step);
+    }
 
     const fuzz_tests = b.addTest(.{
         .name = "libwebgrep-fuzz",
@@ -133,6 +193,9 @@ pub fn build(b: *std.Build) void {
     // e.g. zig build check -Dtarget=x86_64-linux-musl -Dteddy=avx2
     const check_step = b.step("check", "Compile library and tests without running");
     check_step.dependOn(&lib_tests.step);
+    check_step.dependOn(&c_api_tests.step);
+    check_step.dependOn(&webgrep_static.step);
+    check_step.dependOn(&webgrep_shared.step);
     check_step.dependOn(&example_tests.step);
     check_step.dependOn(&example_zh_tests.step);
     if (want_linux_getdents and target.result.os.tag != .linux) {

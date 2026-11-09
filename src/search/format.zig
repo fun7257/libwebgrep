@@ -53,14 +53,20 @@ pub fn spanBefore(_: void, a: Span, b: Span) bool {
 
 pub fn growSpans(alloc: ?std.mem.Allocator, store: []Span, heap: *[]Span, n: usize) SliceError![]Span {
     const a = alloc orelse return error.OutOfMemory;
-    const bigger_n = @max(store.len * 2, n + 1);
+    const bigger_n = @max(store.len * 2, @max(heap.len * 2, n + 1));
     if (heap.len == 0) {
         const bigger = try a.alloc(Span, bigger_n);
         @memcpy(bigger[0..n], store[0..n]);
         heap.* = bigger;
         return bigger;
     }
-    heap.* = try a.realloc(heap.*, bigger_n);
+    const from_inline = (store.ptr != heap.*.ptr);
+    if (heap.len < bigger_n) {
+        heap.* = try a.realloc(heap.*, bigger_n);
+    }
+    if (from_inline and n > 0) {
+        @memcpy(heap.*[0..n], store[0..n]);
+    }
     return heap.*;
 }
 
@@ -79,7 +85,7 @@ pub fn gatherSpans(
     config: SearchConfig,
 ) SliceError![]Span {
     if (known == null) return inline_buf[0..0];
-    var store = inline_buf;
+    var store = if (heap.len > inline_buf.len) heap.* else inline_buf;
     var n: usize = 0;
     if (config.whole_line) {
         if (preview.span) |span| {
@@ -105,11 +111,12 @@ pub fn gatherSpans(
         if (in_window or empty_at_point) {
             if (n == store.len) store = try growSpans(alloc, store, heap, n);
             if (empty_at_point) {
-                store[n] = .{ .start = 0, .end = 0 };
+                store[n] = .{ .start = 0, .end = 0, .pattern_id = found.pattern_id };
             } else {
                 store[n] = .{
                     .start = found.start - win_lo,
                     .end = @min(mend, win_hi) - win_lo,
+                    .pattern_id = found.pattern_id,
                 };
             }
             n += 1;
@@ -147,7 +154,7 @@ pub fn sinkLine(
     var multi = matches;
     if (multi.len == 0) {
         if (span) |found| {
-            one[0] = .{ .start = found.start, .end = found.end };
+            one[0] = .{ .start = found.start, .end = found.end, .pattern_id = found.pattern_id };
             multi = &one;
         }
     }
@@ -197,6 +204,7 @@ pub fn buildLine(
             .u16_start = units.start,
             .u16_end = units.end,
             .replacement = replacement,
+            .pattern_id = found.pattern_id,
         };
         u16_column = units.start + 1;
     }
@@ -461,12 +469,10 @@ pub fn sinkMatched(
     const withheld = config.binary == .report and state.nul_offset != null;
     const bytes = if (withheld) buf[line.start..line.start] else buf[preview.start..preview.end];
     var inline_spans: [32]Span = undefined;
-    var span_heap: []Span = &.{};
-    defer if (span_heap.len != 0) if (state.text_alloc) |alloc| alloc.free(span_heap);
     const matches = if (withheld) inline_spans[0..0] else try gatherSpans(
         state.text_alloc,
         &inline_spans,
-        &span_heap,
+        &state.span_buf,
         matcher,
         buf,
         line,
@@ -531,12 +537,10 @@ pub fn sinkContext(
     const withheld = config.binary == .report and state.nul_offset != null;
     const bytes = if (withheld) buf[line.start..line.start] else buf[preview.start..preview.end];
     var inline_spans: [32]Span = undefined;
-    var span_heap: []Span = &.{};
-    defer if (span_heap.len != 0) if (state.text_alloc) |alloc| alloc.free(span_heap);
     const matches = if (withheld) inline_spans[0..0] else try gatherSpans(
         state.text_alloc,
         &inline_spans,
-        &span_heap,
+        &state.span_buf,
         matcher,
         buf,
         line,
@@ -594,6 +598,7 @@ pub fn spanFrom(buf: []const u8, line: Range, content_end: usize, known: ?BufMat
     return .{
         .start = m.start - line.start,
         .end = @min(m.end, content_end) - line.start,
+        .pattern_id = m.pattern_id,
     };
 }
 

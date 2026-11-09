@@ -88,9 +88,19 @@ pub const PackedPair = struct {
         return self.findInner(width, haystack, start, guard, false, undefined);
     }
 
+    pub fn findWithWidth(
+        self: PackedPair,
+        comptime width: comptime_int,
+        haystack: []const u8,
+        start: usize,
+        guard: ?*Guard,
+    ) ?usize {
+        return self.find(width, haystack, start, guard);
+    }
+
     /// Same as `find`, while also checking already-loaded vectors for NUL bytes.
-    /// If a NUL is seen, writes its offset to `nul_out` and returns null so the caller can apply its binary policy.
-    /// When returning a match, only guarantees no NUL precedes the match start; bytes after the match are checked by the caller.
+    /// If a NUL is seen before a match completes, writes its offset to `nul_out` and returns null so the caller can apply its binary policy.
+    /// When returning a match, guarantees no NUL precedes or lies within the matched span; bytes after the match are checked by the caller.
     pub fn findWatchingNul(
         self: PackedPair,
         comptime width: comptime_int,
@@ -102,6 +112,17 @@ pub const PackedPair = struct {
         return self.findInner(width, haystack, start, guard, true, nul_out);
     }
 
+    pub fn findWatchingNulWithWidth(
+        self: PackedPair,
+        comptime width: comptime_int,
+        haystack: []const u8,
+        start: usize,
+        guard: ?*Guard,
+        nul_out: *?usize,
+    ) ?usize {
+        return self.findWatchingNul(width, haystack, start, guard, nul_out);
+    }
+
     fn findInner(
         self: PackedPair,
         comptime width: comptime_int,
@@ -111,7 +132,7 @@ pub const PackedPair = struct {
         comptime watch_nul: bool,
         nul_out: *?usize,
     ) ?usize {
-        comptime if (width != 16 and width != 32) @compileError("packed pair width must be 16 or 32");
+        comptime if (width != 16 and width != 32 and width != 64) @compileError("packed pair width must be 16, 32, or 64");
         const m = self.pattern.len;
         if (m > haystack.len or start > haystack.len - m) {
             if (watch_nul and start <= haystack.len) {
@@ -197,11 +218,13 @@ pub const PackedPair = struct {
             }
             origin += width;
         }
+        const tail_hit = scalarFrom(self, haystack, origin, last, &previous, fold, watched, guard);
         if (watch_nul) {
             const from = @min(haystack.len, origin + cover_index);
-            if (noteNul(haystack[from..], from, nul_out)) return null;
+            const nul_limit = if (tail_hit) |pos| @min(haystack.len, @max(from, pos + self.pattern.len)) else haystack.len;
+            if (noteNul(haystack[from..nul_limit], from, nul_out)) return null;
         }
-        return scalarFrom(self, haystack, origin, last, &previous, fold, watched, guard);
+        return tail_hit;
     }
 };
 
@@ -262,16 +285,7 @@ fn takeHit(
     guard: *Guard,
     nul_out: *?usize,
 ) ?usize {
-    if (watch_nul) {
-        const cover_index = @min(self.anchor_index, self.other_index);
-        const block: @Vector(width, u8) = haystack[origin + cover_index ..][0..width].*;
-        const zeros = block == @as(@Vector(width, u8), @splat(0));
-        if (@reduce(.Or, zeros)) {
-            const rel = std.simd.firstTrue(zeros).?;
-            nul_out.* = origin + cover_index + @as(usize, rel);
-            return null;
-        }
-    }
+    const cover_index = @min(self.anchor_index, self.other_index);
     const left: @Vector(width, u8) = haystack[origin + self.anchor_index ..][0..width].*;
     const right: @Vector(width, u8) = haystack[origin + self.other_index ..][0..width].*;
     var hits = byteMask(width, left, self.anchor, fold) & byteMask(width, right, self.other, fold);
@@ -286,11 +300,37 @@ fn takeHit(
         );
         const at = origin + @as(usize, rel);
         if (at > last) continue;
-        if (confirm(self, haystack, at)) return @as(usize, rel);
+        if (confirm(self, haystack, at)) {
+            if (watch_nul) {
+                const check_start = @min(haystack.len, origin + cover_index);
+                const check_end = @min(haystack.len, @max(check_start, at + self.pattern.len));
+                if (noteNul(haystack[check_start..check_end], check_start, nul_out)) return null;
+            }
+            return @as(usize, rel);
+        }
         if (!watched) continue;
         guard.noteMiss(at, previous.*);
         previous.* = at + 1;
-        if (guard.gave_up) return null;
+        if (guard.gave_up) {
+            if (watch_nul) {
+                const block: @Vector(width, u8) = haystack[origin + cover_index ..][0..width].*;
+                const zeros = block == @as(@Vector(width, u8), @splat(0));
+                if (@reduce(.Or, zeros)) {
+                    const zrel = std.simd.firstTrue(zeros).?;
+                    nul_out.* = origin + cover_index + @as(usize, zrel);
+                }
+            }
+            return null;
+        }
+    }
+    if (watch_nul) {
+        const block: @Vector(width, u8) = haystack[origin + cover_index ..][0..width].*;
+        const zeros = block == @as(@Vector(width, u8), @splat(0));
+        if (@reduce(.Or, zeros)) {
+            const zrel = std.simd.firstTrue(zeros).?;
+            nul_out.* = origin + cover_index + @as(usize, zrel);
+            return null;
+        }
     }
     return null;
 }
@@ -352,13 +392,13 @@ test "selects the two rarest bytes by rank" {
     try std.testing.expectEqual(@as(u8, 'q'), pair.other);
 }
 
-test "detects NUL during scan, including prefix before minimum anchor offset" {
+test "detects NUL during scan, including prefix before minimum anchor offset and NUL after match in same block" {
     const mid = PackedPair.init("QX", &frequency.default_rank, false);
     var buf: [200]u8 = undefined;
     @memset(&buf, 'a');
     buf[80] = 0;
     @memcpy(buf[120..][0..2], "QX");
-    inline for (.{ 16, 32 }) |w| {
+    inline for (.{ 16, 32, 64 }) |w| {
         var nul: ?usize = null;
         try std.testing.expect(mid.findWatchingNul(w, &buf, 0, null, &nul) == null);
         try std.testing.expectEqual(@as(?usize, 80), nul);
@@ -367,9 +407,19 @@ test "detects NUL during scan, including prefix before minimum anchor offset" {
     @memset(&buf, 'a');
     @memcpy(buf[30..][0..2], "QX");
     buf[150] = 0;
-    inline for (.{ 16, 32 }) |w| {
+    inline for (.{ 16, 32, 64 }) |w| {
         var nul: ?usize = null;
         try std.testing.expectEqual(@as(?usize, 30), mid.findWatchingNul(w, &buf, 0, null, &nul));
+        try std.testing.expect(nul == null);
+    }
+
+    // NUL immediately after match in the same SIMD block must still return the match!
+    @memset(&buf, 'a');
+    @memcpy(buf[2..][0..2], "QX");
+    buf[5] = 0;
+    inline for (.{ 16, 32, 64 }) |w| {
+        var nul: ?usize = null;
+        try std.testing.expectEqual(@as(?usize, 2), mid.findWatchingNul(w, &buf, 0, null, &nul));
         try std.testing.expect(nul == null);
     }
 
@@ -378,7 +428,7 @@ test "detects NUL during scan, including prefix before minimum anchor offset" {
     @memset(&buf, 'b');
     buf[0] = 0;
     @memcpy(buf[40..][0..3], "aQX");
-    inline for (.{ 16, 32 }) |w| {
+    inline for (.{ 16, 32, 64 }) |w| {
         var nul: ?usize = null;
         try std.testing.expect(shifted.findWatchingNul(w, &buf, 0, null, &nul) == null);
         try std.testing.expectEqual(@as(?usize, 0), nul);
@@ -387,7 +437,7 @@ test "detects NUL during scan, including prefix before minimum anchor offset" {
 
 test "verifies candidates and continues past false positives" {
     const pair = PackedPair.init("qx", &frequency.default_rank, false);
-    inline for (.{ 16, 32 }) |w| {
+    inline for (.{ 16, 32, 64 }) |w| {
         try std.testing.expectEqual(@as(?usize, 3), findAll(pair, w, "qqqqxqx", 0));
         try std.testing.expectEqual(@as(?usize, null), findAll(pair, w, "qqqqqq", 0));
         try std.testing.expectEqual(@as(?usize, null), findAll(pair, w, "qx", 1));
@@ -396,7 +446,7 @@ test "verifies candidates and continues past false positives" {
 
 test "case-insensitive matching" {
     const pair = PackedPair.init("Ab", &frequency.default_rank, true);
-    inline for (.{ 16, 32 }) |w| {
+    inline for (.{ 16, 32, 64 }) |w| {
         try std.testing.expectEqual(@as(?usize, 1), findAll(pair, w, "xabXAB", 0));
         try std.testing.expectEqual(@as(?usize, 4), findAll(pair, w, "xabXAB", 2));
         try std.testing.expectEqual(@as(?usize, null), findAll(pair, w, "axb", 0));
@@ -408,7 +458,7 @@ const frequency = @import("frequency.zig");
 test "random differential against naive search" {
     var prng = std.Random.DefaultPrng.init(0x9A11);
     const random = prng.random();
-    var hay: [100]u8 = undefined;
+    var hay: [200]u8 = undefined;
     var pat: [8]u8 = undefined;
     const rank = frequency.default_rank;
     for (0..60) |_| {
@@ -419,7 +469,7 @@ test "random differential against naive search" {
         const start = if (hlen == 0) 0 else random.intRangeAtMost(usize, 0, hlen);
         inline for (.{ false, true }) |fold| {
             const pair = PackedPair.init(pat[0..plen], &rank, fold);
-            inline for (.{ 16, 32 }) |w| {
+            inline for (.{ 16, 32, 64 }) |w| {
                 try std.testing.expectEqual(
                     scalarFind(hay[0..hlen], pat[0..plen], start, fold),
                     findAll(pair, w, hay[0..hlen], start),
@@ -443,7 +493,7 @@ fn fuzzPair(_: void, smith: *std.testing.Smith) !void {
     const fold = smith.value(bool);
     const start: usize = if (hlen == 0) 0 else smith.valueRangeAtMost(u32, 0, @intCast(hlen));
     const pair = PackedPair.init(pat_buf[0..plen], &frequency.default_rank, fold);
-    inline for (.{ 16, 32 }) |w| {
+    inline for (.{ 16, 32, 64 }) |w| {
         try std.testing.expectEqual(
             scalarFind(hay_buf[0..hlen], pat_buf[0..plen], start, fold),
             findAll(pair, w, hay_buf[0..hlen], start),

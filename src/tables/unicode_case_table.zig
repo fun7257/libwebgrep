@@ -274,24 +274,11 @@ pub fn toLowerSimple(cp: u21) u21 {
 
 pub const toFoldedLower = toLowerSimple;
 
-/// Returns whether a Unicode codepoint is a word character (ASCII `[0-9A-Za-z_]` plus Unicode letters, numbers, and CJK/kana/hangul scripts).
+const prop_table = @import("unicode_prop_table.zig");
+
+/// Returns whether a Unicode codepoint is a UAX #29 word character (ASCII `[0-9A-Za-z_]` plus Unicode `L`, `M`, `N`, `Pc`, and Join_Control).
 pub fn isUnicodeWordCodepoint(cp: u21) bool {
-    if (cp < 0x80) {
-        return (cp >= '0' and cp <= '9') or (cp >= 'A' and cp <= 'Z') or (cp >= 'a' and cp <= 'z') or cp == '_';
-    }
-    if (cp > 0x10FFFF) return false;
-    // Exclude Latin-1 control/punctuation/multiplication/division
-    if (cp < 0x00C0 or cp == 0x00D7 or cp == 0x00F7) return false;
-    // Exclude General Punctuation, Spaces, Arrows, Math Operators, Box Drawing, Symbols, Dingbats (U+2000..U+2BFF)
-    if (cp >= 0x2000 and cp <= 0x2BFF and cp != 0x212A) return false;
-    // Exclude CJK Symbols and Punctuation (U+3000..U+303F: ideographic space, ideographic comma/full stop, brackets, etc.)
-    if (cp >= 0x3000 and cp <= 0x303F) return false;
-    // Exclude Fullwidth ASCII punctuation (U+FF00..U+FF0F, U+FF1A..U+FF20, U+FF3B..U+FF40, U+FF5B..U+FF65)
-    if ((cp >= 0xFF00 and cp <= 0xFF0F) or
-        (cp >= 0xFF1A and cp <= 0xFF20) or
-        (cp >= 0xFF3B and cp <= 0xFF40) or
-        (cp >= 0xFF5B and cp <= 0xFF65)) return false;
-    return true;
+    return prop_table.isWordCodepoint(cp);
 }
 
 test "unicode_case_table: canonical folding and word classification" {
@@ -300,5 +287,9 @@ test "unicode_case_table: canonical folding and word classification" {
     try std.testing.expectEqual(@as(u21, 0x03C3), toLowerSimple(0x03A3));
     try std.testing.expectEqual(@as(u21, 0x03C3), toLowerSimple(0x03C2));
     try std.testing.expect(isUnicodeWordCodepoint(0x4F60));
-    try std.testing.expect(!isUnicodeWordCodepoint(0x3002));
+    try std.testing.expect(isUnicodeWordCodepoint(0x0301)); // Combining acute accent (Mn)
+    try std.testing.expect(isUnicodeWordCodepoint(0x203F)); // Undertie (Pc)
+    try std.testing.expect(!isUnicodeWordCodepoint(0x3002)); // Ideographic full stop (Po)
+    try std.testing.expect(!isUnicodeWordCodepoint(0x1F680)); // Rocket emoji (So)
 }
+

@@ -105,14 +105,20 @@ pub fn runExample() !void {
 
 ---
 
-## 构建、测试与交叉编译
+## 构建、测试、模糊测试与交叉编译
 
 ```sh
-# 运行全部 182 项单元测试与 API 文档示例测试
+# 运行全部 205 项单元测试、模糊测试与 API 文档编译校验测试
 zig build test --summary all
 
-# 运行 ReleaseFast 进程内微基准测试
-zig build bench -Doptimize=ReleaseFast
+# 运行跨层差分与 Zig 0.17.1 Smith 模糊测试套件
+zig build fuzz --summary all
+
+# 运行 32 场景 ReleaseFast 进程内微基准测试
+zig build bench -Doptimize=ReleaseFast -Dteddy=avx2
+
+# 按名称子串过滤运行特定微基准场景
+zig build bench -Doptimize=ReleaseFast -Dteddy=avx2 -Dbench-filter=regex_
 
 # 跨平台编译校验
 zig build check -Dtarget=x86_64-linux-musl -Doptimize=ReleaseFast
@@ -122,12 +128,14 @@ zig build check -Dtarget=aarch64-linux-musl
 
 ---
 
-## 文档导航
+## 文档导航（中英双语）
 
+- [**五层架构设计与协同开发指南 (`docs/ARCHITECTURE.zh-CN.md`)**](docs/ARCHITECTURE.zh-CN.md) ([English (`docs/ARCHITECTURE.md`)](docs/ARCHITECTURE.md)) — 五层无环架构布局、`MatcherTraits`/`SinkTraits` 零成本扩展契约与人机协同开发规范。
 - [**API 参考手册 (`docs/API.zh-CN.md`)**](docs/API.zh-CN.md) ([English (`docs/API.md`)](docs/API.md)) — 公共导出符号、事件结构与多租户预算完整说明。
-- [**架构与设计说明 (`DESIGN.md`)**](DESIGN.md) — SIMD 查找内核、Thompson NFA 正则引擎、流式防爆解压与工作窃取调度详解。
+- [**功能矩阵与安全边界 (`docs/FEATURES.zh-CN.md`)**](docs/FEATURES.zh-CN.md) ([English (`docs/FEATURES.md`)](docs/FEATURES.md)) — 核心能力全景与安全红线说明。
+- [**架构演进里程碑 (`docs/ROADMAP.zh-CN.md`)**](docs/ROADMAP.zh-CN.md) ([English (`docs/ROADMAP.md`)](docs/ROADMAP.md)) — 已完成的全部功能与架构演进里程碑。
+- [**算法与内核深入解析 (`DESIGN.md`)**](DESIGN.md) — SIMD 查找内核、Thompson NFA 正则引擎、流式防爆解压与工作窃取调度详解。
 - [**性能基准报告 (`BENCHMARKS.md`)**](BENCHMARKS.md) — 微基准测试方法与吞吐数据解析。
-- [**功能矩阵与安全边界 (`docs/FEATURES.md`)**](docs/FEATURES.md) — 核心能力全景与安全红线说明。
 
 ---
 

@@ -123,14 +123,20 @@ defer re.deinit();
 
 ---
 
-## Building, Testing & Cross-Compiling
+## Building, Testing, Fuzzing & Cross-Compiling
 
 ```sh
-# Run all 182 unit tests and compile-checked API documentation examples
+# Run all 205 unit, fuzz, and compile-checked API documentation tests
 zig build test --summary all
 
-# Run the in-process ReleaseFast microbenchmark suite
-zig build bench -Doptimize=ReleaseFast
+# Run the dedicated cross-layer differential & Smith fuzz suite
+zig build fuzz --summary all
+
+# Run the 32-scenario in-process ReleaseFast microbenchmark suite
+zig build bench -Doptimize=ReleaseFast -Dteddy=avx2
+
+# Filter specific benchmark scenarios
+zig build bench -Doptimize=ReleaseFast -Dteddy=avx2 -Dbench-filter=regex_
 
 # Cross-compile verification (no execution required)
 zig build check -Dtarget=x86_64-linux-musl -Doptimize=ReleaseFast
@@ -146,15 +152,18 @@ zig build check -Dtarget=aarch64-linux-musl
 | `-Dlinux-getdents` | `bool` | `false` | Uses raw `getdents64` syscall for directory enumeration on Linux |
 | `-Dmmap-windows` | `bool` | `false` | Maps large files in 8 MiB rolling windows instead of `readPositional` |
 | `-Dsanitize-thread` | `bool` | `false` | Enables ThreadSanitizer (`TSan`) |
+| `-Dbench-filter` | `string` | `null` | Runs only microbenchmark scenarios whose names contain the substring |
 
 ---
 
-## Documentation
+## Documentation (Bilingual: English & 简体中文)
 
+- [**5-Layer Architecture & Extensibility Guide (`docs/ARCHITECTURE.md`)**](docs/ARCHITECTURE.md) ([简体中文 (`docs/ARCHITECTURE.zh-CN.md`)](docs/ARCHITECTURE.zh-CN.md)) — 5-layer acyclic module layout, `MatcherTraits`/`SinkTraits` extension contracts, and human + AI co-development protocol.
 - [**API Reference (`docs/API.md`)**](docs/API.md) ([简体中文 (`docs/API.zh-CN.md`)](docs/API.zh-CN.md)) — Complete specification of all exported types, functions, events, and multi-tenant budgets.
-- [**Architecture & Design (`DESIGN.md`)**](DESIGN.md) — Deep dive into the SIMD kernels, Thompson NFA regex engine, streaming decompression, and work-stealing scheduler.
+- [**Feature Matrix (`docs/FEATURES.md`)**](docs/FEATURES.md) ([简体中文 (`docs/FEATURES.zh-CN.md`)](docs/FEATURES.zh-CN.md)) — Overview of implemented capabilities and security boundaries.
+- [**Architecture Milestones (`docs/ROADMAP.md`)**](docs/ROADMAP.md) ([简体中文 (`docs/ROADMAP.zh-CN.md`)](docs/ROADMAP.zh-CN.md)) — Completed engineering and architecture milestones.
+- [**Algorithmic Deep Dive (`DESIGN.md`)**](DESIGN.md) — Detailed walkthrough of SIMD kernels, Thompson NFA regex engine, streaming decompression, and work-stealing scheduler.
 - [**Benchmarks (`BENCHMARKS.md`)**](BENCHMARKS.md) — Reproducible microbenchmark suite and throughput analysis.
-- [**Feature Matrix (`docs/FEATURES.md`)**](docs/FEATURES.md) — Overview of implemented capabilities and security boundaries.
 
 ---
 

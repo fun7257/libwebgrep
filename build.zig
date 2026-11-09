@@ -5,6 +5,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer") orelse false;
     const fuzz_filter = b.option([]const u8, "fuzz-filter", "Run only tests whose name contains this substring");
+    const bench_filter = b.option([]const u8, "bench-filter", "Run only benchmark scenarios whose name contains this substring");
     // OS- and ISA-specific optimizations are controlled via build options.
     // Windowed mmap and raw getdents64 are disabled by default.
     // Teddy defaults to neon on aarch64 and off on other architectures.
@@ -70,11 +71,12 @@ pub fn build(b: *std.Build) void {
     });
     const run_lib_tests = b.addRunArtifact(lib_tests);
 
-    // Extract the single canonical code example from docs/API.md and compile it as a test
-    // so the documentation example can never drift out of sync with the library API.
+    // Extract the single canonical code example from docs/API.md and docs/API.zh-CN.md and compile them as tests
+    // so the documentation examples can never drift out of sync with the library API.
     const api_doc = readRepoFile(b, "docs/API.md");
+    const api_zh_doc = readRepoFile(b, "docs/API.zh-CN.md");
     const root_src = readRepoFile(b, "src/root.zig");
-    checkApiDoc(b, root_src, api_doc);
+    checkApiDoc(b, root_src, api_doc, api_zh_doc);
     const example_wf = b.addWriteFiles();
     const example_src = example_wf.add("api_doc_example.zig", extractApiExample(api_doc));
     const example_mod = b.createModule(.{
@@ -94,15 +96,45 @@ pub fn build(b: *std.Build) void {
     });
     const run_example_tests = b.addRunArtifact(example_tests);
 
+    const example_zh_src = example_wf.add("api_zh_doc_example.zig", extractApiExample(api_zh_doc));
+    const example_zh_mod = b.createModule(.{
+        .root_source_file = example_zh_src,
+        .target = compile_target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .imports = &.{
+            .{ .name = "libwebgrep", .module = mod },
+        },
+    });
+    const example_zh_tests = b.addTest(.{
+        .name = "api-zh-doc-example",
+        .root_module = example_zh_mod,
+        .filters = test_filters,
+        .use_llvm = use_llvm,
+    });
+    const run_example_zh_tests = b.addRunArtifact(example_zh_tests);
+
     const test_step = b.step("test", "Run all unit and documentation tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_example_tests.step);
+    test_step.dependOn(&run_example_zh_tests.step);
+
+    const fuzz_tests = b.addTest(.{
+        .name = "libwebgrep-fuzz",
+        .root_module = mod,
+        .filters = &.{"fuzz:"},
+        .use_llvm = use_llvm,
+    });
+    const run_fuzz_tests = b.addRunArtifact(fuzz_tests);
+    const fuzz_step = b.step("fuzz", "Run differential and property-based fuzz test suites");
+    fuzz_step.dependOn(&run_fuzz_tests.step);
 
     // Cross-compilation verification step (compiles library and tests without executing):
     // e.g. zig build check -Dtarget=x86_64-linux-musl -Dteddy=avx2
     const check_step = b.step("check", "Compile library and tests without running");
     check_step.dependOn(&lib_tests.step);
     check_step.dependOn(&example_tests.step);
+    check_step.dependOn(&example_zh_tests.step);
     if (want_linux_getdents and target.result.os.tag != .linux) {
         const fail = b.addFail("-Dlinux-getdents is only supported when targeting Linux");
         test_step.dependOn(&fail.step);
@@ -140,6 +172,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         const run_micro = b.addRunArtifact(micro);
+        if (bench_filter) |f| run_micro.addArg(f);
         bench_step.dependOn(&run_micro.step);
     }
 }
@@ -192,7 +225,7 @@ fn extractApiExample(md: []const u8) []const u8 {
     return found orelse std.process.fatal("docs/API.md is missing compilable test \"API documentation example\"", .{});
 }
 
-fn checkApiDoc(b: *std.Build, root_src: []const u8, api_md: []const u8) void {
+fn checkApiDoc(b: *std.Build, root_src: []const u8, api_md: []const u8, api_zh_md: []const u8) void {
     const required = [_][]const u8{
         "\n## Scope\n",
         "\n## Entry Points\n",
@@ -225,6 +258,9 @@ fn checkApiDoc(b: *std.Build, root_src: []const u8, api_md: []const u8) void {
         if (std.mem.indexOf(u8, api_md, text) != null) {
             std.process.fatal("docs/API.md contains banned text: {s}", .{text});
         }
+        if (std.mem.indexOf(u8, api_zh_md, text) != null) {
+            std.process.fatal("docs/API.zh-CN.md contains banned text: {s}", .{text});
+        }
     }
 
     var prev_doc = false;
@@ -242,6 +278,9 @@ fn checkApiDoc(b: *std.Build, root_src: []const u8, api_md: []const u8) void {
             const heading = std.fmt.allocPrint(b.allocator, "\n### {s}\n", .{name}) catch @panic("OOM");
             if (std.mem.indexOf(u8, api_md, heading) == null) {
                 std.process.fatal("docs/API.md is missing section '### {s}'", .{name});
+            }
+            if (std.mem.indexOf(u8, api_zh_md, heading) == null) {
+                std.process.fatal("docs/API.zh-CN.md is missing section '### {s}'", .{name});
             }
             prev_doc = false;
             continue;

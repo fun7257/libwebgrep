@@ -1,11 +1,16 @@
-//! Leading BOM sniffing and UTF-16 / legacy charset transcoding.
-//!
-//! The matching kernel still operates on bytes. Here we only transcode recognized encodings to UTF-8 before searching,
-//! or replace invalid UTF-8 with U+FFFD when emitting a line. Without a BOM or explicit hint, no encoding is guessed.
+//! [Module] codec/encoding.zig
+//! [Layer] Layer 3 — Stream Codec & Character Transcoding
+//! [Role] Leading BOM sniffing, WHATWG/HTTP charset resolution, and streaming/slice transcoding
+//!        for UTF-8, UTF-16LE, UTF-16BE, GBK (CP936), and ISO-8859-1 (Latin-1) into searchable UTF-8.
+//! [Invariants]
+//!   1. Without a leading BOM or explicit caller encoding/charset hint, raw bytes pass through untouched.
+//!   2. Ill-formed sequences in decoded modes map deterministically to U+FFFD (`\xEF\xBF\xBD`).
+//! [HotPath] `convertIntoMode`, `convertedLenMode`, `Decoder.decodeInto`, and `encodeCp`.
 
 const std = @import("std");
 const unicode = std.unicode;
 const decompress = @import("decompress.zig");
+const gbk_table = @import("../tables/gbk_table.zig");
 
 pub const Encoding = enum {
     /// Only sniff for a BOM at the start of the stream (if no BOM is present, transcode using the `charset` hint if given, otherwise search raw bytes).
@@ -507,21 +512,22 @@ pub const Decoder = struct {
         while (filled < dest.len) {
             const rest = self.in[self.in_i..self.in_len];
             const step = decodeMode(mode, rest, eof) orelse break;
-            this_out: {
-                const start_out = self.out_produced;
-                const start_raw = self.raw_consumed;
-                if (self.offset_map) |m| {
-                    try m.record(allocator, start_out, start_raw);
-                }
-                self.in_i += step.n;
-                self.raw_consumed += step.n;
+            if (self.offset_map) |m| {
+                try m.record(allocator, self.out_produced, self.raw_consumed);
+            }
+            self.in_i += step.n;
+            self.raw_consumed += step.n;
+            if (dest.len - filled >= 4) {
+                const n_out = encodeCp(step.cp, dest[filled..]);
+                filled += n_out;
+                self.out_produced += n_out;
+            } else {
                 self.queueCp(step.cp);
                 self.out_produced += self.out_len;
-                if (self.offset_map) |m| {
-                    try m.record(allocator, self.out_produced, self.raw_consumed);
-                }
                 filled += self.drainOut(dest[filled..]);
-                break :this_out;
+            }
+            if (self.offset_map) |m| {
+                try m.record(allocator, self.out_produced, self.raw_consumed);
             }
         }
         return filled;
@@ -576,9 +582,25 @@ fn convertedUnits(mode: coded_mode, input: []const u8) usize {
 }
 
 fn convertedLen(mode: coded_mode, input: []const u8) usize {
+    return switch (mode) {
+        inline else => |m| convertedLenMode(m, input),
+    };
+}
+
+fn convertedLenMode(comptime mode: coded_mode, input: []const u8) usize {
     var i: usize = 0;
     var n: usize = 0;
     while (i < input.len) {
+        if (mode == .utf16le and i + 2 <= input.len and input[i + 1] == 0 and input[i] < 0x80) {
+            n += 1;
+            i += 2;
+            continue;
+        }
+        if ((mode == .gbk or mode == .utf8) and input[i] < 0x80) {
+            n += 1;
+            i += 1;
+            continue;
+        }
         const step = decodeMode(mode, input[i..], true) orelse break;
         n += utf8Len(step.cp);
         i += step.n;
@@ -587,9 +609,27 @@ fn convertedLen(mode: coded_mode, input: []const u8) usize {
 }
 
 fn convertInto(mode: coded_mode, input: []const u8, out: []u8) usize {
+    return switch (mode) {
+        inline else => |m| convertIntoMode(m, input, out),
+    };
+}
+
+fn convertIntoMode(comptime mode: coded_mode, input: []const u8, out: []u8) usize {
     var i: usize = 0;
     var w: usize = 0;
     while (i < input.len) {
+        if (mode == .utf16le and i + 2 <= input.len and input[i + 1] == 0 and input[i] < 0x80) {
+            out[w] = input[i];
+            w += 1;
+            i += 2;
+            continue;
+        }
+        if ((mode == .gbk or mode == .utf8) and input[i] < 0x80) {
+            out[w] = input[i];
+            w += 1;
+            i += 1;
+            continue;
+        }
         const step = decodeMode(mode, input[i..], true) orelse break;
         w += encodeCp(step.cp, out[w..]);
         i += step.n;
@@ -605,20 +645,20 @@ fn convertIntoWithMap(
     raw_base: u64,
     offset_map: ?*decompress.OffsetMap,
 ) error{OutOfMemory}!usize {
-    if (offset_map) |m| m.base_raw_offset = raw_base;
+    if (offset_map == null) {
+        return convertInto(mode, input, out);
+    }
+    const m = offset_map.?;
+    m.base_raw_offset = raw_base;
     var i: usize = 0;
     var w: usize = 0;
     while (i < input.len) {
         const step = decodeMode(mode, input[i..], true) orelse break;
-        if (offset_map) |m| {
-            try m.record(allocator, w, raw_base + i);
-        }
+        try m.record(allocator, w, raw_base + i);
         w += encodeCp(step.cp, out[w..]);
         i += step.n;
     }
-    if (offset_map) |m| {
-        try m.record(allocator, w, raw_base + i);
-    }
+    try m.record(allocator, w, raw_base + i);
     return w;
 }
 
@@ -637,46 +677,6 @@ fn decodeLatin1(bytes: []const u8) ?Step {
     return .{ .n = 1, .cp = bytes[0] };
 }
 
-const GbkPair = struct {
-    b1: u8,
-    b2: u8,
-    cp: u21,
-};
-
-/// Exact mapping table for common GB2312/GBK double-byte Chinese characters and punctuation; remaining valid double-byte pairs map linearly into the CJK Unified Ideographs block.
-const gbk_common_pairs = [_]GbkPair{
-    .{ .b1 = 0xC4, .b2 = 0xE3, .cp = '你' },
-    .{ .b1 = 0xBA, .b2 = 0xC3, .cp = '好' },
-    .{ .b1 = 0xB2, .b2 = 0xE2, .cp = '测' },
-    .{ .b1 = 0xCA, .b2 = 0xD4, .cp = '试' },
-    .{ .b1 = 0xCB, .b2 = 0xD1, .cp = '搜' },
-    .{ .b1 = 0xCB, .b2 = 0xF7, .cp = '索' },
-    .{ .b1 = 0xB4, .b2 = 0xED, .cp = '错' },
-    .{ .b1 = 0xCE, .b2 = 0xF3, .cp = '误' },
-    .{ .b1 = 0xC3, .b2 = 0xFC, .cp = '命' },
-    .{ .b1 = 0xD6, .b2 = 0xD0, .cp = '中' },
-    .{ .b1 = 0xCE, .b2 = 0xC4, .cp = '文' },
-    .{ .b1 = 0xB3, .b2 = 0xC9, .cp = '成' },
-    .{ .b1 = 0xB9, .b2 = 0xA6, .cp = '功' },
-    .{ .b1 = 0xCA, .b2 = 0xA7, .cp = '失' },
-    .{ .b1 = 0xB0, .b2 = 0xDC, .cp = '败' },
-    .{ .b1 = 0xC8, .b2 = 0xD5, .cp = '日' },
-    .{ .b1 = 0xD6, .b2 = 0xBE, .cp = '志' },
-    .{ .b1 = 0xB7, .b2 = 0xFE, .cp = '服' },
-    .{ .b1 = 0xCE, .b2 = 0xF1, .cp = '务' },
-    .{ .b1 = 0xCA, .b2 = 0xFD, .cp = '数' },
-    .{ .b1 = 0xBE, .b2 = 0xDD, .cp = '据' },
-    .{ .b1 = 0xCF, .b2 = 0xB5, .cp = '系' },
-    .{ .b1 = 0xCD, .b2 = 0xB3, .cp = '统' },
-    .{ .b1 = 0xA1, .b2 = 0xA1, .cp = 0x3000 }, // Ideographic space
-    .{ .b1 = 0xA1, .b2 = 0xA3, .cp = '。' },
-    .{ .b1 = 0xA3, .b2 = 0xAC, .cp = '，' },
-    .{ .b1 = 0xA3, .b2 = 0xBA, .cp = '：' },
-    .{ .b1 = 0xA3, .b2 = 0xBB, .cp = '；' },
-    .{ .b1 = 0xA3, .b2 = 0xBF, .cp = '？' },
-    .{ .b1 = 0xA3, .b2 = 0xA1, .cp = '！' },
-};
-
 fn decodeGbk(bytes: []const u8, eof: bool) ?Step {
     if (bytes.len == 0) return null;
     const b1 = bytes[0];
@@ -691,16 +691,9 @@ fn decodeGbk(bytes: []const u8, eof: bool) ?Step {
     if (b2 < 0x40 or b2 == 0x7F or b2 == 0xFF) {
         return .{ .n = 1, .cp = unicode.replacement_character };
     }
-    for (gbk_common_pairs) |pair| {
-        if (pair.b1 == b1 and pair.b2 == b2) return .{ .n = 2, .cp = pair.cp };
-    }
-    // GB2312 Section 3 fullwidth ASCII (0xA3 0xA1..0xFE -> U+FF01..U+FF5E)
-    if (b1 == 0xA3 and b2 >= 0xA1 and b2 <= 0xFE) {
-        return .{ .n = 2, .cp = 0xFF01 + @as(u21, b2 - 0xA1) };
-    }
-    const trail_idx: u21 = if (b2 > 0x7F) b2 - 0x41 else b2 - 0x40;
-    const linear: u21 = (@as(u21, b1 - 0x81) * 190) + trail_idx;
-    return .{ .n = 2, .cp = 0x4E00 + (linear % 0x51A6) };
+    const trail_idx: usize = if (b2 > 0x7F) b2 - 0x41 else b2 - 0x40;
+    const linear: usize = (@as(usize, b1 - 0x81) * 190) + trail_idx;
+    return .{ .n = 2, .cp = gbk_table.table[linear] };
 }
 
 fn decodeUtf8(bytes: []const u8, eof: bool) ?Step {
@@ -751,12 +744,36 @@ fn utf8Len(cp: u21) usize {
 }
 
 fn encodeCp(cp: u21, out: []u8) usize {
-    const n = unicode.utf8Encode(cp, out) catch {
-        const rep = unicode.replacement_character_utf8;
-        @memcpy(out[0..rep.len], &rep);
-        return rep.len;
-    };
-    return n;
+    if (cp < 0x80) {
+        out[0] = @intCast(cp);
+        return 1;
+    }
+    if (cp < 0x800) {
+        out[0] = @intCast(0xC0 | (cp >> 6));
+        out[1] = @intCast(0x80 | (cp & 0x3F));
+        return 2;
+    }
+    if (cp < 0x10000) {
+        if (cp >= 0xD800 and cp <= 0xDFFF) {
+            const rep = unicode.replacement_character_utf8;
+            @memcpy(out[0..rep.len], &rep);
+            return rep.len;
+        }
+        out[0] = @intCast(0xE0 | (cp >> 12));
+        out[1] = @intCast(0x80 | ((cp >> 6) & 0x3F));
+        out[2] = @intCast(0x80 | (cp & 0x3F));
+        return 3;
+    }
+    if (cp <= 0x10FFFF) {
+        out[0] = @intCast(0xF0 | (cp >> 18));
+        out[1] = @intCast(0x80 | ((cp >> 12) & 0x3F));
+        out[2] = @intCast(0x80 | ((cp >> 6) & 0x3F));
+        out[3] = @intCast(0x80 | (cp & 0x3F));
+        return 4;
+    }
+    const rep = unicode.replacement_character_utf8;
+    @memcpy(out[0..rep.len], &rep);
+    return rep.len;
 }
 
 const testing = std.testing;
@@ -854,4 +871,33 @@ test "transcodes to UTF-8 even when read buffer is smaller than BOM plus one cod
         if (pulled.eof) break;
     }
     try testing.expectEqualStrings("foo\n", out[0..filled]);
+}
+
+test "GBK / CP936 full table decodes Level-1, Level-2, GBK/3, GBK/4, Euro 0x80, and split chunks" {
+    // U+4F60 U+597D (C4 E3 BA C3) + U+9555 (GBK/4: E9 46) + U+5586 (GBK/3: 86 B4) + Euro U+20AC (0x80) + "\n"
+    const gbk_bytes = [_]u8{ 0xC4, 0xE3, 0xBA, 0xC3, 0xE9, 0x46, 0x86, 0xB4, 0x80, '\n' };
+    const decoded = try convertAlloc(testing.allocator, .gbk, &gbk_bytes);
+    defer testing.allocator.free(decoded);
+    try testing.expectEqualStrings("你好镕喆€\n", decoded);
+
+    // Streaming 1 byte at a time across double-byte boundaries
+    var src = Chunk{ .rest = &gbk_bytes, .cap = 1 };
+    var dec = Decoder.init(.gbk);
+    defer dec.deinit(testing.allocator);
+    var out: [64]u8 = undefined;
+    var filled: usize = 0;
+    var read_bytes: u64 = 0;
+    while (true) {
+        const pulled = try dec.pull(testing.allocator, Chunk.read, &src, 1, out[filled..], &read_bytes);
+        filled += pulled.n;
+        if (pulled.eof) break;
+    }
+    try testing.expectEqualStrings("你好镕喆€\n", out[0..filled]);
+    try testing.expectEqual(@as(u64, gbk_bytes.len), read_bytes);
+
+    // Invalid trail byte (0x7F) and truncated lead byte at EOF produce U+FFFD
+    const invalid_gbk = [_]u8{ 0x81, 0x7F, 'A', 0xFE };
+    const lossy_gbk = try convertAlloc(testing.allocator, .gbk, &invalid_gbk);
+    defer testing.allocator.free(lossy_gbk);
+    try testing.expectEqualStrings("\u{FFFD}\x7FA\u{FFFD}", lossy_gbk);
 }

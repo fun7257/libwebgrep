@@ -96,7 +96,24 @@ pub fn resumeSourceSlice(
 ) SliceError!Result
 ```
 
-Resumes searching the same `haystack` slice from a paused `Result` (`previous.paused == true`). Restores `resume_from` from `previous.resume_at` along with all running counters in `previous.resume_state`, and does not re-emit `begin`.
+Resumes searching the same `haystack` slice from a paused `Result` (`previous.paused == true`). Restores `resume_from` from `previous.resume_at` along with all running counters in `previous.resume_state`, and does not re-emit `begin`. When `haystack` uses an uncompressed character encoding (`utf16le`, `utf16be`, `gbk`, `latin1`), only the unsearched raw tail starting at `previous.resume_state.raw_resume_at` is transcoded.
+
+### resumeSource
+
+```zig
+pub fn resumeSource(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    sink: *S,
+    reader: *std.Io.Reader,
+    source_id: []const u8,
+    matcher: anytype,
+    config: SearchConfig,
+    previous: Result,
+) ReadError!Result
+```
+
+Resumes searching a `*std.Io.Reader` from a paused `Result` (`previous.paused == true`) without re-emitting `begin`.
 
 ### openSourcePull
 
@@ -159,7 +176,7 @@ pub const Flow = enum { cont, pause, stop };
 
 Flow control returned by service `event` callbacks:
 - `cont`: Continue scanning.
-- `pause`: Pause immediately, record `Result.resume_state` and `Result.resume_at`, and suppress `end` and `summary` so the caller can resume later via `resumeSourceSlice`.
+- `pause`: Pause immediately, record `Result.resume_state` and `Result.resume_at`, and suppress `end` and `summary` so the caller can resume later via `resumeSourceSlice` or `resumeSource`.
 - `stop`: Stop scanning this source and emit `end`.
 
 ### AnySink
@@ -217,7 +234,7 @@ Literal patterns (`Finder` and `Multi`) cannot contain `\n` (returning `error.Pa
 
 Pattern count is capped at a server hard limit of `1024` (`pattern_count_hard_cap`), and total pattern bytes are capped at `256 KiB` (`pattern_bytes_hard_cap`). Exceeding either returns `error.PatternCountExceeded` or `error.PatternBytesExceeded` before allocating any tables.
 
-Case matching defaults to `sensitive`. It uses ASCII case folding by default (`A-Z` and `a-z`); setting `FindOptions.unicode_case = true` enables Unicode Simple Case Folding in `Multi`.
+Case matching defaults to `sensitive`. Setting `FindOptions.unicode_case = true` enables BMP Unicode Simple Case Folding in both `Finder` and `Multi`.
 
 Smart case is evaluated per pattern (`CaseMode.smart`): a pattern is matched case-insensitively only if that specific pattern contains no uppercase letters, and case-sensitively if it contains any uppercase letter.
 
@@ -234,7 +251,7 @@ pub fn requiredLiteral(self: *const Finder) ?RequiredLiteral
 pub fn resetStats(self: *Finder) void
 ```
 
-Zero heap allocation. `pattern` is borrowed from the caller and must outlive `Finder`. Combines frequency-ranked `PackedPair` 4-window SIMD filtering with worst-case linear-time `TwoWay` fallback and fused single-pass NUL detection (`findWatched`).
+Zero heap allocation. `pattern` is borrowed from the caller and must outlive `Finder`. Combines frequency-ranked `PackedPair` 4-window SIMD filtering with worst-case linear-time `TwoWay` fallback, fused single-pass NUL detection (`findWatched`), and zero-allocation BMP Unicode Simple Case Folding when `options.unicode_case` is `true`.
 
 ### finder
 
@@ -276,17 +293,19 @@ pub fn init(allocator: std.mem.Allocator, pattern: []const u8, options: RegexOpt
 pub fn deinit(self: *Regex) void
 pub fn find(self: *Regex, haystack: []const u8, start: usize, mode: MatchMode) ?Match
 pub fn findWatched(self: *Regex, haystack: []const u8, start: usize, mode: MatchMode, nul_at: *?usize) ?Match
+pub fn findCaptures(self: *const Regex, haystack: []const u8, start: usize, mode: MatchMode) ?Captures
+pub fn extractCaptures(self: *const Regex, haystack: []const u8, match_span: Match) Captures
 pub fn acceptsSpan(self: *Regex, span: []const u8) bool
 pub fn requiredLiteral(self: *const Regex) ?RequiredLiteral
 pub fn resetStats(self: *Regex) void
 ```
 
 Supported regular expression syntax:
-- Literals and escapes: `\d`, `\D`, `\w`, `\W`, `\s`, `\S`, `\n`, `\r`, `\t`, and escaped metacharacters `\.`, `\*`, `\+`, `\?`, `\(`, `\)`, `\[`, `\]`, `\{`, `\}`, `\|`, `\^`, `\$`, `\\`.
-- Wildcard and anchors: `.` (any byte except `\n`, or including `\n` when `dot_all = true` and `multiline = true`), `^` (start of line/input), `$` (end of line/input).
-- Character classes: `[a-z0-9_]`, negated `[^a-z]` or `[!a-z]`, and shorthand classes inside brackets.
-- Quantifiers: `*`, `+`, `?`, `{m}`, `{m,}`, `{m,n}` (greedy).
-- Alternation and grouping: `a|b`, `(expr)`, `(?:expr)`.
+- Literals and escapes: `\d`, `\D`, `\w`, `\W`, `\s`, `\S`, `\b`, `\B`, `\A`, `\z`, `\n`, `\r`, `\t`, `\xHH`, and escaped metacharacters.
+- Wildcard and anchors: `.` (any UTF-8 codepoint except `\n`, or including `\n` when `dot_all = true` and `multiline = true`), `^` (start of line/input), `$` (end of line/input).
+- Character classes: `[a-z0-9_]`, multi-byte UTF-8 classes `[你好α-ω]`, negated `[^a-z]` or `[!a-z]`, and shorthand classes inside brackets.
+- Quantifiers: `*`, `+`, `?`, `{m}`, `{m,}`, `{m,n}` (greedy, operating on complete UTF-8 codepoints).
+- Alternation, grouping, and inline flags: `a|b`, `(expr)` (numbered capture groups `$1`..`$9`), `(?:expr)`, `(?i)`, `(?m)`, `(?s)`, `(?-i)`, `(?i:expr)`.
 
 Executes lockstep Thompson NFA / PikeVM simulation where each NFA instruction is activated at most once per input byte, guaranteeing worst-case $O(n)$ time complexity and immunity to catastrophic backtracking (ReDoS). Enforces a server compile size hard cap (`inst_count_hard_cap = 4096`) and bounded multiline window cap (`multiline_window_hard_cap = 8 MiB`), returning `error.RegexTooLarge` before scanning if exceeded. Automatically extracts a `RequiredLiteral` from the AST and attaches a SIMD `Finder` prefilter.
 
@@ -294,15 +313,30 @@ Executes lockstep Thompson NFA / PikeVM simulation where each NFA instruction is
 
 | Field | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `case` | `CaseMode` | `.sensitive` | Case folding mode (ASCII case folding by default) |
+| `case` | `CaseMode` | `.sensitive` | Case folding mode |
+| `unicode_case` | `bool` | `true` | Enables BMP Unicode Simple Case Folding when `case` is `.insensitive` or `.smart` |
 | `multiline` | `bool` | `false` | Allows matches to span across `\n` within `max_multiline_window`, and makes `^`/`$` match line boundaries |
 | `dot_all` | `bool` | `false` | When `true` alongside `multiline`, allows `.` to match `\n` |
 | `max_inst` | `?usize` | `null` | Compiled NFA instruction cap (`null` uses hard cap `4096`) |
 | `max_multiline_window` | `usize` | `64 * 1024` | Maximum byte span for a multiline match (`64 KiB` default, `8 MiB` hard cap) |
 
+### Captures
+
+```zig
+pub const Captures = struct {
+    match: Match,
+    groups: [9]?Match = .{null} ** 9,
+    pub fn fullMatch(self: Captures) Match
+    pub fn group(self: Captures, index: usize) ?Match
+    pub fn slice(self: Captures, haystack: []const u8, index: usize) ?[]const u8
+};
+```
+
+Holds the full match (`match`) and numbered submatch capture groups `$1`..`$9` (`groups[0..8]`) extracted by `Regex.findCaptures` or `Regex.extractCaptures`, and automatically used by `SearchConfig.replacement` when expanding `$0`, `$&`, `$1`..`$9`, `${1}`..`${9}`, and `$$`.
+
 ### regex
 
-Re-exports `src/regex.zig`, the definition module for `Regex` and `RegexOptions`.
+Re-exports `src/regex.zig`, the definition module for `Regex`, `RegexOptions`, and `Captures`.
 
 ### MatchMode
 

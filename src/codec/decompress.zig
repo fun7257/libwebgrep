@@ -1,13 +1,19 @@
-//! In-process streaming decompression and decompression bomb protection (Gzip / Zstd / XZ).
-//!
-//! Design invariants:
-//! 1. Never spawn external decompression processes (`gzip`/`zstd`/`xz` subprocesses are strictly forbidden); 100% in-process streaming.
-//! 2. Track decompressed byte count (`decompressed_bytes`) and compression ratio (`decompressed_bytes / raw_bytes`) in real time;
-//!    immediately abort and return `error.DecompressLimit` once `max_decompressed_bytes` or `max_compression_ratio` is exceeded
-//!    (recorded by Searcher as `LimitHit.decompressed_bytes`).
-//! 3. Corrupt compressed streams never panic or raise fatal errors; they map to `error.CorruptStream` (recorded by Searcher as `SoftError.read_failed`).
+//! [Module] codec/decompress.zig
+//! [Layer] Layer 3 — Stream Codec & Bomb-Safe Decompression
+//! [Role] In-process streaming decompression and decompression bomb protection (Gzip / Zstd / XZ).
+//! [Invariants]
+//!   1. Never spawn external decompression subprocesses (`gzip`/`zstd`/`xz` are strictly forbidden); 100% in-process streaming.
+//!   2. Track decompressed byte count (`decompressed_bytes`) and compression ratio (`decompressed_bytes / raw_bytes`) in real time;
+//!      immediately abort and return `error.DecompressLimit` once `max_decompressed_bytes` or `max_compression_ratio` is exceeded
+//!      (recorded by Searcher as `LimitHit.decompressed_bytes`).
+//!   3. Corrupt compressed streams never panic or raise fatal errors; they map to `error.CorruptStream` (recorded by Searcher as `SoftError.read_failed`).
+//! [HotPath] `sniff` (branch-free header magic check) and `pumpDecompress`.
 
 const std = @import("std");
+pub const offset_map_mod = @import("offset_map.zig");
+pub const OffsetMap = offset_map_mod.OffsetMap;
+pub const SearchByteOffset = offset_map_mod.SearchByteOffset;
+pub const RawByteOffset = offset_map_mod.RawByteOffset;
 
 pub const Compression = enum {
     /// Do not decompress by default; process as a raw byte stream.
@@ -39,92 +45,6 @@ pub const Error = error{
     OutOfMemory,
     DecompressLimit,
     CorruptStream,
-};
-
-/// Block-level offset map: maps searchable stream offsets after decompression or transcoding back to raw input byte offsets.
-pub const OffsetMap = struct {
-    pub const Anchor = struct {
-        out_offset: u64,
-        raw_offset: u64,
-    };
-
-    anchors: std.ArrayList(Anchor) = .empty,
-    /// Fixed leading offset (e.g., `base_raw_offset = 3` after stripping a 3-byte UTF-8 BOM).
-    base_raw_offset: u64 = 0,
-    active: bool = false,
-
-    pub fn deinit(self: *OffsetMap, allocator: std.mem.Allocator) void {
-        self.anchors.deinit(allocator);
-        self.* = .{};
-    }
-
-    pub fn record(self: *OffsetMap, allocator: std.mem.Allocator, out_offset: u64, raw_offset: u64) error{OutOfMemory}!void {
-        self.active = true;
-        const len = self.anchors.items.len;
-        if (len > 0) {
-            const last = &self.anchors.items[len - 1];
-            if (last.out_offset == out_offset) {
-                last.raw_offset = raw_offset;
-                return;
-            }
-            if (out_offset < last.out_offset) return;
-            if (len >= 2) {
-                const prev = self.anchors.items[len - 2];
-                const d_out1 = last.out_offset - prev.out_offset;
-                const d_raw1 = last.raw_offset -| prev.raw_offset;
-                const d_out2 = out_offset - last.out_offset;
-                const d_raw2 = raw_offset -| last.raw_offset;
-                if (d_out1 > 0 and d_out2 > 0 and last.raw_offset >= prev.raw_offset and raw_offset >= last.raw_offset) {
-                    if (@as(u128, d_raw1) * @as(u128, d_out2) == @as(u128, d_raw2) * @as(u128, d_out1)) {
-                        last.out_offset = out_offset;
-                        last.raw_offset = raw_offset;
-                        return;
-                    }
-                }
-            }
-        }
-        try self.anchors.append(allocator, .{
-            .out_offset = out_offset,
-            .raw_offset = raw_offset,
-        });
-    }
-
-    /// Given an absolute offset `out_offset` in the searchable stream, returns the corresponding raw byte stream offset.
-    pub fn map(self: *const OffsetMap, out_offset: u64) u64 {
-        if (!self.active) return out_offset + self.base_raw_offset;
-        const items = self.anchors.items;
-        if (items.len == 0) return out_offset + self.base_raw_offset;
-
-        // Binary search for the last `anchor.out_offset <= out_offset`
-        var lo: usize = 0;
-        var hi: usize = items.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (items[mid].out_offset <= out_offset) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        if (lo == 0) return items[0].raw_offset;
-        const idx = lo - 1;
-        const cur = items[idx];
-        if (idx + 1 < items.len) {
-            const next = items[idx + 1];
-            if (next.out_offset > cur.out_offset and next.raw_offset == cur.raw_offset) {
-                // Bytes produced within the same compressed block map back to the starting raw offset of that block
-                return cur.raw_offset;
-            }
-            if (next.out_offset > cur.out_offset and next.raw_offset > cur.raw_offset) {
-                const out_span = next.out_offset - cur.out_offset;
-                const raw_span = next.raw_offset - cur.raw_offset;
-                const rel = out_offset - cur.out_offset;
-                if (raw_span == out_span) return cur.raw_offset + rel;
-                return cur.raw_offset + (rel * raw_span) / out_span;
-            }
-        }
-        return cur.raw_offset;
-    }
 };
 
 /// Sniff compression magic bytes at the beginning of a stream.
@@ -237,6 +157,7 @@ fn pumpDecompress(
     while (true) {
         const raw_before: u64 = @intCast(@min(raw_reader.seek, total_raw_len));
         const n = dec_reader.readSliceShort(&chunk) catch {
+            @branchHint(.cold);
             return error.CorruptStream;
         };
         if (n == 0) break;
@@ -247,13 +168,19 @@ fn pumpDecompress(
         local_decompressed = std.math.add(u64, local_decompressed, n) catch return error.DecompressLimit;
         total_decompressed.* = std.math.add(u64, total_decompressed.*, n) catch return error.DecompressLimit;
         if (max_decompressed_bytes) |cap| {
-            if (total_decompressed.* > cap) return error.DecompressLimit;
+            if (total_decompressed.* > cap) {
+                @branchHint(.cold);
+                return error.DecompressLimit;
+            }
         }
 
         const raw_consumed: u64 = @max(1, @as(u64, @intCast(@min(raw_reader.seek, total_raw_len))));
         if (local_decompressed >= ratio_check_min_bytes) {
             const max_allowed = std.math.mul(u64, raw_consumed, ratio_cap) catch std.math.maxInt(u64);
-            if (local_decompressed > max_allowed) return error.DecompressLimit;
+            if (local_decompressed > max_allowed) {
+                @branchHint(.cold);
+                return error.DecompressLimit;
+            }
         }
 
         try out_list.appendSlice(allocator, chunk[0..n]);
@@ -322,6 +249,10 @@ pub fn compressZstdRawAlloc(allocator: std.mem.Allocator, payload: []const u8) e
     try out.appendSlice(allocator, payload);
 
     return out.toOwnedSlice(allocator);
+}
+
+test {
+    _ = offset_map_mod;
 }
 
 test "Gzip decompression and bomb limit enforcement" {

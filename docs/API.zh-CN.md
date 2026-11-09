@@ -166,9 +166,178 @@ pub fn find(self: *Regex, haystack: []const u8, start: usize, mode: MatchMode) ?
 
 ---
 
-## 七、全场景实战代码示例
+## 七、`src/root.zig` 导出符号完整索引（55 项）
 
-以下代码块完整演示了 5 个高频实战场景，并且其英文对应版本由 `build.zig` 自动抽取作为 `api-doc-example` 单元测试编译执行：
+### matcher
+重导出 `src/matcher.zig`，定义字面量与正则共用的匹配模式、区间结构、大小写策略与模式配额上限校验函数 `checkPatternLimits`。
+
+### sink_mod
+重导出 `src/sink.zig`，包含所有服务事件（`Event`）、行结果（`LineEvent` / `Line`）、流控（`Flow`）与完成状态（`Result`）定义。
+
+### searcher
+重导出 `src/searcher.zig`，包含 `SearchConfig`、`SliceError`、`ReadError`、`PullEvent`、`SourcePull` 及全部搜索入口实现。
+
+### MatchMode
+匹配选择模式枚举：`.earliest`（选择最早结束的匹配，默认）或 `.leftmost_first`（选择最左起点的匹配，与 `rg -F` 一致）。
+
+### Match
+半开字节区间 `struct { start: usize, end: usize }`，相对于传入 `find` 的 `haystack` 切片。
+
+### RequiredLiteral
+`struct { bytes: []const u8, offset_in_match: usize }`，从匹配器提取的必需字面量锚点，供 `Searcher` 执行 SIMD 预过滤。
+
+### CaseMode
+大小写匹配模式枚举：`sensitive`（默认）、`insensitive` 或 `smart`（按每条模式独立判断智能大小写）。
+
+### FindOptions
+构造 `Finder` 或 `Multi` 的配置项（`case`、`unicode_case`、`frequency`、`prefilter_fp_threshold`、`max_pattern_count`、`max_pattern_bytes`）。
+
+### Span
+行内匹配的半开字节区间（`start`、`end`）及预计算的 UTF-16 码元端点（`u16_start`、`u16_end`）与可选只读替换切片（`replacement`）。
+
+### Line
+旧版回调入口（`searchSlice` / `searchReader`）交付的匹配行或上下文行结构，切片仅在回调返回前有效。
+
+### BinaryStatus
+二进制检测状态枚举：`none`、`detected` 或 `suppressed`。
+
+### Event
+服务入口同步交付的事件联合体：`begin`、`match`、`context`、`context_break`、`progress`、`heartbeat`、`end`、`summary`。
+
+### LineEvent
+服务入口交付的单行事件结构，包含 `source_id`、1 起始行号、字节列号与 UTF-16 列号、`absolute_offset`、`raw_offset`、行内容切片及 `matches` 区间数组。
+
+### EndEvent
+单来源完成事件。即使来源零命中也必会依次发出 `begin` 与 `end`。
+
+### AnySink
+旧版接收器的运行时多态擦除包装器（`ctx` + `vtable`），其 `vtable` 生命周期须长于 `AnySink`。
+
+### anyVtable
+在编译期为任意旧版接收器类型 `S` 生成 `AnySink.VTable`，零堆内存分配。
+
+### SliceIter
+面向单个内存切片的无上下文、零分配拉式匹配行迭代器（`SliceIter(M)`）。
+
+### Result
+单来源搜索完成后的返回值结构，区分正常匹配、零命中、单来源软错误（`soft_error`）与预算停止原因（`limit_hit`）。
+
+### Outcome
+搜索终止结果枚举：`complete`、`stopped`、`binary_quit` 或 `binary_matched`。
+
+### LimitHit
+搜索触发的多租户配额限制枚举：`none`、`max_results`、`max_bytes`、`deadline`、`decompressed_bytes` 或 `cancelled`。
+
+### SoftError
+单来源非致命软错误枚举（`read_failed`），已剥离任何服务器内部文件路径。
+
+### Flow
+服务事件回调返回的流控指令：`cont`（继续）、`pause`（暂停并保存游标）或 `stop`（停止当前来源）。
+
+### Summary
+单次请求完整结束（未暂停且非打开的实时流）时发出的最终统计汇总事件。
+
+### Progress
+按 `SearchConfig.progress_interval` 字节间隔周期性发出的扫描进度快照。
+
+### Heartbeat
+在实时流（`live = true`）空闲读取达到 `idle_timeout_ns` 时发出的心跳事件。
+
+### ResumeState
+保存在 `Result.resume_state` 中的内部计数器与原始流断点（`raw_resume_at`）快照，供 `resumeSourceSlice` 与 `resumeSource` 在 `Flow.pause` 后无缝恢复。
+
+### BinaryPolicy
+二进制输入处理策略枚举：`quit`（默认遇到 NUL 立即跳过）、`report`（探测但不输出行内容）或 `none`（按普通文本处理）。
+
+### Encoding
+输入字符集编码枚举：`auto`（默认嗅探 BOM 或采用 `charset` 提示）、`none`、`utf8`、`utf16le`、`utf16be`、`gbk`、`latin1`。
+
+### Compression
+进程内流式解压格式枚举：`none`（默认）、`auto`（自动识别 Gzip/Zstd/XZ 魔数，非压缩流保持零缓冲流式扫描）、`gzip`、`zstd`、`xz`。
+
+### decompress
+重导出 `src/decompress.zig`，提供防压缩炸弹的进程内流式解压与原始字节偏移映射表 `OffsetMap`。
+
+### SearchConfig
+搜索行为与多租户预算配置结构；服务入口在预算字段为 `null` 时自动填充安全默认值并强制校验硬顶。
+
+### searchSlice
+旧版内存切片回调搜索入口（不自动填充服务默认预算）。
+
+### searchReader
+旧版 `*std.Io.Reader` 流式回调搜索入口（服务负载请优先使用 `searchSource`）。
+
+### searchSource
+服务级流式搜索入口：在 `*std.Io.Reader` 上搜索调用方指定的 `source_id`，自动应用多租户默认预算。
+
+### resumeSource
+从前一次 `Flow.pause` 返回的 `Result` 断点处继续搜索 `*std.Io.Reader` 流，不重复发出 `begin` 事件。
+
+### searchSourceSlice
+服务级内存切片搜索入口：无需转码、解压或替换预览时执行零堆分配搜索。
+
+### resumeSourceSlice
+从前一次 `Flow.pause` 返回的 `Result` 断点处继续搜索同一切片（转码场景仅对 `raw_resume_at` 之后的未扫描尾部转码），不重复发出 `begin` 事件。
+
+### openSourcePull
+基于拉式迭代器的服务事件搜索入口（返回 `searcher.SourcePull`）。
+
+### memchr
+重导出 `src/finder/memchr.zig`，提供 16/32 字节宽度的向量化单字节查找（`find`、`findEither`、`findAny`、`findLast`、`count`）。
+
+### finder
+重导出 `src/finder/finder.zig`，即单字面量 SIMD 查找器 `Finder` 的定义模块。
+
+### Finder
+单字面量 SIMD 查找器（`PackedPair` 4 窗口 SIMD + `TwoWay` 线性回退，支持 `unicode_case` 零分配 BMP Unicode 大小写折叠），零堆内存分配。
+
+### multi
+重导出 `src/finder/multi.zig`，即多字面量 OR 引擎 `Multi` 的定义模块。
+
+### Multi
+多字面量 OR 自动分级检索引擎（`ByteSet` / `RarePair` / `Teddy` / `AhoCorasick`，支持 BMP 全区段 `unicode_case` 展开与超限自动回退）。
+
+### regex
+重导出 `src/regex.zig`，即线性时间正则引擎 `Regex`、`RegexOptions` 与 `Captures` 的定义模块。
+
+### Regex
+基于锁步 Thompson NFA / PikeVM 与 `RequiredLiteral` SIMD 预过滤的线性时间正则表达式引擎（支持 UTF-8 多字节字符类/量词、`(?i)` 内联标志、`\b`/`\B`/`\A`/`\z` 锚点及 `$1`..`$9` 捕获组）。
+
+### RegexOptions
+构造 `Regex` 的配置项：大小写模式（`case` / `unicode_case`）、有界跨行匹配（`multiline` / `max_multiline_window`）、`dot_all` 及指令数上限（`max_inst`）。
+
+### Captures
+正则子匹配捕获组结构，保存完整匹配（`match`）与编号捕获组 `$1`..`$9`（`groups[0..8]`），供 `Regex.findCaptures`、`Regex.extractCaptures` 及 `SearchConfig.replacement` 替换模板（`$0`/`$&`/`$1`..`$9`/`${1}`..`${9}`/`$$`）使用。
+
+### two_way
+重导出 `src/finder/two_way.zig`，提供最坏时间复杂度严格 $O(n)$、零堆分配的 Crochemore-Perrin Two-Way 子串查找器。
+
+### source
+重导出 `src/source.zig`，提供面向归档或内存虚拟目录树的抽象接口（`Source`、`Memory`）。
+
+### walk_glob
+重导出 `src/walk/glob.zig`，提供支持嵌套花括号展开、条数/长度硬顶与忽略大小写的字节级 Glob 匹配器。
+
+### walk_ignore
+重导出 `src/walk/ignore.zig`，提供内存态 `.gitignore` / `.ignore` / `.rgignore` 规则解析与层级化匹配器。
+
+### walk_deque
+重导出 `src/walk/deque.zig`，提供面向指针元素的无锁 Chase-Lev 工作窃取双端队列 `Deque(T)`。
+
+### walk_file_id
+重导出 `src/walk/file_id.zig`，从已打开的 `std.Io.Dir` 与 `std.Io.File` 句柄提取设备号与 inode 标识（`Id`）。
+
+### walk_types
+重导出 `src/walk/types.zig`，提供内置与可注入的文件类型映射表及 Glob 展开工具。
+
+### walk_list
+重导出 `src/walk/list_dir.zig`，提供在已打开 `std.Io.Dir` 上批量读取目录项的迭代器 `Lister`。
+
+---
+
+## 八、全场景实战代码示例
+
+以下代码块完整演示了 5 个高频实战场景，并由 `build.zig` 自动抽取编译执行：
 1. **单字面量智能大小写搜索与 UTF-16 码元区间读取**（`searchSourceSlice`）
 2. **多模式文本解析（`Multi.initFromText`）与无状态分页暂停/续查**（`Flow.pause` + `resumeSourceSlice`）
 3. **线性时间正则匹配（`Regex`）与只读替换预览**（`SearchConfig.replacement`）

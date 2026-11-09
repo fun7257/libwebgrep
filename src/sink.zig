@@ -1,9 +1,11 @@
-//! Push-based output. Line slices point into Searcher's internal buffer or the caller's haystack, and are only valid until the callback returns.
-//!
-//! Sink is determined by the comptime parameter `S` of `search`. Returning false from a callback stops the current search.
-//! In addition to the optional methods listed here, Searcher calls the optional
-//! `pub fn binary(self: *S, offset: u64) bool` the first time it sees a NUL byte: returning false stops reading further data.
-//! That method must be `pub` so `@hasDecl` can see it.
+//! [Module] sink.zig
+//! [Layer] Layer 5 — Output Event & Result Contracts
+//! [Role] Defines push-based output types (`Event`, `LineEvent`, `Line`, `Span`, `Result`, `Flow`, `ResumeState`),
+//!        runtime-polymorphic `AnySink`, pull-based `SliceIter`, and `SinkTraits(S)` compile-time introspection.
+//! [Invariants]
+//!   1. Borrowed slices (`bytes`, `text`, `raw`, `matches`, `replacement`) point into Searcher buffers or the caller's haystack
+//!      and are valid only until the callback returns.
+//!   2. Service callbacks return `bool` or `Flow` (`cont`, `pause`, `stop`).
 
 const std = @import("std");
 const matcher = @import("matcher.zig");
@@ -26,7 +28,7 @@ pub const Flow = enum {
     stop,
 };
 
-/// Counters needed to resume searching after a pause. Passed to `resumeSourceSlice`.
+/// Counters needed to resume searching after a pause. Passed to `resumeSourceSlice` or `resumeSource`.
 pub const ResumeState = struct {
     matched_lines: u64 = 0,
     matches: u64 = 0,
@@ -39,6 +41,7 @@ pub const ResumeState = struct {
     started_ns: i128 = 0,
     deadline_armed: bool = false,
     skip_begin: bool = false,
+    raw_resume_at: u64 = 0,
 };
 
 /// Reason why the search stopped.
@@ -386,7 +389,7 @@ pub fn SliceIter(comptime M: type) type {
             const mstart = found.start - start;
             const mend = @min(found.end, content_end) - start;
             const raw = self.haystack[start..content_end];
-            const units = @import("encoding.zig").utf16Span(raw, mstart, mend);
+            const units = @import("codec/encoding.zig").utf16Span(raw, mstart, mend);
             return .{
                 .bytes = raw,
                 .text = raw,
@@ -403,6 +406,26 @@ pub fn SliceIter(comptime M: type) type {
                 .line_len = content_end - start,
             };
         }
+    };
+}
+
+/// Compile-time capability descriptor for any sink type `S` (legacy line sink or service `Event` sink).
+pub fn SinkTraits(comptime S: type) type {
+    const Base = switch (@typeInfo(S)) {
+        .pointer => |p| p.child,
+        else => S,
+    };
+    return struct {
+        pub const Self = Base;
+        pub const has_event = @hasDecl(Base, "event");
+        pub const has_begin = @hasDecl(Base, "begin");
+        pub const has_matched = @hasDecl(Base, "matched");
+        pub const has_context = @hasDecl(Base, "context");
+        pub const has_context_break = @hasDecl(Base, "contextBreak");
+        pub const has_binary = @hasDecl(Base, "binary");
+        pub const has_progress = @hasDecl(Base, "progress");
+        pub const has_heartbeat = @hasDecl(Base, "heartbeat");
+        pub const has_finish = @hasDecl(Base, "finish");
     };
 }
 
@@ -453,6 +476,8 @@ test "AnySink forwards calls to concrete type" {
             return false;
         }
     };
+    const T = SinkTraits(Rec);
+    try testing.expect(T.has_begin and T.has_matched and !T.has_event);
     const vt = anyVtable(Rec);
     var rec: Rec = .{};
     var any: AnySink = .{ .ctx = @ptrCast(&rec), .vtable = &vt };

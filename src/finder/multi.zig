@@ -33,6 +33,7 @@ const teddy_mod = if (teddy_on) @import("teddy.zig") else struct {
 pub const Multi = struct {
     kind: Kind,
     ignore_case: bool,
+    unicode_case: bool = false,
     empty_only: bool,
     /// Owned by the caller. Used for whole-line comparison and whole-word per-pattern verification without copying pattern bytes.
     patterns: []const []const u8,
@@ -71,6 +72,7 @@ pub const Multi = struct {
                 return .{
                     .kind = .{ .bytes = byteset.Set.init(patterns, ignore) },
                     .ignore_case = ignore,
+                    .unicode_case = options.unicode_case,
                     .empty_only = false,
                     .patterns = patterns,
                 };
@@ -79,6 +81,7 @@ pub const Multi = struct {
                 return .{
                     .kind = .{ .pairs = engine },
                     .ignore_case = ignore,
+                    .unicode_case = options.unicode_case,
                     .empty_only = false,
                     .patterns = patterns,
                 };
@@ -88,6 +91,7 @@ pub const Multi = struct {
                     return .{
                         .kind = .{ .teddy = teddy_mod.Engine.init(patterns, ignore) },
                         .ignore_case = ignore,
+                        .unicode_case = options.unicode_case,
                         .empty_only = false,
                         .patterns = patterns,
                     };
@@ -96,6 +100,7 @@ pub const Multi = struct {
             return .{
                 .kind = .{ .ac = try aho.build(allocator, patterns, ignore) },
                 .ignore_case = ignore,
+                .unicode_case = options.unicode_case,
                 .empty_only = onlyEmpty(patterns),
                 .patterns = patterns,
             };
@@ -110,6 +115,7 @@ pub const Multi = struct {
                 .allocator = allocator,
             } },
             .ignore_case = false,
+            .unicode_case = options.unicode_case,
             .empty_only = false,
             .patterns = patterns,
         };
@@ -203,7 +209,7 @@ pub const Multi = struct {
         _ = self;
     }
 
-    pub fn find(self: *Multi, haystack: []const u8, start: usize, mode: matcher.MatchMode) ?matcher.Match {
+    pub fn find(self: *const Multi, haystack: []const u8, start: usize, mode: matcher.MatchMode) ?matcher.Match {
         if (self.kind == .mixed) return self.scan(haystack, start, mode, allowAll);
         switch (self.kind) {
             .bytes => |*set| {
@@ -225,7 +231,12 @@ pub const Multi = struct {
         if (start > end or end > haystack.len) return false;
         const span = haystack[start..end];
         for (self.patterns, 0..) |pat, i| {
-            if (ascii.eql(pat, span, self.foldOf(i))) return true;
+            const fold = self.foldOf(i);
+            const matched = if (self.unicode_case and fold)
+                unicode_fold.eqlFolded(pat, span)
+            else
+                ascii.eql(pat, span, fold);
+            if (matched) return true;
         }
         return false;
     }
@@ -262,8 +273,20 @@ pub const Multi = struct {
     ) ?matcher.Match {
         var best: ?Naive = null;
         for (self.patterns, 0..) |pat, id_usize| {
+            const fold = self.foldOf(id_usize);
+            if (self.unicode_case and fold) {
+                if (unicode_fold.matchFoldedPrefix(pat, haystack[at..])) |match_len| {
+                    if (allow(haystack, at, at + match_len)) {
+                        const cand = Naive{ .start = at, .end = at + match_len, .id = @intCast(id_usize) };
+                        if (best) |cur| {
+                            if (better(cand, cur, mode)) best = cand;
+                        } else best = cand;
+                    }
+                }
+                continue;
+            }
             if (at + pat.len > haystack.len) continue;
-            if (!ascii.eql(pat, haystack[at..][0..pat.len], self.ignore_case)) continue;
+            if (!ascii.eql(pat, haystack[at..][0..pat.len], fold)) continue;
             if (!allow(haystack, at, at + pat.len)) continue;
             const cand = Naive{ .start = at, .end = at + pat.len, .id = @intCast(id_usize) };
             if (best) |cur| {
@@ -297,8 +320,19 @@ pub const Multi = struct {
         var i = start;
         while (i <= haystack.len) : (i += 1) {
             for (self.patterns, 0..) |pat, id_usize| {
-                if (i + pat.len > haystack.len) continue;
                 const fold = if (flags) |list| list[id_usize] else self.ignore_case;
+                if (self.unicode_case and fold) {
+                    if (unicode_fold.matchFoldedPrefix(pat, haystack[i..])) |match_len| {
+                        if (allow(haystack, i, i + match_len)) {
+                            const cand = Naive{ .start = i, .end = i + match_len, .id = @intCast(id_usize) };
+                            if (best) |cur| {
+                                if (better(cand, cur, mode)) best = cand;
+                            } else best = cand;
+                        }
+                    }
+                    continue;
+                }
+                if (i + pat.len > haystack.len) continue;
                 if (!ascii.eql(pat, haystack[i..][0..pat.len], fold)) continue;
                 if (!allow(haystack, i, i + pat.len)) continue;
                 const cand = Naive{ .start = i, .end = i + pat.len, .id = @intCast(id_usize) };
@@ -384,6 +418,16 @@ fn initUnicodeFolded(
     patterns: []const []const u8,
     options: matcher.FindOptions,
 ) (matcher.LimitError || error{ PatternHasNewline, OutOfMemory })!Multi {
+    const max_variants_per_pattern: usize = 64;
+    for (patterns) |pat| {
+        const ig = patternIgnoresCaseUnicode(pat, options.case);
+        if (ig and unicode_fold.needsUnicodeExpansion(pat)) {
+            if (unicode_fold.countBranches(pat, true) > max_variants_per_pattern) {
+                return initUnicodeFallback(allocator, patterns, options);
+            }
+        }
+    }
+
     var variant_bytes = std.ArrayList([]u8).empty;
     errdefer {
         for (variant_bytes.items) |v| allocator.free(v);
@@ -396,7 +440,7 @@ fn initUnicodeFolded(
         const ig = patternIgnoresCaseUnicode(pat, options.case);
         if (ig and unicode_fold.needsUnicodeExpansion(pat)) {
             const before = variant_bytes.items.len;
-            try unicode_fold.expandPatternVariants(allocator, pat, &variant_bytes, 32);
+            try unicode_fold.expandPatternVariants(allocator, pat, &variant_bytes, max_variants_per_pattern);
             const added = variant_bytes.items.len - before;
             try variant_flags.appendNTimes(allocator, true, added);
         } else {
@@ -411,7 +455,12 @@ fn initUnicodeFolded(
     errdefer allocator.free(owned_slices);
     for (variant_bytes.items, 0..) |v, i| owned_slices[i] = v;
 
-    try matcher.checkPatternLimits(owned_slices, options);
+    matcher.checkPatternLimits(owned_slices, options) catch {
+        allocator.free(owned_slices);
+        for (variant_bytes.items) |v| allocator.free(v);
+        variant_bytes.deinit(allocator);
+        return initUnicodeFallback(allocator, patterns, options);
+    };
 
     const owned_variants = try variant_bytes.toOwnedSlice(allocator);
     errdefer {
@@ -433,6 +482,7 @@ fn initUnicodeFolded(
         plain_opts.unicode_case = false;
         plain_opts.case = if (first_flag) .insensitive else .sensitive;
         var res = try Multi.init(allocator, owned_slices, plain_opts);
+        res.unicode_case = true;
         res.owned_patterns = owned_slices;
         res.owned_variant_bytes = owned_variants;
         res.patterns_alloc = allocator;
@@ -446,11 +496,34 @@ fn initUnicodeFolded(
             .allocator = allocator,
         } },
         .ignore_case = false,
+        .unicode_case = true,
         .empty_only = false,
         .patterns = owned_slices,
         .owned_patterns = owned_slices,
         .owned_variant_bytes = owned_variants,
         .patterns_alloc = allocator,
+    };
+}
+
+fn initUnicodeFallback(
+    allocator: std.mem.Allocator,
+    patterns: []const []const u8,
+    options: matcher.FindOptions,
+) error{OutOfMemory}!Multi {
+    const flags = try allocator.alloc(bool, patterns.len);
+    errdefer allocator.free(flags);
+    for (patterns, flags) |pat, *flag| {
+        flag.* = patternIgnoresCaseUnicode(pat, options.case);
+    }
+    return .{
+        .kind = .{ .mixed = .{
+            .ignore = flags,
+            .allocator = allocator,
+        } },
+        .ignore_case = false,
+        .unicode_case = true,
+        .empty_only = false,
+        .patterns = patterns,
     };
 }
 
@@ -958,6 +1031,15 @@ test "Unicode case folding applies smart case per pattern" {
     });
     defer many_uni.deinit();
     try std.testing.expectEqual(@as(usize, 0), many_uni.find("STRA\u{1E9E}E", 0, .earliest).?.start);
+
+    // 4. Patterns with >64 fold variants (e.g., 7 Greek letters = 2^7 = 128 variants) fall back to direct folded scan without losing matches.
+    var deep_uni = try Multi.init(std.testing.allocator, &.{"αβγδεζη"}, .{
+        .case = .insensitive,
+        .unicode_case = true,
+    });
+    defer deep_uni.deinit();
+    try std.testing.expectEqual(@as(usize, 2), deep_uni.find("xxΑΒΓΔΕΖΗyy", 0, .earliest).?.start);
+    try std.testing.expect(deep_uni.acceptsSpan("ΑβΓδΕζΗ", 0, "ΑβΓδΕζΗ".len));
 }
 
 fn fuzzMulti(_: void, smith: *std.testing.Smith) !void {

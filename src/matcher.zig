@@ -1,5 +1,12 @@
-//! Matcher contract. Both literal kernels and regex engines implement `find`.
-//! Searcher does not depend on a concrete kernel; it only requires this shape.
+//! [Module] matcher.zig
+//! [Layer] Layer 2 — Pattern Matcher Contract & Compile-Time Trait Introspection
+//! [Role] Defines the zero-cost `Matcher` protocol (`Match`, `MatchMode`, `CaseMode`, `RequiredLiteral`, `FindOptions`)
+//!        and `MatcherTraits(M)` compile-time introspection for plug-and-play matcher extensibility.
+//! [Invariants]
+//!   1. Searcher never depends on a concrete matcher implementation; any type implementing `find` satisfies the contract.
+//!   2. Optional capabilities (`requiredLiteral`, `findCaptures`, `acceptsSpan`, `resetStats`, multiline window bounds)
+//!      are resolved at `comptime` with zero virtual-dispatch overhead.
+//! [HotPath] `MatcherTraits(M)` resolves entirely at compile time.
 
 const std = @import("std");
 
@@ -28,7 +35,7 @@ pub const RequiredLiteral = struct {
 };
 
 /// Case sensitivity mode.
-/// `smart` evaluates each pattern individually: case-insensitive only if all lowercase, and case-sensitive if `A-Z` appears.
+/// `smart` evaluates each pattern individually: case-insensitive only if all lowercase, and case-sensitive if uppercase appears.
 /// This differs from `rg -S`, which evaluates the entire pattern set together.
 pub const CaseMode = enum {
     sensitive,
@@ -84,13 +91,72 @@ pub fn checkPatternLimits(patterns: []const []const u8, options: FindOptions) Li
 
 /// Expected method shape for a Matcher. Documented here for reference; produces no runtime object.
 ///
-/// ```
+/// Required:
+/// ```zig
 /// pub fn find(self: *Self, haystack: []const u8, start: usize, mode: MatchMode) ?Match
 /// ```
 ///
-/// Optional:
-///
-/// ```
+/// Optional extension hooks (auto-discovered at `comptime` by `MatcherTraits`):
+/// ```zig
 /// pub fn requiredLiteral(self: *const Self) ?RequiredLiteral
+/// pub fn acceptsSpan(self: *Self, haystack: []const u8, start: usize, end: usize) bool
+/// pub fn findCaptures(self: *Self, haystack: []const u8, start: usize) ?Captures
+/// pub fn resetStats(self: *Self) void
 /// ```
 pub const matcher_shape_docs = {};
+
+/// Unwraps a pointer type `*M` or `*const M` to its underlying struct/union type `M`.
+pub fn BaseMatcherType(comptime M: type) type {
+    return switch (@typeInfo(M)) {
+        .pointer => |p| p.child,
+        else => M,
+    };
+}
+
+/// Compile-time capability descriptor for any matcher type `M` (or `*M` / `*const M`).
+/// Provides a single point of truth for matcher extensibility across the search pipeline.
+pub fn MatcherTraits(comptime M: type) type {
+    const Base = BaseMatcherType(M);
+    if (!@hasDecl(Base, "find")) {
+        @compileError("Matcher type '" ++ @typeName(Base) ++ "' must declare `pub fn find(self, haystack: []const u8, start: usize, mode: MatchMode) ?Match`");
+    }
+    return struct {
+        pub const Self = Base;
+        pub const has_required_literal = @hasDecl(Base, "requiredLiteral");
+        pub const has_accepts_span = @hasDecl(Base, "acceptsSpan");
+        pub const has_find_captures = @hasDecl(Base, "findCaptures");
+        pub const has_group_index = @hasDecl(Base, "groupIndexByName");
+        pub const has_reset_stats = @hasDecl(Base, "resetStats");
+        pub const has_multiline_field = @hasField(Base, "multiline");
+        pub const has_anchored_start_field = @hasField(Base, "anchored_start");
+        pub const has_needle_field = @hasField(Base, "needle");
+        pub const has_max_len_field = @hasField(Base, "max_len");
+        pub const has_insts_field = @hasField(Base, "insts");
+        pub const has_case_mode_field = @hasField(Base, "case_mode");
+        pub const has_unicode_case_field = @hasField(Base, "unicode_case");
+    };
+}
+
+/// Validates at compile time that `M` conforms to the `Matcher` contract.
+pub fn validateMatcher(comptime M: type) void {
+    _ = MatcherTraits(M);
+}
+
+test "MatcherTraits validates custom plug-and-play matcher at comptime" {
+    const CustomPrefixMatcher = struct {
+        prefix: []const u8,
+        pub fn find(self: *const @This(), haystack: []const u8, start: usize, _: MatchMode) ?Match {
+            if (start > haystack.len) return null;
+            const rel = std.mem.indexOfPos(u8, haystack, start, self.prefix) orelse return null;
+            return .{ .start = rel, .end = rel + self.prefix.len };
+        }
+    };
+    validateMatcher(CustomPrefixMatcher);
+    validateMatcher(*const CustomPrefixMatcher);
+    const T = MatcherTraits(CustomPrefixMatcher);
+    try std.testing.expect(!T.has_find_captures);
+    const m = CustomPrefixMatcher{ .prefix = "abc" };
+    const hit = m.find("xxabcyy", 0, .earliest).?;
+    try std.testing.expectEqual(@as(usize, 2), hit.start);
+    try std.testing.expectEqual(@as(usize, 5), hit.end);
+}

@@ -1,6 +1,6 @@
 .{
     .name = .libwebgrep,
-    .version = "0.1.2",
+    .version = "0.2.0",
     .fingerprint = 0x6150d58a2a1731a6, // Changing this has security and trust implications.
     .minimum_zig_version = "0.17.0",
     .paths = .{
@@ -14,7 +14,13 @@
         "README.zh-CN.md",
         "DESIGN.md",
         "BENCHMARKS.md",
+        "docs/ARCHITECTURE.md",
+        "docs/ARCHITECTURE.zh-CN.md",
         "docs/API.md",
         "docs/API.zh-CN.md",
+        "docs/FEATURES.md",
+        "docs/FEATURES.zh-CN.md",
+        "docs/ROADMAP.md",
+        "docs/ROADMAP.zh-CN.md",
     },
 }

@@ -1,0 +1,288 @@
+//! [Module] regex/inst.zig
+//! [Layer] Layer 2 — Regex Bytecode Instructions & Assertion Helpers
+//! [Role] Defines NFA bytecode instructions (`Inst`), 256-bit byte classes (`ByteSet`),
+//!        zero-width assertions (`AssertKind`), submatch `Captures`, and UTF-8 boundary helpers.
+//! [Invariants]
+//!   1. `ByteSet` is a 256-bit inline bitmap (`[4]u64`) with O(1) membership lookup (`contains`).
+//!   2. Zero-width assertions (`checkAssert`) inspect surrounding bytes without consuming input.
+//! [HotPath] `ByteSet.contains` and `checkAssert`.
+
+const std = @import("std");
+const matcher = @import("../matcher.zig");
+const memchr = @import("../finder/memchr.zig");
+const unicode_fold = @import("../finder/unicode_fold.zig");
+
+pub const Match = matcher.Match;
+pub const MatchMode = matcher.MatchMode;
+pub const CaseMode = matcher.CaseMode;
+pub const RequiredLiteral = matcher.RequiredLiteral;
+
+/// Submatch capture spans for a regex match. `groups[0]` corresponds to `$1`, up to `groups[8]` for `$9`.
+pub const Captures = struct {
+    match: Match,
+    groups: [9]?Match = @splat(null),
+
+    pub fn fullMatch(self: Captures) Match {
+        return self.match;
+    }
+
+    pub fn group(self: Captures, index: usize) ?Match {
+        if (index == 0) return self.match;
+        if (index > 9) return null;
+        return self.groups[index - 1];
+    }
+
+    pub fn slice(self: Captures, haystack: []const u8, index: usize) ?[]const u8 {
+        const g = self.group(index) orelse return null;
+        return haystack[g.start..g.end];
+    }
+};
+
+/// Server hard cap on compiled NFA instruction count.
+pub const max_inst_hard_cap: usize = 4096;
+/// Server hard cap on bounded multiline match window (8 MiB).
+pub const max_multiline_window_hard_cap: usize = 8 * 1024 * 1024;
+/// Default bounded multiline match window (64 KiB).
+pub const default_multiline_window: usize = 64 * 1024;
+
+pub const Error = error{
+    RegexSyntax,
+    RegexTooLarge,
+    PatternHasNewline,
+    PatternCountExceeded,
+    PatternBytesExceeded,
+    OutOfMemory,
+};
+
+pub const RegexOptions = struct {
+    case: CaseMode = .sensitive,
+    /// Enable Unicode simple case folding for multi-byte UTF-8 codepoints when case-insensitive or smart-case is active.
+    unicode_case: bool = true,
+    /// Allow matches to span multiple lines (including `\n`), with `^` and `$` matching line boundaries.
+    multiline: bool = false,
+    /// Allow `.` to match `\n` (requires `multiline = true` to cross lines).
+    dot_all: bool = false,
+    /// Maximum compiled instruction count. Null uses `max_inst_hard_cap`; values above the hard cap return `RegexTooLarge`.
+    max_inst: ?usize = null,
+    /// Maximum byte span window for multiline matching. Values exceeding the hard cap return `RegexTooLarge`.
+    max_multiline_window: usize = default_multiline_window,
+};
+
+pub const ByteSet = struct {
+    bits: [4]u64 = .{ 0, 0, 0, 0 },
+
+    pub fn set(self: *ByteSet, b: u8) void {
+        self.bits[b >> 6] |= (@as(u64, 1) << @as(u6, @intCast(b & 63)));
+    }
+
+    pub fn setWithCase(self: *ByteSet, b: u8, ignore_case: bool) void {
+        self.set(b);
+        if (ignore_case) {
+            if (b >= 'A' and b <= 'Z') self.set(b + 32);
+            if (b >= 'a' and b <= 'z') self.set(b - 32);
+        }
+    }
+
+    pub fn setRange(self: *ByteSet, lo: u8, hi: u8, ignore_case: bool) void {
+        if (lo > hi) return;
+        var c: u16 = lo;
+        while (c <= hi) : (c += 1) {
+            self.setWithCase(@intCast(c), ignore_case);
+        }
+    }
+
+    pub fn invert(self: *ByteSet) void {
+        for (&self.bits) |*w| w.* = ~w.*;
+    }
+
+    pub fn clear(self: *ByteSet, b: u8) void {
+        self.bits[b >> 6] &= ~(@as(u64, 1) << @as(u6, @intCast(b & 63)));
+    }
+
+    pub inline fn contains(self: *const ByteSet, b: u8) bool {
+        return (self.bits[b >> 6] & (@as(u64, 1) << @as(u6, @intCast(b & 63)))) != 0;
+    }
+};
+
+pub const Inst = union(enum) {
+    /// Match a single byte (ignoring ASCII case when `ignore_case` is true).
+    byte: struct { b: u8, ignore_case: bool, out: u32 },
+    /// Match any UTF-8 codepoint or single byte (excluding `\n` when `allow_nl` is false).
+    any: struct { allow_nl: bool, out: u32, cont1: u32 = 0, cont2: u32 = 0, cont3: u32 = 0 },
+    /// Match a UTF-8 continuation byte (`0x80..0xBF`).
+    any_cont: struct { out: u32 },
+    /// Match a 256-bit byte class (with optional multi-byte UTF-8 continuation states for negated classes).
+    class: struct { set: ByteSet, out: u32, utf8_negated: bool = false, cont1: u32 = 0, cont2: u32 = 0, cont3: u32 = 0 },
+    /// Zero-width branch: prefers `out1`, then `out2`.
+    split: struct { out1: u32, out2: u32 },
+    /// Unconditional jump.
+    jmp: u32,
+    /// Zero-width assertion anchor.
+    assert: struct { kind: AssertKind, out: u32 },
+    /// Zero-width submatch boundary slot (`0..17` for groups `1..9`).
+    save: struct { slot: u8, out: u32 },
+    /// Accepting match state.
+    match,
+};
+
+pub const AssertKind = enum {
+    start_line,
+    end_line,
+    start_input,
+    end_input,
+    word_boundary,
+    not_word_boundary,
+};
+
+pub const Thread = struct {
+    pc: u32,
+    start: usize,
+};
+
+
+pub fn popLastUtf8Codepoint(list: *std.ArrayList(u8)) void {
+    if (list.items.len == 0) return;
+    var count: usize = 0;
+    while (list.items.len > 0 and count < 4) {
+        const b = list.pop().?;
+        count += 1;
+        if ((b & 0xC0) != 0x80) break;
+    }
+}
+
+pub fn utf8SeqLenAt(haystack: []const u8, pos: usize, limit: usize) usize {
+    if (pos >= limit) return 0;
+    const b0 = haystack[pos];
+    if (b0 < 0x80) return 1;
+    const seq_len = std.unicode.utf8ByteSequenceLength(b0) catch return 1;
+    if (pos + seq_len > limit) return 1;
+    _ = std.unicode.utf8Decode(haystack[pos .. pos + seq_len]) catch return 1;
+    return seq_len;
+}
+
+pub fn allowAnySpan(haystack: []const u8, start: usize, end: usize) bool {
+    _ = haystack;
+    _ = start;
+    _ = end;
+    return true;
+}
+
+pub fn allowExactLen(haystack: []const u8, start: usize, end: usize) bool {
+    return start == 0 and end == haystack.len;
+}
+
+pub fn hasTopLevelAlt(pattern: []const u8) bool {
+    var depth: usize = 0;
+    var in_class = false;
+    var i: usize = 0;
+    while (i < pattern.len) : (i += 1) {
+        const c = pattern[i];
+        if (c == '\\') {
+            i += 1;
+            continue;
+        }
+        if (in_class) {
+            if (c == ']') in_class = false;
+            continue;
+        }
+        switch (c) {
+            '[' => in_class = true,
+            '(' => depth += 1,
+            ')' => if (depth > 0) {
+                depth -= 1;
+            },
+            '|' => if (depth == 0) return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+pub fn lineStartAt(haystack: []const u8, pos: usize) usize {
+    if (pos == 0) return 0;
+    if (memchr.findLast(memchr.native_width, haystack, 0, pos, '\n')) |nl| return nl + 1;
+    return 0;
+}
+
+pub fn isWordChar(b: u8) bool {
+    return switch (b) {
+        '0'...'9', 'A'...'Z', 'a'...'z', '_' => true,
+        else => false,
+    };
+}
+
+pub fn checkAssert(kind: AssertKind, haystack: []const u8, pos: usize) bool {
+    return switch (kind) {
+        .start_line => pos == 0 or (pos <= haystack.len and haystack[pos - 1] == '\n'),
+        .end_line => pos == haystack.len or haystack[pos] == '\n' or (pos + 1 < haystack.len and haystack[pos] == '\r' and haystack[pos + 1] == '\n'),
+        .start_input => pos == 0,
+        .end_input => pos == haystack.len,
+        .word_boundary => blk: {
+            const left = unicode_fold.isWordBefore(haystack, pos);
+            const right = unicode_fold.isWordAt(haystack, pos);
+            break :blk left != right;
+        },
+        .not_word_boundary => blk: {
+            const left = unicode_fold.isWordBefore(haystack, pos);
+            const right = unicode_fold.isWordAt(haystack, pos);
+            break :blk left == right;
+        },
+    };
+}
+
+pub fn hasLiteralUpper(pattern: []const u8, unicode_case: bool) bool {
+    var i: usize = 0;
+    while (i < pattern.len) {
+        if (pattern[i] == '\\') {
+            i += 2;
+            continue;
+        }
+        if (pattern[i] == '(' and i + 1 < pattern.len and pattern[i + 1] == '?') {
+            i += 2;
+            while (i < pattern.len and (pattern[i] == 'i' or pattern[i] == 'm' or pattern[i] == 's' or pattern[i] == '-')) : (i += 1) {}
+            if (i < pattern.len and (pattern[i] == ':' or pattern[i] == ')')) i += 1;
+            continue;
+        }
+        if (pattern[i] >= 'A' and pattern[i] <= 'Z') return true;
+        if (unicode_case and pattern[i] >= 0x80) {
+            const seq_len = utf8SeqLenAt(pattern, i, pattern.len);
+            if (seq_len > 1) {
+                const cp = std.unicode.utf8Decode(pattern[i .. i + seq_len]) catch {
+                    i += 1;
+                    continue;
+                };
+                if (unicode_fold.isUpperCodepoint(cp)) return true;
+                i += seq_len;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    return false;
+}
+
+
+pub fn addShorthand(set: *ByteSet, kind: u8) void {
+    var tmp = ByteSet{};
+    switch (kind) {
+        'd', 'D' => tmp.setRange('0', '9', false),
+        'w', 'W' => {
+            tmp.setRange('0', '9', false);
+            tmp.setRange('A', 'Z', false);
+            tmp.setRange('a', 'z', false);
+            tmp.set('_');
+        },
+        's', 'S' => {
+            tmp.set(' ');
+            tmp.set('\t');
+            tmp.set('\n');
+            tmp.set('\r');
+            tmp.set(0x0B);
+            tmp.set(0x0C);
+        },
+        else => unreachable,
+    }
+    if (kind == 'D' or kind == 'W' or kind == 'S') tmp.invert();
+    for (0..4) |i| set.bits[i] |= tmp.bits[i];
+}
+

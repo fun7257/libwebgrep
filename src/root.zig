@@ -68,7 +68,7 @@ pub const Encoding = searcher.Encoding;
 /// In-process streaming decompression mode: `none`, `auto`, `gzip`, `zstd`, or `xz`.
 pub const Compression = searcher.Compression;
 /// In-process bomb-safe streaming decompression and raw offset mapping module.
-pub const decompress = @import("decompress.zig");
+pub const decompress = @import("codec/decompress.zig");
 /// Search configuration. Service entry points populate default multi-tenant budgets when left null.
 pub const SearchConfig = searcher.SearchConfig;
 /// Legacy callback entry point for searching an in-memory slice without default service budgets.
@@ -77,6 +77,8 @@ pub const searchSlice = searcher.searchSlice;
 pub const searchReader = searcher.searchReader;
 /// Service entry point: searches a `std.Io.Reader` with caller-assigned `source_id` and multi-tenant budgets.
 pub const searchSource = searcher.searchSource;
+/// Resumes searching a `std.Io.Reader` from a previous `Flow.pause` state without re-emitting `begin`.
+pub const resumeSource = searcher.resumeSource;
 /// Service entry point: searches an in-memory slice with zero heap allocation when no transcoding is needed.
 pub const searchSourceSlice = searcher.searchSourceSlice;
 /// Resumes searching the same slice from a previous `Flow.pause` state without re-emitting `begin`.
@@ -120,6 +122,7 @@ test "public search entry points accept no filesystem handles or paths" {
     try checkSearchFn(@TypeOf(searchSlice));
     try checkSearchFn(@TypeOf(searchReader));
     try checkSearchFn(@TypeOf(searchSource));
+    try checkSearchFn(@TypeOf(resumeSource));
     try checkSearchFn(@TypeOf(searchSourceSlice));
     try checkSearchFn(@TypeOf(resumeSourceSlice));
     try checkSearchFn(@TypeOf(openSourcePull));
@@ -168,10 +171,14 @@ pub const regex = @import("regex.zig");
 pub const Regex = regex.Regex;
 /// Options for constructing `Regex`: case mode, bounded multiline, `dot_all`, and instruction caps.
 pub const RegexOptions = regex.RegexOptions;
+/// Regex submatch capture result holding full match (`match`) and numbered groups `$1`..`$9` (`groups[0..8]`).
+pub const Captures = regex.Captures;
 
 test {
-    _ = @import("decompress.zig");
-    _ = @import("encoding.zig");
+    _ = @import("codec/offset_map.zig");
+    _ = @import("codec/decompress.zig");
+    _ = @import("codec/encoding.zig");
+    _ = @import("tables/unicode_case_table.zig");
     _ = @import("matcher.zig");
     _ = @import("sink.zig");
     _ = @import("searcher.zig");
@@ -227,4 +234,5 @@ test {
     _ = @import("walk/list_dir.zig");
     _ = @import("walk/walker.zig");
     _ = @import("parallel.zig");
+    _ = @import("fuzz.zig");
 }

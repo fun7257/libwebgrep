@@ -14,6 +14,7 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const platform = @import("io/platform.zig");
 const deque = @import("walk/deque.zig");
 const finder_mod = @import("finder/finder.zig");
 const matcher = @import("matcher.zig");
@@ -172,19 +173,26 @@ const Budgets = struct {
 fn alignBudgets(search: searcher.SearchConfig, walk: walker.Config) Budgets {
     var out_search = search;
     var out_walk = walk;
-    const source_raw = search.max_source_bytes orelse walk.max_filesize orelse searcher.SearchConfig.default_max_source_bytes;
-    const request_raw = search.max_request_bytes orelse searcher.SearchConfig.default_max_request_bytes;
-    const source_cap = @min(source_raw, request_raw);
-    out_search.max_source_bytes = source_cap;
-    out_search.max_request_bytes = request_raw;
-    out_walk.max_filesize = source_cap;
+    const source_cap = if (search.max_source_bytes) |s|
+        if (walk.max_filesize) |w| @min(s, w) else s
+    else
+        walk.max_filesize;
+    const request_cap = search.max_request_bytes;
+    const effective_source = if (source_cap) |s|
+        if (request_cap) |r| @min(s, r) else s
+    else
+        request_cap;
+
+    out_search.max_source_bytes = effective_source;
+    out_search.max_request_bytes = request_cap;
+    out_walk.max_filesize = effective_source;
     if (out_search.time_budget_ns == null) {
         out_search.time_budget_ns = searcher.SearchConfig.default_time_budget_ns;
     }
     return .{
         .search = out_search,
         .walk = out_walk,
-        .request_cap = request_raw,
+        .request_cap = request_cap orelse std.math.maxInt(u64),
     };
 }
 
@@ -441,7 +449,7 @@ fn onFile(ctx: *anyopaque, visit: walker.Visit) anyerror!walker.Control {
         return .stop;
     };
     if (shared.stop.load(.acquire)) return .stop;
-    if (shared.request_used.load(.monotonic) >= shared.request_cap) {
+    if (shared.request_cap != std.math.maxInt(u64) and shared.request_used.load(.monotonic) >= shared.request_cap) {
         requestStop(shared);
         return .stop;
     }
@@ -471,6 +479,7 @@ fn onFile(ctx: *anyopaque, visit: walker.Visit) anyerror!walker.Control {
         return .cont;
     };
     defer file.close(shared.io);
+    platform.adviseSequentialFile(file);
     searchOpen(worker, file, visit.path) catch |err| {
         shared.note(visit.path, err);
         switch (err) {
@@ -504,10 +513,12 @@ fn searchOpen(worker: *Worker, file: std.Io.File, path: []const u8) !void {
 fn searchWith(worker: *Worker, engine: anytype, file: std.Io.File, path: []const u8) !void {
     var cfg = worker.config();
     const used = worker.shared.request_used.load(.monotonic);
-    if (used >= worker.shared.request_cap) return;
-    const room = worker.shared.request_cap - used;
-    if (cfg.max_source_bytes) |n| cfg.max_source_bytes = @min(n, room) else cfg.max_source_bytes = room;
-    cfg.max_request_bytes = if (cfg.max_request_bytes) |n| @min(n, room) else room;
+    if (worker.shared.request_cap != std.math.maxInt(u64)) {
+        if (used >= worker.shared.request_cap) return;
+        const room = worker.shared.request_cap - used;
+        if (cfg.max_source_bytes) |n| cfg.max_source_bytes = @min(n, room) else cfg.max_source_bytes = room;
+        cfg.max_request_bytes = if (cfg.max_request_bytes) |n| @min(n, room) else room;
+    }
     var sink = Tally{
         .shared = worker.shared,
         .stop_file = worker.shared.emit == .files_with_matches,
@@ -531,7 +542,7 @@ fn searchWith(worker: *Worker, engine: anytype, file: std.Io.File, path: []const
         .soft_error = result.soft_error,
     } });
     const charged = worker.shared.request_used.fetchAdd(result.bytes_read, .monotonic);
-    if (charged + result.bytes_read >= worker.shared.request_cap) requestStop(worker.shared);
+    if (worker.shared.request_cap != std.math.maxInt(u64) and charged + result.bytes_read >= worker.shared.request_cap) requestStop(worker.shared);
 }
 
 const Tally = struct {

@@ -408,27 +408,64 @@ pub fn tryExtractAltLiterals(self: anytype, pattern: []const u8, find_opts: matc
     var prefix_buf = std.ArrayList(u8).empty;
     defer prefix_buf.deinit(self.allocator);
 
+    var all_exact = true;
     for (branches[0..n_branches]) |br| {
         prefix_buf.clearRetainingCapacity();
         var k: usize = 0;
+        var br_exact = true;
         while (k < br.len) {
             const c = br[k];
             switch (c) {
-                '.', '^', '$', '[', '(', ')' => break,
-                '*', '?', '{' => {
-                    popLastUtf8Codepoint(&prefix_buf);
+                '.', '^', '$', '[', '(', ')' => {
+                    br_exact = false;
                     break;
                 },
-                '+' => break,
-                '\\' => break,
+                '*', '?', '{' => {
+                    popLastUtf8Codepoint(&prefix_buf);
+                    br_exact = false;
+                    break;
+                },
+                '+' => {
+                    br_exact = false;
+                    break;
+                },
+                '\\' => {
+                    if (k + 1 >= br.len) {
+                        br_exact = false;
+                        break;
+                    }
+                    const next_c = br[k + 1];
+                    if (next_c == 'p' or next_c == 'P' or next_c == 'A' or next_c == 'z' or
+                        next_c == 'd' or next_c == 'D' or next_c == 'w' or next_c == 'W' or
+                        next_c == 's' or next_c == 'S' or next_c == 'b' or next_c == 'B' or next_c == '0')
+                    {
+                        br_exact = false;
+                        break;
+                    }
+                    const lit_b: u8 = switch (next_c) {
+                        'n' => if (self.multiline) {
+                            br_exact = false;
+                            break;
+                        } else '\n',
+                        'r' => '\r',
+                        't' => '\t',
+                        else => next_c,
+                    };
+                    try prefix_buf.append(self.allocator, lit_b);
+                    k += 2;
+                },
                 else => {
-                    if (c == '\n') break;
+                    if (c == '\n') {
+                        br_exact = false;
+                        break;
+                    }
                     const seq_len = utf8SeqLenAt(br, k, br.len);
                     try prefix_buf.appendSlice(self.allocator, br[k .. k + seq_len]);
                     k += seq_len;
                 },
             }
         }
+        if (!br_exact or k != br.len) all_exact = false;
         if (prefix_buf.items.len < 2) {
             for (prefixes.items) |s| self.allocator.free(s);
             return;
@@ -442,6 +479,7 @@ pub fn tryExtractAltLiterals(self: anytype, pattern: []const u8, find_opts: matc
     if (Multi.init(self.allocator, owned_slices, find_opts)) |m| {
         self.alt_literal_slices = owned_slices;
         self.alt_prefilter = m;
+        self.alt_is_exact = all_exact and !self.multiline;
     } else |_| {
         for (owned_slices) |s| self.allocator.free(s);
         self.allocator.free(owned_slices);

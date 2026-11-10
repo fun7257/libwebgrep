@@ -11,6 +11,7 @@ const std = @import("std");
 const unicode = std.unicode;
 const decompress = @import("decompress.zig");
 const gbk_table = @import("../tables/gbk_table.zig");
+const memchr = @import("../finder/memchr.zig");
 
 pub const Encoding = enum {
     /// Only sniff for a BOM at the start of the stream (if no BOM is present, transcode using the `charset` hint if given, otherwise search raw bytes).
@@ -123,7 +124,22 @@ pub fn resolveHint(encoding: Encoding, charset: ?[]const u8) Encoding {
     return .auto;
 }
 
+pub inline fn isAsciiSlice(bytes: []const u8) bool {
+    const V = @Vector(memchr.native_width, u8);
+    const msb: V = @splat(0x80);
+    var i: usize = 0;
+    while (i + memchr.native_width <= bytes.len) : (i += memchr.native_width) {
+        const v: V = bytes[i..][0..memchr.native_width].*;
+        if (@reduce(.Or, (v & msb) != @as(V, @splat(0)))) return false;
+    }
+    while (i < bytes.len) : (i += 1) {
+        if (bytes[i] >= 0x80) return false;
+    }
+    return true;
+}
+
 pub fn validUtf8(bytes: []const u8) bool {
+    if (isAsciiSlice(bytes)) return true;
     return unicode.utf8ValidateSlice(bytes);
 }
 
@@ -602,8 +618,8 @@ fn PullError(comptime readFn: anytype) type {
 }
 
 fn prefixAscii(bytes: []const u8, end: usize) bool {
-    for (bytes[0..end]) |b| if (b >= 0x80) return false;
-    return true;
+    const to = @min(end, bytes.len);
+    return isAsciiSlice(bytes[0..to]);
 }
 
 fn unitsOf(cp: u21) usize {

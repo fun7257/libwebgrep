@@ -7,6 +7,7 @@
 //!   2. Line framing (`lineStart`, `lineEnd`, `nextLine`, `lastComplete`, `countLines`) uses vectorized `memchr`.
 //! [HotPath] `lastComplete`, `lineStart`, `lineEnd`, `nextLine`, `countLines`, `stopInMatch`.
 
+const builtin = @import("builtin");
 const std = @import("std");
 const decompress = @import("../codec/decompress.zig");
 const memchr = @import("../finder/memchr.zig");
@@ -140,14 +141,26 @@ pub fn logDetail(config: SearchConfig, label: []const u8, err: anyerror) void {
 }
 
 pub fn monotonicNs() i128 {
-    var ts: std.posix.timespec = undefined;
-    switch (std.posix.errno(std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts))) {
-        .SUCCESS => {
-            const sec: i128 = ts.sec;
-            const nsec: i128 = ts.nsec;
-            return sec * std.time.ns_per_s + nsec;
+    switch (comptime builtin.os.tag) {
+        .linux => {
+            var ts: std.os.linux.timespec = undefined;
+            if (std.os.linux.clock_gettime(.MONOTONIC, &ts) == 0) {
+                return @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec);
+            }
+            return 0;
         },
-        else => return 0,
+        .windows, .wasi, .freestanding => return 0,
+        else => {
+            var ts: std.posix.timespec = undefined;
+            switch (std.posix.errno(std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts))) {
+                .SUCCESS => {
+                    const sec: i128 = ts.sec;
+                    const nsec: i128 = ts.nsec;
+                    return sec * std.time.ns_per_s + nsec;
+                },
+                else => return 0,
+            }
+        },
     }
 }
 
@@ -596,6 +609,25 @@ pub fn callOpt(comptime S: type, comptime name: []const u8, sink: *S, args: anyt
     return @call(.auto, @field(S, name), .{sink} ++ args);
 }
 
+
+pub fn exactMatcherMaxLen(matcher: anytype) ?usize {
+    const T = MatcherType(@TypeOf(matcher));
+    if (@hasField(T, "pattern")) return matcher.pattern.len;
+    if (@hasField(T, "patterns")) {
+        var max: usize = 0;
+        for (matcher.patterns) |pat| max = @max(max, pat.len);
+        return max;
+    }
+    if (@hasField(T, "req_is_exact") and @hasField(T, "alt_is_exact")) {
+        if (matcher.req_is_exact) return matcher.req_literal_bytes.len;
+        if (matcher.alt_is_exact) {
+            var max: usize = 0;
+            for (matcher.alt_literal_slices) |pat| max = @max(max, pat.len);
+            return max;
+        }
+    }
+    return null;
+}
 
 pub fn needleLen(matcher: anytype) usize {
     const T = MatcherType(@TypeOf(matcher));

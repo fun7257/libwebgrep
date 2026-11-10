@@ -99,6 +99,25 @@ pub fn gatherSpans(
     const win_lo = preview.start;
     const win_hi = preview.end;
     var pos = line.start;
+    if (known) |k| {
+        const kmend = @min(k.end, content_end);
+        const kempty = k.start == kmend;
+        const kin_win = k.start >= win_lo and k.start < win_hi;
+        const kempty_at_pt = kempty and k.start == win_lo and win_lo == win_hi;
+        if (kin_win or kempty_at_pt) {
+            if (kempty_at_pt) {
+                store[0] = .{ .start = 0, .end = 0, .pattern_id = k.pattern_id };
+            } else {
+                store[0] = .{
+                    .start = k.start - win_lo,
+                    .end = @min(kmend, win_hi) - win_lo,
+                    .pattern_id = k.pattern_id,
+                };
+            }
+            n = 1;
+        }
+        pos = if (k.end > k.start) k.end else k.start + 1;
+    }
     while (pos <= content_end and pos <= line_buf.len) {
         if (stopInMatch(state, config)) break;
         const found = nextMatch(matcher, line_buf, pos, config) orelse break;
@@ -150,6 +169,7 @@ pub fn sinkLine(
     window_start: u64,
     replacement: ?[]const u8,
 ) bool {
+    if (comptime !@hasDecl(S, name)) return true;
     var one: [1]Span = undefined;
     var multi = matches;
     if (multi.len == 0) {
@@ -178,23 +198,34 @@ pub fn buildLine(
     window_start: u64,
     replacement: ?[]const u8,
 ) Line {
-    const text = lossyText(state, scratch, bytes);
-    var cursor_byte: usize = 0;
-    var cursor_units: usize = 0;
-    for (matches) |*item| {
-        const from = @min(item.start, bytes.len);
-        const to = @min(@max(item.end, from), bytes.len);
-        const units = advanceUtf16Span(bytes, &cursor_byte, &cursor_units, from, to);
-        item.u16_start = units.start;
-        item.u16_end = units.end;
-        item.replacement = replacement;
+    const is_ascii = encoding.isAsciiSlice(bytes);
+    const text = if (is_ascii) bytes else lossyText(state, scratch, bytes);
+    if (is_ascii) {
+        for (matches) |*item| {
+            item.u16_start = item.start;
+            item.u16_end = item.end;
+            item.replacement = replacement;
+        }
+    } else {
+        var cursor_byte: usize = 0;
+        var cursor_units: usize = 0;
+        for (matches) |*item| {
+            const from = @min(item.start, bytes.len);
+            const to = @min(@max(item.end, from), bytes.len);
+            const units = advanceUtf16Span(bytes, &cursor_byte, &cursor_units, from, to);
+            item.u16_start = units.start;
+            item.u16_end = units.end;
+            item.replacement = replacement;
+        }
     }
     var match = span;
     var u16_column: ?u64 = null;
     if (span) |found| {
         const from = @min(found.start, bytes.len);
         const to = @min(@max(found.end, from), bytes.len);
-        const units: encoding.Utf16Span = if (matches.len > 0 and matches[0].start == found.start and matches[0].end == found.end)
+        const units: encoding.Utf16Span = if (is_ascii)
+            .{ .start = from, .end = to }
+        else if (matches.len > 0 and matches[0].start == found.start and matches[0].end == found.end)
             .{ .start = matches[0].u16_start, .end = matches[0].u16_end }
         else
             encoding.utf16Span(bytes, from, to);
@@ -462,6 +493,28 @@ pub fn sinkMatched(
     state: *State,
     config: SearchConfig,
 ) SliceError!bool {
+    if (comptime !@hasDecl(S, "matched")) {
+        const line_abs = state.abs_base + line.start;
+        if (!try sinkBreakAt(S, sink, line_abs, state, config)) return false;
+        countLines(buf, line.start, state, config);
+        const withheld = config.binary == .report and state.nul_offset != null;
+        if (!withheld) {
+            const content_end = contentEnd(buf, line, config);
+            const raw_len = content_end - line.start;
+            const capped_len = if (config.max_line_len == 0 or raw_len <= config.max_line_len) raw_len else config.max_line_len;
+            if (!try guardLine(state, config, capped_len)) return false;
+        }
+        releaseQueue(state);
+        state.last_line_visited = line.end;
+        state.last_abs_end = state.abs_base + line.end;
+        state.remembered_until = @max(state.remembered_until, line.end);
+        state.after_left = afterCount(config);
+        state.has_sunk = true;
+        state.matched_lines += 1;
+        state.matches += 1;
+        state.results_out += 1;
+        return true;
+    }
     const preview = previewLine(buf, line, known, config);
     const line_abs = state.abs_base + line.start;
     if (!try sinkBreakAt(S, sink, line_abs, state, config)) return false;

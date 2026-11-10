@@ -12,6 +12,7 @@
 //! [HotPath] `BoundedDfa.step` (1 table lookup per input byte once determinized).
 
 const std = @import("std");
+const matcher = @import("../matcher.zig");
 const inst_mod = @import("inst.zig");
 const Inst = inst_mod.Inst;
 const UnicodeRangeList = inst_mod.UnicodeRangeList;
@@ -26,22 +27,44 @@ pub const max_closure_pcs: usize = 64;
 pub const StackDfa = BoundedDfa(64);
 pub const HeapDfa = BoundedDfa(256);
 
+/// Returns true when the NFA contains only byte-exact transitions (no zero-width assertions,
+/// Unicode multi-byte classes, or wildcards that require CRLF/UTF-8 post-filtering), so a
+/// greedy determinized DFA without alternations or lazy quantifiers computes the exact match span.
+pub fn isExactInsts(insts: []const Inst) bool {
+    for (insts) |inst| {
+        switch (inst) {
+            .byte, .split, .jmp, .save, .match, .match_id => {},
+            .class => |cl| {
+                if (cl.utf8_negated) return false;
+            },
+            .assert, .unicode_class, .any, .any_cont => return false,
+        }
+    }
+    return true;
+}
+
 pub fn BoundedDfa(comptime max_states_cap: u16) type {
     return struct {
         const Self = @This();
         pub const max_states: u16 = max_states_cap;
 
-        pub const State = struct {
+        pub const StateMeta = struct {
             pcs: [max_closure_pcs]u16 = undefined,
             pc_len: u8 = 0,
-            is_match: bool = false,
-            next: [256]u16 = @splat(unknown_transition),
         };
 
-        states: [max_states_cap]State = undefined,
+        /// Dense 512-byte-stride transition table (`state << 9` indexing without `imul`).
+        trans: [max_states_cap][256]u16 = undefined,
+        /// Per-state match acceptance flags (fits in <= 4 cache lines).
+        is_match: [max_states_cap]bool = @splat(false),
+        /// Number of contiguous linear single-successor non-match states (`s -> s+1 -> ... -> s+L`) starting at `s`.
+        chain_len: [max_states_cap]u8 = @splat(0),
+        /// Cold NFA closure sets used only during state construction, never touched on hot scan path.
+        meta: [max_states_cap]StateMeta = undefined,
         num_states: u16 = 0,
         flushes: u32 = 0,
         bailouts: u32 = 0,
+        stops_on_crlf: bool = false,
         compiled_insts_ptr: usize = 0,
         compiled_start_pc: u32 = std.math.maxInt(u32),
         compiled_multiline: bool = false,
@@ -55,6 +78,7 @@ pub fn BoundedDfa(comptime max_states_cap: u16) type {
             self.num_states = 0;
             self.flushes = 0;
             self.bailouts = 0;
+            self.stops_on_crlf = false;
             self.compiled_insts_ptr = 0;
             self.compiled_start_pc = std.math.maxInt(u32);
         }
@@ -82,29 +106,142 @@ pub fn BoundedDfa(comptime max_states_cap: u16) type {
             return self.initBaseStates(insts, start_pc);
         }
 
+        /// Determinizes all reachable states ahead-of-time up to `max_states_cap`.
+        /// Fails cleanly (returning `false`) if any closure overflows or state table flushes occur.
+        pub fn determinize(
+            self: *Self,
+            insts: []const Inst,
+            unicode_ranges: []const UnicodeRangeList,
+            start_pc: u32,
+            multiline: bool,
+        ) bool {
+            self.reset();
+            if (!self.ensureInitialized(insts, start_pc, multiline, max_states_cap)) return false;
+            var crlf_dead = !multiline;
+            var q_head: u16 = 1;
+            while (q_head < self.num_states) : (q_head += 1) {
+                var b: u16 = 0;
+                while (b < 256) : (b += 1) {
+                    const byte: u8 = @truncate(b);
+                    if (!multiline and byte == '\n') {
+                        self.trans[q_head]['\n'] = dead_state;
+                        continue;
+                    }
+                    const next = self.step(insts, unicode_ranges, q_head, byte, multiline);
+                    if (next == bailout_transition or self.flushes != 0 or self.bailouts != 0) return false;
+                }
+                if (crlf_dead and (self.trans[q_head]['\r'] != dead_state or self.trans[q_head]['\n'] != dead_state)) {
+                    crlf_dead = false;
+                }
+            }
+            self.stops_on_crlf = crlf_dead;
+            self.chain_len = @splat(0);
+            if (self.flushes == 0 and self.bailouts == 0 and self.num_states > 2) {
+                var s_idx: usize = self.num_states - 1;
+                while (s_idx >= 1) : (s_idx -= 1) {
+                    const s: u16 = @intCast(s_idx);
+                    if (!self.is_match[s] and s + 1 < self.num_states) {
+                        const target: u16 = s + 1;
+                        var only_target = true;
+                        var has_target = false;
+                        for (self.trans[s]) |t| {
+                            if (t == target) {
+                                has_target = true;
+                            } else if (t != dead_state) {
+                                only_target = false;
+                                break;
+                            }
+                        }
+                        if (only_target and has_target) {
+                            self.chain_len[s] = @min(@as(u8, 64), 1 +| self.chain_len[target]);
+                        }
+                    }
+                    if (s_idx == 1) break;
+                }
+            }
+            return self.flushes == 0 and self.bailouts == 0;
+        }
+
+        /// Fast single-branch prefix matcher on a fully determinized DFA (`determinize() == true`).
+        /// Returns the longest greedy match length starting at `slice[0]`, or `null` if no match.
+        pub inline fn matchPrefixDeterminized(
+            self: *const Self,
+            slice: []const u8,
+            start_state_id: u16,
+            prefix_offset: usize,
+        ) ?usize {
+            if (prefix_offset > slice.len) return null;
+            const rem = slice[prefix_offset..];
+            var curr_state: u16 = start_state_id;
+            var last_match: ?usize = if (self.is_match[curr_state]) prefix_offset else null;
+            var idx: usize = 0;
+            while (idx < rem.len) {
+                const clen: usize = self.chain_len[curr_state];
+                if (clen >= 2) {
+                    if (idx + clen > rem.len) break;
+                    const p = rem[idx..][0..clen];
+                    const base_s: usize = curr_state;
+                    if (self.trans[base_s + clen - 1][p[clen - 1]] == dead_state or
+                        self.trans[base_s + clen - 2][p[clen - 2]] == dead_state)
+                    {
+                        break;
+                    }
+                    var k: usize = 0;
+                    const limit4 = (clen - 2) & ~@as(usize, 3);
+                    var dead = false;
+                    while (k < limit4) : (k += 4) {
+                        const t0 = self.trans[base_s + k][p[k]];
+                        const t1 = self.trans[base_s + k + 1][p[k + 1]];
+                        const t2 = self.trans[base_s + k + 2][p[k + 2]];
+                        const t3 = self.trans[base_s + k + 3][p[k + 3]];
+                        if ((t0 == dead_state) or (t1 == dead_state) or (t2 == dead_state) or (t3 == dead_state)) {
+                            dead = true;
+                            break;
+                        }
+                    }
+                    if (dead) break;
+                    while (k < clen - 2) : (k += 1) {
+                        if (self.trans[base_s + k][p[k]] == dead_state) {
+                            dead = true;
+                            break;
+                        }
+                    }
+                    if (dead) break;
+                    curr_state = @intCast(base_s + clen);
+                    idx += clen;
+                    if (self.is_match[curr_state]) {
+                        last_match = prefix_offset + idx;
+                    }
+                    continue;
+                }
+                curr_state = self.trans[curr_state][rem[idx]];
+                idx += 1;
+                if (curr_state == dead_state) break;
+                if (self.is_match[curr_state]) {
+                    last_match = prefix_offset + idx;
+                }
+            }
+            return last_match;
+        }
+
         fn initBaseStates(self: *Self, insts: []const Inst, start_pc: u32) bool {
             // State 0: dead state (all transitions loop to dead_state)
-            self.states[dead_state] = .{
-                .pc_len = 0,
-                .is_match = false,
-                .next = @splat(dead_state),
-            };
+            self.meta[dead_state] = .{ .pc_len = 0 };
+            self.is_match[dead_state] = false;
+            self.trans[dead_state] = @splat(dead_state);
 
             // State 1: start state (epsilon closure of start_pc)
             var pcs: [max_closure_pcs]u16 = undefined;
             var pc_len: u8 = 0;
-            var is_match = false;
-            if (!computeEpsilonClosure(insts, start_pc, &pcs, &pc_len, &is_match)) {
+            var match_flag = false;
+            if (!computeEpsilonClosure(insts, start_pc, &pcs, &pc_len, &match_flag)) {
                 self.bailouts +%= 1;
                 self.num_states = 0;
                 return false;
             }
-            self.states[start_state] = .{
-                .pcs = pcs,
-                .pc_len = pc_len,
-                .is_match = is_match,
-                .next = @splat(unknown_transition),
-            };
+            self.meta[start_state] = .{ .pcs = pcs, .pc_len = pc_len };
+            self.is_match[start_state] = match_flag;
+            self.trans[start_state] = @splat(unknown_transition);
             self.num_states = 2;
             return true;
         }
@@ -120,7 +257,7 @@ pub fn BoundedDfa(comptime max_states_cap: u16) type {
             multiline: bool,
         ) u16 {
             if (!multiline and b == '\n') return dead_state;
-            const cached = self.states[state_id].next[b];
+            const cached = self.trans[state_id][b];
             if (cached != unknown_transition) return cached;
             return self.computeTransition(insts, unicode_ranges, state_id, b, multiline);
         }
@@ -137,9 +274,9 @@ pub fn BoundedDfa(comptime max_states_cap: u16) type {
             var next_len: u8 = 0;
             var next_is_match = false;
 
-            const src_len = self.states[state_id].pc_len;
+            const src_len = self.meta[state_id].pc_len;
             var src_pcs: [max_closure_pcs]u16 = undefined;
-            @memcpy(src_pcs[0..src_len], self.states[state_id].pcs[0..src_len]);
+            @memcpy(src_pcs[0..src_len], self.meta[state_id].pcs[0..src_len]);
 
             for (src_pcs[0..src_len]) |pc_u16| {
                 const inst = insts[pc_u16];
@@ -152,7 +289,7 @@ pub fn BoundedDfa(comptime max_states_cap: u16) type {
                         if (ok) {
                             if (!computeEpsilonClosure(insts, by.out, &next_pcs, &next_len, &next_is_match)) {
                                 self.bailouts +%= 1;
-                                self.states[state_id].next[b] = bailout_transition;
+                                self.trans[state_id][b] = bailout_transition;
                                 return bailout_transition;
                             }
                         }
@@ -171,7 +308,7 @@ pub fn BoundedDfa(comptime max_states_cap: u16) type {
                             an.out;
                         if (!computeEpsilonClosure(insts, target_pc, &next_pcs, &next_len, &next_is_match)) {
                             self.bailouts +%= 1;
-                            self.states[state_id].next[b] = bailout_transition;
+                            self.trans[state_id][b] = bailout_transition;
                             return bailout_transition;
                         }
                     },
@@ -179,7 +316,7 @@ pub fn BoundedDfa(comptime max_states_cap: u16) type {
                         if ((b & 0xC0) == 0x80) {
                             if (!computeEpsilonClosure(insts, ac.out, &next_pcs, &next_len, &next_is_match)) {
                                 self.bailouts +%= 1;
-                                self.states[state_id].next[b] = bailout_transition;
+                                self.trans[state_id][b] = bailout_transition;
                                 return bailout_transition;
                             }
                         }
@@ -196,7 +333,7 @@ pub fn BoundedDfa(comptime max_states_cap: u16) type {
                                 cl.out;
                             if (!computeEpsilonClosure(insts, target_pc, &next_pcs, &next_len, &next_is_match)) {
                                 self.bailouts +%= 1;
-                                self.states[state_id].next[b] = bailout_transition;
+                                self.trans[state_id][b] = bailout_transition;
                                 return bailout_transition;
                             }
                             continue;
@@ -204,7 +341,7 @@ pub fn BoundedDfa(comptime max_states_cap: u16) type {
                         if (cl.set.contains(b)) {
                             if (!computeEpsilonClosure(insts, cl.out, &next_pcs, &next_len, &next_is_match)) {
                                 self.bailouts +%= 1;
-                                self.states[state_id].next[b] = bailout_transition;
+                                self.trans[state_id][b] = bailout_transition;
                                 return bailout_transition;
                             }
                         }
@@ -218,7 +355,7 @@ pub fn BoundedDfa(comptime max_states_cap: u16) type {
                             if (matched) {
                                 if (!computeEpsilonClosure(insts, uc.out, &next_pcs, &next_len, &next_is_match)) {
                                     self.bailouts +%= 1;
-                                    self.states[state_id].next[b] = bailout_transition;
+                                    self.trans[state_id][b] = bailout_transition;
                                     return bailout_transition;
                                 }
                             }
@@ -231,7 +368,7 @@ pub fn BoundedDfa(comptime max_states_cap: u16) type {
                                 (if (uc.cont3 != 0) uc.cont3 else uc.out);
                             if (!computeEpsilonClosure(insts, target_pc, &next_pcs, &next_len, &next_is_match)) {
                                 self.bailouts +%= 1;
-                                self.states[state_id].next[b] = bailout_transition;
+                                self.trans[state_id][b] = bailout_transition;
                                 return bailout_transition;
                             }
                         }
@@ -242,17 +379,18 @@ pub fn BoundedDfa(comptime max_states_cap: u16) type {
 
             _ = multiline;
             if (next_len == 0 and !next_is_match) {
-                self.states[state_id].next[b] = dead_state;
+                self.trans[state_id][b] = dead_state;
                 return dead_state;
             }
 
             // Deduplicate against existing DFA states
-            for (self.states[1..self.num_states], 1..) |*st, idx| {
-                if (st.pc_len == next_len and st.is_match == next_is_match and
+            for (1..self.num_states) |idx| {
+                const st = &self.meta[idx];
+                if (st.pc_len == next_len and self.is_match[idx] == next_is_match and
                     std.mem.eql(u16, st.pcs[0..next_len], next_pcs[0..next_len]))
                 {
                     const found_id: u16 = @intCast(idx);
-                    self.states[state_id].next[b] = found_id;
+                    self.trans[state_id][b] = found_id;
                     return found_id;
                 }
             }
@@ -262,15 +400,11 @@ pub fn BoundedDfa(comptime max_states_cap: u16) type {
             if (self.num_states >= self.effective_max_states) {
                 self.flushes +%= 1;
                 _ = self.initBaseStates(insts, self.compiled_start_pc);
-                // Re-insert the source state if it was not start_state
                 if (state_id != start_state) {
                     const reloaded_src = self.num_states;
-                    self.states[reloaded_src] = .{
-                        .pcs = src_pcs,
-                        .pc_len = src_len,
-                        .is_match = false,
-                        .next = @splat(unknown_transition),
-                    };
+                    self.meta[reloaded_src] = .{ .pcs = src_pcs, .pc_len = src_len };
+                    self.is_match[reloaded_src] = false;
+                    self.trans[reloaded_src] = @splat(unknown_transition);
                     self.num_states += 1;
                     actual_src = reloaded_src;
                 } else {
@@ -279,14 +413,11 @@ pub fn BoundedDfa(comptime max_states_cap: u16) type {
             }
 
             const new_id = self.num_states;
-            self.states[new_id] = .{
-                .pcs = next_pcs,
-                .pc_len = next_len,
-                .is_match = next_is_match,
-                .next = @splat(unknown_transition),
-            };
+            self.meta[new_id] = .{ .pcs = next_pcs, .pc_len = next_len };
+            self.is_match[new_id] = next_is_match;
+            self.trans[new_id] = @splat(unknown_transition);
             self.num_states += 1;
-            self.states[actual_src].next[b] = new_id;
+            self.trans[actual_src][b] = new_id;
             return new_id;
         }
     };

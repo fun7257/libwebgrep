@@ -80,10 +80,9 @@ pub const Engine = struct {
         var counts: [256]u32 = @splat(0);
         for (patterns) |pat| {
             if (pat.len < 2) return null;
-            const pick = rarest(ignore, pat);
-            const side = neighbor(pat, pick.offset);
-            if (!addForms(ignore, &pos_rules, &npos, &neg_rules, &nneg, pat[pick.offset], side.byte, side.delta)) return null;
-            counts[pick.byte] += 1;
+            const pick = rarestPair(ignore, pat);
+            if (!addForms(ignore, &pos_rules, &npos, &neg_rules, &nneg, pat[pick.offset], pick.partner, pick.delta)) return null;
+            counts[pick.anchor] += 1;
             min_len = @min(min_len, @as(u32, @intCast(pat.len)));
             max_off = @max(max_off, pick.offset);
         }
@@ -98,10 +97,10 @@ pub const Engine = struct {
         errdefer allocator.free(items);
         var placed: [256]u32 = @splat(0);
         for (patterns, 0..) |pat, id_usize| {
-            const pick = rarest(ignore, pat);
-            const index = spans[pick.byte].begin + placed[pick.byte];
+            const pick = rarestPair(ignore, pat);
+            const index = spans[pick.anchor].begin + placed[pick.anchor];
             items[index] = .{ .offset = pick.offset, .id = @intCast(id_usize) };
-            placed[pick.byte] += 1;
+            placed[pick.anchor] += 1;
         }
         return .{
             .patterns = patterns,
@@ -275,7 +274,7 @@ pub const Engine = struct {
     ) ?usize {
         if (self.collectDirect()) |direct| {
             switch (direct.n) {
-                inline 1...2 => |n| return self.scanDirect(hay, i, end, &direct.rules, n, watch_nul, nul_checked, nul_out),
+                inline 1...8 => |n| return self.scanDirect(hay, i, end, &direct.rules, n, watch_nul, nul_checked, nul_out),
                 else => {},
             }
         }
@@ -309,7 +308,7 @@ pub const Engine = struct {
         hay: []const u8,
         i: *usize,
         end: usize,
-        rules: *const [2]Rule,
+        rules: *const [8]Rule,
         comptime n: u8,
         comptime watch_nul: bool,
         nul_checked: *usize,
@@ -324,45 +323,43 @@ pub const Engine = struct {
             s_splat[k] = @splat(rules[k].partner);
         }
         var at = i.*;
-        const stride = width * fp_windows;
+        const direct_windows: usize = 4;
+        const stride = width * direct_windows;
         while (at + stride + 1 <= hay.len and at + stride <= end) {
-            var m0: [fp_windows]@Vector(width, bool) = undefined;
-            inline for (0..fp_windows) |w| {
+            var m0: [direct_windows]@Vector(width, bool) = undefined;
+            inline for (0..direct_windows) |w| {
                 const base = at + w * width;
                 const v0: V = hay[base..][0..width].*;
-                var m: @Vector(width, bool) = (v0 == f_splat[0]);
-                if (comptime n > 1) m = m | (v0 == f_splat[1]);
+                const v1: V = hay[base + 1 ..][0..width].*;
+                var m: @Vector(width, bool) = (v0 == f_splat[0]) & (v1 == s_splat[0]);
+                inline for (1..n) |k| m = m | ((v0 == f_splat[k]) & (v1 == s_splat[k]));
                 if (watch_nul) m = m | (v0 == zero);
                 m0[w] = m;
             }
-            const lo4 = (m0[0] | m0[1]) | (m0[2] | m0[3]);
-            const hi4 = (m0[4] | m0[5]) | (m0[6] | m0[7]);
-            if (!@reduce(.Or, lo4 | hi4)) {
+            const any = (m0[0] | m0[1]) | (m0[2] | m0[3]);
+            if (!@reduce(.Or, any)) {
                 at += stride;
                 if (watch_nul and at > nul_checked.*) nul_checked.* = at;
                 continue;
             }
-            inline for (0..fp_windows) |w| {
+            inline for (0..direct_windows) |w| {
                 if (@reduce(.Or, m0[w])) {
                     const base = at + w * width;
-                    const v0: V = hay[base..][0..width].*;
-                    const v1: V = hay[base + 1 ..][0..width].*;
-                    var m: @Vector(width, bool) = (v0 == f_splat[0]) & (v1 == s_splat[0]);
-                    if (comptime n > 1) m = m | ((v0 == f_splat[1]) & (v1 == s_splat[1]));
-                    const z = if (watch_nul) (v0 == zero) else @as(@Vector(width, bool), @splat(false));
-                    if (@reduce(.Or, m | z)) {
-                        if (self.verifySpan(hay, base, end)) |found| {
-                            if (watch_nul) {
-                                if (memchr.find(width, hay[0 .. found + 1], nul_checked.*, 0)) |nul_at| {
-                                    nul_out.* = nul_at;
-                                    return null;
-                                }
-                                if (found + 1 > nul_checked.*) nul_checked.* = found + 1;
+                    if (self.verifySpan(hay, base, end)) |found| {
+                        if (watch_nul) {
+                            if (memchr.find(width, hay[0 .. found + 1], nul_checked.*, 0)) |nul_at| {
+                                nul_out.* = nul_at;
+                                return null;
                             }
-                            i.* = found;
-                            return found;
+                            if (found + 1 > nul_checked.*) nul_checked.* = found + 1;
                         }
-                        if (watch_nul and @reduce(.Or, z)) {
+                        i.* = found;
+                        return found;
+                    }
+                    if (watch_nul) {
+                        const v0: V = hay[base..][0..width].*;
+                        const z = v0 == zero;
+                        if (@reduce(.Or, z)) {
                             nul_out.* = base + @as(usize, std.simd.firstTrue(z).?);
                             return null;
                         }
@@ -500,8 +497,8 @@ pub const Engine = struct {
         return null;
     }
 
-    fn collectDirect(self: *const Engine) ?struct { n: u8, rules: [2]Rule } {
-        var rules: [2]Rule = undefined;
+    fn collectDirect(self: *const Engine) ?struct { n: u8, rules: [8]Rule } {
+        var rules: [8]Rule = undefined;
         var n: u8 = 0;
         for (self.pos_rules[0..self.npos]) |rule| {
             if (!noteDirect(&rules, &n, rule.anchor, rule.partner)) return null;
@@ -688,9 +685,9 @@ fn noteBucket(bytes: *[8]u8, n: *u8, hash: u8) bool {
     return true;
 }
 
-fn noteDirect(rules: *[2]Rule, n: *u8, first: u8, second: u8) bool {
+fn noteDirect(rules: *[8]Rule, n: *u8, first: u8, second: u8) bool {
     for (rules[0..n.*]) |have| if (have.anchor == first and have.partner == second) return true;
-    if (n.* == 2) return false;
+    if (n.* == 8) return false;
     rules[n.*] = .{ .anchor = first, .partner = second };
     n.* += 1;
     return true;
@@ -759,38 +756,50 @@ fn sideHit(rules: []const Rule, hay: []const u8, i: usize, anchor: u8, delta: i8
     return false;
 }
 
-const Pick = struct { byte: u8, offset: u32 };
+const PairPick = struct {
+    anchor: u8,
+    partner: u8,
+    offset: u32,
+    delta: i8,
+};
 
-fn rarest(comptime ignore: bool, pat: []const u8) Pick {
+fn rarestPair(comptime ignore: bool, pat: []const u8) PairPick {
     var best_i: usize = 0;
-    var best_byte: u8 = if (ignore) ascii.fold(pat[0]) else pat[0];
-    var best_rank: u8 = frequency.default_rank[best_byte];
-    for (pat[1..], 1..) |raw, i| {
-        const byte = if (ignore) ascii.fold(raw) else raw;
-        const rank = frequency.default_rank[byte];
-        if (rank < best_rank) {
-            best_rank = rank;
-            best_byte = byte;
+    var best_sum: u16 = std.math.maxInt(u16);
+    var best_anchor_rank: u8 = std.math.maxInt(u8);
+    var i: usize = 0;
+    while (i + 1 < pat.len) : (i += 1) {
+        const a = if (ignore) ascii.fold(pat[i]) else pat[i];
+        const b = if (ignore) ascii.fold(pat[i + 1]) else pat[i + 1];
+        const ra = frequency.default_rank[a];
+        const rb = frequency.default_rank[b];
+        const sum: u16 = @as(u16, ra) + @as(u16, rb);
+        const min_r = @min(ra, rb);
+        if (sum < best_sum or (sum == best_sum and min_r < best_anchor_rank)) {
+            best_sum = sum;
+            best_anchor_rank = min_r;
             best_i = i;
         }
     }
-    return .{ .byte = best_byte, .offset = @intCast(best_i) };
-}
-
-fn neighbor(pat: []const u8, off: u32) struct { byte: u8, delta: i8 } {
-    const i: usize = off;
-    const right = i + 1 < pat.len;
-    const left = i > 0;
-    if (right and left) {
-        const rb = pat[i + 1];
-        const lb = pat[i - 1];
-        if (frequency.default_rank[rb] <= frequency.default_rank[lb]) {
-            return .{ .byte = rb, .delta = 1 };
-        }
-        return .{ .byte = lb, .delta = -1 };
+    const a_raw = pat[best_i];
+    const b_raw = pat[best_i + 1];
+    const a = if (ignore) ascii.fold(a_raw) else a_raw;
+    const b = if (ignore) ascii.fold(b_raw) else b_raw;
+    if (frequency.default_rank[a] <= frequency.default_rank[b]) {
+        return .{
+            .anchor = a,
+            .partner = b_raw,
+            .offset = @intCast(best_i),
+            .delta = 1,
+        };
+    } else {
+        return .{
+            .anchor = b,
+            .partner = a_raw,
+            .offset = @intCast(best_i + 1),
+            .delta = -1,
+        };
     }
-    if (right) return .{ .byte = pat[i + 1], .delta = 1 };
-    return .{ .byte = pat[i - 1], .delta = -1 };
 }
 
 inline fn windowHits(

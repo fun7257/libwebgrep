@@ -10,6 +10,13 @@ const pull_mod = @import("pull.zig");
 const ignore_mod = @import("../walk/ignore.zig");
 const walker_mod = @import("../walk/walker.zig");
 const glob_mod = @import("../walk/glob.zig");
+const encoding_mod = @import("../codec/encoding.zig");
+const format_mod = @import("format.zig");
+const state_mod = @import("state.zig");
+const config_mod = @import("config.zig");
+const context_ring_mod = @import("context_ring.zig");
+const Span = sink_mod.Span;
+const Event = sink_mod.Event;
 
 const OneByteReader = struct {
     reader: std.Io.Reader,
@@ -429,4 +436,409 @@ test "vector 5.2: tree depth limit max_depth = 2 on 5-level nested directory" {
     }
     try testing.expect(saw_l1);
     try testing.expect(saw_l2);
+}
+
+// ============================================================================
+// EMPIRICAL CHALLENGER STRESS TESTS: MILESTONE 1
+// ============================================================================
+
+test "M1 CHALLENGE 1: gatherSpans collects all spans for 1, 2, 5, 20, 65, 100, 256 spans" {
+    const target_counts = [_]usize{ 1, 2, 5, 20, 65, 100, 256 };
+    for (target_counts) |count| {
+        // Build a line with exact `count` occurrences of "TARGET "
+        var line_buf = std.ArrayList(u8).empty;
+        defer line_buf.deinit(testing.allocator);
+        for (0..count) |_| {
+            try line_buf.appendSlice(testing.allocator, "TARGET ");
+        }
+        try line_buf.appendSlice(testing.allocator, "\n");
+        const line_str = line_buf.items;
+
+        var finder = try Finder.init("TARGET", .{});
+
+        // Test with replacement == null (critical regression check for worker's reverted short-circuit)
+        const SpanCounterSink = struct {
+            match_events: usize = 0,
+            spans_count: usize = 0,
+            spans_valid: bool = true,
+            pub fn event(self: *@This(), ev: Event) bool {
+                if (ev == .match) {
+                    self.match_events += 1;
+                    self.spans_count = ev.match.matches.len;
+                    for (ev.match.matches, 0..) |s, i| {
+                        const expected_start = i * 7;
+                        const expected_end = i * 7 + 6;
+                        if (s.start != expected_start or s.end != expected_end) {
+                            self.spans_valid = false;
+                        }
+                    }
+                }
+                return true;
+            }
+        };
+
+        var sink = SpanCounterSink{};
+        const res = try searcher.searchSourceSlice(SpanCounterSink, &sink, "m1-gather-null-repl", line_str, &finder, .{
+            .allocator = testing.allocator,
+        });
+
+        try testing.expectEqual(@as(usize, 1), sink.match_events);
+        try testing.expectEqual(count, sink.spans_count);
+        try testing.expect(sink.spans_valid);
+        try testing.expectEqual(@as(u64, 1), res.matched_lines);
+        try testing.expectEqual(@as(u64, count), res.matches);
+
+        // Also test with replacement set
+        var sink_repl = SpanCounterSink{};
+        const res_repl = try searcher.searchSourceSlice(SpanCounterSink, &sink_repl, "m1-gather-repl", line_str, &finder, .{
+            .allocator = testing.allocator,
+            .replacement = "REPL",
+        });
+
+        try testing.expectEqual(@as(usize, 1), sink_repl.match_events);
+        try testing.expectEqual(count, sink_repl.spans_count);
+        try testing.expect(sink_repl.spans_valid);
+        try testing.expectEqual(@as(u64, 1), res_repl.matched_lines);
+        try testing.expectEqual(@as(u64, count), res_repl.matches);
+    }
+}
+
+test "M1 CHALLENGE 2: state.matches tallies all spans across multi-line inputs with variable span density" {
+    // Multi-line file:
+    // Line 1: 1 match
+    // Line 2: 2 matches
+    // Line 3: 5 matches
+    // Line 4: 20 matches
+    // Line 5: 75 matches (>64)
+    // Line 6: 0 matches (interspersed context / non-matching)
+    // Line 7: 10 matches
+    const counts = [_]usize{ 1, 2, 5, 20, 75, 0, 10 };
+    var total_expected_matches: usize = 0;
+    var total_expected_lines: usize = 0;
+    var file_buf = std.ArrayList(u8).empty;
+    defer file_buf.deinit(testing.allocator);
+
+    for (counts) |c| {
+        if (c > 0) {
+            total_expected_matches += c;
+            total_expected_lines += 1;
+            for (0..c) |_| {
+                try file_buf.appendSlice(testing.allocator, "HIT ");
+            }
+        } else {
+            try file_buf.appendSlice(testing.allocator, "no-match-here on this line");
+        }
+        try file_buf.appendSlice(testing.allocator, "\n");
+    }
+
+    var finder = try Finder.init("HIT", .{});
+
+    const TallySink = struct {
+        lines_seen: usize = 0,
+        matches_tallied: usize = 0,
+        summary_matches: usize = 0,
+        summary_lines: usize = 0,
+        end_matches: usize = 0,
+        end_lines: usize = 0,
+        pub fn event(self: *@This(), ev: Event) bool {
+            switch (ev) {
+                .match => |m| {
+                    self.lines_seen += 1;
+                    self.matches_tallied += m.matches.len;
+                },
+                .end => |e| {
+                    self.end_matches = @intCast(e.matches);
+                    self.end_lines = @intCast(e.matched_lines);
+                },
+                .summary => |s| {
+                    self.summary_matches = @intCast(s.matches);
+                    self.summary_lines = @intCast(s.matched_lines);
+                },
+                else => {},
+            }
+            return true;
+        }
+    };
+
+    var sink = TallySink{};
+    const res = try searcher.searchSourceSlice(TallySink, &sink, "m1-tally", file_buf.items, &finder, .{
+        .allocator = testing.allocator,
+    });
+
+    try testing.expectEqual(total_expected_lines, sink.lines_seen);
+    try testing.expectEqual(total_expected_matches, sink.matches_tallied);
+    try testing.expectEqual(total_expected_matches, sink.summary_matches);
+    try testing.expectEqual(total_expected_lines, sink.summary_lines);
+    try testing.expectEqual(total_expected_matches, sink.end_matches);
+    try testing.expectEqual(total_expected_lines, sink.end_lines);
+    try testing.expectEqual(@as(u64, total_expected_lines), res.matched_lines);
+    try testing.expectEqual(@as(u64, total_expected_matches), res.matches);
+}
+
+test "M1 CHALLENGE 3: ASCII fast path in buildLine (isAsciiSlice == true) preserves column & byte equality" {
+    const ascii_line = "alpha FOO beta BAR gamma BAZ delta FOO end\n";
+    try testing.expect(encoding_mod.isAsciiSlice(ascii_line));
+
+    const Multi = @import("../finder/multi.zig").Multi;
+    var multi = try Multi.init(testing.allocator, &.{ "FOO", "BAR", "BAZ" }, .{});
+    defer multi.deinit();
+
+    const LineCaptureSink = struct {
+        u16_all_equal_byte: bool = true,
+        span_count: usize = 0,
+        pub fn event(self: *@This(), ev: Event) bool {
+            if (ev == .match) {
+                self.span_count = ev.match.matches.len;
+                for (ev.match.matches) |s| {
+                    if (s.u16_start != s.start or s.u16_end != s.end) {
+                        self.u16_all_equal_byte = false;
+                    }
+                }
+                // Verify column calculation
+                if (ev.match.matches.len > 0) {
+                    if (ev.match.column != ev.match.matches[0].start + 1) self.u16_all_equal_byte = false;
+                    if (ev.match.u16_column != ev.match.matches[0].u16_start + 1) self.u16_all_equal_byte = false;
+                }
+            }
+            return true;
+        }
+    };
+
+    var sink = LineCaptureSink{};
+    const res = try searcher.searchSourceSlice(LineCaptureSink, &sink, "m1-ascii", ascii_line, &multi, .{
+        .allocator = testing.allocator,
+    });
+
+    try testing.expectEqual(@as(u64, 1), res.matched_lines);
+    try testing.expectEqual(@as(u64, 4), res.matches); // 2x FOO, 1x BAR, 1x BAZ
+    try testing.expectEqual(@as(usize, 4), sink.span_count);
+    try testing.expect(sink.u16_all_equal_byte);
+}
+
+test "M1 CHALLENGE 4: UTF-8 multibyte CJK and Greek fallback accurately computes UTF-16 code units" {
+    // Chinese characters are 3 bytes each in UTF-8, 1 code unit in UTF-16
+    // "开源项目: libwebgrep 高性能文本搜索! 支持多模式搜索.\n"
+    const utf8_cjk = "开源项目: libwebgrep 高性能文本搜索! 支持多模式搜索.\n";
+    try testing.expect(!encoding_mod.isAsciiSlice(utf8_cjk));
+
+    var finder = try Finder.init("搜索", .{});
+
+    // Oracle calculation:
+    // Prefix: "开源项目: libwebgrep 高性能文本"
+    // "开源项目" = 4 chars * 3 bytes = 12 bytes; 4 UTF-16 units
+    // ": " = 2 bytes; 2 UTF-16 units
+    // "libwebgrep " = 11 bytes; 11 UTF-16 units
+    // "高性能文本" = 5 chars * 3 bytes = 15 bytes; 5 UTF-16 units
+    // Match 1 "搜索":
+    // byte_start = 12 + 2 + 11 + 15 = 40
+    // byte_end = 40 + 6 = 46
+    // u16_start = 4 + 2 + 11 + 5 = 22
+    // u16_end = 22 + 2 = 24
+    // Intermediate: "! 支持多模式"
+    // "!" = 1 byte; 1 UTF-16 unit
+    // " " = 1 byte; 1 UTF-16 unit
+    // "支持多模式" = 5 chars * 3 bytes = 15 bytes; 5 UTF-16 units
+    // Match 2 "搜索":
+    // byte_start = 46 + 1 + 1 + 15 = 63
+    // byte_end = 63 + 6 = 69
+    // u16_start = 24 + 1 + 1 + 5 = 31
+    // u16_end = 31 + 2 = 33
+
+    const CjkSink = struct {
+        s0_start: usize = 0,
+        s0_end: usize = 0,
+        s0_u16_start: usize = 0,
+        s0_u16_end: usize = 0,
+        s1_start: usize = 0,
+        s1_end: usize = 0,
+        s1_u16_start: usize = 0,
+        s1_u16_end: usize = 0,
+        span_count: usize = 0,
+        pub fn event(self: *@This(), ev: Event) bool {
+            if (ev == .match) {
+                self.span_count = ev.match.matches.len;
+                if (ev.match.matches.len >= 2) {
+                    self.s0_start = ev.match.matches[0].start;
+                    self.s0_end = ev.match.matches[0].end;
+                    self.s0_u16_start = ev.match.matches[0].u16_start;
+                    self.s0_u16_end = ev.match.matches[0].u16_end;
+
+                    self.s1_start = ev.match.matches[1].start;
+                    self.s1_end = ev.match.matches[1].end;
+                    self.s1_u16_start = ev.match.matches[1].u16_start;
+                    self.s1_u16_end = ev.match.matches[1].u16_end;
+                }
+            }
+            return true;
+        }
+    };
+
+    var sink = CjkSink{};
+    const res = try searcher.searchSourceSlice(CjkSink, &sink, "m1-cjk", utf8_cjk, &finder, .{
+        .allocator = testing.allocator,
+    });
+
+    try testing.expectEqual(@as(u64, 1), res.matched_lines);
+    try testing.expectEqual(@as(u64, 2), res.matches);
+    try testing.expectEqual(@as(usize, 2), sink.span_count);
+
+    try testing.expectEqual(@as(usize, 40), sink.s0_start);
+    try testing.expectEqual(@as(usize, 46), sink.s0_end);
+    try testing.expectEqual(@as(usize, 22), sink.s0_u16_start);
+    try testing.expectEqual(@as(usize, 24), sink.s0_u16_end);
+
+    try testing.expectEqual(@as(usize, 63), sink.s1_start);
+    try testing.expectEqual(@as(usize, 69), sink.s1_end);
+    try testing.expectEqual(@as(usize, 31), sink.s1_u16_start);
+    try testing.expectEqual(@as(usize, 33), sink.s1_u16_end);
+}
+
+test "M1 CHALLENGE 5: Astral plane emojis (4-byte UTF-8, 2 UTF-16 surrogate units) compute accurately" {
+    // In UTF-16, astral plane characters (U+10000..U+10FFFF) require a surrogate pair (2 code units).
+    // In UTF-8, they take 4 bytes.
+    // "Emoji: 🚀 rocket, 🎉 party!\n"
+    const emoji_line = "Emoji: 🚀 rocket, 🎉 party!\n";
+    try testing.expect(!encoding_mod.isAsciiSlice(emoji_line));
+
+    const Multi = @import("../finder/multi.zig").Multi;
+    var multi = try Multi.init(testing.allocator, &.{ "rocket", "party" }, .{});
+    defer multi.deinit();
+
+    // Match 1: "rocket"
+    // byte_start = 7 + 4 + 1 = 12
+    // byte_end = 12 + 6 = 18
+    // u16_start = 7 + 2 + 1 = 10
+    // u16_end = 10 + 6 = 16
+
+    // Match 2: "party"
+    // byte_start = 18 + 2 + 4 + 1 = 25
+    // byte_end = 25 + 5 = 30
+    // u16_start = 16 + 2 + 2 + 1 = 21
+    // u16_end = 21 + 5 = 26
+
+    const EmojiSink = struct {
+        matches_len: usize = 0,
+        m0_start: usize = 0,
+        m0_end: usize = 0,
+        m0_u16_start: usize = 0,
+        m0_u16_end: usize = 0,
+        m1_start: usize = 0,
+        m1_end: usize = 0,
+        m1_u16_start: usize = 0,
+        m1_u16_end: usize = 0,
+        pub fn event(self: *@This(), ev: Event) bool {
+            if (ev == .match) {
+                self.matches_len = ev.match.matches.len;
+                if (ev.match.matches.len >= 2) {
+                    self.m0_start = ev.match.matches[0].start;
+                    self.m0_end = ev.match.matches[0].end;
+                    self.m0_u16_start = ev.match.matches[0].u16_start;
+                    self.m0_u16_end = ev.match.matches[0].u16_end;
+
+                    self.m1_start = ev.match.matches[1].start;
+                    self.m1_end = ev.match.matches[1].end;
+                    self.m1_u16_start = ev.match.matches[1].u16_start;
+                    self.m1_u16_end = ev.match.matches[1].u16_end;
+                }
+            }
+            return true;
+        }
+    };
+
+    var sink = EmojiSink{};
+    const res = try searcher.searchSourceSlice(EmojiSink, &sink, "m1-emoji", emoji_line, &multi, .{
+        .allocator = testing.allocator,
+    });
+
+    try testing.expectEqual(@as(u64, 1), res.matched_lines);
+    try testing.expectEqual(@as(u64, 2), res.matches);
+    try testing.expectEqual(@as(usize, 2), sink.matches_len);
+
+    try testing.expectEqual(@as(usize, 12), sink.m0_start);
+    try testing.expectEqual(@as(usize, 18), sink.m0_end);
+    try testing.expectEqual(@as(usize, 10), sink.m0_u16_start);
+    try testing.expectEqual(@as(usize, 16), sink.m0_u16_end);
+
+    try testing.expectEqual(@as(usize, 25), sink.m1_start);
+    try testing.expectEqual(@as(usize, 30), sink.m1_end);
+    try testing.expectEqual(@as(usize, 21), sink.m1_u16_start);
+    try testing.expectEqual(@as(usize, 26), sink.m1_u16_end);
+}
+
+test "M1 CHALLENGE 6: Hybrid extreme stress - 80 matches on mixed ASCII+CJK+Emoji line (>64 buffer expansion)" {
+    // 80 repetitions of "A🚀中B "
+    // Per block:
+    // "A" : 1 byte, 1 u16 unit
+    // "🚀": 4 bytes, 2 u16 units
+    // "中": 3 bytes, 1 u16 unit
+    // "B" : 1 byte, 1 u16 unit
+    // " " : 1 byte, 1 u16 unit
+    // Total bytes per block = 10
+    // Total u16 units per block = 6
+    // Match "B":
+    // In block k (0 <= k < 80):
+    // byte_start = k * 10 + 8
+    // byte_end   = k * 10 + 9
+    // u16_start  = k * 6 + 4
+    // u16_end    = k * 6 + 5
+    const total_blocks: usize = 80;
+    var line_buf = std.ArrayList(u8).empty;
+    defer line_buf.deinit(testing.allocator);
+
+    for (0..total_blocks) |_| {
+        try line_buf.appendSlice(testing.allocator, "A🚀中B ");
+    }
+    try line_buf.appendSlice(testing.allocator, "\n");
+
+    var finder = try Finder.init("B", .{});
+
+    const StressSink = struct {
+        matches_count: usize = 0,
+        all_exact: bool = true,
+        bad_index: usize = 0,
+        expected_b_start: usize = 0,
+        actual_b_start: usize = 0,
+        expected_u16_start: usize = 0,
+        actual_u16_start: usize = 0,
+        pub fn event(self: *@This(), ev: Event) bool {
+            if (ev == .match) {
+                self.matches_count = ev.match.matches.len;
+                for (ev.match.matches, 0..) |s, k| {
+                    const exp_b_start = k * 10 + 8;
+                    const exp_b_end = k * 10 + 9;
+                    const exp_u16_start = k * 6 + 4;
+                    const exp_u16_end = k * 6 + 5;
+                    if (s.start != exp_b_start or s.end != exp_b_end or s.u16_start != exp_u16_start or s.u16_end != exp_u16_end) {
+                        self.all_exact = false;
+                        self.bad_index = k;
+                        self.expected_b_start = exp_b_start;
+                        self.actual_b_start = s.start;
+                        self.expected_u16_start = exp_u16_start;
+                        self.actual_u16_start = s.u16_start;
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+    };
+
+    var sink = StressSink{};
+    const res = try searcher.searchSourceSlice(StressSink, &sink, "m1-hybrid-stress", line_buf.items, &finder, .{
+        .allocator = testing.allocator,
+    });
+
+    try testing.expectEqual(@as(u64, 1), res.matched_lines);
+    try testing.expectEqual(@as(u64, total_blocks), res.matches);
+    try testing.expectEqual(total_blocks, sink.matches_count);
+    if (!sink.all_exact) {
+        std.debug.print("\nMismatch at block {d}: expected byte {d}, got {d}; expected u16 {d}, got {d}\n", .{
+            sink.bad_index,
+            sink.expected_b_start,
+            sink.actual_b_start,
+            sink.expected_u16_start,
+            sink.actual_u16_start,
+        });
+    }
+    try testing.expect(sink.all_exact);
 }

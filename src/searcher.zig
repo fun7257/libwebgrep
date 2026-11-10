@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
+const platform = @import("io/platform.zig");
 const matcher_mod = @import("matcher.zig");
 const sink_mod = @import("sink.zig");
 
@@ -119,6 +120,7 @@ pub fn searchFile(
             return drive(S, allocator, sink, matcher, config, name, window_map.readBytes, &ctx);
         }
     }
+    platform.adviseSequentialFile(file);
     const Ctx = struct { io: std.Io, file: std.Io.File, offset: u64 = 0 };
     var ctx = Ctx{ .io = io, .file = file };
     return drive(S, allocator, sink, matcher, config, name, struct {

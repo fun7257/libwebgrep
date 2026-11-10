@@ -47,7 +47,7 @@ const nextMatch = line_matcher_mod.nextMatch;
 const matchBuffer = line_matcher_mod.matchBuffer;
 
 pub fn longTail(buf: []const u8, eof: bool, config: SearchConfig) bool {
-    if (eof or buf.len == 0) return false;
+    if (eof or buf.len <= config.max_line_len) return false;
     const end = lastComplete(buf, config);
     return buf.len - end > config.max_line_len;
 }

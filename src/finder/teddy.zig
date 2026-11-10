@@ -9,8 +9,10 @@
 //! Pattern bytes are owned by the caller; no memory is allocated here.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const ascii = @import("ascii.zig");
 const build_options = @import("build_options");
+const frequency = @import("frequency.zig");
 const matcher = @import("../matcher.zig");
 const memchr = @import("memchr.zig");
 
@@ -43,9 +45,12 @@ pub const Engine = struct {
     patterns: []const []const u8,
     ignore_case: bool,
     min_len: usize,
+    min_tail_len: usize,
+    max_offset: usize,
     fingerprint: u8,
     group: Group,
     bucket_pats: [num_buckets]u32,
+    pat_offsets: [max_patterns]u32,
 
     pub fn init(patterns: []const []const u8, ignore_case: bool) Engine {
         std.debug.assert(patterns.len > 0 and patterns.len <= max_patterns);
@@ -57,12 +62,23 @@ pub const Engine = struct {
         const fingerprint: u8 = @intCast(@min(min_len, max_fp));
         var group: Group = std.mem.zeroes(Group);
         var bucket_pats: [num_buckets]u32 = @splat(0);
+        var pat_offsets: [max_patterns]u32 = @splat(0);
+        var max_offset: usize = 0;
+        var min_tail_len: usize = std.math.maxInt(usize);
+
         for (patterns, 0..) |pat, id| {
             const bucket: u3 = @intCast(id % num_buckets);
             const bit: u8 = @as(u8, 1) << bucket;
             bucket_pats[bucket] |= @as(u32, 1) << @intCast(id);
+
+            const off = pickWindowOffset(pat, fingerprint, ignore_case, &group);
+            pat_offsets[id] = @intCast(off);
+            max_offset = @max(max_offset, off);
+            min_tail_len = @min(min_tail_len, pat.len - off);
+
             for (0..fingerprint) |k| {
-                const forms = if (ignore_case) ascii.caseVariants(pat[k]) else [2]u8{ pat[k], pat[k] };
+                const b = pat[off + k];
+                const forms = if (ignore_case) ascii.caseVariants(b) else [2]u8{ b, b };
                 for (forms) |byte| {
                     group.lo[k][byte & 0x0f] |= bit;
                     group.hi[k][byte >> 4] |= bit;
@@ -73,10 +89,53 @@ pub const Engine = struct {
             .patterns = patterns,
             .ignore_case = ignore_case,
             .min_len = min_len,
+            .min_tail_len = min_tail_len,
+            .max_offset = max_offset,
             .fingerprint = fingerprint,
             .group = group,
             .bucket_pats = bucket_pats,
+            .pat_offsets = pat_offsets,
         };
+    }
+
+    fn pickWindowOffset(
+        pat: []const u8,
+        fingerprint: u8,
+        ignore_case: bool,
+        group: *const Group,
+    ) usize {
+        if (pat.len <= fingerprint) return 0;
+        const max_scan = @min(pat.len - fingerprint + 1, 64);
+        var best_off: usize = 0;
+        var best_score: u32 = std.math.maxInt(u32);
+
+        for (0..max_scan) |off| {
+            const w = pat[off .. off + fingerprint];
+            var score: u32 = @intCast(off);
+            for (0..fingerprint) |k| {
+                const b = w[k];
+                const forms = ascii.caseVariants(b);
+                const r: u32 = if (ignore_case)
+                    @max(frequency.default_rank[forms[0]], frequency.default_rank[forms[1]])
+                else
+                    frequency.default_rank[b];
+                // Weight the first two window bytes higher because the hot 128-byte loop filters on them.
+                const weight: u32 = if (k < 2) 2 else 1;
+                score += r * weight;
+                if (b == '=' or b == ':') score += 220;
+                if ((group.lo[k][b & 0x0f] & group.hi[k][b >> 4]) != 0) score += 45;
+            }
+            if (fingerprint >= 2 and ascii.eq(w[0], w[1], ignore_case)) score += 140;
+            if (fingerprint >= 3) {
+                if (ascii.eq(w[1], w[2], ignore_case)) score += 100;
+                if (ascii.eq(w[0], w[2], ignore_case)) score += 35;
+            }
+            if (score < best_score) {
+                best_score = score;
+                best_off = off;
+            }
+        }
+        return best_off;
     }
 
     pub fn deinit(self: *Engine) void {
@@ -130,13 +189,18 @@ pub const Engine = struct {
         const zero: Vec = @splat(0);
 
         outer: while (pos + stride + fast_extra <= haystack.len) {
-            if (mode == .earliest and best != null and done(best, pos, self.min_len)) break;
+            if (best != null and self.done(best, pos, mode)) break;
             var accs: [4]Vec = undefined;
             var nul_hit: @Vector(lanes, bool) = @splat(false);
             inline for (0..4) |w| {
                 const at = pos + w * lanes;
                 const b0: Vec = haystack[at..][0..lanes].*;
-                accs[w] = nibbleVec(lo_tab[0], hi_tab[0], b0);
+                var acc = nibbleVec(lo_tab[0], hi_tab[0], b0);
+                if (comptime fp > 1) {
+                    const b1: Vec = haystack[at + 1 ..][0..lanes].*;
+                    acc &= nibbleVec(lo_tab[1], hi_tab[1], b1);
+                }
+                accs[w] = acc;
                 if (watch_nul) nul_hit = nul_hit | (b0 == zero);
             }
             const combined = (accs[0] | accs[1]) | (accs[2] | accs[3]);
@@ -148,11 +212,11 @@ pub const Engine = struct {
             }
             inline for (0..4) |w| {
                 const at = pos + w * lanes;
-                if (mode == .earliest and done(best, at, self.min_len)) break :outer;
+                if (best != null and self.done(best, at, mode)) break :outer;
                 if (@reduce(.Or, accs[w]) != 0) {
                     const acc = evalRefine(fp, accs[w], haystack, at, &lo_tab, &hi_tab);
                     if (@reduce(.Or, acc) != 0) {
-                        if (self.scanVec(haystack, at, mode, &best, acc)) break :outer;
+                        if (self.scanVec(haystack, at, start, mode, &best, acc)) break :outer;
                     }
                 }
             }
@@ -167,15 +231,15 @@ pub const Engine = struct {
         }
 
         while (pos < haystack.len) {
-            if (mode == .earliest and done(best, pos, self.min_len)) break;
+            if (best != null and self.done(best, pos, mode)) break;
             if (haystack.len - pos >= lanes) {
                 const acc = self.maskTail(fp, haystack, pos, &lo_tab, &hi_tab);
                 if (@reduce(.Or, acc) != 0) {
-                    if (self.scanVec(haystack, pos, mode, &best, acc)) break;
+                    if (self.scanVec(haystack, pos, start, mode, &best, acc)) break;
                 }
                 pos += lanes;
             } else {
-                if (self.confirm(haystack, pos, mode, &best, null)) break;
+                if (self.confirm(haystack, pos, start, mode, &best, null)) break;
                 pos += 1;
             }
         }
@@ -203,10 +267,6 @@ pub const Engine = struct {
         hi_tab: *const [fp]Vec,
     ) Vec {
         var acc = acc0;
-        if (comptime fp > 1) {
-            const b1: Vec = haystack[at + 1 ..][0..lanes].*;
-            acc &= nibbleVec(lo_tab[1], hi_tab[1], b1);
-        }
         if (comptime fp > 2) {
             const b2: Vec = haystack[at + 2 ..][0..lanes].*;
             acc &= nibbleVec(lo_tab[2], hi_tab[2], b2);
@@ -239,18 +299,30 @@ pub const Engine = struct {
         self: *const Engine,
         haystack: []const u8,
         pos: usize,
+        start: usize,
         mode: matcher.MatchMode,
         best: *?Cand,
         acc: Vec,
     ) bool {
-        if (comptime lanes == 16) {
+        if (comptime builtin.cpu.arch.endian() == .little) {
+            const MaskInt = @Int(.unsigned, lanes);
+            const zero: Vec = @splat(0);
+            var bits: MaskInt = @bitCast(acc != zero);
+            while (bits != 0) {
+                @branchHint(.unlikely);
+                const lane: usize = @ctz(bits);
+                bits &= bits - 1;
+                if (self.confirmLane(haystack, pos, start, lane, mode, best, laneByte(acc, lane))) return true;
+            }
+            return false;
+        } else if (comptime lanes == 16) {
             var bits = nonzero16(acc);
             while (bits != 0) {
                 @branchHint(.unlikely);
                 const lane = @ctz(bits) / 4;
                 const shift: u6 = @intCast(lane * 4);
                 bits &= ~(@as(u64, 0xF) << shift);
-                if (self.confirmLane(haystack, pos, lane, mode, best, laneByte(acc, lane))) return true;
+                if (self.confirmLane(haystack, pos, start, lane, mode, best, laneByte(acc, lane))) return true;
             }
             return false;
         } else {
@@ -263,7 +335,7 @@ pub const Engine = struct {
                     const lane = half * 16 + @ctz(bits) / 4;
                     const shift: u6 = @intCast((@ctz(bits) / 4) * 4);
                     bits &= ~(@as(u64, 0xF) << shift);
-                    if (self.confirmLane(haystack, pos, lane, mode, best, laneByte(acc, lane))) return true;
+                    if (self.confirmLane(haystack, pos, start, lane, mode, best, laneByte(acc, lane))) return true;
                 }
             }
             return false;
@@ -274,6 +346,7 @@ pub const Engine = struct {
         self: *const Engine,
         haystack: []const u8,
         pos: usize,
+        start: usize,
         lane: usize,
         mode: matcher.MatchMode,
         best: *?Cand,
@@ -281,8 +354,8 @@ pub const Engine = struct {
     ) bool {
         const at = pos + lane;
         if (at >= haystack.len) return false;
-        if (mode == .earliest and done(best.*, at, self.min_len)) return true;
-        return self.confirm(haystack, at, mode, best, bucket_mask);
+        if (best.* != null and self.done(best.*, at, mode)) return true;
+        return self.confirm(haystack, at, start, mode, best, bucket_mask);
     }
 
     /// Checks all patterns when `bucket_mask` is null (used for tail bytes); otherwise verifies only patterns in set buckets.
@@ -290,6 +363,7 @@ pub const Engine = struct {
         self: *const Engine,
         haystack: []const u8,
         at: usize,
+        start: usize,
         mode: matcher.MatchMode,
         best: *?Cand,
         bucket_mask: ?u8,
@@ -313,14 +387,20 @@ pub const Engine = struct {
         while (pat_bits != 0) {
             const id: u32 = @ctz(pat_bits);
             pat_bits &= pat_bits - 1;
+            const off: usize = self.pat_offsets[id];
+            if (at < off) continue;
+            const pat_start = at - off;
+            if (pat_start < start) continue;
             const pat = self.patterns[id];
-            if (!matchesAt(pat, haystack, at, self.ignore_case)) continue;
-            const cand = Cand{ .start = at, .end = at + pat.len, .id = id };
+            if (!matchesAt(pat, haystack, pat_start, self.ignore_case)) continue;
+            const cand = Cand{ .start = pat_start, .end = pat_start + pat.len, .id = id };
             found = true;
             switch (mode) {
                 .leftmost_first => {
-                    best.* = cand;
-                    return true;
+                    if (best.*) |cur| {
+                        if (preferLeftmost(cand, cur)) best.* = cand;
+                    } else best.* = cand;
+                    if (self.max_offset == 0) return true;
                 },
                 .earliest => {
                     if (best.*) |cur| {
@@ -329,12 +409,16 @@ pub const Engine = struct {
                 },
             }
         }
-        if (mode == .earliest and found) {
-            if (best.*) |cur| {
-                if (at + 1 + self.min_len > cur.end) return true;
-            }
-        }
+        if (found and self.done(best.*, at + 1, mode)) return true;
         return false;
+    }
+
+    inline fn done(self: *const Engine, best: ?Cand, at: usize, mode: matcher.MatchMode) bool {
+        const chosen = best orelse return false;
+        return switch (mode) {
+            .leftmost_first => at > chosen.start + self.max_offset,
+            .earliest => at + self.min_tail_len > chosen.end,
+        };
     }
 };
 
@@ -384,9 +468,9 @@ fn matchesAt(pat: []const u8, haystack: []const u8, at: usize, ignore: bool) boo
     return true;
 }
 
-fn done(best: ?Cand, at: usize, min_len: usize) bool {
-    const chosen = best orelse return false;
-    return at + min_len > chosen.end;
+fn preferLeftmost(a: Cand, b: Cand) bool {
+    if (a.start != b.start) return a.start < b.start;
+    return a.id < b.id;
 }
 
 fn prefer(a: Cand, b: Cand) bool {
@@ -411,4 +495,20 @@ test "aligned fingerprint hits and earliest match termination" {
     const at = engine.find(&buf, 0, .leftmost_first).?;
     try std.testing.expectEqual(@as(usize, 15), at.start);
     try std.testing.expectEqual(@as(usize, 18), at.end);
+}
+
+test "rarest window offset preserves leftmost_first and earliest ordering" {
+    const pats = [_][]const u8{
+        "req=99999999-e89b-12d3-a456-426614174000",
+        "req=ffffffff-ffff-ffff-ffff-ffffffffffff",
+        "FATAL [auth]",
+    };
+    const engine = Engine.init(&pats, false);
+    try std.testing.expect(engine.pat_offsets[0] > 0);
+    try std.testing.expect(engine.pat_offsets[1] > 0);
+
+    const hay = "prefix req=99999999-e89b-12d3-a456-426614174000 FATAL [auth] suffix";
+    const left = engine.find(hay, 0, .leftmost_first).?;
+    try std.testing.expectEqual(@as(usize, 7), left.start);
+    try std.testing.expectEqual(@as(u32, 0), left.pattern_id);
 }

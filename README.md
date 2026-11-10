@@ -28,25 +28,24 @@ It ships with **zero external dependencies**, **does not link `libc`**, guarante
 
 ## Performance Overview
 
-Measured in-process with `zig build bench -Doptimize=ReleaseFast` on Apple M2 (`aarch64`, 16-byte NEON vectors, 64 MiB buffer):
+1. **In-Memory SIMD Kernel Throughput** (`zig build bench -Doptimize=ReleaseFast`, 64 MiB DRAM / L1d–L2 cache):
 
-| Benchmark Scenario | Engine / Path | Throughput |
-| :--- | :--- | ---: |
-| `memchr_either` | 2-byte 4-vector unrolled SIMD | **62.39 GB/s** |
-| `memchr_find` | Single-byte SIMD scan | **48.25 GB/s** |
-| `regex_prefilter` | `Regex` (`"libweb.*[0-9]*grep"`, Lazy DFA / NFA + SIMD prefilter) | **42.87 GB/s** |
-| `finder_alphabet` | `Finder` (`"libwebgrep"` on repeating alphabet text) | **42.82 GB/s** |
-| `finder_sensitive` | `Finder` (`PackedPair` 4-window SIMD, `"NEEDLE"`) | **42.62 GB/s** |
-| `multi_bytes` | `Multi` → `ByteSet` (4-way unrolled SIMD single-byte set) | **34.18 GB/s** |
-| `multi_pairs` | `Multi` → `RarePair` (2-stage direct SIMD pair compare) | **32.16 GB/s** |
-| `search_slice` | Full `searchSlice` pipeline (line framing + fused NUL watch) | **28.06 GB/s** |
-| `finder_ignore` | `Finder` (case-insensitive branchless `(block \| 0x20)`) | **24.88 GB/s** |
-| `multi_ac` | `Multi` → `AhoCorasick` (dense DFA + 64B high-nibble SIMD skip) | **24.27 GB/s** |
-| `multi_teddy` | `Multi` → `Teddy` (NEON `vtbl` nibble mask + 2-phase verify) | **24.13 GB/s** |
-| `pull_reader_stream` | Streaming `openReaderPull` (`256 KiB` rolling buffer) | **11.76 GB/s** |
-| `file_1MiB` | Streaming 128 MiB file via `1 MiB` rolling buffer | **10.99 GB/s** |
+| Benchmark Scenario | Engine / Path | Ryzen 7 7735U AVX2 (L1d/L2 → 64 MiB DRAM) | Apple M2 NEON (64 MiB) |
+| :--- | :--- | ---: | ---: |
+| `memchr_either` | 2-byte 4-vector unrolled SIMD | **147.77 GB/s** (L1d) / **28.18 GB/s** (DRAM) | **62.39 GB/s** |
+| `finder_sensitive` | `Finder` (`PackedPair` 4-window SIMD, `"NEEDLE"`) | **81.03 GB/s** (L2) / **23.31 GB/s** (DRAM) | **42.62 GB/s** |
+| `multi_teddy` | `Multi` → `Teddy` (3-byte rarest-window `vpshufb`/`vtbl`) | **67.18 GB/s** (L2) / **20.40 GB/s** (DRAM) | **24.13 GB/s** |
+| `finder_ignore` | `Finder` (case-insensitive branchless `(block \| 0x20)`) | **63.83 GB/s** (L2) / **20.98 GB/s** (DRAM) | **24.88 GB/s** |
+| `regex_prefilter` | `Regex` (Determinized Lazy DFA / NFA + SIMD prefilter) | **78.56 GB/s** (L3) / **23.22 GB/s** (DRAM) | **42.87 GB/s** |
+| `multi_pairs` | `Multi` → `RarePair` (synchronous 2-byte SIMD compare) | **21.37 GB/s** (DRAM) | **32.16 GB/s** |
+| `search_slice` | Full `searchSlice` pipeline (line framing + fused NUL watch) | **21.02 GB/s** (DRAM) | **28.06 GB/s** |
+| `pull_reader_stream` | Streaming `openReaderPull` (`256 KiB` rolling buffer) | **16.84 GB/s** | **11.76 GB/s** |
 
-See [BENCHMARKS.md](BENCHMARKS.md) for full methodology and detailed breakdowns.
+2. **End-to-End 2.49 GB `zg-corpus` vs. `ripgrep 14.1.1`** (15 scenarios, interleaved ABBA ordering, `mincore(2)` residency verified):
+   - **Warm Cache (`mincore = 100%`)**: Surpasses `rg_best = min(rg --no-mmap, rg --mmap)` in **15 / 15 scenarios** (**`1.01x–72.73x` faster**; e.g., interior-literal regex **`2.31x`**, case-insensitive literal **`1.26x`**, alternation regex **`1.16x`**, dense literal **`1.12x`**, 8-thread 2.49 GB directory scan **`26.72 GB/s`**).
+   - **Cold Disk (`POSIX_FADV_DONTNEED` + `mincore = 0`)**: Surpasses `rg_best` in **15 / 15 scenarios** (**`1.09x–176.67x` faster**; **`1.23x–1.50x`** across all single-file text and regex queries).
+
+See [BENCHMARKS.md](BENCHMARKS.md) for full methodology and detailed 15-scenario breakdowns.
 
 ---
 

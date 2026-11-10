@@ -280,26 +280,46 @@ const FileBatch = struct {
 
 fn flushFiles(host: *Host, job: *Job, batch: *FileBatch) void {
     if (batch.len == 0) return;
-    const names = batch.names[0..batch.len];
+    const count = batch.len;
     batch.len = 0;
     batch.used = 0;
-    const child = createFileJob(host, job, names) catch {
-        for (names) |name| {
-            var rel_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-            const rel = joinRel(&rel_buf, job.rel, name) catch continue;
-            visitCheckedFile(host, job, name, rel);
+    if (host.config.threads > 1) {
+        for (batch.names[0..count]) |name| {
+            const single = [_][]const u8{name};
+            const child = createFileJob(host, job, &single) catch {
+                var rel_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+                const rel = joinRel(&rel_buf, job.rel, name) catch continue;
+                visitCheckedFile(host, job, name, rel);
+                continue;
+            };
+            host.push(host.push_ctx, child) catch |err| {
+                child.destroy(host.io);
+                report(host, job, "", err);
+                var rel_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+                const rel = joinRel(&rel_buf, job.rel, name) catch continue;
+                visitCheckedFile(host, job, name, rel);
+            };
         }
-        return;
-    };
-    host.push(host.push_ctx, child) catch |err| {
-        child.destroy(host.io);
-        report(host, job, "", err);
-        for (names) |name| {
-            var rel_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-            const rel = joinRel(&rel_buf, job.rel, name) catch continue;
-            visitCheckedFile(host, job, name, rel);
-        }
-    };
+    } else {
+        const names = batch.names[0..count];
+        const child = createFileJob(host, job, names) catch {
+            for (names) |name| {
+                var rel_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+                const rel = joinRel(&rel_buf, job.rel, name) catch continue;
+                visitCheckedFile(host, job, name, rel);
+            }
+            return;
+        };
+        host.push(host.push_ctx, child) catch |err| {
+            child.destroy(host.io);
+            report(host, job, "", err);
+            for (names) |name| {
+                var rel_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+                const rel = joinRel(&rel_buf, job.rel, name) catch continue;
+                visitCheckedFile(host, job, name, rel);
+            }
+        };
+    }
 }
 
 fn handleEntry(host: *Host, job: *Job, entry: std.Io.Dir.Entry, batch: *FileBatch) void {

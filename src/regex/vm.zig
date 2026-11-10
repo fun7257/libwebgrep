@@ -126,6 +126,7 @@ pub const Regex = struct {
     /// Extracted required literal (points to internally allocated bytes).
     req_literal_bytes: []u8 = &.{},
     req_literal_offset: usize = 0,
+    req_prefix_shift: usize = 1,
     req_is_prefix: bool = false,
     req_is_exact: bool = false,
     prefilter: ?Finder = null,
@@ -135,6 +136,14 @@ pub const Regex = struct {
     /// Multi-pattern SIMD prefilter for top-level alternations where every branch has a literal prefix.
     alt_literal_slices: [][]const u8 = &.{},
     alt_prefilter: ?Multi = null,
+    alt_is_exact: bool = false,
+    /// Pre-determinized DFA if full ahead-of-time determinization succeeded.
+    precomputed_dfa: ?*HeapDfa = null,
+    has_lazy: bool = false,
+    has_alt: bool = false,
+    dfa_is_exact: bool = false,
+    dfa_prefix_state: u16 = dfa_mod.start_state,
+    dfa_prefix_len: usize = 0,
     /// Counts NFA state transition steps for unit tests asserting linear time complexity.
     steps: u64 = 0,
 
@@ -228,14 +237,70 @@ pub const Regex = struct {
             .anchored_start = std.mem.startsWith(u8, pattern, "\\A") and !hasTopLevelAlt(pattern),
             .max_multiline_window = options.max_multiline_window,
             .max_dfa_states = options.max_dfa_states,
+            .has_lazy = compiler.has_lazy,
+            .has_alt = compiler.has_alt,
         };
         errdefer self.deinit();
 
         try prefilter_mod.extractLiterals(&self, pattern, options.case);
+        if (self.req_is_prefix and self.req_literal_bytes.len > 1 and (!self.ignore_case or !self.unicode_case)) {
+            const lit = self.req_literal_bytes;
+            var shift: usize = lit.len;
+            var k: usize = 1;
+            while (k < lit.len) : (k += 1) {
+                var ok_overlap = true;
+                var j: usize = 0;
+                while (k + j < lit.len) : (j += 1) {
+                    const a = if (self.ignore_case) std.ascii.toLower(lit[j]) else lit[j];
+                    const b = if (self.ignore_case) std.ascii.toLower(lit[k + j]) else lit[k + j];
+                    if (a != b) {
+                        ok_overlap = false;
+                        break;
+                    }
+                }
+                if (ok_overlap) {
+                    shift = k;
+                    break;
+                }
+            }
+            self.req_prefix_shift = shift;
+        }
+        if (options.max_dfa_states > 0 and self.insts.len <= 256) {
+            if (allocator.create(HeapDfa)) |heap_dfa| {
+                heap_dfa.* = HeapDfa.init();
+                if (heap_dfa.determinize(self.insts, self.unicode_ranges, self.start_pc, self.multiline)) {
+                    self.precomputed_dfa = heap_dfa;
+                    self.dfa_is_exact = !self.has_lazy and dfa_mod.isExactInsts(self.insts);
+                    if (self.req_is_prefix and self.req_literal_bytes.len > 0) {
+                        var s: u16 = dfa_mod.start_state;
+                        var ok = true;
+                        var any_prefix_match = heap_dfa.is_match[s];
+                        for (self.req_literal_bytes, 0..) |b, idx| {
+                            const n = heap_dfa.trans[s][b];
+                            if (n == dfa_mod.unknown_transition or n == dfa_mod.bailout_transition or n == dfa_mod.dead_state) {
+                                ok = false;
+                                break;
+                            }
+                            s = n;
+                            if (idx + 1 < self.req_literal_bytes.len and heap_dfa.is_match[s]) {
+                                any_prefix_match = true;
+                            }
+                        }
+                        if (ok and !any_prefix_match and s != dfa_mod.dead_state) {
+                            self.dfa_prefix_state = s;
+                            self.dfa_prefix_len = self.req_literal_bytes.len;
+                        }
+                    }
+                } else {
+                    allocator.destroy(heap_dfa);
+                }
+            } else |_| {}
+        }
         return self;
     }
 
     pub fn deinit(self: *Regex) void {
+        if (self.precomputed_dfa) |d| self.allocator.destroy(d);
         if (self.req_literal_bytes.len != 0) self.allocator.free(self.req_literal_bytes);
         if (self.tail_literal_bytes.len != 0) self.allocator.free(self.tail_literal_bytes);
         if (self.alt_prefilter) |*ap| ap.deinit();
@@ -362,8 +427,46 @@ pub const Regex = struct {
             if (self.prefilter) |*pf| {
                 var pos = start;
                 var cached_win_end: usize = std.math.maxInt(usize);
+                const exact_for_mode = self.dfa_is_exact and (mode != .leftmost_first or !self.has_alt);
                 while (pos <= haystack.len) {
                     const hit = pf.findReadOnly(haystack, pos, .earliest) orelse return null;
+                    if (self.precomputed_dfa) |dfa| {
+                        const can_skip_prefix = (hit.end - hit.start == self.dfa_prefix_len);
+                        const s0: u16 = if (can_skip_prefix) self.dfa_prefix_state else dfa_mod.start_state;
+                        const p0: usize = if (can_skip_prefix) self.dfa_prefix_len else 0;
+                        if (exact_for_mode and dfa.stops_on_crlf) {
+                            if (dfa.matchPrefixDeterminized(haystack[hit.start..], s0, p0)) |match_len| {
+                                return Match{
+                                    .start = hit.start,
+                                    .end = hit.start + match_len,
+                                    .pattern_id = null,
+                                };
+                            }
+                            pos = hit.start + self.req_prefix_shift;
+                            continue;
+                        }
+                        const win_end = if (!self.multiline and cached_win_end != std.math.maxInt(usize) and hit.start <= cached_win_end)
+                            cached_win_end
+                        else blk: {
+                            const w = self.windowLimit(haystack, hit.start);
+                            cached_win_end = w;
+                            break :blk w;
+                        };
+                        if (dfa.matchPrefixDeterminized(haystack[hit.start..win_end], s0, p0)) |match_len| {
+                            if (exact_for_mode) {
+                                return Match{
+                                    .start = hit.start,
+                                    .end = hit.start + match_len,
+                                    .pattern_id = null,
+                                };
+                            }
+                            if (self.runRangeAllowed(haystack, hit.start, hit.start, win_end, mode, allowAnySpan, steps, scratch)) |m| {
+                                return m;
+                            }
+                        }
+                        pos = hit.start + self.req_prefix_shift;
+                        continue;
+                    }
                     const win_end = if (!self.multiline and cached_win_end != std.math.maxInt(usize) and hit.start <= cached_win_end)
                         cached_win_end
                     else blk: {
@@ -429,6 +532,12 @@ pub const Regex = struct {
 
         // Fast path 4: top-level alternation where every branch starts with a literal prefix
         if (self.alt_prefilter) |*ap| {
+            if (self.alt_is_exact) {
+                if (ap.find(haystack, start, mode)) |m| {
+                    return Match{ .start = m.start, .end = m.end, .pattern_id = null };
+                }
+                return null;
+            }
             var pos = start;
             var min_start = start;
             var cached_win_end: usize = std.math.maxInt(usize);
@@ -498,7 +607,7 @@ pub const Regex = struct {
         }
 
         // If the start state itself can accept zero bytes (e.g., `a*`, `^`, `$`, `\b`), delegate to PikeVM
-        if (dfa.states[dfa_mod.start_state].is_match) {
+        if (dfa.is_match[dfa_mod.start_state]) {
             return self.runRangeAllowed(haystack, start, limit, limit, mode, allowAnySpan, steps, scratch);
         }
 
@@ -571,7 +680,7 @@ pub const Regex = struct {
             curr_state = next_state;
             pos += 1;
 
-            if (dfa.states[curr_state].is_match) {
+            if (dfa.is_match[curr_state]) {
                 const win_end = @min(limit, self.windowLimit(haystack, active_since));
                 if (self.runRangeAllowed(haystack, active_since, active_since, win_end, mode, allowAnySpan, steps, scratch)) |m| {
                     return m;
@@ -586,14 +695,27 @@ pub const Regex = struct {
     }
 
     pub fn findWatched(self: *const Regex, haystack: []const u8, start: usize, nul: *?usize) ?Match {
+        if (!self.anchored_start or start == 0) {
+            if (self.req_is_exact) {
+                if (self.prefilter) |*pf| {
+                    return pf.findWatched(haystack, start, nul);
+                }
+            }
+            if (self.alt_is_exact) {
+                if (self.alt_prefilter) |*ap| {
+                    if (ap.findWatched(haystack, start, nul)) |m| {
+                        return Match{ .start = m.start, .end = m.end, .pattern_id = null };
+                    }
+                    return null;
+                }
+            }
+        }
         const hit = self.find(haystack, start, .earliest);
         const limit = if (hit) |m| m.start else haystack.len;
         if (start < limit) {
-            if (memchr.find(memchr.native_width, haystack, start, 0)) |at| {
-                if (at < limit) {
-                    nul.* = at;
-                    return null;
-                }
+            if (memchr.find(memchr.native_width, haystack[0..limit], start, 0)) |at| {
+                nul.* = at;
+                return null;
             }
         }
         return hit;
@@ -1128,3 +1250,45 @@ pub const Regex = struct {
         }
     }
 };
+
+test "precomputed DFA fast path preserves exact semantics on repeated prefixes, assertions, and alternations" {
+    const alloc = std.testing.allocator;
+
+    // 1. Repeated prefix on the same line where the first candidate fails
+    {
+        var re = try Regex.init(alloc, "ERROR \\[http\\] req=[0-9a-f]{4}", .{});
+        defer re.deinit();
+        const line = "ERROR [http] req=ZZZZ and ERROR [http] req=09af done\n";
+        const m = re.find(line, 0, .earliest) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("ERROR [http] req=09af", line[m.start..m.end]);
+    }
+
+    // 2. End-of-line assertion `$` must not over-match via DFA epsilon closure
+    {
+        var re = try Regex.init(alloc, "ERROR_foo$", .{});
+        defer re.deinit();
+        try std.testing.expect(re.find("ERROR_foobar\n", 0, .earliest) == null);
+        const m = re.find("ERROR_foo\n", 0, .earliest) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, 0), m.start);
+        try std.testing.expectEqual(@as(usize, 9), m.end);
+    }
+
+    // 3. Word boundary `\b` must not falsely match inside identifier
+    {
+        var re = try Regex.init(alloc, "ERROR_foo\\b", .{});
+        defer re.deinit();
+        try std.testing.expect(re.find("ERROR_foobar", 0, .earliest) == null);
+        const m = re.find("ERROR_foo bar", 0, .earliest) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, 0), m.start);
+        try std.testing.expectEqual(@as(usize, 9), m.end);
+    }
+
+    // 4. Leftmost-first alternation priority (`a|ab` on `ab` -> `a`)
+    {
+        var re = try Regex.init(alloc, "prefix(a|ab)", .{});
+        defer re.deinit();
+        const m = re.find("prefixab", 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, 0), m.start);
+        try std.testing.expectEqual(@as(usize, 7), m.end);
+    }
+}

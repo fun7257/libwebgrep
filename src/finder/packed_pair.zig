@@ -6,6 +6,7 @@
 //! The loop exits SIMD only when both bytes hit together. Even if individual bytes are common,
 //! as long as their relative offset does not match, execution stays entirely within vector instructions.
 
+const builtin = @import("builtin");
 const std = @import("std");
 const ascii = @import("ascii.zig");
 
@@ -42,8 +43,12 @@ pub const PackedPair = struct {
     pattern: []const u8,
     anchor_index: usize,
     other_index: usize,
+    third_index: usize,
+    fourth_index: usize,
     anchor: u8,
     other: u8,
+    third: u8,
+    fourth: u8,
     ignore_case: bool,
 
     /// Smaller `rank` values indicate rarer bytes. `pattern` is owned by the caller.
@@ -63,14 +68,42 @@ pub const PackedPair = struct {
                 best = i;
             } else if (r < rank[pattern[second]]) {
                 second = i;
+            } else if (r == rank[pattern[second]]) {
+                const cur_dist = if (second > best) second - best else best - second;
+                const new_dist = if (i > best) i - best else best - i;
+                if (new_dist > cur_dist) {
+                    second = i;
+                }
+            }
+        }
+        var third_idx: usize = second;
+        var third_rank: u16 = 256;
+        for (pattern, 0..) |b, idx| {
+            if (idx == best or idx == second) continue;
+            if (rank[b] < third_rank) {
+                third_rank = rank[b];
+                third_idx = idx;
+            }
+        }
+        var fourth_idx: usize = third_idx;
+        var fourth_rank: u16 = 256;
+        for (pattern, 0..) |b, idx| {
+            if (idx == best or idx == second or idx == third_idx) continue;
+            if (rank[b] < fourth_rank) {
+                fourth_rank = rank[b];
+                fourth_idx = idx;
             }
         }
         return .{
             .pattern = pattern,
             .anchor_index = best,
             .other_index = second,
+            .third_index = third_idx,
+            .fourth_index = fourth_idx,
             .anchor = pattern[best],
             .other = pattern[second],
+            .third = pattern[third_idx],
+            .fourth = pattern[fourth_idx],
             .ignore_case = ignore_case,
         };
     }
@@ -162,7 +195,7 @@ pub const PackedPair = struct {
         guard: *Guard,
         nul_out: *?usize,
     ) ?usize {
-        const max_index = @max(self.anchor_index, self.other_index);
+        const max_index = @max(@max(self.anchor_index, self.other_index), @max(self.third_index, self.fourth_index));
         const cover_index = @min(self.anchor_index, self.other_index);
         // When the minimum anchor offset is non-zero, SIMD loads do not cover the leading bytes after `start`.
         if (watch_nul and cover_index > 0) {
@@ -171,14 +204,6 @@ pub const PackedPair = struct {
         }
         var origin = start;
         var previous = start;
-        // During dense matches, the next hit is often within a few dozen bytes. Scan this short prefix
-        // scalarly to avoid entering the SIMD loop for a single confirmation; on rare literals this adds only a few dozen byte checks per block.
-        if (!watch_nul) {
-            const bound = @min(last, start + 47);
-            if (scalarFrom(self, haystack, origin, bound, &previous, fold, watched, guard)) |hit| return hit;
-            if (watched and guard.gave_up) return null;
-            origin = bound + 1;
-        }
         // Advance 4 vectors per iteration and OR their masks into a single reduction, cutting reduction and branch instructions by 75%.
         const stride = width * 4;
         while (origin <= last and origin + max_index + stride <= haystack.len) {
@@ -231,7 +256,6 @@ pub const PackedPair = struct {
 fn confirm(self: PackedPair, haystack: []const u8, origin: usize) bool {
     const pat = self.pattern;
     const window = haystack[origin..][0..pat.len];
-    // Case-sensitive comparison delegates to std, which returns on the first mismatch without scanning the full pattern on false positives.
     if (!self.ignore_case) return std.mem.eql(u8, pat, window);
     for (pat, window) |p, h| {
         if (!ascii.eq(p, h, true)) return false;
@@ -289,44 +313,91 @@ fn takeHit(
     const left: @Vector(width, u8) = haystack[origin + self.anchor_index ..][0..width].*;
     const right: @Vector(width, u8) = haystack[origin + self.other_index ..][0..width].*;
     var hits = byteMask(width, left, self.anchor, fold) & byteMask(width, right, self.other, fold);
-    const Index = std.simd.VectorIndex(@TypeOf(hits));
-    const indices = comptime std.simd.iota(Index, width);
-    while (std.simd.firstTrue(hits)) |rel| {
-        hits = @select(
-            bool,
-            indices == @as(@Vector(width, Index), @splat(rel)),
-            @as(@Vector(width, bool), @splat(false)),
-            hits,
-        );
-        const at = origin + @as(usize, rel);
-        if (at > last) continue;
-        if (confirm(self, haystack, at)) {
-            if (watch_nul) {
-                const check_start = @min(haystack.len, origin + cover_index);
-                const check_end = @min(haystack.len, @max(check_start, at + self.pattern.len));
-                if (noteNul(haystack[check_start..check_end], check_start, nul_out)) return null;
-            }
-            return @as(usize, rel);
-        }
-        if (!watched) continue;
-        guard.noteMiss(at, previous.*);
-        previous.* = at + 1;
-        if (guard.gave_up) {
-            if (watch_nul) {
-                const block: @Vector(width, u8) = haystack[origin + cover_index ..][0..width].*;
-                const zeros = block == @as(@Vector(width, u8), @splat(0));
-                if (@reduce(.Or, zeros)) {
-                    const zrel = std.simd.firstTrue(zeros).?;
-                    nul_out.* = origin + cover_index + @as(usize, zrel);
+    if (self.pattern.len >= 4) {
+        const b3: @Vector(width, u8) = haystack[origin + self.third_index ..][0..width].*;
+        const b4: @Vector(width, u8) = haystack[origin + self.fourth_index ..][0..width].*;
+        hits = hits & byteMask(width, b3, self.third, fold) & byteMask(width, b4, self.fourth, fold);
+    }
+
+    if (comptime builtin.cpu.arch.endian() == .little) {
+        // Little-endian bitmask extraction (`vpmovmskb` + `tzcnt` + `blsr` on x86_64 AVX2, optimal bit-scan on aarch64).
+        const MaskInt = @Int(.unsigned, width);
+        var mask: MaskInt = @bitCast(hits);
+        while (mask != 0) : (mask &= mask - 1) {
+            const rel: usize = @ctz(mask);
+            const at = origin + rel;
+            if (at > last) continue;
+            if (confirm(self, haystack, at)) {
+                if (watch_nul) {
+                    const check_start = @min(haystack.len, origin + cover_index);
+                    const check_end = @min(haystack.len, @max(check_start, at + self.pattern.len));
+                    if (noteNul(haystack[check_start..check_end], check_start, nul_out)) return null;
                 }
+                return rel;
             }
-            return null;
+            if (!watched) continue;
+            guard.noteMiss(at, previous.*);
+            previous.* = at + 1;
+            if (guard.gave_up) {
+                if (watch_nul) {
+                    const block: @Vector(width, u8) = haystack[origin + cover_index ..][0..width].*;
+                    const zeros = block == @as(@Vector(width, u8), @splat(0));
+                    const zmask: MaskInt = @bitCast(zeros);
+                    if (zmask != 0) {
+                        nul_out.* = origin + cover_index + @as(usize, @ctz(zmask));
+                    }
+                }
+                return null;
+            }
+        }
+    } else {
+        const Index = std.simd.VectorIndex(@TypeOf(hits));
+        const indices = comptime std.simd.iota(Index, width);
+        while (std.simd.firstTrue(hits)) |rel| {
+            hits = @select(
+                bool,
+                indices == @as(@Vector(width, Index), @splat(rel)),
+                @as(@Vector(width, bool), @splat(false)),
+                hits,
+            );
+            const at = origin + @as(usize, rel);
+            if (at > last) continue;
+            if (confirm(self, haystack, at)) {
+                if (watch_nul) {
+                    const check_start = @min(haystack.len, origin + cover_index);
+                    const check_end = @min(haystack.len, @max(check_start, at + self.pattern.len));
+                    if (noteNul(haystack[check_start..check_end], check_start, nul_out)) return null;
+                }
+                return @as(usize, rel);
+            }
+            if (!watched) continue;
+            guard.noteMiss(at, previous.*);
+            previous.* = at + 1;
+            if (guard.gave_up) {
+                if (watch_nul) {
+                    const block: @Vector(width, u8) = haystack[origin + cover_index ..][0..width].*;
+                    const zeros = block == @as(@Vector(width, u8), @splat(0));
+                    if (@reduce(.Or, zeros)) {
+                        const zrel = std.simd.firstTrue(zeros).?;
+                        nul_out.* = origin + cover_index + @as(usize, zrel);
+                    }
+                }
+                return null;
+            }
         }
     }
+
     if (watch_nul) {
         const block: @Vector(width, u8) = haystack[origin + cover_index ..][0..width].*;
         const zeros = block == @as(@Vector(width, u8), @splat(0));
-        if (@reduce(.Or, zeros)) {
+        if (comptime builtin.cpu.arch.endian() == .little) {
+            const MaskInt = @Int(.unsigned, width);
+            const zmask: MaskInt = @bitCast(zeros);
+            if (zmask != 0) {
+                nul_out.* = origin + cover_index + @as(usize, @ctz(zmask));
+                return null;
+            }
+        } else if (@reduce(.Or, zeros)) {
             const zrel = std.simd.firstTrue(zeros).?;
             nul_out.* = origin + cover_index + @as(usize, zrel);
             return null;

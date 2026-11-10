@@ -44,6 +44,8 @@ pub const Compiler = struct {
     max_inst: usize,
     insts: std.ArrayList(Inst) = .empty,
     unicode_ranges: std.ArrayList(UnicodeRangeList) = .empty,
+    has_lazy: bool = false,
+    has_alt: bool = false,
     diag: ?*CompileDiagnostic = null,
     pattern_index: ?usize = null,
     match_inst: Inst = .match,
@@ -201,6 +203,7 @@ pub const Compiler = struct {
     fn parseAlt(self: *Compiler) Error!Frag {
         var left = try self.parseConcat();
         while (self.pos < self.pattern.len and self.pattern[self.pos] == '|') {
+            self.has_alt = true;
             self.pos += 1;
             const right = try self.parseConcat();
             const split_pc = try self.emit(.{ .split = .{ .out1 = left.start, .out2 = right.start } });
@@ -248,6 +251,7 @@ pub const Compiler = struct {
                     var lazy = false;
                     if (self.pos < self.pattern.len and self.pattern[self.pos] == '?') {
                         lazy = true;
+                        self.has_lazy = true;
                         self.pos += 1;
                     }
                     atom = try self.applyQuantifier(atom, c, lazy);
@@ -261,6 +265,7 @@ pub const Compiler = struct {
                     var lazy = false;
                     if (self.pos < self.pattern.len and self.pattern[self.pos] == '?') {
                         lazy = true;
+                        self.has_lazy = true;
                         self.pos += 1;
                     }
                     atom = try self.applyBoundedRepeat(atom, atom_start_pos, atom_end_pos, bounds.min, bounds.max, lazy);

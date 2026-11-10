@@ -23,16 +23,16 @@ fn defaultRank() [256]u8 {
     var score: u8 = 230;
     for (lower_by_frequency) |c| {
         rank[c] = score;
-        rank[c - ('a' - 'A')] = score / 3;
+        rank[c - ('a' - 'A')] = @intCast(@as(u16, score) * 7 / 10);
         score -= 7;
     }
 
     var digit: u8 = '0';
     while (digit <= '9') : (digit += 1) rank[digit] = 70;
 
-    for ("_./-") |c| rank[c] = 160;
-    for (",;:'\"()[]{}") |c| rank[c] = 90;
-    for ("*#@$%^&!~`|\\<>?+=") |c| rank[c] = 25;
+    for ("_./-=") |c| rank[c] = 160;
+    for (",;:'\"()[]{}") |c| rank[c] = 140;
+    for ("*#@$%^&!~`|\\<>?+") |c| rank[c] = 25;
 
     return rank;
 }

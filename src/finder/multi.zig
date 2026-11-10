@@ -84,6 +84,17 @@ pub const Multi = struct {
                     .patterns = patterns,
                 };
             }
+            if (comptime teddy_on) {
+                if (preferTeddyOverPairs(patterns)) {
+                    return .{
+                        .kind = .{ .teddy = teddy_mod.Engine.init(patterns, ignore) },
+                        .ignore_case = ignore,
+                        .unicode_case = options.unicode_case,
+                        .empty_only = false,
+                        .patterns = patterns,
+                    };
+                }
+            }
             if (try pairs.Engine.create(allocator, patterns, ignore)) |engine| {
                 return .{
                     .kind = .{ .pairs = engine },
@@ -705,6 +716,17 @@ fn teddyEligible(patterns: []const []const u8) bool {
     return true;
 }
 
+fn preferTeddyOverPairs(patterns: []const []const u8) bool {
+    if (!teddyEligible(patterns)) return false;
+    if (patterns.len > 4) return true;
+    if (patterns.len >= 3) {
+        for (patterns) |pat| {
+            if (pat.len >= 8) return true;
+        }
+    }
+    return false;
+}
+
 fn onlyEmpty(patterns: []const []const u8) bool {
     if (patterns.len == 0) return false;
     for (patterns) |pat| if (pat.len != 0) return false;
@@ -918,7 +940,11 @@ test "window boundaries, adjacent pairs, and later-starting match ending earlier
     };
     var multi = try Multi.init(std.testing.allocator, &pats, .{});
     defer multi.deinit();
-    try std.testing.expect(multi.kind == .pairs);
+    if (comptime teddy_on) {
+        try std.testing.expect(multi.kind == .teddy);
+    } else {
+        try std.testing.expect(multi.kind == .pairs);
+    }
 
     var hay: [48]u8 = @splat('x');
     @memcpy(hay[0..4], "iota");

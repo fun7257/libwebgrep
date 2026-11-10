@@ -72,6 +72,7 @@ pub fn build(b: *std.Build) void {
         .target = compile_target,
         .optimize = optimize,
         .sanitize_thread = sanitize_thread,
+        .pic = true,
     });
     c_api_mod.addOptions("build_options", options);
 

@@ -12,6 +12,7 @@ flowchart TD
     M3 --> M4["Milestone 5: Controlled Multi-Source Pipeline<br/>Nested brace globbing with caps, in-memory & layered Ignore rules,<br/>injectable file-type tables, controlled worker concurrency & streaming events"]
     M4 --> M5["Milestone 6: 5-Layer Architecture & Differential Fuzzing<br/>Modular tables/codec/regex/search decomposition, MatcherTraits & SinkTraits,<br/>Zig 0.17.1 Smith + PRNG differential fuzz suite (src/fuzz.zig)"]
     M5 --> M6["Milestone 7 (v0.3.0): Hybrid Lazy DFA, RegexSet, Streaming Pull, ArchiveTree & C ABI<br/>*const lock-free matchers, pattern_id, Unicode properties & UAX #29 word boundaries,<br/>openReaderPull, Scratch pool, zero-disk ArchiveTree/searchTree, zero-libc C ABI"]
+    M6 --> M7["Milestone 8 (v0.4.0): Platform-Conditional SIMD/IO Optimization & Full-Scenario ripgrep Surpass<br/>3-byte rarest-window Teddy + evalRefine, determinized DFA chain_len + 4-way verify,<br/>fused bounded-matcher chunk scan, L2-aware optimalBufferSize, 15/15 Warm & Cold surpass vs rg 14.1.1"]
 ```
 
 | Milestone | Focus Area | Key Modules | Status | Verification & Performance Highlights |
@@ -23,4 +24,5 @@ flowchart TD
 | **Milestone 5** | **Controlled Multi-Source Pipeline** | `src/walk/*`, `src/parallel.zig` | **Completed** | Nested `{a,{b,c}}` glob expansion with caps; pure-text & `.gitignore`/`.ignore`/`.rgignore` switches; `expandTypesToGlobs`; strict `max_concurrency` |
 | **Milestone 6** | **5-Layer Co-Development Architecture & Fuzzing** | `src/tables/*`, `src/codec/*`, `src/regex/*`, `src/search/*`, `src/fuzz.zig` | **Completed** | Strict 5-layer acyclic decomposition; `MatcherTraits` & `SinkTraits` compile-time contracts; Zig 0.17.1 `std.testing.fuzz` + multi-seed differential fuzzers |
 | **Milestone 7 (`v0.3.0`)** | **Hybrid Lazy DFA, `RegexSet`, Streaming Pull, `ArchiveTree` & C ABI** | `src/regex/dfa.zig`, `src/regex/set.zig`, `src/codec/archive.zig`, `src/search/tree.zig`, `src/c_api.zig` | **Completed** | `*const` lock-free matchers; `pattern_id`; `\p{...}` Unicode properties & UAX #29 `\b`/`\B`; `CompileDiagnostic`; `openReaderPull`; `Scratch` pool; zero-disk `ArchiveTree` & `searchTree`; C ABI (`include/webgrep.h`) |
+| **Milestone 8 (`v0.4.0`)** | **Platform-Conditional SIMD/IO Specialization & Full `ripgrep` Surpass** | `src/finder/packed_pair.zig`, `src/finder/teddy.zig`, `src/finder/pairs.zig`, `src/regex/dfa.zig`, `src/search/pipeline.zig`, `src/io/platform.zig` | **Completed** | 15/15 Warm Cache (`mincore=100%`, `1.01x–72.73x`) & Cold Disk (`mincore=0`, `1.09x–176.67x`) surpass vs `ripgrep 14.1.1`; 3-byte rarest-window `Teddy`; determinized DFA `chain_len` + 4-way verify; `fuse_full_buf` streaming scan; L2-aware `SearchConfig.optimalBufferSize` |
 

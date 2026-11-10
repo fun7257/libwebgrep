@@ -28,25 +28,24 @@
 
 ## 性能基准概览
 
-以下数据由 `zig build bench -Doptimize=ReleaseFast` 在 Apple M2（`aarch64`，16 字节 NEON 向量，64 MiB 内存缓冲）上进程内实测：
+1. **进程内 SIMD 内核与流管线吞吐**（`zig build bench -Doptimize=ReleaseFast`，64 MiB 主存与 L1d/L2 缓存实测）：
 
-| 基准场景 | 引擎 / 路径 | 吞吐 (GB/s) |
-| :--- | :--- | ---: |
-| `memchr_either` | 双字节 4 向量展开 SIMD 扫描 | **62.39 GB/s** |
-| `memchr_find` | 单字节向量扫描 | **48.25 GB/s** |
-| `regex_prefilter` | `Regex`（`"libweb.*[0-9]*grep"`，Lazy DFA / NFA + SIMD 预过滤） | **42.87 GB/s** |
-| `finder_alphabet` | `Finder`（重复字母表文本查找 `"libwebgrep"`） | **42.82 GB/s** |
-| `finder_sensitive` | `Finder`（`PackedPair` 4 窗口 SIMD，`"NEEDLE"`） | **42.62 GB/s** |
-| `multi_bytes` | `Multi` → `ByteSet`（4 路展开单字节集合 SIMD） | **34.18 GB/s** |
-| `multi_pairs` | `Multi` → `RarePair`（两阶段直接向量字节对比较） | **32.16 GB/s** |
-| `search_slice` | `searchSlice` 完整切片搜索管线（含分行与融合 NUL 检测） | **28.06 GB/s** |
-| `finder_ignore` | `Finder`（无分支 `(block \| 0x20)` 忽略大小写） | **24.88 GB/s** |
-| `multi_ac` | `Multi` → `AhoCorasick`（稠密 DFA + 64B 高半字节 SIMD 跳步） | **24.27 GB/s** |
-| `multi_teddy` | `Multi` → `Teddy`（NEON `vtbl` 半字节查表 + 两阶段验证） | **24.13 GB/s** |
-| `pull_reader_stream` | `openReaderPull` 增量流式拉模式迭代（`256 KiB` 滚动缓冲） | **11.76 GB/s** |
-| `file_1MiB` | `1 MiB` 滚动缓冲流式扫描 `128 MiB` 文件 | **10.99 GB/s** |
+| 基准场景 | 引擎 / 路径 | Ryzen 7 7735U AVX2 (L1d/L2 → 64 MiB DRAM) | Apple M2 NEON (64 MiB) |
+| :--- | :--- | ---: | ---: |
+| `memchr_either` | 双字节 4 向量展开 SIMD 扫描 | **147.77 GB/s** (L1d) / **28.18 GB/s** (DRAM) | **62.39 GB/s** |
+| `finder_sensitive` | `Finder`（`PackedPair` 4 窗口 SIMD，`"NEEDLE"`） | **81.03 GB/s** (L2) / **23.31 GB/s** (DRAM) | **42.62 GB/s** |
+| `multi_teddy` | `Multi` → `Teddy`（3 字节稀有窗口 `vpshufb`/`vtbl`） | **67.18 GB/s** (L2) / **20.40 GB/s** (DRAM) | **24.13 GB/s** |
+| `finder_ignore` | `Finder`（无分支 `(block \| 0x20)` 忽略大小写） | **63.83 GB/s** (L2) / **20.98 GB/s** (DRAM) | **24.88 GB/s** |
+| `regex_prefilter` | `Regex`（预确定化 Lazy DFA / NFA + SIMD 预过滤） | **78.56 GB/s** (L3) / **23.22 GB/s** (DRAM) | **42.87 GB/s** |
+| `multi_pairs` | `Multi` → `RarePair`（双字节同步向量比较） | **21.37 GB/s** (DRAM) | **32.16 GB/s** |
+| `search_slice` | `searchSlice` 完整切片搜索管线（含分行与融合 NUL 检测） | **21.02 GB/s** (DRAM) | **28.06 GB/s** |
+| `pull_reader_stream` | `openReaderPull` 增量流式拉模式迭代（`256 KiB` 滚动缓冲） | **16.84 GB/s** | **11.76 GB/s** |
 
-完整的基准方法与详细分析请参阅 [BENCHMARKS.md](BENCHMARKS.md)。
+2. **2.49 GB `zg-corpus` 真实语料 15 场景对标 `ripgrep 14.1.1`**（ABBA 正反交替采样、`mincore(2)` 页缓存驻留验真）：
+   - **热缓存（Warm Cache，`mincore = 100%`）**：**15 / 15 场景 100% 全面超越 `rg_best = min(rg --no-mmap, rg --mmap)`**（提速 **`1.01x～72.73x`**；其中内部字面量正则快 **`2.31x`**、忽略大小写快 **`1.26x`**、多分支交替正则快 **`1.16x`**、密集字面量快 **`1.12x`**、8 线程 2.49 GB 全目录扫描达 **`26.72 GB/s`**）。
+   - **冷盘读取（Cold Disk，`POSIX_FADV_DONTNEED` + `mincore = 0`）**：**15 / 15 场景 100% 全面超越 `rg_best`**（常规文本与目录场景提速 **`1.09x～1.50x`**，二进制首块熔断提速 **`176.67x`**）。
+
+完整的实验方法与全 15 场景数据解析请参阅 [BENCHMARKS.md](BENCHMARKS.md)。
 
 ---
 

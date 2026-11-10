@@ -371,6 +371,61 @@ pub fn searchPrepared(
     if (rejectEmptyResults(&state, config)) return finishSink(S, sink, &state, config);
     if (stopForBudget(&state, config)) return finishSink(S, sink, &state, config);
 
+    if (watchesBinary(config) and config.binary == .quit and view.len > bufferWindow(config) and canFuse(matcher, config, &state)) {
+        const window = bufferWindow(config);
+        while (state.pos < view.len and !state.stopped) {
+            var nul_at: ?usize = null;
+            const found = if (comptime @hasDecl(state_mod.MatcherType(@TypeOf(matcher)), "findWatched"))
+                matcher.findWatched(view, state.pos, &nul_at)
+            else
+                unreachable;
+            if (nul_at) |nul| {
+                noteBinary(&state, config, state.abs_base + nul);
+                _ = callOpt(S, "binary", sink, .{state.nul_offset.?});
+                const boundary = (nul / window) * window;
+                if (boundary > state.pos) {
+                    if (!try matchBuffer(S, sink, matcher, view[0..boundary], &state, config)) state.stopped = true;
+                }
+                if (state.hit_byte_cap) noteLimit(&state, .max_bytes);
+                return finishSink(S, sink, &state, config);
+            }
+            const hit = found orelse {
+                state.pos = view.len;
+                if (stopInMatch(&state, config) or !maybeProgress(S, sink, &state, config)) state.stopped = true;
+                break;
+            };
+            const hit_line_end = lineEnd(view, @max(hit.end, hit.start), config);
+            const win_end = @min(view.len, ((@max(hit.start, hit_line_end -| 1) / window) + 1) * window);
+            if (memchr.find(width, view[hit.start..win_end], 0, 0)) |rel| {
+                const nul = hit.start + rel;
+                noteBinary(&state, config, state.abs_base + nul);
+                _ = callOpt(S, "binary", sink, .{state.nul_offset.?});
+                const boundary = (nul / window) * window;
+                if (boundary > state.pos) {
+                    if (!try matchBuffer(S, sink, matcher, view[0..boundary], &state, config)) state.stopped = true;
+                }
+                if (state.hit_byte_cap) noteLimit(&state, .max_bytes);
+                return finishSink(S, sink, &state, config);
+            }
+            if (config.progress_interval == null or config.progress_interval.? == 0) {
+                const ls = lineStart(view, hit.start, config);
+                if (ls > state.pos) {
+                    countLines(view, ls, &state, config);
+                    state.pos = ls;
+                }
+            }
+            const seg_end = if (win_end == view.len) view.len else lastComplete(view[0..win_end], config);
+            if (!try matchBuffer(S, sink, matcher, view[0..seg_end], &state, config)) {
+                state.stopped = true;
+                break;
+            }
+        }
+        const consumed_w = (!state.stopped or state.pos >= view.len) and !state.output_blocked;
+        if (consumed_w and !state.hit_byte_cap and state.soft_error == null) state.scanned_all = true;
+        if (state.hit_byte_cap) noteLimit(&state, .max_bytes);
+        return finishSink(S, sink, &state, config);
+    }
+
     var skip_match = false;
     if (watchesBinary(config)) {
         var nul_at: ?usize = null;
@@ -773,33 +828,65 @@ pub fn drive(
             chunk_at = 0;
         }
 
-        const search_end = if (eof) filled else lastComplete(buf[0..filled], config);
-        const view_end = if (eof) filled else search_end;
-        // Fast text path fuses NUL detection into the pattern search. Scanning for NUL in a separate pass costs ~19 ms on a 1 GiB warm file,
-        // which would make single-byte patterns slower than rg. Context and dense-match paths still use the separate NUL pre-pass.
-        const fuse = search_end > state.pos and canFuse(matcher, config, &state);
+        const exact_max = state_mod.exactMatcherMaxLen(matcher);
+        const can_fuse_chunk = canFuse(matcher, config, &state);
+        const fuse_full_buf = can_fuse_chunk and exact_max != null and exact_max.? > 0 and filled > state.pos;
+        var search_end: usize = 0;
+        var view_end: usize = 0;
         var skip_match = false;
-        if (fuse) {
+        var fast_consumed: ?usize = null;
+        var fast_next_pos: ?usize = null;
+
+        if (fuse_full_buf) {
             var nul_rel: ?usize = null;
-            const found = if (comptime @hasDecl(state_mod.MatcherType(@TypeOf(matcher)), "findWatched")) matcher.findWatched(buf[0..search_end], state.pos, &nul_rel) else unreachable;
-            if (nul_rel == null and search_end < filled) {
-                if (memchr.find(width, buf[search_end..filled], 0, 0)) |rel| nul_rel = search_end + rel;
-            }
+            const found = if (comptime @hasDecl(state_mod.MatcherType(@TypeOf(matcher)), "findWatched"))
+                matcher.findWatched(buf[0..filled], state.pos, &nul_rel)
+            else
+                unreachable;
             if (nul_rel == null) {
                 if (found) |hit| {
                     if (memchr.find(width, buf[hit.start..filled], 0, 0)) |rel| {
                         nul_rel = hit.start + rel;
                     } else {
-                        if (hit.start < state.pos + 4096) {
-                            state.prefer_prepass = true;
-                        }
-                        if (config.progress_interval == null or config.progress_interval.? == 0) {
-                            state.pos = lineStart(buf[0..view_end], hit.start, config);
+                        search_end = if (eof) filled else lastComplete(buf[0..filled], config);
+                        view_end = if (eof) filled else search_end;
+                        if (hit.start < search_end) {
+                            if (hit.start < state.pos + 4096) {
+                                state.prefer_prepass = true;
+                            }
+                            if (config.progress_interval == null or config.progress_interval.? == 0) {
+                                state.pos = lineStart(buf[0..view_end], hit.start, config);
+                            }
+                        } else {
+                            skip_match = true;
+                            state.pos = view_end;
                         }
                     }
                 } else {
                     skip_match = true;
-                    state.pos = view_end;
+                    const keep_overlap = exact_max.? -| 1;
+                    const can_drop_incomplete = (comptime !@hasDecl(S, "matched") and !@hasDecl(S, "context")) and
+                        state.line_number == null and
+                        config.max_output_bytes == null and
+                        config.max_queued_event_bytes == null and
+                        !state.long_active;
+                    if (eof) {
+                        search_end = filled;
+                        view_end = filled;
+                        state.pos = filled;
+                    } else if (can_drop_incomplete) {
+                        const cons = filled -| keep_overlap;
+                        search_end = cons;
+                        view_end = cons;
+                        state.pos = cons;
+                        fast_consumed = cons;
+                    } else {
+                        search_end = lastComplete(buf[0..filled], config);
+                        view_end = search_end;
+                        state.pos = view_end;
+                        const rem = filled - search_end;
+                        fast_next_pos = rem -| keep_overlap;
+                    }
                 }
             }
             if (nul_rel) |rel| {
@@ -811,15 +898,57 @@ pub fn drive(
                     break;
                 }
                 skip_match = false;
+                search_end = if (eof) filled else lastComplete(buf[0..filled], config);
+                view_end = if (eof) filled else search_end;
             }
-        } else if (!eof and watchesBinary(config) and state.nul_offset == null) {
-            if (memchr.find(width, buf[chunk_at..filled], 0, 0)) |rel| {
-                noteBinary(&state, config, state.abs_base + chunk_at + rel);
-                const cont = callOpt(S, "binary", sink, .{state.nul_offset.?});
-                if (config.binary == .quit or !cont) {
-                    filled = chunk_at;
-                    state.stopped = true;
-                    break;
+        } else {
+            search_end = if (eof) filled else lastComplete(buf[0..filled], config);
+            view_end = if (eof) filled else search_end;
+            const fuse = search_end > state.pos and can_fuse_chunk;
+            if (fuse) {
+                var nul_rel: ?usize = null;
+                const found = if (comptime @hasDecl(state_mod.MatcherType(@TypeOf(matcher)), "findWatched")) matcher.findWatched(buf[0..search_end], state.pos, &nul_rel) else unreachable;
+                if (nul_rel == null) {
+                    if (found) |hit| {
+                        if (memchr.find(width, buf[hit.start..filled], 0, 0)) |rel| {
+                            nul_rel = hit.start + rel;
+                        } else {
+                            if (hit.start < state.pos + 4096) {
+                                state.prefer_prepass = true;
+                            }
+                            if (config.progress_interval == null or config.progress_interval.? == 0) {
+                                state.pos = lineStart(buf[0..view_end], hit.start, config);
+                            }
+                        }
+                    } else {
+                        if (search_end < filled) {
+                            if (memchr.find(width, buf[search_end..filled], 0, 0)) |rel| nul_rel = search_end + rel;
+                        }
+                        if (nul_rel == null) {
+                            skip_match = true;
+                            state.pos = view_end;
+                        }
+                    }
+                }
+                if (nul_rel) |rel| {
+                    noteBinary(&state, config, state.abs_base + rel);
+                    const cont = callOpt(S, "binary", sink, .{state.nul_offset.?});
+                    if (config.binary == .quit or !cont) {
+                        filled = chunk_at;
+                        state.stopped = true;
+                        break;
+                    }
+                    skip_match = false;
+                }
+            } else if (!eof and watchesBinary(config) and state.nul_offset == null) {
+                if (memchr.find(width, buf[chunk_at..filled], 0, 0)) |rel| {
+                    noteBinary(&state, config, state.abs_base + chunk_at + rel);
+                    const cont = callOpt(S, "binary", sink, .{state.nul_offset.?});
+                    if (config.binary == .quit or !cont) {
+                        filled = chunk_at;
+                        state.stopped = true;
+                        break;
+                    }
                 }
             }
         }
@@ -857,7 +986,9 @@ pub fn drive(
         }
         if (state.stopped) break;
 
-        const consumed = if (is_ml and search_end > ml_win)
+        const consumed = if (fast_consumed) |fc|
+            fc
+        else if (is_ml and search_end > ml_win)
             @max(state.last_line_visited, lineEnd(buf[0..search_end], search_end - ml_win, config))
         else
             search_end;
@@ -871,7 +1002,7 @@ pub fn drive(
             std.mem.copyForwards(u8, buf[0..remain], buf[consumed..filled]);
         }
         filled = remain;
-        state.pos = if (state.pos >= consumed) state.pos - consumed else 0;
+        state.pos = if (fast_next_pos) |fnp| fnp else if (state.pos >= consumed) state.pos - consumed else 0;
         state.last_line_visited = 0;
         state.last_line_counted = 0;
         state.remembered_until = 0;

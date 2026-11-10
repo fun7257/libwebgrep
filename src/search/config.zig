@@ -6,6 +6,7 @@
 //!   1. Caller-supplied caps can only tighten limits below server hard caps; exceeding a hard cap returns `BudgetExceeded` or `ContextLinesExceeded`.
 //!   2. Service entry points (`serviceConfig`) populate default multi-tenant budgets when left null.
 
+const builtin = @import("builtin");
 const std = @import("std");
 const decompress = @import("../codec/decompress.zig");
 const encoding = @import("../codec/encoding.zig");
@@ -29,6 +30,19 @@ pub const BinaryPolicy = enum {
 pub const SearchConfig = struct {
     /// Initial chunk size. 1 MiB is the fastest of the four tiers on a 128 MiB file (see `BENCHMARKS.md`). Defaults to 1 MiB.
     pub const default_buffer_size: usize = 1024 * 1024;
+
+    /// Platform-aware per-thread stream buffer size.
+    /// Single-threaded searches use `default_buffer_size` (1 MiB) to maximize sequential read batching in L3 cache.
+    /// Multi-threaded searches (`threads > 1`) on modern x86_64 and aarch64 CPUs size each worker's buffer to 256 KiB
+    /// so every concurrent thread's working buffer fits within its core-private L2 cache (typically 512 KiB–1 MiB)
+    /// and reduces concurrent anonymous page minor faults (`mm->mmap_lock` contention) by 4x.
+    pub fn optimalBufferSize(threads: u32) usize {
+        if (threads <= 1) return default_buffer_size;
+        return switch (comptime builtin.cpu.arch) {
+            .x86_64, .aarch64 => 256 * 1024,
+            else => default_buffer_size,
+        };
+    }
     /// Single-line byte limit. The read buffer does not exceed this value plus one newline byte; longer lines use a sliding window.
     pub const default_max_line_len: usize = 2 * 1024 * 1024;
     /// Hard cap on context line count. Callers may lower the effective limit, but cannot exceed this value.

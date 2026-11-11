@@ -149,7 +149,24 @@ pub fn monotonicNs() i128 {
             }
             return 0;
         },
-        .windows, .wasi, .freestanding => return 0,
+        .windows => {
+            var counter: i64 = 0;
+            var freq: i64 = 0;
+            _ = std.os.windows.ntdll.RtlQueryPerformanceCounter(&counter);
+            _ = std.os.windows.ntdll.RtlQueryPerformanceFrequency(&freq);
+            if (freq > 0 and counter > 0) {
+                return @divFloor(@as(i128, counter) * std.time.ns_per_s, @as(i128, freq));
+            }
+            return 0;
+        },
+        .wasi => {
+            var ts: std.os.wasi.timestamp_t = 0;
+            if (std.os.wasi.clock_time_get(.MONOTONIC, 1, &ts) == .SUCCESS) {
+                return @intCast(ts);
+            }
+            return 0;
+        },
+        .freestanding => return 0,
         else => {
             var ts: std.posix.timespec = undefined;
             switch (std.posix.errno(std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts))) {
@@ -178,7 +195,13 @@ pub fn armClock(state: *State, config: SearchConfig) void {
     }
     state.started_ns = readClock(config);
     state.last_input_ns = state.started_ns;
-    if (config.time_budget_ns != null) state.deadline_armed = true;
+    if (config.time_budget_ns) |budget| {
+        if (comptime builtin.os.tag != .freestanding) {
+            state.deadline_armed = true;
+        } else {
+            state.deadline_armed = config.clock != null or budget == 0;
+        }
+    }
 }
 
 pub fn restoreCounters(state: *State, config: SearchConfig) void {

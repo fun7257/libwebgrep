@@ -241,10 +241,10 @@ test "slice: binary report and quit policies" {
 
     var quiet = try run("MATCH\nfoo\x00\n", "MATCH", .{ .binary = .quit, .buffer_size = 64 });
     defer quiet.deinit(testing.allocator);
-    try testing.expectEqualStrings("", quiet.text.items);
+    try testing.expectEqualStrings("MATCH\n", quiet.text.items);
     const q = try finishOf("MATCH\nfoo\x00\n", "MATCH", .quit);
     try testing.expectEqual(Outcome.binary_quit, q.outcome);
-    try testing.expectEqual(@as(u64, 0), q.matched_lines);
+    try testing.expectEqual(@as(u64, 1), q.matched_lines);
 
     var text = try run("xxMATCH\x00yy\n", "MATCH", .{ .binary = .none, .line_numbers = true });
     defer text.deinit(testing.allocator);
@@ -329,8 +329,8 @@ test "chunked reading fuses NUL detection into search" {
         .max_line_len = 64,
     });
     try testing.expectEqual(Outcome.binary_quit, quit_result.outcome);
-    try testing.expectEqual(@as(u64, 0), quit_result.matched_lines);
-    try testing.expectEqualStrings("", quit.text.items);
+    try testing.expectEqual(@as(u64, 1), quit_result.matched_lines);
+    try testing.expectEqualStrings("MATCH\n", quit.text.items);
 
     var byte_reader = std.Io.Reader.fixed("ab\ncd\nZ\n");
     var byte_finder = try Finder.init("Z", .{});

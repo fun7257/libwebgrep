@@ -383,9 +383,34 @@ pub fn pumpLong(
     if (stopInMatch(state, config)) return false;
     if (watchesBinary(config) and state.nul_offset == null and new_at < filled.*) {
         if (memchr.find(width, buf.*[new_at..filled.*], 0, 0)) |rel| {
-            noteBinary(state, config, state.abs_base + new_at + rel);
+            const nul_idx = new_at + rel;
+            const abs_nul = state.abs_base + nul_idx;
+            if (config.binary == .quit) {
+                if (state.long_active) {
+                    if (memchr.find(width, buf.*[0..nul_idx], 0, recordSep(config))) |nl| {
+                        var content_len = nl;
+                        if (!config.null_data and nl > 0 and buf.*[nl - 1] == '\r') content_len = nl - 1;
+                        try noteLong(allocator, matcher, buf.*[0..content_len], hold, seen, state, config, true);
+                        if (!try finishLong(S, sink, buf, filled, hold.*, seen.*, state, config, content_len, nl + 1)) return false;
+                        const rem_nul = nul_idx - (nl + 1);
+                        const safe_end = state_mod.lineStart(buf.*[0..rem_nul], rem_nul, config);
+                        if (safe_end > state.pos) {
+                            if (!try matchBuffer(S, sink, matcher, buf.*[0..safe_end], state, config)) return false;
+                        }
+                    }
+                } else {
+                    const safe_end = state_mod.lineStart(buf.*[0..nul_idx], nul_idx, config);
+                    if (safe_end > state.pos) {
+                        if (!try matchBuffer(S, sink, matcher, buf.*[0..safe_end], state, config)) return false;
+                    }
+                }
+                noteBinary(state, config, abs_nul);
+                _ = callOpt(S, "binary", sink, .{state.nul_offset.?});
+                return false;
+            }
+            noteBinary(state, config, abs_nul);
             const cont = callOpt(S, "binary", sink, .{state.nul_offset.?});
-            if (config.binary == .quit or !cont) return false;
+            if (!cont) return false;
         }
     }
     if (!state.long_active) {
@@ -402,7 +427,7 @@ pub fn pumpLong(
         return !state.stopped;
     }
     const sep = recordSep(config);
-    if (memchr.find(width, buf.*, 0, sep)) |nl| {
+    if (memchr.find(width, buf.*[0..filled.*], 0, sep)) |nl| {
         var content_len = nl;
         if (!config.null_data and nl > 0 and buf.*[nl - 1] == '\r') content_len = nl - 1;
         try noteLong(allocator, matcher, buf.*[0..content_len], hold, seen, state, config, true);

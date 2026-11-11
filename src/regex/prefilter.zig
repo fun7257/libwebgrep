@@ -213,10 +213,12 @@ pub fn extractLiterals(self: anytype, pattern: []const u8, case_mode: CaseMode) 
             },
         }
     }
+    var best_is_trailing = false;
     if (curr_lit.items.len > best_lit.items.len) {
         best_lit.clearRetainingCapacity();
         try best_lit.appendSlice(self.allocator, curr_lit.items);
         best_offset = curr_offset;
+        best_is_trailing = true;
     }
 
     const find_opts = matcher.FindOptions{
@@ -247,6 +249,11 @@ pub fn extractLiterals(self: anytype, pattern: []const u8, case_mode: CaseMode) 
         self.req_is_prefix = false;
         self.req_is_exact = false;
         self.prefilter = Finder.init(self.req_literal_bytes, find_opts) catch null;
+
+        if (!best_is_trailing and depth == 0 and curr_lit.items.len >= 2) {
+            self.tail_literal_bytes = try self.allocator.dupe(u8, curr_lit.items);
+            self.tail_finder = Finder.init(self.tail_literal_bytes, find_opts) catch null;
+        }
     } else {
         try tryExtractAltLiterals(self, pattern, find_opts);
     }

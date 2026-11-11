@@ -40,6 +40,23 @@ const emitRing = ring_mod.emitRing;
 const sinkMatched = format_mod.sinkMatched;
 const sinkContext = format_mod.sinkContext;
 
+pub fn needLineStart(comptime S: type, state: *const State, config: SearchConfig) bool {
+    if (comptime @hasDecl(S, "matched") or @hasDecl(S, "context") or @hasDecl(S, "context_break")) return true;
+    return state.line_number != null or
+        config.max_output_bytes != null or
+        config.max_queued_event_bytes != null or
+        config.resume_from > 0 or
+        config.stop_on_nonmatch or
+        config.whole_line or
+        config.passthru or
+        beforeCount(config) > 0 or
+        afterCount(config) > 0 or
+        config.contains.len > 0 or
+        config.excludes.len > 0 or
+        config.contains_regexes.len > 0 or
+        config.excludes_regexes.len > 0;
+}
+
 pub fn matchBuffer(
     comptime S: type,
     sink: *S,
@@ -48,13 +65,18 @@ pub fn matchBuffer(
     state: *State,
     config: SearchConfig,
 ) SliceError!bool {
+    const need_ls = needLineStart(S, state, config);
     while (state.pos < buf.len) {
         if (state.stopped) return false;
+        if (state_mod.flagIsSet(config)) {
+            state.stopped = true;
+            return false;
+        }
         if (stopInMatch(state, config)) return false;
         if (!maybeProgress(S, sink, state, config)) return false;
         if (config.invert) {
             if (!try matchInvert(S, sink, matcher, buf, state, config)) break;
-        } else if (try findLine(matcher, buf, state, config)) |line| {
+        } else if (try findLineOpts(matcher, buf, state, config, need_ls)) |line| {
             if (state.abs_base + @as(u64, line.start) < config.resume_from) {
                 state.pos = line.end;
                 continue;
@@ -121,6 +143,10 @@ pub const FoundLine = struct {
 };
 
 pub fn findLine(matcher: anytype, buf: []const u8, state: *State, config: SearchConfig) SliceError!?FoundLine {
+    return findLineOpts(matcher, buf, state, config, true);
+}
+
+pub fn findLineOpts(matcher: anytype, buf: []const u8, state: *State, config: SearchConfig, need_ls: bool) SliceError!?FoundLine {
     if (state.exceeded(config)) return null;
     var pos = state.pos;
     while (pos < buf.len) {
@@ -130,6 +156,16 @@ pub fn findLine(matcher: anytype, buf: []const u8, state: *State, config: Search
             nextMatch(matcher, buf, pos, config);
         const hit = found orelse return null;
         if (hit.start > buf.len or hit.start < pos) return null;
+        if (!need_ls and hit.start < buf.len) {
+            const end = lineEnd(buf, hit.end, config);
+            return .{
+                .start = pos,
+                .end = end,
+                .mstart = hit.start,
+                .mend = hit.end,
+                .mpid = hit.pattern_id,
+            };
+        }
         const start = lineStart(buf, hit.start, config);
         if (start == buf.len) {
             pos = buf.len;

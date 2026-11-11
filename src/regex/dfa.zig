@@ -162,17 +162,103 @@ pub fn BoundedDfa(comptime max_states_cap: u16) type {
             return self.flushes == 0 and self.bailouts == 0;
         }
 
+        /// Adds an additional root state for `suffix_pc` into an already determinized DFA
+        /// and determinizes all states reachable from it. Rolls back cleanly and returns `null`
+        /// if state capacity (`max_states_cap`) or closure capacity is exceeded.
+        pub fn determinizeSuffix(
+            self: *Self,
+            insts: []const Inst,
+            unicode_ranges: []const UnicodeRangeList,
+            suffix_pc: u32,
+            multiline: bool,
+        ) ?u16 {
+            if (self.flushes != 0 or self.bailouts != 0 or self.num_states < 2) return null;
+            var pcs: [max_closure_pcs]u16 = undefined;
+            var pc_len: u8 = 0;
+            var match_flag = false;
+            if (!computeEpsilonClosure(insts, suffix_pc, &pcs, &pc_len, &match_flag)) return null;
+            if (pc_len == 0 and !match_flag) return dead_state;
+
+            for (1..self.num_states) |idx| {
+                const st = &self.meta[idx];
+                if (st.pc_len == pc_len and self.is_match[idx] == match_flag and
+                    std.mem.eql(u16, st.pcs[0..pc_len], pcs[0..pc_len]))
+                {
+                    return @intCast(idx);
+                }
+            }
+
+            if (self.num_states >= self.effective_max_states) return null;
+            const saved_crlf = self.stops_on_crlf;
+            const root_id = self.num_states;
+            self.meta[root_id] = .{ .pcs = pcs, .pc_len = pc_len };
+            self.is_match[root_id] = match_flag;
+            self.trans[root_id] = @splat(unknown_transition);
+            self.num_states += 1;
+
+            var crlf_dead = saved_crlf and !multiline;
+            var q_head: u16 = root_id;
+            while (q_head < self.num_states) : (q_head += 1) {
+                var b: u16 = 0;
+                while (b < 256) : (b += 1) {
+                    const byte: u8 = @truncate(b);
+                    if (!multiline and byte == '\n') {
+                        self.trans[q_head]['\n'] = dead_state;
+                        continue;
+                    }
+                    const next = self.step(insts, unicode_ranges, q_head, byte, multiline);
+                    if (next == bailout_transition or self.flushes != 0 or self.bailouts != 0) {
+                        // Re-determinize clean base DFA so caller can still use precomputed_dfa
+                        _ = self.determinize(insts, unicode_ranges, self.compiled_start_pc, multiline);
+                        return null;
+                    }
+                }
+                if (crlf_dead and (self.trans[q_head]['\r'] != dead_state or self.trans[q_head]['\n'] != dead_state)) {
+                    crlf_dead = false;
+                }
+            }
+            self.stops_on_crlf = crlf_dead;
+            if (self.flushes == 0 and self.bailouts == 0 and self.num_states > root_id) {
+                var s_idx: usize = self.num_states - 1;
+                while (s_idx >= root_id) : (s_idx -= 1) {
+                    const s: u16 = @intCast(s_idx);
+                    self.chain_len[s] = 0;
+                    if (!self.is_match[s] and s + 1 < self.num_states) {
+                        const target: u16 = s + 1;
+                        var only_target = true;
+                        var has_target = false;
+                        for (self.trans[s]) |t| {
+                            if (t == target) {
+                                has_target = true;
+                            } else if (t != dead_state) {
+                                only_target = false;
+                                break;
+                            }
+                        }
+                        if (only_target and has_target) {
+                            self.chain_len[s] = @min(@as(u8, 64), 1 +| self.chain_len[target]);
+                        }
+                    }
+                    if (s_idx == root_id) break;
+                }
+            }
+            return root_id;
+        }
+
         /// Fast single-branch prefix matcher on a fully determinized DFA (`determinize() == true`).
-        /// Returns the longest greedy match length starting at `slice[0]`, or `null` if no match.
+        /// When `earliest` is true, returns immediately upon reaching the first accepting state;
+        /// otherwise returns the longest greedy match length starting at `slice[0]`, or `null` if no match.
         pub inline fn matchPrefixDeterminized(
             self: *const Self,
             slice: []const u8,
             start_state_id: u16,
             prefix_offset: usize,
+            earliest: bool,
         ) ?usize {
             if (prefix_offset > slice.len) return null;
             const rem = slice[prefix_offset..];
             var curr_state: u16 = start_state_id;
+            if (earliest and self.is_match[curr_state]) return prefix_offset;
             var last_match: ?usize = if (self.is_match[curr_state]) prefix_offset else null;
             var idx: usize = 0;
             while (idx < rem.len) {
@@ -210,6 +296,7 @@ pub fn BoundedDfa(comptime max_states_cap: u16) type {
                     curr_state = @intCast(base_s + clen);
                     idx += clen;
                     if (self.is_match[curr_state]) {
+                        if (earliest) return prefix_offset + idx;
                         last_match = prefix_offset + idx;
                     }
                     continue;
@@ -218,6 +305,7 @@ pub fn BoundedDfa(comptime max_states_cap: u16) type {
                 idx += 1;
                 if (curr_state == dead_state) break;
                 if (self.is_match[curr_state]) {
+                    if (earliest) return prefix_offset + idx;
                     last_match = prefix_offset + idx;
                 }
             }

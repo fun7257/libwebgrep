@@ -459,7 +459,9 @@ test "AnyMatcher wraps Finder and Multi (value and const pointer)" {
     const multi_mod = @import("finder/multi.zig");
     _ = @import("finder/pairs.zig");
     _ = @import("finder/aho.zig");
-    _ = @import("finder/teddy.zig");
+    if (@import("build_options").teddy != .off) {
+        _ = @import("finder/teddy.zig");
+    }
 
     const f = try finder_mod.Finder.init("match", .{});
     const any_f = AnyMatcher.init(finder_mod.Finder, &f);

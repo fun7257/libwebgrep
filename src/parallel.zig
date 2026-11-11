@@ -19,6 +19,7 @@ const deque = @import("walk/deque.zig");
 const finder_mod = @import("finder/finder.zig");
 const matcher = @import("matcher.zig");
 const multi_mod = @import("finder/multi.zig");
+const regex_mod = @import("regex/vm.zig");
 const searcher = @import("searcher.zig");
 const sink_mod = @import("sink.zig");
 const walker = @import("walk/walker.zig");
@@ -49,10 +50,17 @@ pub const Run = struct {
     pattern: []const u8 = "",
     /// Uses multi-pattern search when more than one pattern is present. An empty slice uses `pattern`.
     patterns: []const []const u8 = &.{},
+    /// Optional compiled regex shared read-only across all worker threads.
+    regex: ?*const regex_mod.Regex = null,
     find: matcher.FindOptions = .{},
     roots: []const []const u8,
     search: searcher.SearchConfig = .{},
     walk: walker.Config = .{},
+    /// When true (default), applies multi-tenant default byte and time budgets matching `serviceConfig`.
+    /// Set to false for unconstrained local CLI/benchmark directory runs.
+    enforce_service_budgets: bool = true,
+    use_mmap: bool = false,
+    count_lines_only: bool = false,
     emit: Emit = .text,
     stdout: *std.Io.Writer,
     column: bool = false,
@@ -76,9 +84,12 @@ const Shared = struct {
     walk: walker.Config,
     search: searcher.SearchConfig,
     emit: Emit,
+    use_mmap: bool = false,
+    count_lines_only: bool = false,
     finder: finder_mod.Finder,
     /// When non-null, workers share this read-only automaton instead of using `finder`.
     many: ?*multi_mod.Multi = null,
+    regex: ?*const regex_mod.Regex = null,
     column: bool,
     use_separator: bool,
     saw: *bool,
@@ -152,6 +163,9 @@ const Worker = struct {
 
     fn config(self: *Worker) searcher.SearchConfig {
         var cfg = self.shared.search;
+        if (cfg.buffer_size == searcher.SearchConfig.default_buffer_size) {
+            cfg.buffer_size = searcher.SearchConfig.optimalBufferSize(self.shared.workers);
+        }
         cfg.scratch = &self.scratch;
         cfg.stop = &self.shared.stop;
         if (self.shared.emit == .json) cfg.line_numbers = true;
@@ -170,9 +184,25 @@ const Budgets = struct {
     request_cap: u64,
 };
 
-fn alignBudgets(search: searcher.SearchConfig, walk: walker.Config) Budgets {
+fn alignBudgets(search: searcher.SearchConfig, walk: walker.Config, enforce_defaults: bool) Budgets {
     var out_search = search;
     var out_walk = walk;
+    if (enforce_defaults) {
+        const source_raw = search.max_source_bytes orelse walk.max_filesize orelse searcher.SearchConfig.default_max_source_bytes;
+        const request_raw = search.max_request_bytes orelse searcher.SearchConfig.default_max_request_bytes;
+        const source_cap = @min(source_raw, request_raw);
+        out_search.max_source_bytes = source_cap;
+        out_search.max_request_bytes = request_raw;
+        out_walk.max_filesize = source_cap;
+        if (out_search.time_budget_ns == null) {
+            out_search.time_budget_ns = searcher.SearchConfig.default_time_budget_ns;
+        }
+        return .{
+            .search = out_search,
+            .walk = out_walk,
+            .request_cap = request_raw,
+        };
+    }
     const source_cap = if (search.max_source_bytes) |s|
         if (walk.max_filesize) |w| @min(s, w) else s
     else
@@ -186,9 +216,6 @@ fn alignBudgets(search: searcher.SearchConfig, walk: walker.Config) Budgets {
     out_search.max_source_bytes = effective_source;
     out_search.max_request_bytes = request_cap;
     out_walk.max_filesize = effective_source;
-    if (out_search.time_budget_ns == null) {
-        out_search.time_budget_ns = searcher.SearchConfig.default_time_budget_ns;
-    }
     return .{
         .search = out_search,
         .walk = out_walk,
@@ -198,7 +225,7 @@ fn alignBudgets(search: searcher.SearchConfig, walk: walker.Config) Budgets {
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, req: Run) !Stats {
     const workers = resolveConcurrency(req.walk.threads, req.search.max_concurrency);
-    const budgets = alignBudgets(req.search, req.walk);
+    const budgets = alignBudgets(req.search, req.walk, req.enforce_service_budgets);
     var walk_cfg = budgets.walk;
     walk_cfg.threads = workers;
     const deques = try allocator.alloc(Queue, workers);
@@ -224,7 +251,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, req: Run) !Stats {
     if (req.patterns.len > 1) {
         many = try multi_mod.Multi.init(allocator, req.patterns, req.find);
     }
-    const finder = if (many != null)
+    const finder = if (many != null or req.regex != null)
         try finder_mod.Finder.init("", .{})
     else
         try finder_mod.Finder.init(req.pattern, req.find);
@@ -237,8 +264,11 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, req: Run) !Stats {
         .search = budgets.search,
         .request_cap = budgets.request_cap,
         .emit = req.emit,
+        .use_mmap = req.use_mmap,
+        .count_lines_only = req.count_lines_only,
         .finder = finder,
         .many = if (many) |*engine| engine else null,
+        .regex = req.regex,
         .column = req.column,
         .use_separator = req.use_separator and req.emit == .text,
         .saw = req.saw_output,
@@ -506,8 +536,43 @@ fn noteSoft(worker: *Worker, path: []const u8, result: searcher.Result) void {
 }
 
 fn searchOpen(worker: *Worker, file: std.Io.File, path: []const u8) !void {
+    if (worker.shared.regex) |re| return searchWith(worker, re, file, path);
     if (worker.shared.many) |many| return searchWith(worker, many, file, path);
     return searchWith(worker, &worker.finder, file, path);
+}
+
+const CountTally = struct {};
+
+fn runFileOrMmap(
+    comptime S: type,
+    worker: *Worker,
+    sink: *S,
+    file: std.Io.File,
+    path: []const u8,
+    engine: anytype,
+    cfg: searcher.SearchConfig,
+) !searcher.Result {
+    if (worker.shared.use_mmap) {
+        const st = file.stat(worker.shared.io) catch null;
+        if (st) |info| {
+            if (info.kind == .file and info.size > 0 and info.size <= std.math.maxInt(usize)) {
+                var mm = std.Io.File.MemoryMap.create(worker.shared.io, file, .{
+                    .len = @intCast(info.size),
+                    .offset = 0,
+                    .protection = .{ .read = true, .write = false },
+                    .populate = false,
+                }) catch null;
+                if (mm) |*mapped| {
+                    defer mapped.destroy(worker.shared.io);
+                    if (cfg.binary != .quit or std.mem.indexOfScalar(u8, mapped.memory[0..@min(mapped.memory.len, 4096)], 0) == null) {
+                        platform.adviseMappedSequential(mapped.memory);
+                    }
+                    return searcher.searchSlice(S, sink, mapped.memory, path, engine, cfg);
+                }
+            }
+        }
+    }
+    return searcher.searchFile(S, worker.shared.allocator, worker.shared.io, sink, file, path, engine, cfg);
 }
 
 fn searchWith(worker: *Worker, engine: anytype, file: std.Io.File, path: []const u8) !void {
@@ -519,13 +584,18 @@ fn searchWith(worker: *Worker, engine: anytype, file: std.Io.File, path: []const
         if (cfg.max_source_bytes) |n| cfg.max_source_bytes = @min(n, room) else cfg.max_source_bytes = room;
         cfg.max_request_bytes = if (cfg.max_request_bytes) |n| @min(n, room) else room;
     }
-    var sink = Tally{
-        .shared = worker.shared,
-        .stop_file = worker.shared.emit == .files_with_matches,
-        .source_id = path,
-    };
     _ = worker.shared.emitEvent(.{ .begin = .{ .source_id = path } });
-    const result = try searcher.searchFile(Tally, worker.shared.allocator, worker.shared.io, &sink, file, path, engine, cfg);
+    const result = if (worker.shared.emit == .count and worker.shared.count_lines_only) blk: {
+        var count_sink = CountTally{};
+        break :blk try runFileOrMmap(CountTally, worker, &count_sink, file, path, engine, cfg);
+    } else blk: {
+        var sink = Tally{
+            .shared = worker.shared,
+            .stop_file = worker.shared.emit == .files_with_matches,
+            .source_id = path,
+        };
+        break :blk try runFileOrMmap(Tally, worker, &sink, file, path, engine, cfg);
+    };
     noteSoft(worker, path, result);
     worker.shared.addSearch(result, result.matches, result.bytes_read, 0);
     _ = worker.shared.emitEvent(.{ .end = .{

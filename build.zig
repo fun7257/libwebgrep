@@ -239,6 +239,45 @@ pub fn build(b: *std.Build) void {
         if (bench_filter) |f| run_micro.addArg(f);
         bench_step.dependOn(&run_micro.step);
     }
+
+    const bench_cli_step = b.step("bench-cli", "Build standalone wg-cli and bench-driver binaries (ReleaseFast)");
+    if (optimize != .fast) {
+        const fail = b.addFail("Benchmark binaries must be built with ReleaseFast: zig build bench-cli -Doptimize=ReleaseFast");
+        bench_cli_step.dependOn(&fail.step);
+    } else {
+        const wg_cli = b.addExecutable(.{
+            .name = "wg-cli",
+            .use_llvm = use_llvm,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("bench/wg_cli.zig"),
+                .target = compile_target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "libwebgrep_internal", .module = internal_mod },
+                },
+            }),
+        });
+        const install_wg_cli = b.addInstallArtifact(wg_cli, .{});
+        bench_cli_step.dependOn(&install_wg_cli.step);
+
+        if (target.result.os.tag == .linux) {
+            const bench_driver = b.addExecutable(.{
+                .name = "bench-driver",
+                .use_llvm = use_llvm,
+                .root_module = b.createModule(.{
+                    .target = compile_target,
+                    .optimize = optimize,
+                    .link_libc = true,
+                }),
+            });
+            bench_driver.root_module.addCSourceFile(.{
+                .file = b.path("bench/bench_driver.c"),
+                .flags = &.{ "-std=c11", "-O3", "-Wall", "-Wextra", "-Werror" },
+            });
+            const install_driver = b.addInstallArtifact(bench_driver, .{});
+            bench_cli_step.dependOn(&install_driver.step);
+        }
+    }
 }
 
 fn readRepoFile(b: *std.Build, sub_path: []const u8) []const u8 {

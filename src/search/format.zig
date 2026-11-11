@@ -498,7 +498,7 @@ pub fn sinkMatched(
         if (!try sinkBreakAt(S, sink, line_abs, state, config)) return false;
         countLines(buf, line.start, state, config);
         const withheld = config.binary == .report and state.nul_offset != null;
-        if (!withheld) {
+        if (!withheld and (config.max_queued_event_bytes != null or config.max_output_bytes != null)) {
             const content_end = contentEnd(buf, line, config);
             const raw_len = content_end - line.start;
             const capped_len = if (config.max_line_len == 0 or raw_len <= config.max_line_len) raw_len else config.max_line_len;
@@ -513,7 +513,9 @@ pub fn sinkMatched(
         state.matched_lines += 1;
         state.matches += 1;
         state.results_out += 1;
-        return true;
+        if (!maybeProgress(S, sink, state, config)) return false;
+        if (!noteHitLimit(state, config, state.abs_base + line.end)) return false;
+        return !state.paused;
     }
     const preview = previewLine(buf, line, known, config);
     const line_abs = state.abs_base + line.start;

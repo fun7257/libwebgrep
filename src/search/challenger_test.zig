@@ -842,3 +842,313 @@ test "M1 CHALLENGE 6: Hybrid extreme stress - 80 matches on mixed ASCII+CJK+Emoj
     }
     try testing.expect(sink.all_exact);
 }
+
+test "regression: BinaryPolicy.quit emits complete matching lines before NUL deterministically across slice, reader, and pull" {
+    const hay = "MATCH 1\nclean line\nMATCH 2\nbinary\x00line\nMATCH 3\n";
+    var finder = try Finder.init("MATCH", .{});
+
+    const LineRec = struct {
+        lines: std.ArrayList([]u8) = .empty,
+        pub fn matched(self: *@This(), line: sink_mod.Line) bool {
+            const dup = testing.allocator.dupe(u8, line.bytes) catch return false;
+            self.lines.append(testing.allocator, dup) catch {
+                testing.allocator.free(dup);
+                return false;
+            };
+            return true;
+        }
+        fn deinit(self: *@This()) void {
+            for (self.lines.items) |s| testing.allocator.free(s);
+            self.lines.deinit(testing.allocator);
+        }
+    };
+
+    // 1. searchSlice
+    var rec_slice = LineRec{};
+    defer rec_slice.deinit();
+    const res_slice = try searcher.searchSlice(LineRec, &rec_slice, hay, "s", &finder, .{ .binary = .quit });
+    try testing.expectEqual(sink_mod.Outcome.binary_quit, res_slice.outcome);
+    try testing.expectEqual(@as(u64, 2), res_slice.matched_lines);
+    try testing.expectEqual(@as(usize, 2), rec_slice.lines.items.len);
+    try testing.expectEqualStrings("MATCH 1", rec_slice.lines.items[0]);
+    try testing.expectEqualStrings("MATCH 2", rec_slice.lines.items[1]);
+
+    // 2. searchReader with large buffer (single chunk) and small buffer (multi-chunk)
+    for ([_]usize{ 64 * 1024, 12 }) |buf_sz| {
+        var rec_rdr = LineRec{};
+        defer rec_rdr.deinit();
+        var rdr = std.Io.Reader.fixed(hay);
+        const res_rdr = try searcher.searchReader(LineRec, testing.allocator, &rec_rdr, &rdr, "r", &finder, .{
+            .binary = .quit,
+            .buffer_size = buf_sz,
+            .max_line_len = 64,
+        });
+        try testing.expectEqual(sink_mod.Outcome.binary_quit, res_rdr.outcome);
+        try testing.expectEqual(@as(u64, 2), res_rdr.matched_lines);
+        try testing.expectEqual(@as(usize, 2), rec_rdr.lines.items.len);
+        try testing.expectEqualStrings("MATCH 1", rec_rdr.lines.items[0]);
+        try testing.expectEqualStrings("MATCH 2", rec_rdr.lines.items[1]);
+    }
+
+    // 3. openReaderPull
+    var rdr_pull = std.Io.Reader.fixed(hay);
+    var pull = try pull_mod.openReaderPull(testing.allocator, &finder, "p", &rdr_pull, .{ .binary = .quit });
+    defer pull.deinit();
+    var pull_matches: usize = 0;
+    var pull_outcome: sink_mod.Outcome = .complete;
+    while (try pull.next()) |ev| {
+        if (ev.kind == .match) pull_matches += 1;
+        if (ev.kind == .end) pull_outcome = ev.outcome;
+    }
+    try testing.expectEqual(@as(usize, 2), pull_matches);
+    try testing.expectEqual(sink_mod.Outcome.binary_quit, pull_outcome);
+}
+
+test "regression: count-only sink without matched callback honors exists and max_results" {
+    const CountOnlySink = struct {
+        progress_calls: usize = 0,
+        pub fn progress(self: *@This(), _: u64, _: u64, _: u64) bool {
+            self.progress_calls += 1;
+            return true;
+        }
+    };
+    const hay = "hit 1\nhit 2\nhit 3\nhit 4\n";
+    var finder = try Finder.init("hit", .{});
+
+    var s_exists = CountOnlySink{};
+    const r_exists = try searcher.searchSlice(CountOnlySink, &s_exists, hay, "ex", &finder, .{
+        .exists = true,
+        .binary = .none,
+    });
+    try testing.expectEqual(sink_mod.Outcome.stopped, r_exists.outcome);
+    try testing.expectEqual(@as(u64, 1), r_exists.matched_lines);
+
+    var s_max = CountOnlySink{};
+    const r_max = try searcher.searchSlice(CountOnlySink, &s_max, hay, "max", &finder, .{
+        .max_results = 2,
+        .progress_interval = 1,
+        .binary = .none,
+    });
+    try testing.expectEqual(sink_mod.Outcome.stopped, r_max.outcome);
+    try testing.expectEqual(sink_mod.LimitHit.max_results, r_max.limit_hit);
+    try testing.expectEqual(@as(u64, 2), r_max.matched_lines);
+    try testing.expectEqual(@as(?u64, 12), r_max.resume_at);
+    try testing.expect(s_max.progress_calls >= 1);
+}
+
+test "regression: Regex prefix DFA respects .earliest vs .leftmost_first and findWatched single-pass" {
+    const Regex = @import("../regex/vm.zig").Regex;
+
+    var re1 = try Regex.init(testing.allocator, "prefix(a|ab)", .{});
+    defer re1.deinit();
+    const e1 = re1.find("prefixab", 0, .earliest).?;
+    const l1 = re1.find("prefixab", 0, .leftmost_first).?;
+    try testing.expectEqual(@as(usize, 0), e1.start);
+    try testing.expectEqual(@as(usize, 7), e1.end);
+    try testing.expectEqual(@as(usize, 0), l1.start);
+    try testing.expectEqual(@as(usize, 7), l1.end);
+
+    var re2 = try Regex.init(testing.allocator, "prefix(ab|a)", .{});
+    defer re2.deinit();
+    const e2 = re2.find("prefixab", 0, .earliest).?;
+    const l2 = re2.find("prefixab", 0, .leftmost_first).?;
+    try testing.expectEqual(@as(usize, 0), e2.start);
+    try testing.expectEqual(@as(usize, 8), e2.end);
+    try testing.expectEqual(@as(usize, 0), l2.start);
+    try testing.expectEqual(@as(usize, 8), l2.end);
+
+    var re3 = try Regex.init(testing.allocator, "WARN_[0-9]{4}_[a-z]{3,8}", .{});
+    defer re3.deinit();
+    const e3 = re3.find("WARN_1234_abcdefgh", 0, .earliest).?;
+    const l3 = re3.find("WARN_1234_abcdefgh", 0, .leftmost_first).?;
+    try testing.expectEqual(@as(usize, 18), e3.end);
+    try testing.expectEqual(@as(usize, 18), l3.end);
+
+    var nul_pos: ?usize = null;
+    const w_hit = re3.findWatched("ok\nWARN_1234_abc\nfoo\x00\n", 0, &nul_pos).?;
+    try testing.expect(nul_pos == null);
+    try testing.expectEqual(@as(usize, 3), w_hit.start);
+    try testing.expectEqual(@as(usize, 16), w_hit.end);
+
+    var nul_pos2: ?usize = null;
+    try testing.expect(re3.findWatched("foo\x00\nWARN_1234_abc\n", 0, &nul_pos2) == null);
+    try testing.expectEqual(@as(?usize, 3), nul_pos2);
+
+    var re4 = try Regex.init(testing.allocator, "[a-z]+tion\\s+[a-z]+\\s+the", .{});
+    defer re4.deinit();
+    try testing.expect(re4.find("national generation gap of", 0, .earliest) == null);
+    const hit4 = re4.find("national generation gap the end", 0, .earliest).?;
+    try testing.expectEqual(@as(usize, 9), hit4.start);
+    try testing.expectEqual(@as(usize, 27), hit4.end);
+    const hit4_lf = re4.find("nation generation gap the end", 0, .leftmost_first).?;
+    try testing.expectEqual(@as(usize, 7), hit4_lf.start);
+    try testing.expectEqual(@as(usize, 25), hit4_lf.end);
+
+    var re5 = try Regex.init(testing.allocator, "order_id=[0-9a-f]{8}-[0-9a-f]{4}", .{});
+    defer re5.deinit();
+    try testing.expect(re5.find("order_id=zzzzzzzz-1234", 0, .earliest) == null);
+    const hit5 = re5.find("prefix order_id=deadbeef-cafe suffix", 0, .earliest).?;
+    try testing.expectEqual(@as(usize, 7), hit5.start);
+    try testing.expectEqual(@as(usize, 29), hit5.end);
+
+    // Unicode case-insensitive interior literal regex does not mis-trigger ASCII suffix DFA
+    var re_uni = try Regex.init(testing.allocator, "[a-z]+tion\\s+the", .{ .case = .insensitive, .unicode_case = true });
+    defer re_uni.deinit();
+    try testing.expectEqual(@as(u16, 0), re_uni.dfa_suffix_state);
+    const hit_uni = re_uni.find("NaTiOn   ThE", 0, .earliest).?;
+    try testing.expectEqual(@as(usize, 0), hit_uni.start);
+    try testing.expectEqual(@as(usize, 12), hit_uni.end);
+}
+
+test "regression: searchSlice fused BinaryPolicy.quit honors max_count and stop atomic flag" {
+    const MatchMode = @import("../matcher.zig").MatchMode;
+    const hay = "hit 1\nhit 2\nhit 3\nhit 4\n";
+    var finder = try Finder.init("hit", .{});
+
+    const CountOnlySink = struct {};
+    const CallbackSink = struct {
+        seen: usize = 0,
+        stop_flag: ?*std.atomic.Value(bool) = null,
+        stop_on_hit: usize = 0,
+        pub fn matched(self: *@This(), _: sink_mod.Line) bool {
+            self.seen += 1;
+            if (self.stop_flag) |f| {
+                if (self.seen >= self.stop_on_hit) f.store(true, .release);
+            }
+            return true;
+        }
+    };
+
+    // 1. Count-only sink with max_count = 1 and max_count = 2 under default .binary = .quit
+    var c1 = CountOnlySink{};
+    const r_c1 = try searcher.searchSlice(CountOnlySink, &c1, hay, "mc1", &finder, .{
+        .max_count = 1,
+        .binary = .quit,
+    });
+    try testing.expectEqual(sink_mod.Outcome.stopped, r_c1.outcome);
+    try testing.expectEqual(@as(u64, 1), r_c1.matched_lines);
+
+    var c2 = CountOnlySink{};
+    const r_c2 = try searcher.searchSlice(CountOnlySink, &c2, hay, "mc2", &finder, .{
+        .max_count = 2,
+        .binary = .quit,
+    });
+    try testing.expectEqual(sink_mod.Outcome.stopped, r_c2.outcome);
+    try testing.expectEqual(@as(u64, 2), r_c2.matched_lines);
+
+    // 2. Callback sink with max_count = 1 and max_count = 2 under default .binary = .quit (both .earliest and .leftmost_first)
+    for ([_]MatchMode{ .earliest, .leftmost_first }) |mm| {
+        var cb1 = CallbackSink{};
+        const r_cb1 = try searcher.searchSlice(CallbackSink, &cb1, hay, "cb1", &finder, .{
+            .max_count = 1,
+            .binary = .quit,
+            .match_mode = mm,
+        });
+        try testing.expectEqual(sink_mod.Outcome.stopped, r_cb1.outcome);
+        try testing.expectEqual(@as(u64, 1), r_cb1.matched_lines);
+        try testing.expectEqual(@as(usize, 1), cb1.seen);
+
+        var cb2 = CallbackSink{};
+        const r_cb2 = try searcher.searchSlice(CallbackSink, &cb2, hay, "cb2", &finder, .{
+            .max_count = 2,
+            .binary = .quit,
+            .match_mode = mm,
+        });
+        try testing.expectEqual(sink_mod.Outcome.stopped, r_cb2.outcome);
+        try testing.expectEqual(@as(u64, 2), r_cb2.matched_lines);
+        try testing.expectEqual(@as(usize, 2), cb2.seen);
+    }
+
+    // 3. Atomic stop flag pre-set and set mid-search
+    var flag_pre = std.atomic.Value(bool).init(true);
+    var c_pre = CountOnlySink{};
+    const r_pre = try searcher.searchSlice(CountOnlySink, &c_pre, hay, "stop-pre", &finder, .{
+        .stop = &flag_pre,
+        .binary = .quit,
+    });
+    try testing.expectEqual(sink_mod.Outcome.stopped, r_pre.outcome);
+    try testing.expectEqual(@as(u64, 0), r_pre.matched_lines);
+
+    var flag_mid = std.atomic.Value(bool).init(false);
+    var cb_mid = CallbackSink{ .stop_flag = &flag_mid, .stop_on_hit = 2 };
+    const r_mid = try searcher.searchSlice(CallbackSink, &cb_mid, hay, "stop-mid", &finder, .{
+        .stop = &flag_mid,
+        .binary = .quit,
+    });
+    try testing.expectEqual(sink_mod.Outcome.stopped, r_mid.outcome);
+    try testing.expectEqual(@as(u64, 2), r_mid.matched_lines);
+    try testing.expectEqual(@as(usize, 2), cb_mid.seen);
+}
+
+test "regression: pumpLong emits completed > max_line_len long line before subsequent-line NUL quit" {
+    // Construct a > max_line_len (max_line_len = 32) matching line followed by a normal line and a binary line with NUL.
+    const long_line = "AAA_MATCH_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx_END\n";
+    const tail = "SECOND_MATCH_LINE\nbinary\x00line\nTHIRD_MATCH\n";
+    const payload = long_line ++ tail;
+
+    var finder = try Finder.init("MATCH", .{});
+
+    const RecSink = struct {
+        matched_count: usize = 0,
+        first_truncated: bool = false,
+        pub fn matched(self: *@This(), line: sink_mod.Line) bool {
+            if (self.matched_count == 0) self.first_truncated = line.truncated;
+            self.matched_count += 1;
+            return true;
+        }
+    };
+
+    // Test with buffer_size = 40 so Chunk 1 enters state.long_active, and Chunk 2 reads both the '\n' of long_line and the '\x00' of tail!
+    var sink = RecSink{};
+    var reader = std.Io.Reader.fixed(payload);
+    const res = try searcher.searchReader(RecSink, testing.allocator, &sink, &reader, "long-nul", &finder, .{
+        .binary = .quit,
+        .max_line_len = 32,
+        .buffer_size = 40,
+    });
+    try testing.expectEqual(sink_mod.Outcome.binary_quit, res.outcome);
+    try testing.expectEqual(@as(u64, 2), res.matched_lines);
+    try testing.expectEqual(@as(usize, 2), sink.matched_count);
+    try testing.expect(sink.first_truncated);
+}
+
+test "regression: parallel.run count_lines_only = false preserves multi-span stats.matches vs count_lines_only = true" {
+    const parallel = @import("../parallel.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "multi.txt", .data = "hit hit hit\nhit hit\nnone\n" });
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+    const root_path = path_buf[0..path_len];
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var saw = false;
+
+    // 1. Default count_lines_only = false preserves exact span count (5 matches across 2 lines)
+    const st_default = try parallel.run(testing.allocator, io, .{
+        .pattern = "hit",
+        .roots = &.{root_path},
+        .walk = .{ .threads = 1 },
+        .emit = .count,
+        .stdout = &out.writer,
+        .saw_output = &saw,
+    });
+    try testing.expectEqual(@as(u64, 2), st_default.matched_lines);
+    try testing.expectEqual(@as(u64, 5), st_default.matches);
+
+    // 2. Fast CLI mode count_lines_only = true skips per-line span enumeration (2 matched_lines, 2 matches)
+    const st_fast = try parallel.run(testing.allocator, io, .{
+        .pattern = "hit",
+        .roots = &.{root_path},
+        .walk = .{ .threads = 1 },
+        .emit = .count,
+        .count_lines_only = true,
+        .stdout = &out.writer,
+        .saw_output = &saw,
+    });
+    try testing.expectEqual(@as(u64, 2), st_fast.matched_lines);
+    try testing.expectEqual(@as(u64, 2), st_fast.matches);
+}

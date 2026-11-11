@@ -964,9 +964,27 @@ pub fn ReaderPull(comptime M: type) type {
                     }
                 }
                 if (nul_rel) |rel| {
+                    if (self.config.binary == .quit) {
+                        const safe_end = state_mod.lineStart(self.buf[0..rel], rel, self.config);
+                        if (safe_end > self.state.pos) {
+                            if (!try line_matcher_mod.matchBuffer(PullBridge(M), &bridge, self.matcher, self.buf[0..safe_end], &self.state, self.config)) {
+                                self.state.stopped = true;
+                                self.finishSearch();
+                                self.phase = .done;
+                                return false;
+                            }
+                        }
+                        state_mod.noteBinary(&self.state, self.config, self.state.abs_base + rel);
+                        _ = bridge.binary(self.state.nul_offset.?);
+                        self.filled = safe_end;
+                        self.state.stopped = true;
+                        self.finishSearch();
+                        self.phase = .done;
+                        return false;
+                    }
                     state_mod.noteBinary(&self.state, self.config, self.state.abs_base + rel);
                     const cont = bridge.binary(self.state.nul_offset.?);
-                    if (self.config.binary == .quit or !cont) {
+                    if (!cont) {
                         self.filled = chunk_at;
                         self.state.stopped = true;
                         self.finishSearch();
@@ -975,11 +993,30 @@ pub fn ReaderPull(comptime M: type) type {
                     }
                     skip_match = false;
                 }
-            } else if (!eof and cfg_mod.watchesBinary(self.config) and self.state.nul_offset == null) {
+            } else if (chunk_at < self.filled and cfg_mod.watchesBinary(self.config) and self.state.nul_offset == null) {
                 if (memchr.find(cfg_mod.width, self.buf[chunk_at..self.filled], 0, 0)) |rel| {
-                    state_mod.noteBinary(&self.state, self.config, self.state.abs_base + chunk_at + rel);
+                    const nul_idx = chunk_at + rel;
+                    if (self.config.binary == .quit) {
+                        const safe_end = state_mod.lineStart(self.buf[0..nul_idx], nul_idx, self.config);
+                        if (safe_end > self.state.pos) {
+                            if (!try line_matcher_mod.matchBuffer(PullBridge(M), &bridge, self.matcher, self.buf[0..safe_end], &self.state, self.config)) {
+                                self.state.stopped = true;
+                                self.finishSearch();
+                                self.phase = .done;
+                                return false;
+                            }
+                        }
+                        state_mod.noteBinary(&self.state, self.config, self.state.abs_base + nul_idx);
+                        _ = bridge.binary(self.state.nul_offset.?);
+                        self.filled = safe_end;
+                        self.state.stopped = true;
+                        self.finishSearch();
+                        self.phase = .done;
+                        return false;
+                    }
+                    state_mod.noteBinary(&self.state, self.config, self.state.abs_base + nul_idx);
                     const cont = bridge.binary(self.state.nul_offset.?);
-                    if (self.config.binary == .quit or !cont) {
+                    if (!cont) {
                         self.filled = chunk_at;
                         self.state.stopped = true;
                         self.finishSearch();

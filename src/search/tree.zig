@@ -804,6 +804,9 @@ pub fn searchTree(
             }
 
             var file_cfg = config.search;
+            if (file_cfg.buffer_size == config_mod.SearchConfig.default_buffer_size and config.max_concurrency > 1) {
+                file_cfg.buffer_size = config_mod.SearchConfig.optimalBufferSize(@intCast(@min(config.max_concurrency, std.math.maxInt(u32))));
+            }
             if (file_cfg.scratch_pool == null) {
                 file_cfg.scratch_pool = &scratch;
             }

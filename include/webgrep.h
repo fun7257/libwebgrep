@@ -1,6 +1,6 @@
 /**
  * @file webgrep.h
- * @brief C ABI and Cross-Language FFI Header for libwebgrep v0.4.0.
+ * @brief C ABI and Cross-Language FFI Header for libwebgrep v0.4.1.
  *
  * Thread-safe, zero-global-state SIMD literal, multi-pattern, and linear-time
  * regular expression search engine with in-memory archive and streaming reader support.
@@ -24,7 +24,7 @@ extern "C" {
 #define WEBGREP_VERSION_MAJOR 0
 #define WEBGREP_VERSION_MINOR 4
 #define WEBGREP_VERSION_PATCH 0
-#define WEBGREP_VERSION_STRING "0.4.0"
+#define WEBGREP_VERSION_STRING "0.4.1"
 
 /* ============================================================================
  * Status & Error Codes
@@ -297,7 +297,7 @@ typedef int (*webgrep_read_cb)(uint8_t *buf, size_t cap, size_t *out_n, void *us
  * Exported C ABI Functions (17 Functions)
  * ========================================================================= */
 
-/** 1. Returns the null-terminated semantic version string ("0.4.0"). */
+/** 1. Returns the null-terminated semantic version string ("0.4.1"). */
 const char *webgrep_version(void);
 
 /** 2. Returns default literal/multi find options by value. */

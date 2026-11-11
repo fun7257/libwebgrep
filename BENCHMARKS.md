@@ -1,6 +1,6 @@
-# libwebgrep Benchmarks (v0.4.0+)
+# libwebgrep Benchmarks (v0.4.1)
 
-This document records the reproducible `ReleaseFast` microbenchmarks ([`bench/micro.zig`](bench/micro.zig)) across `x86_64` (AMD Ryzen 7 7735U AVX2) and `aarch64` (Apple M2 NEON), the microarchitectural cache-hierarchy throughput curves, the `v0.3.0`–`v0.4.0+` engine specialization evaluations, and the **reproducible 17-scenario Warm Cache (`mincore=100%`) & Cold Disk (`fsync` + `POSIX_FADV_DONTNEED` + `mincore=0`) end-to-end comparative experiment against `ripgrep 15.2.0`** ([`bench/wg_cli.zig`](bench/wg_cli.zig) & [`bench/bench_driver.c`](bench/bench_driver.c)).
+This document records the reproducible `ReleaseFast` microbenchmarks ([`bench/micro.zig`](bench/micro.zig)) across `x86_64` (AMD Ryzen 7 7735U AVX2) and `aarch64` (Apple M2 NEON), the microarchitectural cache-hierarchy throughput curves, the `v0.3.0`–`v0.4.1` engine specialization evaluations, and the **reproducible 17-scenario Warm Cache (`mincore=100%`) & Cold Disk (`fsync` + `POSIX_FADV_DONTNEED` + `mincore=0`) end-to-end comparative experiment against `ripgrep 15.2.0`** ([`bench/wg_cli.zig`](bench/wg_cli.zig) & [`bench/bench_driver.c`](bench/bench_driver.c)).
 
 Run the in-process microbenchmark suite with:
 
@@ -22,7 +22,7 @@ zig build bench-cli -Doptimize=ReleaseFast -Dteddy=avx2
 1. **Microarchitectural Compute Peak vs. Memory Bandwidth Wall**:
    - Inside L1d / L2 cache on a single physical core (AMD Ryzen 7 7735U, Zen 3+, 32-byte AVX2 vectors), `libwebgrep` reaches **`147.8 GB/s`** (`memchr.findEither`), **`81.0 GB/s`** (`Finder` / `PackedPair`), **`67.2 GB/s`** (AVX2 `Teddy`), and **`63.8 GB/s`** (`Finder` case-insensitive).
    - Once the working set exceeds the 16 MiB L3 cache into 64 MiB DRAM, throughput converges to the single-core memory controller read bandwidth ceiling (**`20.4–28.2 GB/s`** on LPDDR5 `x86_64` with CV `0.10%–0.32%`, and **`24.1–62.4 GB/s`** on unified-memory Apple M2 `aarch64`).
-2. **Core Engine Capabilities (`v0.3.0`–`v0.4.0+`)**:
+2. **Core Engine Capabilities (`v0.3.0`–`v0.4.1`)**:
    - **`Scratch` Worker Buffer Pool**: Reduces heap allocations across `20,000 × 4 KiB` context-enabled streaming searches from `40,000` allocations (`81.25 GiB`) to **2 warmup allocations (`0` steady-state allocations)**, boosting throughput by **`44.7x` (`12,284 QPS → 549,368 QPS`, `1.82 µs/req`)**.
    - **`RegexSet` Single-Pass Multi-Regex**: Evaluates 256 prefixed regular expressions simultaneously at **`35.13 GB/s`** (**`266x` faster** than looping 256 individual `Regex.isMatch` calls at `0.132 GB/s`).
    - **Zero-Cost Polymorphism & C ABI ([`include/webgrep.h`](include/webgrep.h))**: Runtime-dispatched `AnyMatcher` + `AnyEventSink` incurs **`< 0.02%`** overhead vs. static generics, and the zero-`libc` C ABI (`webgrep_search_slice`) incurs **`< 0.4%`** FFI overhead.
@@ -33,7 +33,7 @@ zig build bench-cli -Doptimize=ReleaseFast -Dteddy=avx2
 
 ## 2. Test Environments
 
-| Property | Primary Linux `x86_64` Rig (`v0.4.0+`) | Reference macOS `aarch64` Rig |
+| Property | Primary Linux `x86_64` Rig (`v0.4.1`) | Reference macOS `aarch64` Rig |
 | :--- | :--- | :--- |
 | **Processor** | AMD Ryzen 7 7735U (Zen 3+, 8C/16T, up to `4.82 GHz`) | Apple M2 (8 cores, 8 GiB unified RAM) |
 | **Cache Topology** | L1d `32 KiB/core` \| L2 `512 KiB/core` \| **L3 `16 MiB` shared** | L1d `128/64 KiB` \| SLC + unified memory |

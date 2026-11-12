@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Build & Test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux (x86_64)
+            os: ubuntu-latest
+            arch: x86_64
+            teddy_simd: avx2
+          - name: Linux (arm64)
+            os: ubuntu-24.04-arm
+            arch: aarch64
+            teddy_simd: neon
+          - name: macOS (arm64)
+            os: macos-latest
+            arch: aarch64
+            teddy_simd: neon
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Zig 0.17.1
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+          use-cache: true
+
+      - name: Compile check (Native SIMD & scalar configurations)
+        run: |
+          zig build check -Dteddy=${{ matrix.teddy_simd }}
+          zig build check -Dteddy=off
+          zig build check -Dmmap-windows=true -Dteddy=${{ matrix.teddy_simd }}
+
+      - name: Compile check (Linux getdents64 + mmap-windows)
+        if: runner.os == 'Linux'
+        run: |
+          zig build check -Dlinux-getdents=true -Dmmap-windows=true -Dteddy=${{ matrix.teddy_simd }}
+
+      - name: Compile check (x86_64 SSSE3)
+        if: matrix.arch == 'x86_64'
+        run: |
+          zig build check -Dteddy=ssse3
+
+      - name: Compile check (macOS x86_64 cross-target)
+        if: runner.os == 'macOS'
+        run: |
+          zig build check -Dtarget=x86_64-macos -Dteddy=avx2
+
+      - name: Run unit, C ABI, and documentation tests (SIMD=${{ matrix.teddy_simd }})
+        run: zig build test -Dteddy=${{ matrix.teddy_simd }}
+
+      - name: Run unit, C ABI, and documentation tests (SIMD=off)
+        run: zig build test -Dteddy=off
+
+      - name: Verify ReleaseFast CLI compilation
+        run: zig build bench-cli -Doptimize=ReleaseFast -Dteddy=${{ matrix.teddy_simd }}

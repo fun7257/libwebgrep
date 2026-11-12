@@ -18,11 +18,14 @@ const CliArgs = struct {
     binary_policy: libwebgrep.BinaryPolicy = .quit,
     threads: u32 = 1,
     io_mode: IoMode = .no_mmap,
-    globs: [16][]const u8 = undefined,
-    globs_len: usize = 0,
-    patterns: [32][]const u8 = undefined,
-    patterns_len: usize = 0,
+    globs: std.ArrayList([]const u8) = .empty,
+    patterns: std.ArrayList([]const u8) = .empty,
     target_path: []const u8 = "",
+
+    pub fn deinit(self: *CliArgs, allocator: std.mem.Allocator) void {
+        self.globs.deinit(allocator);
+        self.patterns.deinit(allocator);
+    }
 };
 
 const CountSink = struct {};
@@ -184,6 +187,7 @@ pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
 
     var cli = CliArgs{};
+    defer cli.deinit(gpa);
     var argv_it = try init.minimal.args.iterateAllocator(gpa);
     defer argv_it.deinit();
     _ = argv_it.next(); // skip argv[0]
@@ -232,15 +236,11 @@ pub fn main(init: std.process.Init) !u8 {
                 continue;
             } else if (std.mem.eql(u8, arg, "-g") or std.mem.eql(u8, arg, "--glob")) {
                 const g = argv_it.next() orelse return 2;
-                if (cli.globs_len >= cli.globs.len) return 2;
-                cli.globs[cli.globs_len] = g;
-                cli.globs_len += 1;
+                try cli.globs.append(gpa, g);
                 continue;
             } else if (std.mem.eql(u8, arg, "-e") or std.mem.eql(u8, arg, "--regexp")) {
                 const p = argv_it.next() orelse return 2;
-                if (cli.patterns_len >= cli.patterns.len) return 2;
-                cli.patterns[cli.patterns_len] = p;
-                cli.patterns_len += 1;
+                try cli.patterns.append(gpa, p);
                 continue;
             } else if (std.mem.eql(u8, arg, "-j") or std.mem.eql(u8, arg, "--threads")) {
                 const j_str = argv_it.next() orelse return 2;
@@ -251,44 +251,43 @@ pub fn main(init: std.process.Init) !u8 {
                 return 2;
             }
         }
-        if (cli.patterns_len == 0 and positional_pat == null) {
+        if (cli.patterns.items.len == 0 and positional_pat == null) {
             positional_pat = arg;
         } else {
             cli.target_path = arg;
         }
     }
 
-    if (cli.patterns_len == 0) {
+    if (cli.patterns.items.len == 0) {
         if (positional_pat) |p| {
-            cli.patterns[0] = p;
-            cli.patterns_len = 1;
+            try cli.patterns.append(gpa, p);
         } else return 2;
     }
     if (cli.target_path.len == 0) return 2;
 
     const case_mode: libwebgrep.CaseMode = if (cli.ignore_case) .insensitive else .sensitive;
     var cm: CompiledMatcher = if (cli.fixed_strings) blk: {
-        if (cli.patterns_len == 1) {
-            break :blk .{ .finder = try libwebgrep.Finder.init(cli.patterns[0], .{ .case = case_mode }) };
+        if (cli.patterns.items.len == 1) {
+            break :blk .{ .finder = try libwebgrep.Finder.init(cli.patterns.items[0], .{ .case = case_mode }) };
         } else {
-            break :blk .{ .multi = try libwebgrep.Multi.init(gpa, cli.patterns[0..cli.patterns_len], .{ .case = case_mode }) };
+            break :blk .{ .multi = try libwebgrep.Multi.init(gpa, cli.patterns.items, .{ .case = case_mode }) };
         }
     } else blk: {
-        if (cli.patterns_len == 1) {
-            break :blk .{ .regex = libwebgrep.Regex.init(gpa, cli.patterns[0], .{
+        if (cli.patterns.items.len == 1) {
+            break :blk .{ .regex = libwebgrep.Regex.init(gpa, cli.patterns.items[0], .{
                 .case = case_mode,
                 .unicode_case = !cli.no_unicode,
             }) catch return 2 };
         } else {
             var total_len: usize = 0;
-            for (cli.patterns[0..cli.patterns_len], 0..) |pat, idx| {
+            for (cli.patterns.items, 0..) |pat, idx| {
                 if (idx > 0) total_len += 1;
                 total_len += 4 + pat.len;
             }
             const joined = try gpa.alloc(u8, total_len);
             defer gpa.free(joined);
             var pos: usize = 0;
-            for (cli.patterns[0..cli.patterns_len], 0..) |pat, idx| {
+            for (cli.patterns.items, 0..) |pat, idx| {
                 if (idx > 0) {
                     joined[pos] = '|';
                     pos += 1;
@@ -333,8 +332,8 @@ pub fn main(init: std.process.Init) !u8 {
             .line_numbers = cli.line_numbers,
         };
         const stats = try internal.parallel.run(gpa, io, .{
-            .pattern = if (cli.fixed_strings and cli.patterns_len == 1) cli.patterns[0] else "",
-            .patterns = if (cli.fixed_strings and cli.patterns_len > 1) cli.patterns[0..cli.patterns_len] else &.{},
+            .pattern = if (cli.fixed_strings and cli.patterns.items.len == 1) cli.patterns.items[0] else "",
+            .patterns = if (cli.fixed_strings and cli.patterns.items.len > 1) cli.patterns.items else &.{},
             .regex = switch (cm) {
                 .regex => |*r| r,
                 else => null,
@@ -350,7 +349,7 @@ pub fn main(init: std.process.Init) !u8 {
             .walk = .{
                 .threads = cli.threads,
                 .read_ignore = !cli.no_ignore,
-                .globs = cli.globs[0..cli.globs_len],
+                .globs = cli.globs.items,
             },
             .enforce_service_budgets = false,
             .use_mmap = (cli.io_mode == .mmap),

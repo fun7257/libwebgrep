@@ -56,6 +56,7 @@ pub const Run = struct {
     roots: []const []const u8,
     search: searcher.SearchConfig = .{},
     walk: walker.Config = .{},
+    max_threads: ?u32 = null,
     /// When true (default), applies multi-tenant default byte and time budgets matching `serviceConfig`.
     /// Set to false for unconstrained local CLI/benchmark directory runs.
     enforce_service_budgets: bool = true,
@@ -224,7 +225,7 @@ fn alignBudgets(search: searcher.SearchConfig, walk: walker.Config, enforce_defa
 }
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, req: Run) !Stats {
-    const workers = resolveConcurrency(req.walk.threads, req.search.max_concurrency);
+    const workers = resolveConcurrencyWithCap(req.walk.threads, req.search.max_concurrency, req.max_threads);
     const budgets = alignBudgets(req.search, req.walk, req.enforce_service_budgets);
     var walk_cfg = budgets.walk;
     walk_cfg.threads = workers;
@@ -650,16 +651,25 @@ const Tally = struct {
 };
 
 /// Worker thread count is determined strictly by caller configuration and never probes the host CPU core count.
-/// Defaults to 1 (single-threaded) when unspecified (0) and is capped at `max_concurrency_hard_cap`.
-pub fn resolveThreads(requested: u32) u32 {
+/// Defaults to 1 (single-threaded) when unspecified (0). Clamped to `cap` only when `cap` is non-null.
+pub fn resolveThreadsWithCap(requested: u32, cap: ?u32) u32 {
     if (builtin.single_threaded) return 1;
     if (requested == 0) return 1;
-    return @min(requested, max_concurrency_hard_cap);
+    if (cap) |c| return @min(requested, c);
+    return requested;
+}
+
+pub fn resolveThreads(requested: u32) u32 {
+    return resolveThreadsWithCap(requested, null);
 }
 
 pub fn resolveConcurrency(walk_threads: u32, max_concurrency: ?u32) u32 {
-    if (max_concurrency) |mc| return resolveThreads(mc);
-    return resolveThreads(walk_threads);
+    return resolveConcurrencyWithCap(walk_threads, max_concurrency, null);
+}
+
+pub fn resolveConcurrencyWithCap(walk_threads: u32, max_concurrency: ?u32, cap: ?u32) u32 {
+    if (max_concurrency) |mc| return resolveThreadsWithCap(mc, cap);
+    return resolveThreadsWithCap(walk_threads, cap);
 }
 
 test "thread count is strictly bounded without probing CPU core count" {
@@ -668,8 +678,10 @@ test "thread count is strictly bounded without probing CPU core count" {
     if (!builtin.single_threaded) {
         try testing.expectEqual(@as(u32, 4), resolveThreads(4));
         try testing.expectEqual(@as(u32, 6), resolveConcurrency(2, 6));
-        try testing.expectEqual(max_concurrency_hard_cap, resolveThreads(999));
-        try testing.expectEqual(max_concurrency_hard_cap, resolveConcurrency(1, 999));
+        try testing.expectEqual(@as(u32, 999), resolveThreads(999));
+        try testing.expectEqual(@as(u32, 999), resolveConcurrency(1, 999));
+        try testing.expectEqual(max_concurrency_hard_cap, resolveThreadsWithCap(999, max_concurrency_hard_cap));
+        try testing.expectEqual(max_concurrency_hard_cap, resolveConcurrencyWithCap(1, 999, max_concurrency_hard_cap));
     }
 }
 

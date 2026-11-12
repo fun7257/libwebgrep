@@ -52,6 +52,10 @@ pub const TreeConfig = struct {
     max_filesize: ?u64 = null,
     max_concurrency: usize = 1,
     files: bool = false,
+    max_ignore_file_bytes: usize = max_ignore_file_bytes,
+    max_glob_rules: ?usize = null,
+    max_glob_rule_len: ?usize = null,
+    max_glob_brace_depth: ?usize = null,
 };
 
 fn markSummaryIncomplete(summary: *sink_mod.Summary) void {
@@ -192,17 +196,17 @@ fn loadDirectoryIgnoreSet(
         if (config.respect_gitignore) {
             const p = try joinPath(gpa, dir_full_path, ".gitignore");
             defer gpa.free(p);
-            gitignore_bytes = readVirtualFileBounded(gpa, io, src, p, max_ignore_file_bytes);
+            gitignore_bytes = readVirtualFileBounded(gpa, io, src, p, config.max_ignore_file_bytes);
         }
         if (config.respect_ignore) {
             const p = try joinPath(gpa, dir_full_path, ".ignore");
             defer gpa.free(p);
-            ignore_bytes = readVirtualFileBounded(gpa, io, src, p, max_ignore_file_bytes);
+            ignore_bytes = readVirtualFileBounded(gpa, io, src, p, config.max_ignore_file_bytes);
         }
         if (config.respect_rgignore) {
             const p = try joinPath(gpa, dir_full_path, ".rgignore");
             defer gpa.free(p);
-            rgignore_bytes = readVirtualFileBounded(gpa, io, src, p, max_ignore_file_bytes);
+            rgignore_bytes = readVirtualFileBounded(gpa, io, src, p, config.max_ignore_file_bytes);
         }
     }
 
@@ -225,6 +229,9 @@ fn loadDirectoryIgnoreSet(
                 .dot = config.respect_ignore or config.respect_rgignore,
                 .exclude = false,
                 .case_insensitive = config.ignore_case_insensitive,
+                .max_rules = config.max_glob_rules,
+                .max_rule_len = config.max_glob_rule_len,
+                .max_brace_depth = config.max_glob_brace_depth,
             },
             &ig_list,
         );
@@ -235,7 +242,12 @@ fn loadDirectoryIgnoreSet(
             arena,
             config.ignore_texts,
             &ig_list,
-            .{ .case_insensitive = config.ignore_case_insensitive },
+            .{
+                .case_insensitive = config.ignore_case_insensitive,
+                .max_rules = config.max_glob_rules,
+                .max_rule_len = config.max_glob_rule_len,
+                .max_brace_depth = config.max_glob_brace_depth,
+            },
         );
     }
 
@@ -723,14 +735,26 @@ pub fn searchTree(
     const arena = arena_state.allocator();
 
     // Compile globs and iglobs
-    const regular_globs = try glob_mod.compileGlobs(arena, config.globs, .{ .case_insensitive = config.iglob });
-    const insensitive_globs = try glob_mod.compileGlobs(arena, config.iglobs, .{ .case_insensitive = true });
+    const max_glob_rules = config.max_glob_rules orelse glob_mod.rule_count_hard_cap;
+    const regular_globs = try glob_mod.compileGlobs(arena, config.globs, .{
+        .case_insensitive = config.iglob,
+        .max_rules = max_glob_rules,
+        .max_rule_len = config.max_glob_rule_len,
+        .max_brace_depth = config.max_glob_brace_depth,
+    });
+    if (config.iglobs.len > 0 and regular_globs.len >= max_glob_rules) return error.GlobCountExceeded;
+    const insensitive_globs = if (config.iglobs.len > 0) try glob_mod.compileGlobs(arena, config.iglobs, .{
+        .case_insensitive = true,
+        .max_rules = max_glob_rules - regular_globs.len,
+        .max_rule_len = config.max_glob_rule_len,
+        .max_brace_depth = config.max_glob_brace_depth,
+    }) else &.{};
     var user_globs = try arena.alloc(glob_mod.Glob, regular_globs.len + insensitive_globs.len);
     if (regular_globs.len > 0) @memcpy(user_globs[0..regular_globs.len], regular_globs);
     if (insensitive_globs.len > 0) @memcpy(user_globs[regular_globs.len..], insensitive_globs);
 
-    const max_depth = @min(config.max_depth, max_depth_hard_cap);
-    const max_entries = @min(config.max_entries, max_entries_hard_cap);
+    const max_depth = config.max_depth;
+    const max_entries = config.max_entries;
     var seen_entries: u64 = 0;
 
     var files_list: std.ArrayList(WalkItem) = .empty;

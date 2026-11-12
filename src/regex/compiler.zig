@@ -42,6 +42,8 @@ pub const Compiler = struct {
     capture_count: u8 = 0,
     capture_positions: [9]usize = @splat(std.math.maxInt(usize)),
     max_inst: usize,
+    max_repeat: usize = inst_mod.default_max_repeat,
+    max_recursion_depth: usize = inst_mod.default_max_recursion_depth,
     insts: std.ArrayList(Inst) = .empty,
     unicode_ranges: std.ArrayList(UnicodeRangeList) = .empty,
     has_lazy: bool = false,
@@ -365,7 +367,7 @@ pub const Compiler = struct {
             val = std.math.add(usize, val, self.pattern[self.pos] - '0') catch {
                 return self.fail(error.RegexTooLarge, .instruction_limit_exceeded, brace_pos, "repeat count overflow");
             };
-            if (val > inst_mod.max_repeat_hard_cap or val > self.max_inst) {
+            if (val > self.max_repeat or val > self.max_inst) {
                 return self.fail(error.RegexTooLarge, .instruction_limit_exceeded, brace_pos, "repeat count exceeds maximum limit");
             }
         }
@@ -440,8 +442,8 @@ pub const Compiler = struct {
         switch (c) {
             '(' => {
                 const paren_pos = self.pos;
-                if (self.depth >= inst_mod.max_recursion_depth) {
-                    return self.fail(error.RegexTooLarge, .recursion_depth_exceeded, paren_pos, "group nesting depth exceeds maximum (64)");
+                if (self.depth >= self.max_recursion_depth) {
+                    return self.fail(error.RegexTooLarge, .recursion_depth_exceeded, paren_pos, "group nesting depth exceeds maximum");
                 }
                 self.pos += 1;
                 if (self.pos < self.pattern.len and self.pattern[self.pos] == '?') {

@@ -327,9 +327,9 @@ fn expandRecursive(
     include_cross_ascii: bool,
     prefix: *std.ArrayList(u8),
     out_list: *std.ArrayList([]u8),
-    max_variants: usize,
+    limit: usize,
 ) error{OutOfMemory}!void {
-    if (out_list.items.len >= max_variants) return;
+    if (out_list.items.len >= limit) return;
     if (pos >= pattern.len) {
         const copy = try allocator.dupe(u8, prefix.items);
         errdefer allocator.free(copy);
@@ -343,49 +343,49 @@ fn expandRecursive(
         if (include_cross_ascii and (b == 'k' or b == 'K')) {
             // Original ASCII byte (handled by ASCII case-folding or case-sensitive matching) + U+212A
             try prefix.append(allocator, b);
-            try expandRecursive(allocator, pattern, pos + 1, include_cross_ascii, prefix, out_list, max_variants);
+            try expandRecursive(allocator, pattern, pos + 1, include_cross_ascii, prefix, out_list, limit);
             prefix.shrinkRetainingCapacity(saved_len);
 
             var utf8_buf: [4]u8 = undefined;
             const n = std.unicode.utf8Encode(0x212A, &utf8_buf) catch unreachable;
             try prefix.appendSlice(allocator, utf8_buf[0..n]);
-            try expandRecursive(allocator, pattern, pos + 1, include_cross_ascii, prefix, out_list, max_variants);
+            try expandRecursive(allocator, pattern, pos + 1, include_cross_ascii, prefix, out_list, limit);
             prefix.shrinkRetainingCapacity(saved_len);
             return;
         }
         if (include_cross_ascii and (b == 's' or b == 'S')) {
             try prefix.append(allocator, b);
-            try expandRecursive(allocator, pattern, pos + 1, include_cross_ascii, prefix, out_list, max_variants);
+            try expandRecursive(allocator, pattern, pos + 1, include_cross_ascii, prefix, out_list, limit);
             prefix.shrinkRetainingCapacity(saved_len);
 
             var utf8_buf: [4]u8 = undefined;
             const n = std.unicode.utf8Encode(0x017F, &utf8_buf) catch unreachable;
             try prefix.appendSlice(allocator, utf8_buf[0..n]);
-            try expandRecursive(allocator, pattern, pos + 1, include_cross_ascii, prefix, out_list, max_variants);
+            try expandRecursive(allocator, pattern, pos + 1, include_cross_ascii, prefix, out_list, limit);
             prefix.shrinkRetainingCapacity(saved_len);
             return;
         }
         try prefix.append(allocator, b);
-        try expandRecursive(allocator, pattern, pos + 1, include_cross_ascii, prefix, out_list, max_variants);
+        try expandRecursive(allocator, pattern, pos + 1, include_cross_ascii, prefix, out_list, limit);
         prefix.shrinkRetainingCapacity(saved_len);
         return;
     }
 
     const len = std.unicode.utf8ByteSequenceLength(b) catch {
         try prefix.append(allocator, b);
-        try expandRecursive(allocator, pattern, pos + 1, include_cross_ascii, prefix, out_list, max_variants);
+        try expandRecursive(allocator, pattern, pos + 1, include_cross_ascii, prefix, out_list, limit);
         prefix.shrinkRetainingCapacity(saved_len);
         return;
     };
     if (pos + len > pattern.len) {
         try prefix.appendSlice(allocator, pattern[pos..]);
-        try expandRecursive(allocator, pattern, pattern.len, include_cross_ascii, prefix, out_list, max_variants);
+        try expandRecursive(allocator, pattern, pattern.len, include_cross_ascii, prefix, out_list, limit);
         prefix.shrinkRetainingCapacity(saved_len);
         return;
     }
     const cp = std.unicode.utf8Decode(pattern[pos .. pos + len]) catch {
         try prefix.appendSlice(allocator, pattern[pos .. pos + len]);
-        try expandRecursive(allocator, pattern, pos + len, include_cross_ascii, prefix, out_list, max_variants);
+        try expandRecursive(allocator, pattern, pos + len, include_cross_ascii, prefix, out_list, limit);
         prefix.shrinkRetainingCapacity(saved_len);
         return;
     };
@@ -396,7 +396,7 @@ fn expandRecursive(
         var utf8_buf: [4]u8 = undefined;
         const enc_len = std.unicode.utf8Encode(alt_cp, &utf8_buf) catch continue;
         try prefix.appendSlice(allocator, utf8_buf[0..enc_len]);
-        try expandRecursive(allocator, pattern, pos + len, include_cross_ascii, prefix, out_list, max_variants);
+        try expandRecursive(allocator, pattern, pos + len, include_cross_ascii, prefix, out_list, limit);
         prefix.shrinkRetainingCapacity(saved_len);
     }
 }

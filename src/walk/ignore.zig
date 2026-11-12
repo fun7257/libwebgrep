@@ -34,7 +34,11 @@ pub const Set = struct {
 pub const ParseOptions = struct {
     case_insensitive: bool = false,
     max_rules: ?usize = null,
+    max_rule_len: ?usize = null,
+    max_brace_depth: ?usize = null,
 };
+pub const Options = ParseOptions;
+pub const AddOptions = ParseOptions;
 
 pub const LayerFiles = struct {
     git_exclude: ?[]const u8 = null,
@@ -54,6 +58,8 @@ pub const LayerSwitch = struct {
     case_insensitive: bool = false,
     /// Maximum number of rules parsed per call (bounded by the hard cap).
     max_rules: ?usize = null,
+    max_rule_len: ?usize = null,
+    max_brace_depth: ?usize = null,
 };
 
 /// Parses an ignore file and appends its globs. `text` is duplicated into `allocator`.
@@ -68,13 +74,14 @@ pub fn parseIntoWithOptions(
     out: *std.ArrayList(glob.Glob),
     options: ParseOptions,
 ) !void {
-    const cap = if (options.max_rules) |m| @min(m, glob.rule_count_hard_cap) else glob.rule_count_hard_cap;
+    const cap = options.max_rules orelse glob.rule_count_hard_cap;
+    const max_len = options.max_rule_len orelse glob.rule_len_hard_cap;
     var line_start: usize = 0;
     while (line_start <= text.len) {
         const line_end = std.mem.indexOfScalarPos(u8, text, line_start, '\n') orelse text.len;
         var line = text[line_start..line_end];
         if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-        if (try parseLineWithOptions(allocator, line, options.case_insensitive)) |item| {
+        if (try parseLineWithLimits(allocator, line, options.case_insensitive, max_len)) |item| {
             if (out.items.len >= cap) return error.GlobCountExceeded;
             try out.append(allocator, item);
         }
@@ -105,6 +112,8 @@ pub fn parseLayerInto(
     const opts = ParseOptions{
         .case_insensitive = switches.case_insensitive,
         .max_rules = switches.max_rules,
+        .max_rule_len = switches.max_rule_len,
+        .max_brace_depth = switches.max_brace_depth,
     };
     if (switches.exclude) {
         if (files.git_exclude) |bytes| try parseIntoWithOptions(allocator, bytes, out, opts);
@@ -129,7 +138,16 @@ pub fn parseLineWithOptions(
     line: []const u8,
     case_insensitive: bool,
 ) !?glob.Glob {
-    if (line.len > glob.rule_len_hard_cap) return error.GlobTooLong;
+    return parseLineWithLimits(allocator, line, case_insensitive, glob.rule_len_hard_cap);
+}
+
+pub fn parseLineWithLimits(
+    allocator: std.mem.Allocator,
+    line: []const u8,
+    case_insensitive: bool,
+    max_rule_len: usize,
+) !?glob.Glob {
+    if (line.len > max_rule_len) return error.GlobTooLong;
     const trimmed = stripTrailingSpace(line);
     if (trimmed.len == 0 or trimmed[0] == '#') return null;
 

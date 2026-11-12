@@ -62,10 +62,15 @@ pub const CaseMode = enum {
     smart,
 };
 
-/// Hard cap on pattern count. Callers may lower the limit, but cannot exceed this value.
-pub const pattern_count_hard_cap: usize = 1024;
-/// Hard cap on total byte length across all patterns, summed over each pattern's length.
-pub const pattern_bytes_hard_cap: usize = 256 * 1024;
+/// Default maximum number of patterns. Callers may override via FindOptions.max_pattern_count.
+pub const default_max_pattern_count: usize = 1024;
+/// Default maximum total byte length across all patterns. Callers may override via FindOptions.max_pattern_bytes.
+pub const default_max_pattern_bytes: usize = 256 * 1024;
+
+/// Compatibility alias for default_max_pattern_count.
+pub const pattern_count_hard_cap: usize = default_max_pattern_count;
+/// Compatibility alias for default_max_pattern_bytes.
+pub const pattern_bytes_hard_cap: usize = default_max_pattern_bytes;
 
 pub const LimitError = error{
     PatternCountExceeded,
@@ -83,23 +88,25 @@ pub const FindOptions = struct {
     /// subsequent searches switch to Two-Way. Set to 1 or greater to stay in packed pair.
     /// Patterns of 32 bytes or fewer do not use this threshold.
     prefilter_fp_threshold: f32 = 0.80,
-    /// Maximum number of patterns. Null uses the hard cap; values above the hard cap are still rejected at the hard cap.
+    /// Maximum number of patterns. Null uses default_max_pattern_count (1024).
     max_pattern_count: ?usize = null,
-    /// Maximum total pattern bytes. Null uses the hard cap; values above the hard cap are still rejected at the hard cap.
+    /// Maximum total pattern bytes. Null uses default_max_pattern_bytes (256 KiB).
     max_pattern_bytes: ?usize = null,
+    /// Maximum Unicode variants per pattern expanded during case-insensitive folding. Defaults to 64.
+    max_unicode_variants: usize = 64,
 };
 
 pub fn patternCountLimit(options: FindOptions) usize {
-    return @min(options.max_pattern_count orelse pattern_count_hard_cap, pattern_count_hard_cap);
+    return options.max_pattern_count orelse default_max_pattern_count;
 }
 
 pub fn patternBytesLimit(options: FindOptions) usize {
-    return @min(options.max_pattern_bytes orelse pattern_bytes_hard_cap, pattern_bytes_hard_cap);
+    return options.max_pattern_bytes orelse default_max_pattern_bytes;
 }
 
 /// Called before allocating automata, Teddy tables, or pair tables. Rejects before searching begins if limits are exceeded.
 pub fn checkPatternLimits(patterns: []const []const u8, options: FindOptions) LimitError!void {
-    if (patterns.len > patternCountLimit(options)) return error.PatternCountExceeded;
+    if (patterns.len > patternCountLimit(options) or patterns.len > std.math.maxInt(u32)) return error.PatternCountExceeded;
     const byte_limit = patternBytesLimit(options);
     var total: usize = 0;
     for (patterns) |pat| {

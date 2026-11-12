@@ -184,12 +184,29 @@ pub const SearchConfig = struct {
     log_ctx: ?*anyopaque = null,
 };
 
+pub const RingSlot = struct {
+    len: u32 = 0,
+    abs: u64 = 0,
+    end_abs: u64 = 0,
+    number: ?u64 = null,
+    truncated: bool = false,
+    line_len: u64 = 0,
+    window_start: u64 = 0,
+    mstart: u32 = 0,
+    mend: u32 = 0,
+    mpid: ?u32 = null,
+    has_match: bool = false,
+    src_start: usize = 0,
+    src_end: usize = 0,
+};
+
 /// Reusable scratch buffer pool across multiple searches on the same worker thread.
 /// Retains allocated buffers across searches and frees them all in `deinit()`.
 pub const Scratch = struct {
     allocator: std.mem.Allocator,
     stream_buf: []u8 = &.{},
     ring_storage: []u8 = &.{},
+    ring_slots: []RingSlot = &.{},
     long_hold: []u8 = &.{},
     long_seen: []bool = &.{},
     text_buf: []u8 = &.{},
@@ -208,6 +225,7 @@ pub const Scratch = struct {
     pub fn deinit(self: *Scratch) void {
         if (self.stream_buf.len != 0) self.allocator.free(self.stream_buf);
         if (self.ring_storage.len != 0) self.allocator.free(self.ring_storage);
+        if (self.ring_slots.len != 0) self.allocator.free(self.ring_slots);
         if (self.long_hold.len != 0) self.allocator.free(self.long_hold);
         if (self.long_seen.len != 0) self.allocator.free(self.long_seen);
         if (self.text_buf.len != 0) self.allocator.free(self.text_buf);
@@ -264,13 +282,11 @@ pub fn serviceConfig(config: SearchConfig) SearchConfig {
     if (cfg.max_output_bytes == null) cfg.max_output_bytes = SearchConfig.default_max_output_bytes;
     if (cfg.max_decode_bytes == null) cfg.max_decode_bytes = SearchConfig.default_max_decode_bytes;
     if (cfg.max_queued_event_bytes == null) {
-        const want = @max(cfg.max_line_len, SearchConfig.default_max_queued_event_bytes);
-        cfg.max_queued_event_bytes = @min(want, SearchConfig.max_queued_event_bytes_hard_cap);
+        cfg.max_queued_event_bytes = @max(cfg.max_line_len, SearchConfig.default_max_queued_event_bytes);
     }
     if (cfg.max_before_bytes == null) {
         const need = beforeContextCapacity(cfg);
-        const want = @max(need, SearchConfig.default_max_before_bytes);
-        cfg.max_before_bytes = @min(want, SearchConfig.max_before_bytes_hard_cap);
+        cfg.max_before_bytes = @max(need, SearchConfig.default_max_before_bytes);
     }
     return cfg;
 }
@@ -291,18 +307,12 @@ pub fn decodeCap(config: SearchConfig) usize {
 
 pub fn validateBudgets(config: SearchConfig) error{ ContextLinesExceeded, BudgetExceeded, BufferLimit }!void {
     try rejectWideContext(config);
-    if (config.max_line_len > SearchConfig.max_line_len_hard_cap) return error.BudgetExceeded;
-    if (config.max_source_bytes) |n| if (n > SearchConfig.max_source_bytes_hard_cap) return error.BudgetExceeded;
-    if (config.max_request_bytes) |n| if (n > SearchConfig.max_request_bytes_hard_cap) return error.BudgetExceeded;
-    if (config.time_budget_ns) |n| if (n > SearchConfig.max_time_budget_ns) return error.BudgetExceeded;
-    if (config.max_output_bytes) |n| if (n > SearchConfig.max_output_bytes_hard_cap) return error.BudgetExceeded;
-    if (config.max_decode_bytes) |n| if (n > SearchConfig.max_decode_bytes_hard_cap) return error.BudgetExceeded;
-    if (config.max_queued_event_bytes) |n| if (n > SearchConfig.max_queued_event_bytes_hard_cap) return error.BudgetExceeded;
-    if (config.max_before_bytes) |n| if (n > SearchConfig.max_before_bytes_hard_cap) return error.BudgetExceeded;
-    if (config.max_decompressed_bytes) |n| if (n > SearchConfig.max_source_bytes_hard_cap) return error.BudgetExceeded;
-    if (config.max_compression_ratio) |r| if (r == 0 or r > decompress.max_compression_ratio_hard_cap) return error.BudgetExceeded;
-    const before_cap = config.max_before_bytes orelse SearchConfig.max_before_bytes_hard_cap;
-    if (beforeContextCapacity(config) > before_cap) return error.BufferLimit;
+    if (config.max_line_len == std.math.maxInt(usize)) return error.BudgetExceeded;
+    if (config.max_compression_ratio) |r| if (r == 0) return error.BudgetExceeded;
+    const need_before = std.math.mul(usize, @as(usize, beforeCount(config)), config.max_line_len) catch return error.BufferLimit;
+    if (config.max_before_bytes) |before_cap| {
+        if (need_before > before_cap) return error.BufferLimit;
+    }
 }
 
 
@@ -328,8 +338,7 @@ pub fn binaryStatus(config: SearchConfig, nul: ?u64) sink_mod.BinaryStatus {
 
 
 pub fn contextLineLimit(config: SearchConfig) u32 {
-    const hard = SearchConfig.context_lines_hard_cap;
-    return @min(config.max_context_lines orelse hard, hard);
+    return config.max_context_lines orelse SearchConfig.context_lines_hard_cap;
 }
 
 pub fn rejectWideContext(config: SearchConfig) error{ContextLinesExceeded}!void {

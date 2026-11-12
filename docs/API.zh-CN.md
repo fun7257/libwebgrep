@@ -75,7 +75,7 @@ pub fn deinit(self: *Multi) void
 pub fn find(self: *Multi, haystack: []const u8, start: usize, mode: MatchMode) ?Match
 ```
 
-- **构造前硬顶保护**：模式条数硬顶 `1024`（`pattern_count_hard_cap`），总字节硬顶 `256 KiB`（`pattern_bytes_hard_cap`），超限在分配表之前返回 `error.PatternCountExceeded` 或 `error.PatternBytesExceeded`。
+- **构造前保护与灵活配置**：模式条数默认上限 `1024`（`default_max_pattern_count`），总字节默认上限 `256 KiB`（`default_max_pattern_bytes`），调用方可通过 `FindOptions` 自由上调或下调；超限在分配表之前返回 `error.PatternCountExceeded` 或 `error.PatternBytesExceeded`。
 - **按单条模式智能大小写（`CaseMode.smart`）**：每条模式独立判断（全小写才忽略大小写，含大写则区分大小写）。设置 `FindOptions.unicode_case = true` 时启用 Unicode 简单大小写折叠（Simple Case Folding）。
 - **四级自动加速**：按模式特征自动选择 `ByteSet`（34.2 GB/s）→ `RarePair`（32.2 GB/s）→ `Teddy`（24.1 GB/s）→ `AhoCorasick`（稠密 DFA + 64B 高半字节 SIMD 跳步，24.3 GB/s）。构造完成后只读，可安全在多线程间共享。
 
@@ -88,15 +88,15 @@ pub fn find(self: *Regex, haystack: []const u8, start: usize, mode: MatchMode) ?
 ```
 
 - **语法支持**：字符类 `[a-z0-9_]` / `[^...]`、预定义类 `\d` `\D` `\w` `\W` `\s` `\S`、通配符 `.`、行/流锚点 `^` `$`、量词 `*` `+` `?` `{m}` `{m,}` `{m,n}`、交替 `a|b` 与分组 `(...)` / `(?:...)`。
-- **绝对防 ReDoS**：采用锁步 Thompson NFA / PikeVM 执行，每个输入字节上每条指令最多激活 1 次，最坏时间复杂度严格为 $O(n)$；内置编译指令数硬顶 `4096`，超限返回 `error.RegexTooLarge`。
+- **绝对防 ReDoS**：采用锁步 Thompson NFA / PikeVM 执行，每个输入字节上每条指令最多激活 1 次，最坏时间复杂度严格为 $O(n)$；默认编译指令数上限 `8192`（可通过 `max_inst` 按需上调或下调），超限返回 `error.RegexTooLarge`。
 - **SIMD 字面量双预过滤**：自动从 AST 提取必需的前缀与尾随字面量（`RequiredLiteral`）并挂载 `Finder` 做 42.9 GB/s SIMD 预过滤。
-- **有界窗口跨行（`RegexOptions.multiline`）**：跨行跨度严格限制在 `max_multiline_window`（默认 `64 KiB`，硬顶 `8 MiB`）内，窗口耗尽仍未闭合匹配时立即判定失配。
+- **有界窗口跨行（`RegexOptions.multiline`）**：跨行跨度严格限制在 `max_multiline_window`（默认 `64 KiB`，支持调用方按需配置）内，窗口耗尽仍未闭合匹配时立即判定失配。
 
 ---
 
 ## 四、`SearchConfig` 完整配置表
 
-| 字段名 | 类型 | 结构体默认值 | 服务入口默认值 / 服务端硬顶 | 功能说明 |
+| 字段名 | 类型 | 结构体默认值 | 服务入口默认值 / 配置行为 | 功能说明 |
 | :--- | :--- | :--- | :--- | :--- |
 | `line_numbers` | `bool` | `false` | 服务入口强制 `true` | 是否计算从 1 开始的行号 |
 | `invert` | `bool` | `false` | `false` | 按行反选（交出不匹配的行） |
@@ -108,8 +108,9 @@ pub fn find(self: *Regex, haystack: []const u8, start: usize, mode: MatchMode) ?
 | `filter_smart_case` | `bool` | `false` | `false` | `contains` 与 `excludes` 按每条过滤词独立评估智能大小写 |
 | `contains_regexes` | `[]const Regex` | `&.{}` | `&.{}` | 行内必须全部命中的已编译正则列表（AND） |
 | `excludes_regexes` | `[]const Regex` | `&.{}` | `&.{}` | 行内不得命中的已编译正则列表（NOT） |
-| `context` | `u32` | `0` | 硬顶 `10` 行 | 对称的前后上下文行数 |
-| `before` / `after` | `?u32` | `null` | 硬顶 `10` 行 | 单独指定前置 / 后置上下文行数 |
+| `context` | `u32` | `0` | 默认上限 `10` 行（可通过 `max_context_lines` 配置） | 对称的前后上下文行数 |
+| `before` / `after` | `?u32` | `null` | 默认上限 `10` 行（可通过 `max_context_lines` 配置） | 单独指定前置 / 后置上下文行数 |
+| `max_context_lines` | `?u32` | `null` | 默认 `10` 行（可按需上调或下调） | 最大允许的上下文行数上限 |
 | `passthru` | `bool` | `false` | `false` | 全文高亮模式：未命中行作为 `context` 交出，受 `max_output_bytes` 约束 |
 | `replacement` | `?[]const u8` | `null` | `null` | 只读替换预览模板（填充 `Span.replacement` 与 `LineEvent.replaced`，不改原输入） |
 | `max_count` | `?u64` | `null` | 不限 | 单来源最大匹配行数（达到后 `outcome = .stopped`） |
@@ -123,17 +124,17 @@ pub fn find(self: *Regex, haystack: []const u8, start: usize, mode: MatchMode) ?
 | `encoding` | `Encoding` | `.auto` | `.auto` | 编码处理：`.auto`（嗅探 BOM 或用 `charset`）、`.utf8`、`.utf16le/be`、`.gbk`、`.latin1`、`.none` |
 | `charset` | `?[]const u8` | `null` | `null` | WHATWG 标签或 HTTP `Content-Type` 字符集提示（如 `"gbk"`） |
 | `compression` | `Compression` | `.none` | `.none` | 进程内流式解压：`.none`、`.auto`（魔数识别）、`.gzip`、`.zstd`、`.xz` |
-| `max_compression_ratio` | `?u64` | `null` | 默认 `100`，硬顶 `1000` | 最大允许解压膨胀比（拦截压缩炸弹） |
+| `max_compression_ratio` | `?u64` | `null` | 默认 `100`（调用方可配置） | 最大允许解压膨胀比（拦截压缩炸弹） |
 | `max_decompressed_bytes` | `?u64` | `null` | 开启解压时默认 `64 MiB` | 最大解压产出字节上限（超限记为 `LimitHit.decompressed_bytes`） |
 | `decode_allocator` | `?Allocator` | `null` | `null` | 切片入口在需要转码/解压/生成替换预览时使用的分配器 |
 | `buffer_size` | `usize` | `1 MiB` | `1 MiB` | 流式读取滚动缓冲区大小 |
-| `max_line_len` | `usize` | `2 MiB` | 硬顶 `8 MiB` | 单行最大长度上限（超长行进入恒定内存滑窗预览） |
+| `max_line_len` | `usize` | `2 MiB` | 默认 `2 MiB`（调用方可配置） | 单行最大长度上限（超长行进入恒定内存滑窗预览） |
 | `match_mode` | `MatchMode` | `.earliest` | `.earliest` | `.earliest`（最早结束优先）或 `.leftmost_first`（最左起点优先） |
 | `scratch` | `?*[]u8` | `null` | `null` | 供 `searchSource` / `searchReader` 跨调用复用的缓冲区指针 |
-| `max_source_bytes` | `?u64` | `null` | 默认 `16 MiB`，硬顶 `64 MiB` | 单个来源最大扫描字节预算 |
-| `max_request_bytes` | `?u64` | `null` | 默认 `16 MiB`，硬顶 `64 MiB` | 单次请求最大扫描字节预算 |
-| `max_output_bytes` | `?u64` | `null` | 默认 `1 MiB`，硬顶 `8 MiB` | 行事件累计输出字节上限 |
-| `time_budget_ns` | `?u64` | `null` | 默认 `30s`，硬顶 `120s` | 纳秒级单调时钟超时预算（`LimitHit.deadline`） |
+| `max_source_bytes` | `?u64` | `null` | 默认 `16 MiB`（调用方可配置） | 单个来源最大扫描字节预算 |
+| `max_request_bytes` | `?u64` | `null` | 默认 `16 MiB`（调用方可配置） | 单次请求最大扫描字节预算 |
+| `max_output_bytes` | `?u64` | `null` | 默认 `1 MiB`（调用方可配置） | 行事件累计输出字节上限 |
+| `time_budget_ns` | `?u64` | `null` | 默认 `30s`（调用方可配置） | 纳秒级单调时钟超时预算（`LimitHit.deadline`） |
 | `cancel` | `?*const Atomic(bool)` | `null` | `null` | 原子取消令牌（置真后立即停止并触发 `LimitHit.cancelled`） |
 
 ---
@@ -154,13 +155,13 @@ pub fn find(self: *Regex, haystack: []const u8, start: usize, mode: MatchMode) ?
 ### 2. `Result`（搜索返回值）与三态错误分离
 - **无匹配**：函数正常返回 `Result`，`soft_error == null` 且 `matched_lines == 0`，`begin` 和 `end` 事件照常发出。
 - **单来源软错误**：上游读取失败或压缩流损坏时，函数仍正常返回 `Result`，`soft_error == .read_failed`（不含任何服务器内部路径）。
-- **致命错误**：配置超硬顶（`error.BudgetExceeded`）、上下文超限（`error.ContextLinesExceeded`）或内存不足（`error.OutOfMemory`）通过 Zig 错误联合直接返回。
+- **致命错误**：上下文超限（`error.ContextLinesExceeded`）、缓冲/转码配额超限（`error.BufferLimit` / `error.DecodeLimit`）或内存不足（`error.OutOfMemory`）通过 Zig 错误联合直接返回。
 
 ---
 
 ## 六、来源过滤辅助模块（`walk_*`）
 
-- **`walk_glob`（`src/walk/glob.zig`）**：支持 `*`、`?`、`**`、字符类 `[a-z]`、`!` 否定、嵌套花括号 `{a,{b,c}}` 展开（`expandBraces`、`compileGlobs`）、忽略大小写匹配（`classifyWithCase`、`matchTextCase`）与后写规则优先裁决（`matchGlobs`），内置条数硬顶（`1024`）、长度硬顶（`4096`）与花括号深度硬顶（`8`）。
+- **`walk_glob`（`src/walk/glob.zig`）**：支持 `*`、`?`、`**`、字符类 `[a-z]`、`!` 否定、嵌套花括号 `{a,{b,c}}` 展开（`expandBraces`、`compileGlobs`）、忽略大小写匹配（`classifyWithCase`、`matchTextCase`）与后写规则优先裁决（`matchGlobs`），条数上限（默认 `1024`）、长度上限（默认 `4096`）与花括号深度上限（默认 `8`）均可按需配置。
 - **`walk_ignore`（`src/walk/ignore.zig`）**：解析内存中的 `.gitignore` / `.ignore` / `.rgignore` 规则文本（`parseInto`、`parseTextsInto`、`parseLayerInto`），支持 `dot` / `vcs` / `exclude` / `case_insensitive` 细分开关。
 - **`walk_types`（`src/walk/types.zig`）**：支持内置类型表（`zig`、`rust`、`py`、`ts` 等）与调用方自定义类型表注入及展开为 Glob（`expandTypesToGlobs`、`matchesWithTable`）。
 
@@ -190,7 +191,7 @@ pub fn find(self: *Regex, haystack: []const u8, start: usize, mode: MatchMode) ?
 大小写匹配模式枚举：`sensitive`（默认）、`insensitive` 或 `smart`（按每条模式独立判断智能大小写）。
 
 ### FindOptions
-构造 `Finder` 或 `Multi` 的配置项（`case`、`unicode_case`、`frequency`、`prefilter_fp_threshold`、`max_pattern_count`、`max_pattern_bytes`）。
+构造 `Finder` 或 `Multi` 的配置项（`case`、`unicode_case`、`frequency`、`prefilter_fp_threshold`、`max_pattern_count`、`max_pattern_bytes`、`max_unicode_variants`）。
 
 ### AnyMatcher
 面向 `*const Finder`、`*const Multi`、`*const Regex`、`*const RegexSet` 及自定义匹配器的零分配运行时多态擦除包装器（`ctx: *const anyopaque` + `vtable`），支持无锁多线程共享与减少编译期单态化膨胀。
@@ -271,7 +272,7 @@ pub fn find(self: *Regex, haystack: []const u8, start: usize, mode: MatchMode) ?
 重导出 `src/codec/decompress.zig`，提供防压缩炸弹的进程内流式解压与原始字节偏移映射表 `OffsetMap`。
 
 ### SearchConfig
-搜索行为与多租户预算配置结构（含统一 `allocator` 与零分配复用池 `scratch_pool`）；服务入口在预算字段为 `null` 时自动填充安全默认值并强制校验硬顶。
+搜索行为与多租户预算配置结构（含统一 `allocator` 与零分配复用池 `scratch_pool`）；服务入口在预算字段为 `null` 时自动填充安全默认值，并支持调用方按需覆盖配置。
 
 ### Scratch
 跨请求/跨来源复用的工作线程内存缓冲池（`SearchConfig.scratch_pool`），复用流式读缓冲、转码缓冲、替换预览缓冲与前文环形缓冲，实现稳态零堆分配。
@@ -334,7 +335,7 @@ pub fn find(self: *Regex, haystack: []const u8, start: usize, mode: MatchMode) ?
 供 `Regex.findWithScratch` 复用的线程本地 DFA 状态缓存与 NFA 队列缓冲池，实现稳态零分配正则匹配。
 
 ### RegexSet
-多正则单遍同时匹配引擎（最多 `1,024` 条正则编译为合并 Thompson NFA 并自动挂载 `Multi` SIMD 前缀预过滤，支持 `isMatch`、`find` 与单遍获取全部命中模式 ID 的 `matches`）。
+多正则单遍同时匹配引擎（默认上限 `1,024` 条正则、可通过 `max_pattern_count` / `max_pattern_bytes` 配置，编译为合并 Thompson NFA 并自动挂载 `Multi` SIMD 前缀预过滤，支持 `isMatch`、`find` 与单遍获取全部命中模式 ID 的 `matches`）。
 
 ### DiagnosticCode
 正则编译诊断错误码枚举（精确标识未闭合括号、未闭合字符类、未知 Unicode 属性、非法量词、递归深度超限、指令数超限等）。
@@ -343,7 +344,7 @@ pub fn find(self: *Regex, haystack: []const u8, start: usize, mode: MatchMode) ?
 由 `Regex.initDiagnostic` 与 `RegexSet.initDiagnostic` 填充的结构化编译错误诊断信息（含字节偏移 `offset`、1 起始 `line`/`column`、错误描述 `message` 与模式索引 `pattern_index`）。
 
 ### RegexOptions
-构造 `Regex` 与 `RegexSet` 的配置项：大小写模式（`case` / `unicode_case`）、有界跨行匹配（`multiline` / `max_multiline_window`）、`dot_all` 及指令数上限（`max_inst`）。
+构造 `Regex` 与 `RegexSet` 的配置项：大小写模式（`case` / `unicode_case`）、有界跨行匹配（`multiline` / `max_multiline_window` 默认 `64 KiB`）、`dot_all`、编译限制（`max_inst` / `max_insts: ?usize = null` 默认 `8192`、`max_repeat: usize = 1000`、`max_recursion_depth: usize = 64`）、多模式与预过滤限制（`max_pattern_count: ?usize = null` 默认 `1024`、`max_pattern_bytes: ?usize = null` 默认 `256 KiB`、`max_unicode_variants: usize = 64`）及 DFA 规模限制（`aot_dfa_max_insts: usize = 256`、`max_dfa_states: u16 = 256`）。
 
 ### Captures
 正则子匹配捕获组结构，保存完整匹配（`match`）与编号捕获组 `$1`..`$9`（`groups[0..8]`），供 `Regex.findCaptures`、`Regex.extractCaptures` 及 `SearchConfig.replacement` 替换模板（`$0`/`$&`/`$1`..`$9`/`${1}`..`${9}`/`$$`）使用。
@@ -373,7 +374,7 @@ pub fn find(self: *Regex, haystack: []const u8, start: usize, mode: MatchMode) ?
 重导出 `src/search/tree.zig`，提供面向虚拟目录树与内存归档的检索编排入口（`TreeConfig`、`searchTree`、`searchArchiveSlice`、`searchArchive`）。
 
 ### TreeConfig
-虚拟树与归档检索配置（聚合 `SearchConfig`、`ArchiveOptions`、Glob/文件类型过滤、内存与分层 `.gitignore`/`.ignore`/`.rgignore` 开关及目录深度/文件数配额）。
+虚拟树与归档检索配置（聚合 `SearchConfig`、`ArchiveOptions`、Glob/文件类型过滤及配额 `max_glob_rules`/`max_glob_rule_len`/`max_glob_brace_depth`、内存与分层 `.gitignore`/`.ignore`/`.rgignore` 开关及目录深度/文件数配额）。
 
 ### searchTree
 在虚拟 `source.Source` 目录树上执行分层 `.gitignore` 过滤、Glob/类型筛选与多租户预算受控检索（绝不接收物理文件句柄 `std.Io.File` 或 `std.Io.Dir`）。
@@ -385,7 +386,7 @@ pub fn find(self: *Regex, haystack: []const u8, start: usize, mode: MatchMode) ?
 直接对 `*std.Io.Reader` 归档字节流执行零落盘解包与多文件检索。
 
 ### walk_glob
-重导出 `src/walk/glob.zig`，提供支持嵌套花括号展开、条数/长度硬顶与忽略大小写的字节级 Glob 匹配器。
+重导出 `src/walk/glob.zig`，提供支持嵌套花括号展开、可配置条数/长度/花括号深度上限与忽略大小写的字节级 Glob 匹配器。
 
 ### walk_ignore
 重导出 `src/walk/ignore.zig`，提供内存态 `.gitignore` / `.ignore` / `.rgignore` 规则解析与层级化匹配器。

@@ -1,6 +1,6 @@
 /**
  * @file c_api_test.c
- * @brief Comprehensive C ABI and FFI verification suite for libwebgrep v0.4.1.
+ * @brief Comprehensive C ABI and FFI verification suite for libwebgrep v0.5.0.
  *
  * Exercises all 17 exported C ABI functions, adversarial streaming reader callbacks,
  * corrupt and path-traversal archives, NULL/boundary pointer checks, 1,000 allocation/free
@@ -206,27 +206,42 @@ int main(void) {
     /* 1. webgrep_version() */
     const char *ver = webgrep_version();
     assert(ver != NULL);
-    assert(strcmp(ver, "0.4.1") == 0);
+    assert(strcmp(ver, "0.5.0") == 0);
     printf("[1/16] webgrep_version(): PASS (version=\"%s\")\n", ver);
 
     /* 2. *_default() option & config functions */
     webgrep_find_options_t fopts = webgrep_find_options_default();
     assert(fopts.case_mode == WEBGREP_CASE_SENSITIVE);
     assert(fopts.unicode_case == 1);
+    assert(fopts.max_patterns == 0);
+    assert(fopts.max_pattern_bytes == 0);
+    assert(fopts.max_unicode_variants == 0);
 
     webgrep_regex_options_t ropts = webgrep_regex_options_default();
     assert(ropts.case_mode == WEBGREP_CASE_SENSITIVE);
     assert(ropts.unicode_case == 1);
     assert(ropts.multiline == 0);
     assert(ropts.dot_all == 0);
+    assert(ropts.max_repeat == 0);
+    assert(ropts.max_recursion_depth == 0);
+    assert(ropts.max_patterns == 0);
+    assert(ropts.max_pattern_bytes == 0);
 
     webgrep_config_t cfg = webgrep_config_default();
     assert(cfg.scratch == NULL);
     assert(cfg.line_number == 1);
+    assert(cfg.max_context_lines == 0);
+    assert(cfg.max_compression_ratio == 0);
+    assert(cfg.time_budget_ns == 0);
+    assert(cfg.max_output_bytes == 0);
 
     webgrep_tree_config_t tcfg = webgrep_tree_config_default();
     assert(tcfg.format == WEBGREP_ARCHIVE_AUTO);
     assert(tcfg.skip_git == 1);
+    assert(tcfg.max_ignore_file_bytes == 0);
+    assert(tcfg.max_glob_rules == 0);
+    assert(tcfg.max_glob_rule_len == 0);
+    assert(tcfg.max_glob_brace_depth == 0);
     printf("[2/16] *_default() option & config functions: PASS\n");
 
     /* 3. webgrep_matcher_compile_literal() + webgrep_find() */
@@ -273,6 +288,15 @@ int main(void) {
     const char *hay3 = "hello user_42 world";
     assert(webgrep_find(re_m, (const uint8_t *)hay3, strlen(hay3), 0, &cm) == 1);
     assert(cm.start == 6 && cm.end == 13);
+
+    /* Test custom limits exceeding former hard caps */
+    webgrep_regex_options_t ropts_high = webgrep_regex_options_default();
+    ropts_high.max_repeat = 2000;
+    ropts_high.max_inst = 15000;
+    webgrep_matcher_t *re_high = NULL;
+    assert(webgrep_matcher_compile_regex((const uint8_t *)"a{1200}", 7, &ropts_high, &diag, &re_high) == WEBGREP_OK);
+    assert(re_high != NULL);
+    webgrep_matcher_free(re_high);
     printf("[5/16] webgrep_matcher_compile_regex() + diagnostics + webgrep_find(): PASS\n");
 
     /* 6. webgrep_matcher_compile_regex_set() + webgrep_regex_set_matches() */
@@ -340,6 +364,32 @@ int main(void) {
     ) == WEBGREP_OK);
     assert(lctx.matched_lines == 1);
     assert(sum.stopped == 1);
+
+    /* Test custom max_context_lines exceeding former hard cap 10 with 25 non-matching lines + 1 matching line */
+    const char *many_ctx_text =
+        "nonmatch 01\nnonmatch 02\nnonmatch 03\nnonmatch 04\nnonmatch 05\n"
+        "nonmatch 06\nnonmatch 07\nnonmatch 08\nnonmatch 09\nnonmatch 10\n"
+        "nonmatch 11\nnonmatch 12\nnonmatch 13\nnonmatch 14\nnonmatch 15\n"
+        "nonmatch 16\nnonmatch 17\nnonmatch 18\nnonmatch 19\nnonmatch 20\n"
+        "nonmatch 21\nnonmatch 22\nnonmatch 23\nnonmatch 24\nnonmatch 25\n"
+        "hit user_999 target\n";
+    webgrep_config_t high_ctx_cfg = webgrep_config_default();
+    high_ctx_cfg.max_context_lines = 25;
+    high_ctx_cfg.before_context = 20;
+    memset(&sum, 0, sizeof(sum));
+    memset(&lctx, 0, sizeof(lctx));
+    assert(webgrep_search_slice(
+        re_m,
+        (const uint8_t *)many_ctx_text,
+        strlen(many_ctx_text),
+        &high_ctx_cfg,
+        on_line_capture,
+        &lctx,
+        &sum
+    ) == WEBGREP_OK);
+    assert(sum.matched_lines == 1);
+    assert(lctx.matched_lines == 1);
+    assert(lctx.context_lines == 20);
     webgrep_matcher_free(re_m);
     printf("[8/16] webgrep_search_slice() with callback, context, replacement, early stop: PASS\n");
 

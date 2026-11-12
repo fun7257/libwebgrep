@@ -59,25 +59,36 @@ pub fn expandTypesToGlobs(
     include: []const []const u8,
     exclude: []const []const u8,
 ) glob.GlobError![]glob.Glob {
+    return expandTypesToGlobsWithOptions(arena, table, include, exclude, .{});
+}
+
+pub fn expandTypesToGlobsWithOptions(
+    arena: std.mem.Allocator,
+    table: []const Type,
+    include: []const []const u8,
+    exclude: []const []const u8,
+    options: glob.CompileOptions,
+) glob.GlobError![]glob.Glob {
+    const max_rules = options.max_rules orelse glob.rule_count_hard_cap;
     var raw_list: std.ArrayList([]const u8) = .empty;
     defer raw_list.deinit(arena);
 
     for (include) |name| {
         const item = findInTable(table, name) orelse continue;
         for (item.patterns) |pat| {
-            if (raw_list.items.len >= glob.rule_count_hard_cap) return error.GlobCountExceeded;
+            if (raw_list.items.len >= max_rules) return error.GlobCountExceeded;
             try raw_list.append(arena, pat);
         }
     }
     for (exclude) |name| {
         const item = findInTable(table, name) orelse continue;
         for (item.patterns) |pat| {
-            if (raw_list.items.len >= glob.rule_count_hard_cap) return error.GlobCountExceeded;
+            if (raw_list.items.len >= max_rules) return error.GlobCountExceeded;
             const neg = try std.fmt.allocPrint(arena, "!{s}", .{pat});
             try raw_list.append(arena, neg);
         }
     }
-    return glob.compileGlobs(arena, raw_list.items, .{});
+    return glob.compileGlobs(arena, raw_list.items, options);
 }
 
 /// An empty `selected` slice applies no positive type filter; matching any `excluded` type rejects the file immediately.

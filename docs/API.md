@@ -329,7 +329,7 @@ Re-exports `src/search/tree.zig`, providing `TreeConfig`, `searchTree`, `searchA
 
 ### TreeConfig
 
-Configures virtual tree and archive search (`search: SearchConfig`, `archive: ArchiveOptions`, `globs`, `iglobs`, `iglob`, `types`, `types_not`, `custom_types`, `ignore_texts`, `respect_gitignore`, `respect_ignore`, `respect_rgignore`, `hidden`, `skip_git`, `max_depth`, `max_entries`, `max_filesize`, `max_concurrency`, and `files`).
+Configures virtual tree and archive search (`search: SearchConfig`, `archive: ArchiveOptions`, `globs`, `iglobs`, `iglob`, `types`, `types_not`, `custom_types`, `ignore_texts`, `respect_gitignore`, `respect_ignore`, `respect_rgignore`, `hidden`, `skip_git`, `max_depth`, `max_entries`, `max_filesize`, `max_concurrency`, `max_glob_rules`, `max_glob_rule_len`, `max_glob_brace_depth`, and `files`).
 
 ### searchTree
 
@@ -388,7 +388,7 @@ Unpacks an archive stream from `reader` into an in-memory `ArchiveTree` and sear
 
 Literal patterns (`Finder` and `Multi`) cannot contain `\n` (returning `error.PatternHasNewline` before scanning). An empty literal pattern `""` produces a zero-width match `[0, 0)` once per line.
 
-Pattern count is capped at a server hard limit of `1024` (`pattern_count_hard_cap`), and total pattern bytes are capped at `256 KiB` (`pattern_bytes_hard_cap`). Exceeding either returns `error.PatternCountExceeded` or `error.PatternBytesExceeded` before allocating any tables.
+Pattern count defaults to `1024` (`default_max_pattern_count`), and total pattern bytes default to `256 KiB` (`default_max_pattern_bytes`). Both limits can be configured or raised freely via `FindOptions.max_pattern_count` and `FindOptions.max_pattern_bytes`. Exceeding the configured limit returns `error.PatternCountExceeded` or `error.PatternBytesExceeded` before allocating any tables.
 
 Case matching defaults to `sensitive`. Setting `FindOptions.unicode_case = true` enables BMP Unicode Simple Case Folding in both `Finder` and `Multi`.
 
@@ -521,8 +521,16 @@ Populated by `Regex.initDiagnostic` and `RegexSet.initDiagnostic` when compilati
 | `unicode_case` | `bool` | `true` | Enables BMP Unicode Simple Case Folding and UAX #29 word boundaries |
 | `multiline` | `bool` | `false` | Allows matches to span across `\n` within `max_multiline_window`, and makes `^`/`$` match line boundaries |
 | `dot_all` | `bool` | `false` | When `true` alongside `multiline`, allows `.` to match `\n` |
-| `max_inst` | `?usize` | `null` | Compiled NFA instruction cap (`null` uses default `2048`, hard cap `4096`) |
-| `max_multiline_window` | `usize` | `64 * 1024` | Maximum byte span for a multiline match (`64 KiB` default, `8 MiB` hard cap) |
+| `max_inst` | `?usize` | `null` | Compiled NFA instruction cap (`null` uses default `8192`, unconstrained override up to `u32` max) |
+| `max_insts` | `?usize` | `null` | Alias for `max_inst` |
+| `max_repeat` | `usize` | `1000` | Maximum bounded repetition count `{m,n}` (default `1000`, caller-configurable) |
+| `max_recursion_depth` | `usize` | `64` | Maximum AST nesting/recursion depth (default `64`, caller-configurable) |
+| `max_multiline_window` | `usize` | `64 * 1024` | Maximum byte span for a multiline match (`64 KiB` default, unconstrained override) |
+| `max_pattern_count` | `?usize` | `null` | Optional pattern count cap for `RegexSet` (`null` uses default `1024`, caller-configurable) |
+| `max_pattern_bytes` | `?usize` | `null` | Optional total pattern bytes cap for `RegexSet` (`null` uses default `256 KiB`, caller-configurable) |
+| `max_unicode_variants` | `usize` | `64` | Maximum Unicode variants per pattern expanded for SIMD prefilters |
+| `aot_dfa_max_insts` | `usize` | `256` | Maximum NFA instructions eligible for AOT dense DFA compilation |
+| `max_dfa_states` | `u16` | `256` | Maximum lazy DFA states cached before falling back to PikeVM |
 
 ### Captures
 
@@ -583,12 +591,13 @@ Half-open byte range `{ start: usize, end: usize, pattern_id: u32 = 0 }` relativ
 | `unicode_case` | `bool` | `false` | Enables Unicode Simple Case Folding expansion in `Finder` and `Multi` |
 | `frequency` | `?*const [256]u8` | `null` | Optional custom byte frequency rank table for anchor selection |
 | `prefilter_fp_threshold` | `f32` | `0.80` | Threshold (`< 1.0` enables adaptive fallback to `TwoWay` on patterns `> 32` bytes) |
-| `max_pattern_count` | `?usize` | `null` | Optional pattern count cap (clamped to hard cap `1024`) |
-| `max_pattern_bytes` | `?usize` | `null` | Optional total pattern bytes cap (clamped to hard cap `256 KiB`) |
+| `max_pattern_count` | `?usize` | `null` | Optional pattern count cap (defaults to `1024`, caller configurable) |
+| `max_pattern_bytes` | `?usize` | `null` | Optional total pattern bytes cap (defaults to `256 KiB`, caller configurable) |
+| `max_unicode_variants` | `usize` | `64` | Maximum Unicode variants per pattern expanded during case folding |
 
 ### matcher
 
-Re-exports `src/matcher.zig`, defining `MatchMode`, `Match`, `RequiredLiteral`, `CaseMode`, `FindOptions`, `AnyMatcher`, `anyMatcherVtable`, `pattern_count_hard_cap` (`1024`), `pattern_bytes_hard_cap` (`256 KiB`), and `checkPatternLimits`.
+Re-exports `src/matcher.zig`, defining `MatchMode`, `Match`, `RequiredLiteral`, `CaseMode`, `FindOptions`, `AnyMatcher`, `anyMatcherVtable`, `default_max_pattern_count` (`1024`), `default_max_pattern_bytes` (`256 KiB`), and `checkPatternLimits`.
 
 ### RequiredLiteral
 
@@ -631,7 +640,7 @@ In-process streaming decompression mode:
 - `auto`: Detects Gzip (`1F 8B`), Zstd (`28 B5 2F FD`), and XZ (`FD 37 7A 58 5A 00`) magic headers automatically.
 - `gzip`, `zstd`, `xz`: Explicit format decompression.
 
-Enforces both `max_decompressed_bytes` and `max_compression_ratio` (default `100:1`, hard cap `1000:1`) on every decompressed chunk to block Zip Bombs (`LimitHit.decompressed_bytes`). Corrupted compressed streams are handled gracefully as `SoftError.read_failed`.
+Enforces both `max_decompressed_bytes` and `max_compression_ratio` (default `100:1`, caller-configurable) on every decompressed chunk to block Zip Bombs (`LimitHit.decompressed_bytes`). Corrupted compressed streams are handled gracefully as `SoftError.read_failed`.
 
 ### decompress
 
@@ -661,7 +670,7 @@ Binary detection uses NUL byte heuristics fused into the SIMD search loop. Binar
 
 `context` sets symmetric before/after context line counts (default `0`), overridable individually via `before` and `after`. Before-context uses a bounded circular ring buffer without seeking; adjacent or overlapping context windows merge automatically and emit `context_break` when non-contiguous.
 
-Context lines are capped at `SearchConfig.context_lines_hard_cap` (`10`), and the before-context buffer is capped by `max_before_bytes` (default `20 MiB`, hard cap `80 MiB`).
+Context lines default to `10` when unconfigured, overridable via `SearchConfig.max_context_lines`. The before-context buffer is optionally capped by `max_before_bytes`.
 
 Setting `passthru = true` enables full-stream highlighting mode: all non-matching lines are emitted as `context` events and matching lines as `match` events, subject to `max_output_bytes`.
 
@@ -793,7 +802,7 @@ All multi-tenant budgets are configured via `SearchConfig` and enforced determin
 
 ### SearchConfig
 
-| Field | Type | Struct Default | Service Default / Hard Cap | Description |
+| Field | Type | Struct Default | Service Default / Behavior | Description |
 | :--- | :--- | :--- | :--- | :--- |
 | `line_numbers` | `bool` | `false` | Forced `true` on service entry | Enables 1-based line numbers |
 | `invert` | `bool` | `false` | `false` | Emits lines that do not match |
@@ -805,9 +814,9 @@ All multi-tenant budgets are configured via `SearchConfig` and enforced determin
 | `filter_smart_case` | `bool` | `false` | `false` | Enables per-filter smart-case matching for `contains` and `excludes` |
 | `contains_regexes` | `[]const Regex` | `&.{}` | `&.{}` | Compiled regexes that must all match within the line (AND) |
 | `excludes_regexes` | `[]const Regex` | `&.{}` | `&.{}` | Compiled regexes that must not match within the line (NOT) |
-| `context` | `u32` | `0` | Hard cap `10` | Symmetric before/after context lines |
-| `before` / `after` | `?u32` | `null` | Hard cap `10` | Asymmetric before/after context lines |
-| `max_context_lines` | `?u32` | `null` | Hard cap `10` | Lowers maximum allowed context lines |
+| `context` | `u32` | `0` | Default limit `10` (`max_context_lines`) | Symmetric before/after context lines |
+| `before` / `after` | `?u32` | `null` | Default limit `10` (`max_context_lines`) | Asymmetric before/after context lines |
+| `max_context_lines` | `?u32` | `null` | Default `10` (caller-configurable) | Maximum allowed context lines |
 | `passthru` | `bool` | `false` | `false` | Emits all lines (`match` and `context`), bounded by `max_output_bytes` |
 | `replacement` | `?[]const u8` | `null` | `null` | Read-only replacement preview template (`$0`, `$&`, `$1`..`$9`, `$$`) |
 | `max_count` | `?u64` | `null` | Unbounded | Per-source matched line limit (`Outcome.stopped`) |
@@ -821,26 +830,26 @@ All multi-tenant budgets are configured via `SearchConfig` and enforced determin
 | `encoding` | `Encoding` | `.auto` | `.auto` | BOM sniffing or explicit encoding (`utf8`, `utf16le/be`, `gbk`, `latin1`) |
 | `charset` | `?[]const u8` | `null` | `null` | WHATWG or HTTP `Content-Type` charset hint |
 | `compression` | `Compression` | `.none` | `.none` | In-process streaming decompression (`none`, `auto`, `gzip`, `zstd`, `xz`) |
-| `max_compression_ratio` | `?u64` | `null` | Default `100`, Hard cap `1000` | Maximum decompression expansion ratio (`decompressed / raw`) |
+| `max_compression_ratio` | `?u64` | `null` | Default `100` (caller-configurable) | Maximum decompression expansion ratio (`decompressed / raw`) |
 | `decompressed_bytes` | `u64` | `0` | `0` | Prior decompressed bytes charged to this request |
 | `max_decompressed_bytes` | `?u64` | `null` | Default `64 MiB` when compressed | Maximum decompressed bytes (`LimitHit.decompressed_bytes`) |
 | `allocator` | `?Allocator` | `null` | `null` | Unified allocator for slice transcoding, decompression, and replacement preview |
 | `decode_allocator` | `?Allocator` | `null` | `null` | Legacy alias for `allocator` (deprecated in favor of `allocator` / `scratch_pool`) |
 | `buffer_size` | `usize` | `1 MiB` | `1 MiB` | Rolling stream read buffer size |
-| `max_line_len` | `usize` | `2 MiB` | Hard cap `8 MiB` | Sliding window cap for ultra-long lines |
+| `max_line_len` | `usize` | `2 MiB` | Default `2 MiB` (caller-configurable) | Sliding window cap for ultra-long lines |
 | `match_mode` | `MatchMode` | `.earliest` | `.earliest` | `.earliest` or `.leftmost_first` |
 | `scratch` | `?*[]u8` | `null` | `null` | Reusable raw byte buffer pointer across streaming calls |
 | `scratch_pool` | `?*Scratch` | `null` | `null` | Reusable `Scratch` pool eliminating steady-state heap allocations |
-| `max_source_bytes` | `?u64` | `null` | Default `16 MiB`, Hard cap `64 MiB` | Max bytes scanned per source (`LimitHit.max_bytes`) |
-| `max_request_bytes` | `?u64` | `null` | Default `16 MiB`, Hard cap `64 MiB` | Max bytes scanned per request (`LimitHit.max_bytes`) |
-| `max_output_bytes` | `?u64` | `null` | Default `1 MiB`, Hard cap `8 MiB` | Max cumulative bytes emitted in line events |
-| `time_budget_ns` | `?u64` | `null` | Default `30s`, Hard cap `120s` | Wall-clock deadline in nanoseconds (`LimitHit.deadline`) |
+| `max_source_bytes` | `?u64` | `null` | Default `16 MiB` (caller-configurable) | Max bytes scanned per source (`LimitHit.max_bytes`) |
+| `max_request_bytes` | `?u64` | `null` | Default `16 MiB` (caller-configurable) | Max bytes scanned per request (`LimitHit.max_bytes`) |
+| `max_output_bytes` | `?u64` | `null` | Default `1 MiB` (caller-configurable) | Max cumulative bytes emitted in line events |
+| `time_budget_ns` | `?u64` | `null` | Default `30s` (caller-configurable) | Wall-clock deadline in nanoseconds (`LimitHit.deadline`) |
 | `cancel` | `?*const Atomic(bool)` | `null` | `null` | Atomic cancellation token (`LimitHit.cancelled`) |
 | `stop` | `?*const Atomic(bool)` | `null` | `null` | Cooperative stop flag between chunks |
-| `max_before_bytes` | `?usize` | `null` | Default `20 MiB`, Hard cap `80 MiB` | Cap on before-context ring buffer |
-| `max_decode_bytes` | `?usize` | `null` | Default `4 MiB`, Hard cap `8 MiB` | Cap on transcoding buffer |
-| `max_queued_event_bytes` | `?usize` | `null` | Default `2 MiB`, Hard cap `8 MiB` | Cap on a single pending event payload |
-| `max_concurrency` | `?u32` | `null` | Clamped to `32` | Caller-injected worker thread limit |
+| `max_before_bytes` | `?usize` | `null` | Default `20 MiB` (caller-configurable) | Cap on before-context ring buffer |
+| `max_decode_bytes` | `?usize` | `null` | Default `4 MiB` (caller-configurable) | Cap on transcoding buffer |
+| `max_queued_event_bytes` | `?usize` | `null` | Default `2 MiB` (caller-configurable) | Cap on a single pending event payload |
+| `max_concurrency` | `?u32` | `null` | Caller-configurable | Caller-injected worker thread limit |
 | `progress_interval` | `?u64` | `null` | `null` | Byte interval between `progress` events |
 | `live` | `bool` | `false` | `false` | Treats 0-byte reads as idle stream rather than EOF |
 | `idle_timeout_ns` | `?u64` | `null` | `null` | Idle duration before emitting `heartbeat` on a live stream |
@@ -856,11 +865,11 @@ All multi-tenant budgets are configured via `SearchConfig` and enforced determin
 Service entry points (`searchSourceSlice`, `searchSource`, `resumeSourceSlice`, `openSourcePull`, `openReaderPull`) populate safe multi-tenant defaults whenever budget fields are `null`:
 - `line_numbers`: `true`
 - `binary`: `BinaryPolicy.quit` (Binary inputs are skipped by default)
-- `max_source_bytes` / `max_request_bytes`: `16 MiB` (hard cap `64 MiB`)
-- `time_budget_ns`: `30s` (hard cap `120s`)
-- `max_output_bytes`: `1 MiB` (hard cap `8 MiB`)
-- `max_decode_bytes`: `4 MiB` (hard cap `8 MiB`)
-- `max_before_bytes`: `20 MiB` (hard cap `80 MiB`)
+- `max_source_bytes` / `max_request_bytes`: `16 MiB` (caller-configurable)
+- `time_budget_ns`: `30s` (caller-configurable)
+- `max_output_bytes`: `1 MiB` (caller-configurable)
+- `max_decode_bytes`: `4 MiB` (caller-configurable)
+- `max_before_bytes`: `20 MiB` (caller-configurable)
 
 ---
 
@@ -881,7 +890,7 @@ Re-exports `src/searcher.zig`, containing `SearchConfig`, `Scratch`, `SliceError
 
 ### walk_glob
 
-Re-exports `src/walk/glob.zig`. Byte-oriented glob matcher supporting `*`, `?`, `**`, character classes `[a-z]` with `!`/`^` negation, nested brace expansion `{a,{b,c}}` (`expandBraces`, `compileGlobs`), `case_insensitive` matching (`classifyWithCase`, `matchTextCase`), later-rule precedence (`matchGlobs`), and server hard caps (`rule_count_hard_cap = 1024`, `rule_len_hard_cap = 4096`, `brace_depth_hard_cap = 8`).
+Re-exports `src/walk/glob.zig`. Byte-oriented glob matcher supporting `*`, `?`, `**`, character classes `[a-z]` with `!`/`^` negation, nested brace expansion `{a,{b,c}}` (`expandBraces`, `compileGlobs`), `case_insensitive` matching (`classifyWithCase`, `matchTextCase`), later-rule precedence (`matchGlobs`), and caller-configurable limits (`max_rules` default 1024, `max_rule_len` default 4096, `max_brace_depth` default 8).
 
 ### walk_ignore
 

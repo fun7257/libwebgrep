@@ -18,7 +18,9 @@ pub const CompileOptions = struct {
     case_insensitive: bool = false,
     max_rules: ?usize = null,
     max_rule_len: ?usize = null,
+    max_brace_depth: ?usize = null,
 };
+pub const Options = CompileOptions;
 
 pub const Class = enum {
     /// No metacharacters.
@@ -71,13 +73,24 @@ pub fn expandBraces(
     out: *std.ArrayList([]u8),
     max_rules: usize,
 ) GlobError!void {
-    const effective_max = @min(max_rules, rule_count_hard_cap);
-    if (pattern.len > rule_len_hard_cap) return error.GlobTooLong;
-    try checkBraceDepth(pattern);
-    try expandBracesInner(allocator, pattern, out, effective_max, 0);
+    return expandBracesWithOptions(allocator, pattern, out, .{ .max_rules = max_rules });
 }
 
-fn checkBraceDepth(pattern: []const u8) GlobError!void {
+pub fn expandBracesWithOptions(
+    allocator: std.mem.Allocator,
+    pattern: []const u8,
+    out: *std.ArrayList([]u8),
+    options: CompileOptions,
+) GlobError!void {
+    const max_rules = options.max_rules orelse rule_count_hard_cap;
+    const max_len = options.max_rule_len orelse rule_len_hard_cap;
+    const max_brace = options.max_brace_depth orelse brace_depth_hard_cap;
+    if (pattern.len > max_len) return error.GlobTooLong;
+    try checkBraceDepth(pattern, max_brace);
+    try expandBracesInner(allocator, pattern, out, max_rules, max_len, max_brace, 0);
+}
+
+fn checkBraceDepth(pattern: []const u8, max_brace: usize) GlobError!void {
     var depth: usize = 0;
     var in_class = false;
     var i: usize = 0;
@@ -96,7 +109,7 @@ fn checkBraceDepth(pattern: []const u8) GlobError!void {
         }
         if (pattern[i] == '{') {
             depth += 1;
-            if (depth > brace_depth_hard_cap) return error.GlobBraceDepthExceeded;
+            if (depth > max_brace) return error.GlobBraceDepthExceeded;
         } else if (pattern[i] == '}') {
             if (depth > 0) depth -= 1;
         }
@@ -164,9 +177,11 @@ fn expandBracesInner(
     pattern: []const u8,
     out: *std.ArrayList([]u8),
     max_rules: usize,
+    max_len: usize,
+    max_brace: usize,
     depth: usize,
 ) GlobError!void {
-    if (pattern.len > rule_len_hard_cap) return error.GlobTooLong;
+    if (pattern.len > max_len) return error.GlobTooLong;
     const span = findExpandableBrace(pattern) orelse {
         if (out.items.len >= max_rules) return error.GlobCountExceeded;
         const copy = try allocator.dupe(u8, pattern);
@@ -174,7 +189,7 @@ fn expandBracesInner(
         try out.append(allocator, copy);
         return;
     };
-    if (depth >= brace_depth_hard_cap) return error.GlobBraceDepthExceeded;
+    if (depth >= max_brace) return error.GlobBraceDepthExceeded;
 
     const prefix = pattern[0..span.open];
     const body = pattern[span.open + 1 .. span.close];
@@ -210,26 +225,27 @@ fn expandBracesInner(
         if (i == body.len or (body[i] == ',' and sub_depth == 0)) {
             const part = body[part_start..i];
             const combined_len = prefix.len + part.len + suffix.len;
-            if (combined_len > rule_len_hard_cap) return error.GlobTooLong;
+            if (combined_len > max_len) return error.GlobTooLong;
             const combined = try allocator.alloc(u8, combined_len);
             defer allocator.free(combined);
             @memcpy(combined[0..prefix.len], prefix);
             @memcpy(combined[prefix.len .. prefix.len + part.len], part);
             @memcpy(combined[prefix.len + part.len ..], suffix);
-            try expandBracesInner(allocator, combined, out, max_rules, depth + 1);
+            try expandBracesInner(allocator, combined, out, max_rules, max_len, max_brace, depth + 1);
             part_start = i + 1;
         }
     }
 }
 
-/// Compiles glob rules supporting `!` negation and `{a,{b,c}}` nested braces while enforcing hard caps on rule count and length.
+/// Compiles glob rules supporting `!` negation and `{a,{b,c}}` nested braces while enforcing limits on rule count and length.
 pub fn compileGlobs(
     arena: std.mem.Allocator,
     patterns: []const []const u8,
     options: CompileOptions,
 ) GlobError![]Glob {
-    const max_rules = if (options.max_rules) |m| @min(m, rule_count_hard_cap) else rule_count_hard_cap;
-    const max_len = if (options.max_rule_len) |m| @min(m, rule_len_hard_cap) else rule_len_hard_cap;
+    const max_rules = options.max_rules orelse rule_count_hard_cap;
+    const max_len = options.max_rule_len orelse rule_len_hard_cap;
+    const max_brace = options.max_brace_depth orelse brace_depth_hard_cap;
     if (patterns.len > max_rules) return error.GlobCountExceeded;
 
     var expanded: std.ArrayList([]u8) = .empty;
@@ -247,7 +263,11 @@ pub fn compileGlobs(
         }
         expanded.clearRetainingCapacity();
         const remain = if (max_rules >= out.items.len) max_rules - out.items.len else 0;
-        try expandBraces(arena, body, &expanded, remain);
+        try expandBracesWithOptions(arena, body, &expanded, .{
+            .max_rules = remain,
+            .max_rule_len = max_len,
+            .max_brace_depth = max_brace,
+        });
         for (expanded.items) |branch| {
             if (branch.len > max_len) return error.GlobTooLong;
             var pat = branch;

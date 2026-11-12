@@ -1,6 +1,6 @@
 /**
  * @file webgrep.h
- * @brief C ABI and Cross-Language FFI Header for libwebgrep v0.4.1.
+ * @brief C ABI and Cross-Language FFI Header for libwebgrep v0.5.0.
  *
  * Thread-safe, zero-global-state SIMD literal, multi-pattern, and linear-time
  * regular expression search engine with in-memory archive and streaming reader support.
@@ -22,9 +22,9 @@ extern "C" {
  * ========================================================================= */
 
 #define WEBGREP_VERSION_MAJOR 0
-#define WEBGREP_VERSION_MINOR 4
+#define WEBGREP_VERSION_MINOR 5
 #define WEBGREP_VERSION_PATCH 0
-#define WEBGREP_VERSION_STRING "0.4.1"
+#define WEBGREP_VERSION_STRING "0.5.0"
 
 /* ============================================================================
  * Status & Error Codes
@@ -147,6 +147,7 @@ typedef struct webgrep_find_options_s {
     uint8_t  unicode_case;
     size_t   max_patterns;
     size_t   max_pattern_bytes;
+    size_t   max_unicode_variants;
 } webgrep_find_options_t;
 
 /** Options for `Regex` and `RegexSet` compilation. */
@@ -158,6 +159,10 @@ typedef struct webgrep_regex_options_s {
     size_t   max_inst;
     size_t   max_multiline_window;
     uint16_t max_dfa_states;
+    size_t   max_repeat;
+    size_t   max_recursion_depth;
+    size_t   max_patterns;
+    size_t   max_pattern_bytes;
 } webgrep_regex_options_t;
 
 /** Structured compile diagnostic populated when regex compilation fails. */
@@ -231,6 +236,10 @@ typedef struct webgrep_config_s {
     uint8_t            column;
     uint8_t            whole_word;
     uint8_t            line_regexp;
+    uint32_t           max_context_lines;
+    uint64_t           max_compression_ratio;
+    uint64_t           time_budget_ns;
+    uint64_t           max_output_bytes;
 } webgrep_config_t;
 
 /** Summary populated by `webgrep_search_slice` and `webgrep_search_reader`. */
@@ -260,6 +269,10 @@ typedef struct webgrep_tree_config_s {
     uint8_t          skip_git;
     uint8_t          respect_gitignore;
     uint8_t          respect_ignore;
+    size_t           max_ignore_file_bytes;
+    size_t           max_glob_rules;
+    size_t           max_glob_rule_len;
+    size_t           max_glob_brace_depth;
 } webgrep_tree_config_t;
 
 /** Summary populated by `webgrep_search_archive_slice`. */
@@ -297,7 +310,7 @@ typedef int (*webgrep_read_cb)(uint8_t *buf, size_t cap, size_t *out_n, void *us
  * Exported C ABI Functions (17 Functions)
  * ========================================================================= */
 
-/** 1. Returns the null-terminated semantic version string ("0.4.1"). */
+/** 1. Returns the null-terminated semantic version string ("0.5.0"). */
 const char *webgrep_version(void);
 
 /** 2. Returns default literal/multi find options by value. */

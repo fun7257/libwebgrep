@@ -62,6 +62,7 @@ pub const webgrep_find_options_t = extern struct {
     unicode_case: u8 = 1,
     max_patterns: usize = 0,
     max_pattern_bytes: usize = 0,
+    max_unicode_variants: usize = 0,
 };
 
 pub const webgrep_regex_options_t = extern struct {
@@ -72,6 +73,10 @@ pub const webgrep_regex_options_t = extern struct {
     max_inst: usize = 0,
     max_multiline_window: usize = 64 * 1024,
     max_dfa_states: u16 = 256,
+    max_repeat: usize = 0,
+    max_recursion_depth: usize = 0,
+    max_patterns: usize = 0,
+    max_pattern_bytes: usize = 0,
 };
 
 pub const webgrep_compile_diag_t = extern struct {
@@ -142,6 +147,10 @@ pub const webgrep_config_t = extern struct {
     column: u8 = 0,
     whole_word: u8 = 0,
     line_regexp: u8 = 0,
+    max_context_lines: u32 = 0,
+    max_compression_ratio: u64 = 0,
+    time_budget_ns: u64 = 0,
+    max_output_bytes: u64 = 0,
 };
 
 pub const webgrep_summary_t = extern struct {
@@ -169,6 +178,10 @@ pub const webgrep_tree_config_t = extern struct {
     skip_git: u8 = 1,
     respect_gitignore: u8 = 1,
     respect_ignore: u8 = 1,
+    max_ignore_file_bytes: usize = 0,
+    max_glob_rules: usize = 0,
+    max_glob_rule_len: usize = 0,
+    max_glob_brace_depth: usize = 0,
 };
 
 pub const webgrep_tree_summary_t = extern struct {
@@ -256,6 +269,7 @@ fn toFindOptions(opts: ?*const webgrep_find_options_t) ?matcher_mod.FindOptions 
         .unicode_case = o.unicode_case != 0,
         .max_pattern_count = if (o.max_patterns > 0) o.max_patterns else null,
         .max_pattern_bytes = if (o.max_pattern_bytes > 0) o.max_pattern_bytes else null,
+        .max_unicode_variants = if (o.max_unicode_variants > 0) o.max_unicode_variants else 64,
     };
 }
 
@@ -270,6 +284,10 @@ fn toRegexOptions(opts: ?*const webgrep_regex_options_t) ?regex_mod.RegexOptions
         .max_inst = if (o.max_inst > 0) o.max_inst else null,
         .max_multiline_window = if (o.max_multiline_window > 0) o.max_multiline_window else regex_mod.default_multiline_window,
         .max_dfa_states = if (o.max_dfa_states > 0) o.max_dfa_states else 256,
+        .max_repeat = if (o.max_repeat > 0) o.max_repeat else regex_mod.default_max_repeat,
+        .max_recursion_depth = if (o.max_recursion_depth > 0) o.max_recursion_depth else regex_mod.default_max_recursion_depth,
+        .max_pattern_count = if (o.max_patterns > 0) o.max_patterns else null,
+        .max_pattern_bytes = if (o.max_pattern_bytes > 0) o.max_pattern_bytes else null,
     };
 }
 
@@ -336,6 +354,10 @@ fn toSearchConfig(cfg: ?*const webgrep_config_t) ?searcher.SearchConfig {
     }
     if (c.buffer_size > 0) z_cfg.buffer_size = c.buffer_size;
     if (c.max_line_len > 0) z_cfg.max_line_len = c.max_line_len;
+    if (c.max_context_lines > 0) z_cfg.max_context_lines = c.max_context_lines;
+    if (c.max_compression_ratio > 0) z_cfg.max_compression_ratio = c.max_compression_ratio;
+    if (c.time_budget_ns > 0) z_cfg.time_budget_ns = c.time_budget_ns;
+    if (c.max_output_bytes > 0) z_cfg.max_output_bytes = c.max_output_bytes;
 
     z_cfg.encoding = switch (c.encoding) {
         0 => .auto,
@@ -470,7 +492,7 @@ fn populateCSummary(out_summary: ?*webgrep_summary_t, res: sink_mod.Result, stop
 // ============================================================================
 
 pub export fn webgrep_version() callconv(.c) [*:0]const u8 {
-    return "0.4.1";
+    return "0.5.0";
 }
 
 pub export fn webgrep_find_options_default() callconv(.c) webgrep_find_options_t {
@@ -917,6 +939,10 @@ pub export fn webgrep_search_archive_slice(
         .max_entries = if (c_tcfg.max_entries > 0) @intCast(c_tcfg.max_entries) else tree_mod.default_max_entries,
         .max_filesize = archive_opts.max_entry_bytes,
         .max_concurrency = if (c_tcfg.max_concurrency > 0) c_tcfg.max_concurrency else 1,
+        .max_ignore_file_bytes = if (c_tcfg.max_ignore_file_bytes > 0) c_tcfg.max_ignore_file_bytes else tree_mod.max_ignore_file_bytes,
+        .max_glob_rules = if (c_tcfg.max_glob_rules > 0) c_tcfg.max_glob_rules else null,
+        .max_glob_rule_len = if (c_tcfg.max_glob_rule_len > 0) c_tcfg.max_glob_rule_len else null,
+        .max_glob_brace_depth = if (c_tcfg.max_glob_brace_depth > 0) c_tcfg.max_glob_brace_depth else null,
     };
 
     const archive_bytes: []const u8 = if (archive_ptr) |p| p[0..archive_len] else "";
@@ -952,6 +978,9 @@ pub export fn webgrep_search_archive_slice(
         error.BudgetExceeded,
         error.BufferLimit,
         error.DecodeLimit,
+        error.GlobCountExceeded,
+        error.GlobTooLong,
+        error.GlobBraceDepthExceeded,
         => WEBGREP_ERR_BUDGET_EXCEEDED,
         else => WEBGREP_ERR_CORRUPT_ARCHIVE,
     };
@@ -977,24 +1006,64 @@ pub export fn webgrep_search_archive_slice(
 
 test "c_api: version and options default" {
     const ver = std.mem.span(webgrep_version());
-    try std.testing.expectEqualStrings("0.4.1", ver);
+    try std.testing.expectEqualStrings("0.5.0", ver);
 
     const fopts = webgrep_find_options_default();
     try std.testing.expectEqual(@as(c_int, 0), fopts.case_mode);
     try std.testing.expectEqual(@as(u8, 1), fopts.unicode_case);
+    try std.testing.expectEqual(@as(usize, 0), fopts.max_patterns);
+    try std.testing.expectEqual(@as(usize, 0), fopts.max_pattern_bytes);
+    try std.testing.expectEqual(@as(usize, 0), fopts.max_unicode_variants);
 
     const ropts = webgrep_regex_options_default();
     try std.testing.expectEqual(@as(c_int, 0), ropts.case_mode);
     try std.testing.expectEqual(@as(u8, 1), ropts.unicode_case);
     try std.testing.expectEqual(@as(u8, 0), ropts.multiline);
+    try std.testing.expectEqual(@as(usize, 0), ropts.max_repeat);
+    try std.testing.expectEqual(@as(usize, 0), ropts.max_recursion_depth);
+    try std.testing.expectEqual(@as(usize, 0), ropts.max_patterns);
+    try std.testing.expectEqual(@as(usize, 0), ropts.max_pattern_bytes);
 
     const cfg = webgrep_config_default();
     try std.testing.expect(cfg.scratch == null);
     try std.testing.expectEqual(@as(u8, 1), cfg.line_number);
+    try std.testing.expectEqual(@as(u32, 0), cfg.max_context_lines);
+    try std.testing.expectEqual(@as(u64, 0), cfg.max_compression_ratio);
+    try std.testing.expectEqual(@as(u64, 0), cfg.time_budget_ns);
+    try std.testing.expectEqual(@as(u64, 0), cfg.max_output_bytes);
 
     const tcfg = webgrep_tree_config_default();
     try std.testing.expectEqual(@as(c_int, 0), tcfg.format);
     try std.testing.expectEqual(@as(u8, 1), tcfg.skip_git);
+    try std.testing.expectEqual(@as(usize, 0), tcfg.max_ignore_file_bytes);
+    try std.testing.expectEqual(@as(usize, 0), tcfg.max_glob_rules);
+    try std.testing.expectEqual(@as(usize, 0), tcfg.max_glob_rule_len);
+    try std.testing.expectEqual(@as(usize, 0), tcfg.max_glob_brace_depth);
+}
+
+test "c_api: custom limits exceeding former hard caps" {
+    var ropts = webgrep_regex_options_default();
+    ropts.max_repeat = 2000;
+    ropts.max_inst = 15000;
+    var diag: webgrep_compile_diag_t = .{};
+    var re_m: ?*webgrep_matcher_t = null;
+    try std.testing.expectEqual(WEBGREP_OK, webgrep_matcher_compile_regex("a{1200}", 7, &ropts, &diag, &re_m));
+    defer webgrep_matcher_free(re_m);
+
+    var high_ctx_cfg = webgrep_config_default();
+    high_ctx_cfg.max_context_lines = 25;
+    high_ctx_cfg.before_context = 20;
+    var sum: webgrep_summary_t = .{};
+    const slice_text = "ctx before\nhello user_42 world\nctx after\n";
+    try std.testing.expectEqual(WEBGREP_OK, webgrep_search_slice(
+        re_m,
+        slice_text.ptr,
+        slice_text.len,
+        &high_ctx_cfg,
+        null,
+        null,
+        &sum,
+    ));
 }
 
 test "c_api: compile literal, multi, regex, regex_set and find" {

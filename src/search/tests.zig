@@ -46,6 +46,7 @@ const openSourcePull = searcher.openSourcePull;
 const drive = searcher.pipeline_mod.drive;
 const serviceConfig = searcher.config_mod.serviceConfig;
 const beforeContextCapacity = searcher.config_mod.beforeContextCapacity;
+const validateBudgets = searcher.config_mod.validateBudgets;
 const EventBridge = searcher.pull_mod.EventBridge;
 const emitSummary = searcher.pull_mod.emitSummary;
 
@@ -741,14 +742,21 @@ test "pattern count and total byte length are rejected before construction" {
     const alloc = failing.allocator();
     var gate = LimitGate{};
 
-    var pats: [matcher_mod.pattern_count_hard_cap + 1][]const u8 = undefined;
+    var pats: [matcher_mod.default_max_pattern_count + 1][]const u8 = undefined;
     for (&pats) |*slot| slot.* = "a";
     try testing.expectError(error.PatternCountExceeded, searchOrReject(alloc, &pats, .{}, &gate));
     try testing.expectEqual(@as(usize, 0), gate.reads);
     try testing.expectEqual(@as(usize, 0), failing.allocations);
 
+    // Raising max_pattern_count above former hard cap allows patterns to pass limit gate
+    var allowed_gate = LimitGate{};
+    _ = searchOrReject(alloc, &pats, .{
+        .max_pattern_count = matcher_mod.default_max_pattern_count + 50,
+    }, &allowed_gate) catch {};
+
+    // Lowering max_pattern_count below count still fails
     try testing.expectError(error.PatternCountExceeded, searchOrReject(alloc, &pats, .{
-        .max_pattern_count = matcher_mod.pattern_count_hard_cap + 50,
+        .max_pattern_count = matcher_mod.default_max_pattern_count - 10,
     }, &gate));
     try testing.expectEqual(@as(usize, 0), gate.reads);
 
@@ -756,13 +764,16 @@ test "pattern count and total byte length are rejected before construction" {
     try testing.expectError(error.PatternBytesExceeded, Multi.init(alloc, &.{"abcd"}, .{ .max_pattern_bytes = 3 }));
     try testing.expectError(error.PatternCountExceeded, Finder.init("a", .{ .max_pattern_count = 0 }));
 
-    const big = try testing.allocator.alloc(u8, matcher_mod.pattern_bytes_hard_cap + 1);
+    const big = try testing.allocator.alloc(u8, matcher_mod.default_max_pattern_bytes + 1);
     defer testing.allocator.free(big);
     @memset(big, 'b');
-    try testing.expectError(error.PatternBytesExceeded, searchOrReject(alloc, &.{big}, .{
-        .max_pattern_bytes = matcher_mod.pattern_bytes_hard_cap + 10,
-    }, &gate));
+    // Default limit rejects big pattern bytes
+    try testing.expectError(error.PatternBytesExceeded, searchOrReject(alloc, &.{big}, .{}, &gate));
     try testing.expectError(error.PatternBytesExceeded, Finder.init(big, .{}));
+    // Custom limit higher than former hard cap allows it past limit gate
+    _ = searchOrReject(alloc, &.{big}, .{
+        .max_pattern_bytes = matcher_mod.default_max_pattern_bytes + 10,
+    }, &gate) catch {};
     try testing.expectEqual(@as(usize, 0), gate.reads);
 
     var ok = try Multi.init(testing.allocator, &.{ "foo", "bar" }, .{
@@ -1222,9 +1233,23 @@ test "context line count cannot exceed the hard cap" {
     try testing.expectError(error.ContextLinesExceeded, searchSlice(Rec, &rec, "M\n", "", &finder, .{
         .after = over,
     }));
-    try testing.expectError(error.ContextLinesExceeded, searchSlice(Rec, &rec, "M\n", "", &finder, .{
+    // Before > 10 without allocator or scratch_pool returns error.BufferLimit
+    try testing.expectError(error.BufferLimit, searchSlice(Rec, &rec, "M\n", "", &finder, .{
         .before = over,
         .max_context_lines = over + 5,
+        .binary = .none,
+    }));
+    const ok_high = try searchSlice(Rec, &rec, "M\n", "", &finder, .{
+        .before = over,
+        .max_context_lines = over + 5,
+        .binary = .none,
+        .allocator = testing.allocator,
+    });
+    try testing.expectEqual(@as(u64, 1), ok_high.matched_lines);
+    try testing.expectError(error.ContextLinesExceeded, searchSlice(Rec, &rec, "M\n", "", &finder, .{
+        .before = over + 6,
+        .max_context_lines = over + 5,
+        .allocator = testing.allocator,
     }));
     try testing.expectError(error.ContextLinesExceeded, searchSlice(Rec, &rec, "M\n", "", &finder, .{
         .context = 3,
@@ -2250,11 +2275,19 @@ test "budgets come from caller parameters" {
 
     var rec = Rec{};
     defer rec.deinit(testing.allocator);
-    try testing.expectError(error.BudgetExceeded, searchSlice(Rec, &rec, "M\n", "", &finder, .{
+    // Custom limits above former hard caps are accepted without error
+    _ = try searchSlice(Rec, &rec, "M\n", "", &finder, .{
         .max_source_bytes = SearchConfig.max_source_bytes_hard_cap + 1,
+    });
+    _ = try searchSlice(Rec, &rec, "M\n", "", &finder, .{
+        .time_budget_ns = SearchConfig.max_time_budget_ns + 1,
+    });
+    // Artificial invalid budgets are still rejected
+    try testing.expectError(error.BudgetExceeded, searchSlice(Rec, &rec, "M\n", "", &finder, .{
+        .max_line_len = std.math.maxInt(usize),
     }));
     try testing.expectError(error.BudgetExceeded, searchSlice(Rec, &rec, "M\n", "", &finder, .{
-        .time_budget_ns = SearchConfig.max_time_budget_ns + 1,
+        .max_compression_ratio = 0,
     }));
 
     var reader = std.Io.Reader.fixed(hay);
@@ -4214,6 +4247,195 @@ test "empirical: AnyEventSink flow control (cont, pause, stop, resume) and AnyMa
     any_sink = sink_mod.AnyEventSink.init(FlowSink, &flow_sink);
     _ = try searchSourceSlice(sink_mod.AnyEventSink, &any_sink, "re-test", "val: 12345 and 678\n", &any_re, .{});
     try testing.expectEqual(@as(usize, 1), flow_sink.matches_seen);
+}
+
+test "policy limits: default limits apply when omitted and unconstrained custom limits work above former hard caps" {
+    const alloc = testing.allocator;
+    const Multi = @import("../finder/multi.zig").Multi;
+    const Regex = regex_mod.Regex;
+    const RegexSet = regex_mod.RegexSet;
+
+    // 1. Multi pattern count default (1024) vs custom limit (1100)
+    var pat_bufs = try alloc.alloc([16]u8, 1101);
+    defer alloc.free(pat_bufs);
+    var pat_slices = try alloc.alloc([]const u8, 1101);
+    defer alloc.free(pat_slices);
+    for (0..1101) |i| {
+        pat_slices[i] = try std.fmt.bufPrint(&pat_bufs[i], "k_{d:0>5}", .{i});
+    }
+
+    // Default options (null max_pattern_count) rejects 1025 patterns
+    try testing.expectError(error.PatternCountExceeded, Multi.init(alloc, pat_slices[0..1025], .{}));
+
+    // Custom max_pattern_count > 1024 succeeds and finds matches
+    var multi_high = try Multi.init(alloc, pat_slices[0..1100], .{ .max_pattern_count = 1200 });
+    defer multi_high.deinit();
+    const m_hit = multi_high.find("prefix k_01099 suffix", 0, .earliest);
+    try testing.expect(m_hit != null);
+    try testing.expectEqual(@as(u32, 1099), m_hit.?.pattern_id.?);
+
+    // 2. Regex repeat count default (1000) vs custom limit (1200)
+    try testing.expectError(error.RegexTooLarge, Regex.init(alloc, "a{1001}", .{}));
+    var re_repeat = try Regex.init(alloc, "a{1200}", .{ .max_repeat = 1500, .max_inst = 20000 });
+    defer re_repeat.deinit();
+    const hay_a = try alloc.alloc(u8, 1205);
+    defer alloc.free(hay_a);
+    @memset(hay_a, 'a');
+    try testing.expect(re_repeat.find(hay_a, 0, .earliest) != null);
+
+    // 3. Regex recursion depth default (64) vs custom limit (80)
+    var deep_pat: [200]u8 = undefined;
+    for (0..70) |i| deep_pat[i] = '(';
+    deep_pat[70] = 'z';
+    for (71..141) |i| deep_pat[i] = ')';
+    const deep_slice = deep_pat[0..141];
+
+    try testing.expectError(error.RegexTooLarge, Regex.init(alloc, deep_slice, .{}));
+    var re_deep = try Regex.init(alloc, deep_slice, .{ .max_recursion_depth = 80 });
+    defer re_deep.deinit();
+    try testing.expect(re_deep.find("test z test", 0, .earliest) != null);
+
+    // 4. RegexSet with pattern count > 1024 and custom max_inst
+    var rset_high = try RegexSet.init(alloc, pat_slices[0..1100], .{ .max_pattern_count = 1200, .max_inst = 20000 });
+    defer rset_high.deinit();
+    var rset_out: [4]u32 = undefined;
+    const rset_matches = rset_high.matches("test k_01050 end", &rset_out);
+    try testing.expect(rset_matches > 0);
+    try testing.expectEqual(@as(u32, 1050), rset_out[0]);
+
+    // 5. SearchConfig context lines default (10) vs custom limit (25)
+    try testing.expectError(error.ContextLinesExceeded, validateBudgets(.{ .context = 11 }));
+    try validateBudgets(.{ .max_context_lines = 25, .context = 20 });
+    try testing.expectError(error.ContextLinesExceeded, validateBudgets(.{ .max_context_lines = 25, .context = 26 }));
+
+    // 5b. BeforeRing dynamic heap_slots when before > 10 (25 non-matching lines + 1 matching line)
+    {
+        const Scratch = searcher.Scratch;
+        var hay_list = std.ArrayList(u8).empty;
+        defer hay_list.deinit(alloc);
+        for (1..26) |line_idx| {
+            var buf: [32]u8 = undefined;
+            const s = try std.fmt.bufPrint(&buf, "ctx_{d:0>2}\n", .{line_idx});
+            try hay_list.appendSlice(alloc, s);
+        }
+        try hay_list.appendSlice(alloc, "TARGET_HIT\n");
+
+        const finder_ctx = try Finder.init("TARGET_HIT", .{});
+
+        // (i) searchSlice with .allocator = alloc
+        {
+            var rec_slice = Rec{};
+            defer rec_slice.deinit(alloc);
+            const res = try searchSlice(Rec, &rec_slice, hay_list.items, "ctx_slice", &finder_ctx, .{
+                .line_numbers = true,
+                .max_context_lines = 25,
+                .before = 20,
+                .allocator = alloc,
+            });
+            try testing.expectEqual(@as(u64, 1), res.matched_lines);
+            var ctx_lines: usize = 0;
+            var it = std.mem.splitScalar(u8, rec_slice.text.items, '\n');
+            while (it.next()) |ln| {
+                if (ln.len == 0) continue;
+                if (std.mem.indexOfScalar(u8, ln, '-') != null) ctx_lines += 1;
+            }
+            try testing.expectEqual(@as(usize, 20), ctx_lines);
+            try testing.expect(std.mem.startsWith(u8, rec_slice.text.items, "6-ctx_06\n"));
+        }
+
+        // (ii) searchSlice with Scratch pool reuse
+        {
+            var sp = Scratch.init(alloc);
+            defer sp.deinit();
+            var rec_sp = Rec{};
+            defer rec_sp.deinit(alloc);
+            const res = try searchSlice(Rec, &rec_sp, hay_list.items, "ctx_sp", &finder_ctx, .{
+                .line_numbers = true,
+                .max_context_lines = 25,
+                .before = 20,
+                .scratch_pool = &sp,
+            });
+            try testing.expectEqual(@as(u64, 1), res.matched_lines);
+            try testing.expect(sp.ring_slots.len >= 20);
+            try testing.expect(std.mem.startsWith(u8, rec_sp.text.items, "6-ctx_06\n"));
+        }
+
+        // (iii) searchReader / searchSource streaming
+        {
+            var reader = std.Io.Reader.fixed(hay_list.items);
+            var rec_stream = Rec{};
+            defer rec_stream.deinit(alloc);
+            const res = try searchReader(Rec, alloc, &rec_stream, &reader, "ctx_reader", &finder_ctx, .{
+                .line_numbers = true,
+                .max_context_lines = 25,
+                .before = 20,
+                .buffer_size = 64,
+            });
+            try testing.expectEqual(@as(u64, 1), res.matched_lines);
+            var ctx_lines: usize = 0;
+            var it = std.mem.splitScalar(u8, rec_stream.text.items, '\n');
+            while (it.next()) |ln| {
+                if (ln.len == 0) continue;
+                if (std.mem.indexOfScalar(u8, ln, '-') != null) ctx_lines += 1;
+            }
+            try testing.expectEqual(@as(usize, 20), ctx_lines);
+            try testing.expect(std.mem.startsWith(u8, rec_stream.text.items, "6-ctx_06\n"));
+        }
+
+        // (iv) openReaderPull streaming pull iterator
+        {
+            var reader = std.Io.Reader.fixed(hay_list.items);
+            var rpull = try searcher.openReaderPull(alloc, &finder_ctx, "ctx_rpull", &reader, .{
+                .max_context_lines = 25,
+                .before = 20,
+                .buffer_size = 64,
+            });
+            defer rpull.deinit();
+            var pull_ctx_count: usize = 0;
+            var pull_match_count: usize = 0;
+            var first_ctx_line: u64 = 0;
+            while (try rpull.next()) |ev| {
+                if (ev.kind == .context) {
+                    if (pull_ctx_count == 0) first_ctx_line = ev.line_number;
+                    pull_ctx_count += 1;
+                } else if (ev.kind == .match) {
+                    pull_match_count += 1;
+                }
+            }
+            try testing.expectEqual(@as(usize, 20), pull_ctx_count);
+            try testing.expectEqual(@as(usize, 1), pull_match_count);
+            try testing.expectEqual(@as(u64, 6), first_ctx_line);
+        }
+    }
+
+    // 6. SearchConfig source bytes > 64 MiB and compression ratio > 1000
+    try validateBudgets(.{
+        .max_source_bytes = 100 * 1024 * 1024,
+        .max_compression_ratio = 2000,
+    });
+
+    // 7. Walker depth default (64) vs custom limit (100)
+    const walk_def = @import("../walk/walker.zig").Config{};
+    try testing.expectEqual(@as(u32, 64), walk_def.effectiveMaxDepth());
+    const walk_high = @import("../walk/walker.zig").Config{ .max_depth = 100 };
+    try testing.expectEqual(@as(u32, 100), walk_high.effectiveMaxDepth());
+
+    // 8. Glob brace depth default (8) vs custom limit (12)
+    const brace_pat = "{a,{b,{c,{d,{e,{f,{g,{h,{i,j}}}}}}}}}"; // 9 levels
+    var brace_list = std.ArrayList([]u8).empty;
+    defer {
+        for (brace_list.items) |b| alloc.free(b);
+        brace_list.deinit(alloc);
+    }
+    const glob_mod = @import("../walk/glob.zig");
+    try testing.expectError(error.GlobBraceDepthExceeded, glob_mod.expandBraces(alloc, brace_pat, &brace_list, 100));
+    try glob_mod.expandBracesWithOptions(alloc, brace_pat, &brace_list, .{ .max_brace_depth = 12 });
+    try testing.expect(brace_list.items.len > 0);
+
+    // 9. Parallel threads > 32
+    const parallel_mod = @import("../parallel.zig");
+    try testing.expectEqual(@as(u32, 48), parallel_mod.resolveThreads(48));
+    try testing.expectEqual(@as(u32, 48), parallel_mod.resolveConcurrency(1, 48));
 }
 
 test {

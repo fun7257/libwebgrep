@@ -52,16 +52,23 @@ pub const Captures = struct {
     }
 };
 
-/// Server hard cap on compiled NFA instruction count.
-pub const max_inst_hard_cap: usize = 8192;
-/// Server hard cap on bounded repeat count `{m,n}` per quantifier.
-pub const max_repeat_hard_cap: usize = 1000;
-/// Server hard cap on group nesting recursion depth.
-pub const max_recursion_depth: usize = 64;
-/// Server hard cap on bounded multiline match window (8 MiB).
-pub const max_multiline_window_hard_cap: usize = 8 * 1024 * 1024;
+/// Default compiled NFA instruction limit.
+pub const default_max_inst: usize = 8192;
+/// Default bounded repeat count `{m,n}` per quantifier.
+pub const default_max_repeat: usize = 1000;
+/// Default group nesting recursion depth.
+pub const default_max_recursion_depth: usize = 64;
 /// Default bounded multiline match window (64 KiB).
 pub const default_multiline_window: usize = 64 * 1024;
+
+/// Server hard cap on compiled NFA instruction count (compatibility alias for default_max_inst).
+pub const max_inst_hard_cap: usize = default_max_inst;
+/// Server hard cap on bounded repeat count `{m,n}` per quantifier (compatibility alias for default_max_repeat).
+pub const max_repeat_hard_cap: usize = default_max_repeat;
+/// Server hard cap on group nesting recursion depth (compatibility alias for default_max_recursion_depth).
+pub const max_recursion_depth: usize = default_max_recursion_depth;
+/// Server hard cap on bounded multiline match window (8 MiB) (compatibility alias).
+pub const max_multiline_window_hard_cap: usize = 8 * 1024 * 1024;
 
 pub const Error = error{
     RegexSyntax,
@@ -167,11 +174,23 @@ pub const RegexOptions = struct {
     multiline: bool = false,
     /// Allow `.` to match `\n` (requires `multiline = true` to cross lines).
     dot_all: bool = false,
-    /// Maximum compiled instruction count. Null uses `max_inst_hard_cap`; values above the hard cap return `RegexTooLarge`.
+    /// Maximum compiled instruction count. Null uses default_max_inst (8192).
     max_inst: ?usize = null,
     /// Alias for `max_inst`.
     max_insts: ?usize = null,
-    /// Maximum byte span window for multiline matching. Values exceeding the hard cap return `RegexTooLarge`.
+    /// Maximum repeat quantifier count. Defaults to default_max_repeat (1000).
+    max_repeat: usize = default_max_repeat,
+    /// Maximum group nesting recursion depth. Defaults to default_max_recursion_depth (64).
+    max_recursion_depth: usize = default_max_recursion_depth,
+    /// Maximum pattern count (for RegexSet). Null uses matcher default.
+    max_pattern_count: ?usize = null,
+    /// Maximum pattern bytes (for RegexSet / prefilters). Null uses matcher default.
+    max_pattern_bytes: ?usize = null,
+    /// Maximum Unicode variants per pattern expanded during case-insensitive folding. Defaults to 64.
+    max_unicode_variants: usize = 64,
+    /// Maximum compiled instruction count for AOT DFA construction. Defaults to 256.
+    aot_dfa_max_insts: usize = 256,
+    /// Maximum byte span window for multiline matching.
     max_multiline_window: usize = default_multiline_window,
     /// Maximum lazy DFA states cached during search.
     max_dfa_states: u16 = 256,

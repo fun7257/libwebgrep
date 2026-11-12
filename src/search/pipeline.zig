@@ -347,6 +347,25 @@ pub fn searchPrepared(
     }
     state.ring.cap = beforeCount(config);
     state.ring.stride = config.max_line_len;
+    if (state.ring.cap > SearchConfig.context_lines_hard_cap) {
+        const needed_slots: usize = state.ring.cap;
+        if (config.scratch_pool) |sp| {
+            if (sp.ring_slots.len < needed_slots) {
+                if (sp.ring_slots.len == 0) {
+                    sp.ring_slots = try sp.allocator.alloc(cfg_mod.RingSlot, needed_slots);
+                } else {
+                    sp.ring_slots = try sp.allocator.realloc(sp.ring_slots, needed_slots);
+                }
+            }
+            state.ring.heap_slots = sp.ring_slots[0..needed_slots];
+        } else {
+            const alloc = pool_alloc orelse return error.BufferLimit;
+            state.ring.heap_slots = try alloc.alloc(cfg_mod.RingSlot, needed_slots);
+        }
+    }
+    defer if (config.scratch_pool == null and state.ring.heap_slots.len != 0) {
+        if (pool_alloc) |alloc| alloc.free(state.ring.heap_slots);
+    };
     if (config.line_numbers) state.line_number = 1;
     restoreCounters(&state, config);
     if (prepared.decompress_limit_hit) {
@@ -565,6 +584,22 @@ pub fn drive(
     }
     state.ring.cap = beforeCount(config);
     state.ring.stride = config.max_line_len;
+    if (state.ring.cap > SearchConfig.context_lines_hard_cap) {
+        const needed_slots: usize = state.ring.cap;
+        if (config.scratch_pool) |sp| {
+            if (sp.ring_slots.len < needed_slots) {
+                if (sp.ring_slots.len == 0) {
+                    sp.ring_slots = try sp.allocator.alloc(cfg_mod.RingSlot, needed_slots);
+                } else {
+                    sp.ring_slots = try sp.allocator.realloc(sp.ring_slots, needed_slots);
+                }
+            }
+            state.ring.heap_slots = sp.ring_slots[0..needed_slots];
+        } else {
+            state.ring.heap_slots = try pool_alloc.alloc(cfg_mod.RingSlot, needed_slots);
+        }
+    }
+    defer if (config.scratch_pool == null and state.ring.heap_slots.len != 0) pool_alloc.free(state.ring.heap_slots);
     if (state.ring.cap > 0) {
         const bytes = beforeContextCapacity(config);
         if (bytes > 0) {

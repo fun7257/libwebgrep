@@ -161,15 +161,19 @@ pub const Regex = struct {
         if (diag) |d| d.* = .{};
 
         const inst_cap = options.effectiveMaxInst() orelse max_inst_hard_cap;
-        if (inst_cap > max_inst_hard_cap or inst_cap == 0) {
-            populateDiagnostic(diag, pattern, error.RegexTooLarge, .instruction_limit_exceeded, 0, "max_inst exceeds hard cap or is zero", null);
+        if (inst_cap == 0 or inst_cap > std.math.maxInt(u32)) {
+            populateDiagnostic(diag, pattern, error.RegexTooLarge, .instruction_limit_exceeded, 0, "max_inst is zero or exceeds u32 max", null);
             return error.RegexTooLarge;
         }
-        if (options.max_multiline_window > max_multiline_window_hard_cap or options.max_multiline_window == 0) {
-            populateDiagnostic(diag, pattern, error.RegexTooLarge, .multiline_window_exceeded, 0, "max_multiline_window exceeds hard cap or is zero", null);
+        if (options.max_multiline_window == 0) {
+            populateDiagnostic(diag, pattern, error.RegexTooLarge, .multiline_window_exceeded, 0, "max_multiline_window is zero", null);
             return error.RegexTooLarge;
         }
-        matcher.checkPatternLimits(&.{pattern}, .{}) catch |err| {
+        matcher.checkPatternLimits(&.{pattern}, .{
+            .max_pattern_count = options.max_pattern_count,
+            .max_pattern_bytes = options.max_pattern_bytes,
+            .max_unicode_variants = options.max_unicode_variants,
+        }) catch |err| {
             const code: DiagnosticCode = switch (err) {
                 error.PatternCountExceeded => .pattern_count_exceeded,
                 error.PatternBytesExceeded => .pattern_bytes_exceeded,
@@ -197,6 +201,8 @@ pub const Regex = struct {
             .multiline = options.multiline,
             .dot_all = options.dot_all,
             .max_inst = inst_cap,
+            .max_repeat = options.max_repeat,
+            .max_recursion_depth = options.max_recursion_depth,
             .diag = diag,
         };
         defer compiler.deinit();
@@ -243,7 +249,7 @@ pub const Regex = struct {
         };
         errdefer self.deinit();
 
-        try prefilter_mod.extractLiterals(&self, pattern, options.case);
+        try prefilter_mod.extractLiterals(&self, pattern, options);
         if (self.req_literal_bytes.len > 1 and (!self.ignore_case or !self.unicode_case)) {
             const lit = self.req_literal_bytes;
             var shift: usize = lit.len;
@@ -266,7 +272,7 @@ pub const Regex = struct {
             }
             self.req_prefix_shift = shift;
         }
-        if (options.max_dfa_states > 0 and self.insts.len <= 256) {
+        if (options.max_dfa_states > 0 and self.insts.len <= options.aot_dfa_max_insts) {
             if (allocator.create(HeapDfa)) |heap_dfa| {
                 heap_dfa.* = HeapDfa.init();
                 if (heap_dfa.determinize(self.insts, self.unicode_ranges, self.start_pc, self.multiline)) {

@@ -233,7 +233,11 @@ pub fn SourcePull(comptime M: type) type {
                 }
             };
             var collect = Collect{ .pull = self };
-            _ = searchSourceSlice(Collect, &collect, self.source_id, self.haystack, self.matcher, self.config) catch |err| return err;
+            var cfg = self.config;
+            if (cfg.allocator == null and cfg.decode_allocator == null and cfg.scratch_pool == null) {
+                cfg.allocator = self.allocator;
+            }
+            _ = searchSourceSlice(Collect, &collect, self.source_id, self.haystack, self.matcher, cfg) catch |err| return err;
             if (collect.failed) return error.OutOfMemory;
         }
     };
@@ -675,6 +679,22 @@ pub fn ReaderPull(comptime M: type) type {
 
             state.ring.cap = cfg_mod.beforeCount(config);
             state.ring.stride = config.max_line_len;
+            if (state.ring.cap > SearchConfig.context_lines_hard_cap) {
+                const needed_slots: usize = state.ring.cap;
+                if (config.scratch_pool) |sp| {
+                    if (sp.ring_slots.len < needed_slots) {
+                        if (sp.ring_slots.len == 0) {
+                            sp.ring_slots = try sp.allocator.alloc(cfg_mod.RingSlot, needed_slots);
+                        } else {
+                            sp.ring_slots = try sp.allocator.realloc(sp.ring_slots, needed_slots);
+                        }
+                    }
+                    state.ring.heap_slots = sp.ring_slots[0..needed_slots];
+                } else {
+                    state.ring.heap_slots = try allocator.alloc(cfg_mod.RingSlot, needed_slots);
+                }
+            }
+            errdefer if (config.scratch_pool == null and state.ring.heap_slots.len != 0) allocator.free(state.ring.heap_slots);
             if (state.ring.cap > 0) {
                 const bytes = cfg_mod.beforeContextCapacity(config);
                 if (bytes > 0) {
@@ -1159,6 +1179,9 @@ pub fn ReaderPull(comptime M: type) type {
                 if (self.seen.len != 0) self.pool_alloc.free(self.seen);
             }
 
+            if (self.config.scratch_pool == null and self.state.ring.heap_slots.len != 0) {
+                self.allocator.free(self.state.ring.heap_slots);
+            }
             if (self.config.scratch_pool == null and self.state.ring.storage.len != 0) {
                 self.allocator.free(self.state.ring.storage);
             }

@@ -44,13 +44,21 @@ pub const Config = struct {
     skip_git: bool = true,
     /// By default, directories on a different device than the search root are not entered. Callers may disable this; there is no field to enable link traversal.
     one_file_system: bool = true,
+    /// Maximum byte limit for reading ignore files (.gitignore, .ignore, etc.). Defaults to 1 MiB.
+    max_ignore_file_bytes: usize = 1024 * 1024,
+    /// Maximum glob rules parsed. Null uses glob default.
+    max_glob_rules: ?usize = null,
+    /// Maximum length of a single glob rule. Null uses glob default.
+    max_glob_rule_len: ?usize = null,
+    /// Maximum nested brace depth in globs. Null uses glob default.
+    max_glob_brace_depth: ?usize = null,
 
     pub fn effectiveMaxDepth(self: Config) u32 {
-        return if (self.max_depth) |d| @min(d, max_depth_hard_cap) else max_depth_hard_cap;
+        return self.max_depth orelse max_depth_hard_cap;
     }
 
     pub fn effectiveMaxEntries(self: Config) u64 {
-        return if (self.max_entries) |n| @min(n, max_entries_hard_cap) else max_entries_hard_cap;
+        return self.max_entries orelse max_entries_hard_cap;
     }
 };
 
@@ -137,18 +145,26 @@ pub const Session = struct {
         const arena = self.arena.allocator();
         if (!self.globs_prepared and (config.globs.len > 0 or config.iglobs.len > 0)) {
             var list: std.ArrayList(glob.Glob) = .empty;
+            const max_rules = config.max_glob_rules orelse glob.rule_count_hard_cap;
+            const max_len = config.max_glob_rule_len;
+            const max_brace = config.max_glob_brace_depth;
             if (config.globs.len > 0) {
                 const compiled = try glob.compileGlobs(arena, config.globs, .{
                     .case_insensitive = config.iglob,
+                    .max_rules = max_rules,
+                    .max_rule_len = max_len,
+                    .max_brace_depth = max_brace,
                 });
                 try list.appendSlice(arena, compiled);
             }
             if (config.iglobs.len > 0) {
-                if (list.items.len >= glob.rule_count_hard_cap) return error.GlobCountExceeded;
-                const remain = glob.rule_count_hard_cap - list.items.len;
+                if (list.items.len >= max_rules) return error.GlobCountExceeded;
+                const remain = max_rules - list.items.len;
                 const compiled_i = try glob.compileGlobs(arena, config.iglobs, .{
                     .case_insensitive = true,
                     .max_rules = remain,
+                    .max_rule_len = max_len,
+                    .max_brace_depth = max_brace,
                 });
                 try list.appendSlice(arena, compiled_i);
             }
@@ -159,7 +175,9 @@ pub const Session = struct {
             var ig_list: std.ArrayList(glob.Glob) = .empty;
             try ignore.parseTextsInto(arena, config.ignore_texts, &ig_list, .{
                 .case_insensitive = config.ignore_switches.case_insensitive,
-                .max_rules = config.ignore_switches.max_rules,
+                .max_rules = config.max_glob_rules orelse config.ignore_switches.max_rules,
+                .max_rule_len = config.max_glob_rule_len orelse config.ignore_switches.max_rule_len,
+                .max_brace_depth = config.max_glob_brace_depth orelse config.ignore_switches.max_brace_depth,
             });
             if (ig_list.items.len > 0) {
                 const owned = try ig_list.toOwnedSlice(arena);
@@ -524,7 +542,10 @@ fn loadRules(
     prefix: usize,
 ) !*const ignore.Set {
     if (!host.config.read_ignore) return parent;
-    const sw = host.config.ignore_switches;
+    var sw = host.config.ignore_switches;
+    if (host.config.max_glob_rules) |r| sw.max_rules = r;
+    if (host.config.max_glob_rule_len) |l| sw.max_rule_len = l;
+    if (host.config.max_glob_brace_depth) |b| sw.max_brace_depth = b;
     const git_excl = if (sw.exclude and prefix == 0) readOptional(host, dir, ".git/info/exclude") else null;
     defer if (git_excl) |bytes| host.allocator.free(bytes);
     const git = if (sw.vcs) readOptional(host, dir, ".gitignore") else null;
@@ -562,7 +583,7 @@ fn loadRules(
 }
 
 fn readOptional(host: *Host, dir: std.Io.Dir, name: []const u8) ?[]u8 {
-    return dir.readFileAlloc(host.io, name, host.allocator, .limited(1 << 20)) catch null;
+    return dir.readFileAlloc(host.io, name, host.allocator, .limited(host.config.max_ignore_file_bytes)) catch null;
 }
 
 fn allowFile(host: *Host, rel: []const u8) bool {
@@ -943,9 +964,11 @@ test "fixed maximum traversal depth and entry count cap" {
     const path_len = try tmp.dir.realPath(io, &path_buf);
     const root = path_buf[0..path_len];
 
-    // 1. Oversized max_depth is clamped to max_depth_hard_cap, and explicit depth limits are respected
+    // 1. Unspecified max_depth defaults to max_depth_hard_cap, and caller-configured high depth is respected without clamping
+    const cfg_default = Config{};
+    try std.testing.expectEqual(Config.max_depth_hard_cap, cfg_default.effectiveMaxDepth());
     const cfg_huge = Config{ .max_depth = 9999 };
-    try std.testing.expectEqual(Config.max_depth_hard_cap, cfg_huge.effectiveMaxDepth());
+    try std.testing.expectEqual(@as(u32, 9999), cfg_huge.effectiveMaxDepth());
 
     var depth2_found: std.ArrayList([]u8) = .empty;
     defer freeFound(&depth2_found);

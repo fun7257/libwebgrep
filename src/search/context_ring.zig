@@ -102,30 +102,25 @@ pub fn previewLine(buf: []const u8, line: Range, known: ?BufMatch, config: Searc
     };
 }
 
-pub const RingSlot = struct {
-    len: u32 = 0,
-    abs: u64 = 0,
-    end_abs: u64 = 0,
-    number: ?u64 = null,
-    truncated: bool = false,
-    line_len: u64 = 0,
-    window_start: u64 = 0,
-    mstart: u32 = 0,
-    mend: u32 = 0,
-    mpid: ?u32 = null,
-    has_match: bool = false,
-    src_start: usize = 0,
-    src_end: usize = 0,
-};
+pub const RingSlot = cfg_mod.RingSlot;
 
 pub const BeforeRing = struct {
-    slots: [SearchConfig.context_lines_hard_cap]RingSlot = undefined,
+    inline_slots: [SearchConfig.context_lines_hard_cap]RingSlot = undefined,
+    heap_slots: []RingSlot = &.{},
     storage: []u8 = &.{},
     stride: usize = 0,
     cap: u32 = 0,
     count: u32 = 0,
     head: u32 = 0,
     owned: bool = false,
+
+    pub inline fn slotPtr(self: *BeforeRing, idx: u32) *RingSlot {
+        return if (self.heap_slots.len != 0) &self.heap_slots[idx] else &self.inline_slots[idx];
+    }
+
+    pub inline fn slotAt(self: *const BeforeRing, idx: u32) RingSlot {
+        return if (self.heap_slots.len != 0) self.heap_slots[idx] else self.inline_slots[idx];
+    }
 
     pub fn clear(self: *BeforeRing) void {
         self.count = 0;
@@ -146,7 +141,8 @@ pub const BeforeRing = struct {
         const idx = self.head;
         if (self.count < self.cap) self.count += 1;
         const len = slice.len;
-        self.slots[idx] = .{
+        const slot = self.slotPtr(idx);
+        slot.* = .{
             .len = std.math.cast(u32, len) orelse std.math.maxInt(u32),
             .abs = abs,
             .end_abs = end_abs,
@@ -165,13 +161,13 @@ pub const BeforeRing = struct {
             const at = @as(usize, idx) * self.stride;
             const n = @min(len, self.stride);
             @memcpy(self.storage[at..][0..n], slice[0..n]);
-            self.slots[idx].len = std.math.cast(u32, n) orelse 0;
+            slot.len = std.math.cast(u32, n) orelse 0;
         }
         self.head = (self.head + 1) % self.cap;
     }
 
     pub fn bytes(self: *const BeforeRing, idx: u32, buf: []const u8) []const u8 {
-        const slot = self.slots[idx];
+        const slot = self.slotAt(idx);
         if (self.owned) {
             if (self.stride == 0 or slot.len == 0) return &.{};
             const at = @as(usize, idx) * self.stride;
@@ -214,7 +210,7 @@ pub fn emitRing(
     var i: u32 = 0;
     while (i < state.ring.count) : (i += 1) {
         const idx = state.ring.index(i);
-        const slot = state.ring.slots[idx];
+        const slot = state.ring.slotAt(idx);
         if (!try sinkBreakAt(S, sink, slot.abs, state, config)) {
             state.ring.clear();
             return false;

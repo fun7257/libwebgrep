@@ -69,15 +69,19 @@ pub const RegexSet = struct {
         if (diag) |d| d.* = .{};
 
         const inst_cap = options.effectiveMaxInst() orelse max_inst_hard_cap;
-        if (inst_cap > max_inst_hard_cap or inst_cap == 0) {
-            populateDiagnostic(diag, "", error.RegexTooLarge, .instruction_limit_exceeded, 0, "max_inst exceeds hard cap or is zero", null);
+        if (inst_cap == 0 or inst_cap > std.math.maxInt(u32)) {
+            populateDiagnostic(diag, "", error.RegexTooLarge, .instruction_limit_exceeded, 0, "max_inst is zero or exceeds u32 max", null);
             return error.RegexTooLarge;
         }
-        if (options.max_multiline_window > max_multiline_window_hard_cap or options.max_multiline_window == 0) {
-            populateDiagnostic(diag, "", error.RegexTooLarge, .multiline_window_exceeded, 0, "max_multiline_window exceeds hard cap or is zero", null);
+        if (options.max_multiline_window == 0) {
+            populateDiagnostic(diag, "", error.RegexTooLarge, .multiline_window_exceeded, 0, "max_multiline_window is zero", null);
             return error.RegexTooLarge;
         }
-        matcher.checkPatternLimits(patterns, .{}) catch |err| {
+        matcher.checkPatternLimits(patterns, .{
+            .max_pattern_count = options.max_pattern_count,
+            .max_pattern_bytes = options.max_pattern_bytes,
+            .max_unicode_variants = options.max_unicode_variants,
+        }) catch |err| {
             const code: DiagnosticCode = switch (err) {
                 error.PatternCountExceeded => .pattern_count_exceeded,
                 error.PatternBytesExceeded => .pattern_bytes_exceeded,
@@ -103,6 +107,8 @@ pub const RegexSet = struct {
             .multiline = options.multiline,
             .dot_all = options.dot_all,
             .max_inst = inst_cap,
+            .max_repeat = options.max_repeat,
+            .max_recursion_depth = options.max_recursion_depth,
             .diag = diag,
         };
         defer compiler.deinit();
@@ -194,7 +200,7 @@ pub const RegexSet = struct {
         };
         errdefer self.deinit();
 
-        try self.tryBuildMultiPrefilter(patterns, any_ignore_case, options.unicode_case);
+        try self.tryBuildMultiPrefilter(patterns, any_ignore_case, options);
         return self;
     }
 
@@ -202,7 +208,7 @@ pub const RegexSet = struct {
         self: *RegexSet,
         patterns: []const []const u8,
         any_ignore_case: bool,
-        unicode_case: bool,
+        options: RegexOptions,
     ) !void {
         var prefixes = std.ArrayList([]u8).empty;
         errdefer {
@@ -224,7 +230,10 @@ pub const RegexSet = struct {
         const const_slices: []const []const u8 = @ptrCast(owned_prefixes);
         const find_opts = matcher.FindOptions{
             .case = if (any_ignore_case) .insensitive else .sensitive,
-            .unicode_case = unicode_case,
+            .unicode_case = options.unicode_case,
+            .max_pattern_count = options.max_pattern_count,
+            .max_pattern_bytes = options.max_pattern_bytes,
+            .max_unicode_variants = options.max_unicode_variants,
         };
         if (Multi.init(self.allocator, const_slices, find_opts)) |m| {
             self.prefix_slices = owned_prefixes;

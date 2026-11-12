@@ -517,7 +517,7 @@ fn initUnicodeFolded(
     patterns: []const []const u8,
     options: matcher.FindOptions,
 ) (matcher.LimitError || error{ PatternHasNewline, OutOfMemory })!Multi {
-    const max_variants_per_pattern: usize = 64;
+    const max_variants_per_pattern: usize = @max(options.max_unicode_variants, 1);
     for (patterns) |pat| {
         const ig = patternIgnoresCaseUnicode(pat, options.case);
         if (ig and unicode_fold.needsUnicodeExpansion(pat)) {

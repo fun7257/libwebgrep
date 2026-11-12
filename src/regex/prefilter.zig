@@ -16,7 +16,7 @@ const CaseMode = inst_mod.CaseMode;
 const popLastUtf8Codepoint = inst_mod.popLastUtf8Codepoint;
 const utf8SeqLenAt = inst_mod.utf8SeqLenAt;
 
-pub fn extractLiterals(self: anytype, pattern: []const u8, case_mode: CaseMode) !void {
+pub fn extractLiterals(self: anytype, pattern: []const u8, options: inst_mod.RegexOptions) !void {
     // Analyze required literal runs on the main spine: top-level contiguous literals outside `(a|b)`, `*`, `?`, or `{0,...}`
     var first_lit = std.ArrayList(u8).empty;
     defer first_lit.deinit(self.allocator);
@@ -222,8 +222,11 @@ pub fn extractLiterals(self: anytype, pattern: []const u8, case_mode: CaseMode) 
     }
 
     const find_opts = matcher.FindOptions{
-        .case = if (self.ignore_case) .insensitive else case_mode,
+        .case = if (self.ignore_case) .insensitive else options.case,
         .unicode_case = self.unicode_case,
+        .max_pattern_count = options.max_pattern_count,
+        .max_pattern_bytes = options.max_pattern_bytes,
+        .max_unicode_variants = options.max_unicode_variants,
     };
 
     if (has_top_alt) {

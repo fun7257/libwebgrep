@@ -27,6 +27,37 @@ pub const BinaryPolicy = enum {
     none,
 };
 
+/// Half-open byte range `[start, end)` within a source. `end == null` searches through EOF.
+pub const ByteRange = struct {
+    start: u64 = 0,
+    end: ?u64 = null,
+};
+
+/// Controls whether 1-based line numbers are computed, forced from 1, or omitted as unknown.
+pub const LineNumberMode = enum {
+    /// Compute 1-based line numbers when starting at offset 0 or when `initial_line_number` / `continuation` is supplied;
+    /// mark line numbers unknown (`Line.number = null`, `LineEvent.line_number_known = false`) when starting mid-file without scanning from 0.
+    auto,
+    /// Count lines starting at 1 from the start of the searched range (unless `initial_line_number` overrides it).
+    from_one,
+    /// Never compute line numbers (`Line.number = null`, `LineEvent.line_number = 0`, `LineEvent.line_number_known = false`).
+    unknown,
+};
+
+/// Candidate line passed to `SearchConfig.line_filter` before consuming `max_count`, `max_results`, or match counters.
+pub const LineFilterCandidate = struct {
+    /// Line content excluding record delimiter (and trailing `\r` in LF mode).
+    bytes: []const u8,
+    /// Raw line slice including any trailing delimiter present in the buffer.
+    raw_bytes: []const u8,
+    /// Absolute byte offset of the start of this line in the searchable stream.
+    absolute_offset: u64,
+    /// First match span relative to `bytes` (`0..0` when `is_inverted` is true).
+    first_match: sink_mod.Span,
+    /// True when the candidate was produced by `invert = true`.
+    is_inverted: bool = false,
+};
+
 pub const SearchConfig = struct {
     /// Initial chunk size. 1 MiB is the fastest of the four tiers on a 128 MiB file (see `BENCHMARKS.md`). Defaults to 1 MiB.
     pub const default_buffer_size: usize = 1024 * 1024;
@@ -86,6 +117,10 @@ pub const SearchConfig = struct {
     whole_word: bool = false,
     /// Whole-line matching. After stripping LF and a single preceding CR, the entire line content must match one of the patterns.
     whole_line: bool = false,
+    /// Enables cross-line matching semantics and sliding-window buffering even if the matcher did not set `isMultiline()`.
+    multiline: bool = false,
+    /// Optional override for maximum cross-line match window in bytes (`null` uses `matcher.multilineWindow()`, or `64 KiB` when `config.multiline` is set).
+    max_multiline_window: ?usize = null,
     /// Every byte slice listed here must appear in the line content for the line to be emitted (exact byte comparison unless `filter_case_insensitive` is set). Empty means no extra requirement.
     contains: []const []const u8 = &.{},
     /// None of the byte slices listed here may appear in the line content (exact byte comparison unless `filter_case_insensitive` is set). Independent of `invert`.
@@ -179,6 +214,27 @@ pub const SearchConfig = struct {
     passthru: bool = false,
     /// Read-only replacement preview template. When non-null, populates `Span.replacement` and `Line.replaced` / `LineEvent.replaced` without modifying the input.
     replacement: ?[]const u8 = null,
+    /// Optional byte range `[start, end)` to search within the input without scanning outside the range.
+    byte_range: ?ByteRange = null,
+    /// When true with `byte_range`: if `start > 0` and not preceded by a record delimiter, advances `start` to the next line boundary;
+    /// if `end` is non-null and cuts inside a line starting `< end`, extends through the end of that line.
+    range_align_lines: bool = false,
+    /// Optional callback to seek the upstream input to an exact byte offset (`0`-based) for `byte_range`, `resume_from`, or `Flow.skipTo`.
+    seek_input: ?*const fn (?*anyopaque, u64) anyerror!void = null,
+    seek_ctx: ?*anyopaque = null,
+    /// Optional positional read callback `(ctx, offset, out) -> bytes_read` enabling zero-seek range and jump I/O.
+    read_at: ?*const fn (?*anyopaque, u64, []u8) anyerror!usize = null,
+    read_at_ctx: ?*anyopaque = null,
+    /// Indicates that the caller has already positioned the `std.Io.Reader` at this absolute byte offset.
+    stream_offset: ?u64 = null,
+    /// Explicit starting 1-based line number for the first line at the effective start offset (or last line in reverse tail search).
+    initial_line_number: ?u64 = null,
+    /// Line numbering policy (`.auto`, `.from_one`, `.unknown`).
+    line_number_mode: LineNumberMode = .auto,
+    /// Synchronous pre-count / pre-quota predicate evaluated after pattern + `whole_word`/`whole_line`/`contains`/`excludes` filters
+    /// and strictly before incrementing `max_count`, `max_results`, `matched_lines`, `matches`, or context emission.
+    line_filter: ?*const fn (?*anyopaque, LineFilterCandidate) bool = null,
+    line_filter_ctx: ?*anyopaque = null,
     /// Diagnostic logging callback. Messages may include file paths, whereas returned errors never do. The library never writes these messages to a terminal.
     log: ?*const fn (?*anyopaque, []const u8) void = null,
     log_ctx: ?*anyopaque = null,
@@ -249,6 +305,7 @@ pub const Event = sink_mod.Event;
 pub const LineEvent = sink_mod.LineEvent;
 pub const EndEvent = sink_mod.EndEvent;
 pub const Flow = sink_mod.Flow;
+pub const FlowAction = sink_mod.FlowAction;
 pub const Summary = sink_mod.Summary;
 pub const Progress = sink_mod.Progress;
 pub const Heartbeat = sink_mod.Heartbeat;
@@ -275,7 +332,7 @@ pub const width = memchr.native_width;
 
 pub fn serviceConfig(config: SearchConfig) SearchConfig {
     var cfg = config;
-    cfg.line_numbers = true;
+    cfg.line_numbers = (cfg.line_number_mode != .unknown);
     if (cfg.max_source_bytes == null) cfg.max_source_bytes = SearchConfig.default_max_source_bytes;
     if (cfg.max_request_bytes == null) cfg.max_request_bytes = SearchConfig.default_max_request_bytes;
     if (cfg.time_budget_ns == null) cfg.time_budget_ns = SearchConfig.default_time_budget_ns;

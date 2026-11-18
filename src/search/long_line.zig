@@ -41,7 +41,7 @@ const windowOrigin = ring_mod.windowOrigin;
 const rememberBefore = ring_mod.rememberBefore;
 const emitRing = ring_mod.emitRing;
 const sinkBreakAt = format_mod.sinkBreakAt;
-const sinkLine = format_mod.sinkLine;
+const sinkLineAction = format_mod.sinkLineAction;
 const sliceContainsFilter = line_matcher_mod.sliceContainsFilter;
 const nextMatch = line_matcher_mod.nextMatch;
 const matchBuffer = line_matcher_mod.matchBuffer;
@@ -189,6 +189,10 @@ pub fn slideLong(buf: *[]u8, filled: *usize, matcher: anytype, state: *State, co
     const keep = overlapKeep(matcher, config);
     if (filled.* <= keep) return;
     const drop = filled.* - keep;
+    if (state.line_number) |ln| {
+        const nls = memchr.count(width, buf.*[0..drop], 0, drop, recordSep(config));
+        state.line_number = ln + nls;
+    }
     std.mem.copyForwards(u8, buf.*[0..keep], buf.*[drop..filled.*]);
     filled.* = keep;
     state.long_dropped += drop;
@@ -203,6 +207,7 @@ pub fn emitHold(
     config: SearchConfig,
     as_match: bool,
     end_abs: u64,
+    next_line_num: u64,
 ) SliceError!bool {
     const withheld = config.binary == .report and state.nul_offset != null;
     const n = @min(state.long_hold_len, hold.len);
@@ -219,10 +224,10 @@ pub fn emitHold(
     const window = if (withheld) 0 else state.long_window_start;
     var none: [0]Span = .{};
     const repl = if (withheld) null else config.replacement;
-    const keep = if (as_match)
-        sinkLine(S, "matched", sink, state, bytes, span, &none, state.long_origin, state.long_number, truncated, state.long_line_len, window, repl)
+    const action = if (as_match)
+        sinkLineAction(S, "matched", sink, state, bytes, bytes, 0, bytes.len, config.match_mode, span, &none, state.long_origin, state.long_number, truncated, state.long_line_len, window, repl)
     else
-        sinkLine(S, "context", sink, state, bytes, span, &none, state.long_origin, state.long_number, truncated, state.long_line_len, window, repl);
+        sinkLineAction(S, "context", sink, state, bytes, bytes, 0, bytes.len, config.match_mode, span, &none, state.long_origin, state.long_number, truncated, state.long_line_len, window, repl);
     releaseQueue(state);
     if (as_match) {
         state.matched_lines += 1;
@@ -231,9 +236,30 @@ pub fn emitHold(
     }
     state.last_abs_end = end_abs;
     state.has_sunk = true;
-    if (!keep) noteRejected(S, state, sink);
+    var keep = true;
+    switch (action) {
+        .cont => {},
+        .skip_to => |target| {
+            if (target > end_abs) {
+                state.after_left = 0;
+                state.ring.clear();
+                state.pending_skip_to = target;
+            }
+        },
+        .pause => {
+            state.paused = true;
+            state.resume_at = end_abs;
+            state.resume_line = next_line_num;
+            state.stopped = true;
+            keep = false;
+        },
+        .stop => {
+            state.stopped = true;
+            keep = false;
+        },
+    }
     if (as_match and !noteHitLimit(state, config, end_abs)) return false;
-    return keep;
+    return keep and !state.paused;
 }
 
 pub fn finishLong(
@@ -253,21 +279,59 @@ pub fn finishLong(
     const matched_pat = state.long_has_match and !config.whole_line;
     var is_hit = if (config.invert) !matched_pat else matched_pat;
     if (!filters_ok) is_hit = false;
+    if (is_hit and config.line_filter != null) {
+        const raw = hold[0..@min(state.long_hold_len, hold.len)];
+        const first_sp: Span = if (!config.invert and state.long_hold_kind == 2) .{
+            .start = state.long_match_start,
+            .end = state.long_match_end,
+            .pattern_id = state.long_match_pid,
+        } else .{ .start = 0, .end = 0 };
+        if (config.line_filter) |cb| {
+            if (!cb(config.line_filter_ctx, .{
+                .bytes = raw,
+                .raw_bytes = raw,
+                .absolute_offset = state.long_origin,
+                .first_match = first_sp,
+                .is_inverted = config.invert,
+            })) {
+                is_hit = false;
+            }
+        }
+    }
     const end_abs = state.abs_base + drop_buf;
+    const clamped_drop = @min(drop_buf, filled.*);
+    const next_ln: u64 = if (state.line_number) |ln|
+        ln + memchr.count(width, buf.*, state.last_line_counted, clamped_drop, recordSep(config))
+    else
+        0;
     if (is_hit and !state.exceeded(config)) {
         if (!config.passthru) {
-            if (!try emitRing(S, sink, buf.*, state, config)) return false;
+            if (!try emitRing(S, sink, buf.*, state, config)) {
+                if (state.pending_skip_to != null) {
+                    countLines(buf.*, clamped_drop, state, config);
+                    compactBuf(buf.*, filled, clamped_drop, state);
+                    state.pos = 0;
+                    state.last_line_visited = 0;
+                    state.remembered_until = 0;
+                    state.long_active = false;
+                    state.long_hold_kind = 0;
+                    state.long_has_match = false;
+                    state.long_match_pid = null;
+                    return !state.stopped;
+                }
+                return false;
+            }
         }
         state.limit_count += 1;
-        if (!try emitHold(S, sink, hold, state, config, true, end_abs)) return false;
-        state.after_left = afterCount(config);
+        if (!try emitHold(S, sink, hold, state, config, true, end_abs, next_ln)) return false;
+        if (state.pending_skip_to == null) state.after_left = afterCount(config);
     } else if (!is_hit and config.stop_on_nonmatch and state.matched_lines > 0) {
         state.stopped = true;
         state.need_close = true;
     } else if (config.passthru and !state.exceeded(config)) {
-        if (!try emitHold(S, sink, hold, state, config, false, end_abs)) return false;
+        if (!try emitHold(S, sink, hold, state, config, false, end_abs, next_ln)) return false;
     } else if (state.after_left > 0) {
-        if (!try emitHold(S, sink, hold, state, config, is_hit, end_abs)) return false;
+        if (!try emitHold(S, sink, hold, state, config, is_hit, end_abs, next_ln)) return false;
         if (state.after_left > 0) state.after_left -= 1;
     } else if (beforeCount(config) > 0) {
         const raw = hold[0..@min(state.long_hold_len, hold.len)];
@@ -285,8 +349,8 @@ pub fn finishLong(
         };
         state.ring.pushBytes(raw, preview, state.long_origin, end_abs, state.long_number);
     }
-    countLines(buf.*, @min(drop_buf, filled.*), state, config);
-    compactBuf(buf.*, filled, @min(drop_buf, filled.*), state);
+    countLines(buf.*, clamped_drop, state, config);
+    compactBuf(buf.*, filled, clamped_drop, state);
     state.pos = 0;
     state.last_line_visited = 0;
     state.remembered_until = 0;
@@ -297,7 +361,7 @@ pub fn finishLong(
     return !state.stopped;
 }
 
-pub fn beginLong(
+pub fn beginLongWithMatch(
     allocator: std.mem.Allocator,
     matcher: anytype,
     buf: *[]u8,
@@ -306,6 +370,7 @@ pub fn beginLong(
     seen: *[]bool,
     state: *State,
     config: SearchConfig,
+    preset_match: ?matcher_mod.Match,
 ) error{OutOfMemory}!void {
     state.long_active = true;
     state.long_origin = state.abs_base;
@@ -327,11 +392,143 @@ pub fn beginLong(
     }
     if (seen.len > 0) @memset(seen.*, false);
     const bytes = buf.*[0..filled.*];
-    if (config.invert or config.passthru or beforeCount(config) > 0 or state.after_left > 0) {
+    if (preset_match) |pm| {
+        try saveMatchWindow(allocator, bytes, pm, hold, state, config);
+        state.long_has_match = true;
+    } else if (config.invert or config.passthru or beforeCount(config) > 0 or state.after_left > 0) {
         try savePrefix(allocator, bytes, hold, state, config);
     }
     try noteLong(allocator, matcher, bytes, hold, seen, state, config, false);
     slideLong(buf, filled, matcher, state, config);
+}
+
+pub fn beginLong(
+    allocator: std.mem.Allocator,
+    matcher: anytype,
+    buf: *[]u8,
+    filled: *usize,
+    hold: *[]u8,
+    seen: *[]bool,
+    state: *State,
+    config: SearchConfig,
+) error{OutOfMemory}!void {
+    return beginLongWithMatch(allocator, matcher, buf, filled, hold, seen, state, config, null);
+}
+
+fn transitionToLong(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    sink: *S,
+    matcher: anytype,
+    buf: *[]u8,
+    filled: *usize,
+    initial_search_end: usize,
+    hold: *[]u8,
+    seen: *[]bool,
+    state: *State,
+    config: SearchConfig,
+) ReadError!bool {
+    var search_end = initial_search_end;
+    if (search_end > 0) {
+        if (!state_mod.effectiveMultiline(matcher, config) or config.whole_line) {
+            if (!try matchBuffer(S, sink, matcher, buf.*[0..search_end], state, config)) {
+                if (state.pending_skip_to != null) return true;
+                return false;
+            }
+            rememberBefore(matcher, buf.*, state, config, search_end);
+            countLines(buf.*, search_end, state, config);
+            compactBuf(buf.*, filled, search_end, state);
+        } else {
+            const ml_win = state_mod.effectiveMultilineWindow(matcher, config);
+            const safe_ce = state_mod.lineStart(buf.*[0..search_end], search_end -| ml_win, config);
+            if (safe_ce > 0) {
+                if (!try line_matcher_mod.matchBufferWithLimit(S, sink, matcher, buf.*[0..filled.*], safe_ce, true, state, config)) {
+                    if (state.pending_skip_to != null) return true;
+                    return false;
+                }
+                const drop = state.pos;
+                if (drop > 0) {
+                    rememberBefore(matcher, buf.*, state, config, drop);
+                    countLines(buf.*, drop, state, config);
+                    compactBuf(buf.*, filled, drop, state);
+                    search_end = lastComplete(buf.*[0..filled.*], config);
+                    if (filled.* - search_end <= config.max_line_len) return !state.stopped;
+                }
+            }
+            var bridged = false;
+            while (search_end > 0 and state.pos < search_end) {
+                const m_opt = nextMatch(matcher, buf.*[0..filled.*], state.pos, config);
+                if (m_opt == null or m_opt.?.start >= search_end) {
+                    if (!try matchBuffer(S, sink, matcher, buf.*[0..search_end], state, config)) {
+                        if (state.pending_skip_to != null) return true;
+                        return false;
+                    }
+                    rememberBefore(matcher, buf.*, state, config, search_end);
+                    countLines(buf.*, search_end, state, config);
+                    compactBuf(buf.*, filled, search_end, state);
+                    break;
+                }
+                const hit = m_opt.?;
+                const ls = state_mod.lineStart(buf.*[0..search_end], hit.start, config);
+                var end_line = line_matcher_mod.matchLineEnd(buf.*[0..filled.*], ls, hit, config);
+                if (end_line <= search_end) {
+                    var cur = hit;
+                    while (true) {
+                        const next_from = if (cur.end == cur.start) cur.end + 1 else cur.end;
+                        if (next_from >= end_line or next_from > filled.*) break;
+                        const probe_lim = line_matcher_mod.bridgingProbeLimit(matcher, buf.*[0..filled.*], end_line, config);
+                        const m2 = nextMatch(matcher, buf.*[0..probe_lim], next_from, config) orelse break;
+                        if (m2.start >= end_line) break;
+                        const end2 = line_matcher_mod.matchLineEnd(buf.*[0..filled.*], ls, m2, config);
+                        if (end2 > end_line) end_line = end2;
+                        cur = m2;
+                    }
+                }
+                if (end_line <= search_end) {
+                    if (!try line_matcher_mod.matchBufferWithLimit(S, sink, matcher, buf.*[0..search_end], end_line, false, state, config)) {
+                        if (state.pending_skip_to != null) return true;
+                        return false;
+                    }
+                    if (state.pos < end_line) state.pos = end_line;
+                } else {
+                    if (ls > state.pos) {
+                        if (!try matchBuffer(S, sink, matcher, buf.*[0..ls], state, config)) {
+                            if (state.pending_skip_to != null) return true;
+                            return false;
+                        }
+                    }
+                    if (ls > 0) {
+                        rememberBefore(matcher, buf.*, state, config, ls);
+                        countLines(buf.*, ls, state, config);
+                        compactBuf(buf.*, filled, ls, state);
+                    }
+                    const shifted = matcher_mod.Match{
+                        .start = hit.start - ls,
+                        .end = hit.end - ls,
+                        .pattern_id = hit.pattern_id,
+                    };
+                    try beginLongWithMatch(allocator, matcher, buf, filled, hold, seen, state, config, shifted);
+                    bridged = true;
+                    break;
+                }
+            }
+            if (bridged) return !state.stopped;
+            if (search_end > 0 and filled.* >= search_end and lastComplete(buf.*[0..filled.*], config) > 0) {
+                const rem_se = lastComplete(buf.*[0..filled.*], config);
+                if (rem_se > 0) {
+                    if (!try matchBuffer(S, sink, matcher, buf.*[0..rem_se], state, config)) {
+                        if (state.pending_skip_to != null) return true;
+                        return false;
+                    }
+                    rememberBefore(matcher, buf.*, state, config, rem_se);
+                    countLines(buf.*, rem_se, state, config);
+                    compactBuf(buf.*, filled, rem_se, state);
+                }
+            }
+        }
+    }
+    try beginLong(allocator, matcher, buf, filled, hold, seen, state, config);
+    return !state.stopped;
 }
 
 pub fn makeRoom(
@@ -353,11 +550,35 @@ pub fn makeRoom(
     }
     const end = lastComplete(buf.*[0..filled.*], config);
     if (end > 0) {
-        if (!try matchBuffer(S, sink, matcher, buf.*[0..end], state, config)) return false;
-        rememberBefore(matcher, buf.*, state, config, end);
-        countLines(buf.*, end, state, config);
-        compactBuf(buf.*, filled, end, state);
-        return filled.* < buf.len;
+        if (!state_mod.effectiveMultiline(matcher, config)) {
+            if (!try matchBuffer(S, sink, matcher, buf.*[0..end], state, config)) {
+                if (state.pending_skip_to != null) return true;
+                return false;
+            }
+            rememberBefore(matcher, buf.*, state, config, end);
+            countLines(buf.*, end, state, config);
+            compactBuf(buf.*, filled, end, state);
+            return filled.* < buf.len;
+        }
+        const ml_win = state_mod.effectiveMultilineWindow(matcher, config);
+        const safe_ce = state_mod.lineStart(buf.*[0..end], end -| ml_win, config);
+        if (safe_ce > 0) {
+            if (!try line_matcher_mod.matchBufferWithLimit(S, sink, matcher, buf.*[0..filled.*], safe_ce, true, state, config)) {
+                if (state.pending_skip_to != null) return true;
+                return false;
+            }
+            const drop = state.pos;
+            if (drop > 0) {
+                rememberBefore(matcher, buf.*, state, config, drop);
+                countLines(buf.*, drop, state, config);
+                compactBuf(buf.*, filled, drop, state);
+                return filled.* < buf.len;
+            }
+        }
+        if (filled.* - end > config.max_line_len) {
+            if (!try transitionToLong(S, allocator, sink, matcher, buf, filled, end, hold, seen, state, config)) return false;
+            return filled.* < buf.len;
+        }
     }
     if (filled.* > config.max_line_len) {
         try beginLong(allocator, matcher, buf, filled, hold, seen, state, config);
@@ -417,14 +638,7 @@ pub fn pumpLong(
         if (eof) return true;
         const search_end = lastComplete(buf.*[0..filled.*], config);
         if (filled.* - search_end <= config.max_line_len) return true;
-        if (search_end > 0) {
-            if (!try matchBuffer(S, sink, matcher, buf.*[0..search_end], state, config)) return false;
-            rememberBefore(matcher, buf.*, state, config, search_end);
-            countLines(buf.*, search_end, state, config);
-            compactBuf(buf.*, filled, search_end, state);
-        }
-        try beginLong(allocator, matcher, buf, filled, hold, seen, state, config);
-        return !state.stopped;
+        return transitionToLong(S, allocator, sink, matcher, buf, filled, search_end, hold, seen, state, config);
     }
     const sep = recordSep(config);
     if (memchr.find(width, buf.*[0..filled.*], 0, sep)) |nl| {

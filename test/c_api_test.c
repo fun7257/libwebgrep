@@ -25,7 +25,11 @@ typedef struct {
     int      saw_replacement;
     int      stop_after_first;
     int32_t  last_pattern_id;
+    uint64_t first_line_no;
     uint64_t last_line_no;
+    uint64_t first_offset;
+    uint64_t last_offset;
+    uint8_t  last_line_known;
 } line_capture_ctx_t;
 
 static int bytes_contains(const uint8_t *hay, size_t hay_len, const char *needle, size_t needle_len) {
@@ -44,8 +48,14 @@ static int on_line_capture(const webgrep_line_event_t *ev, void *userdata) {
     if (ev->is_context) {
         ctx->context_lines++;
     } else {
+        if (ctx->matched_lines == 0) {
+            ctx->first_line_no = ev->line_number;
+            ctx->first_offset = ev->byte_offset;
+        }
         ctx->matched_lines++;
         ctx->last_line_no = ev->line_number;
+        ctx->last_offset = ev->byte_offset;
+        ctx->last_line_known = ev->line_number_known;
         if (ev->matches_len > 0 && ev->matches_ptr) {
             ctx->last_pattern_id = ev->matches_ptr[0].pattern_id;
         }
@@ -59,6 +69,39 @@ static int on_line_capture(const webgrep_line_event_t *ev, void *userdata) {
         }
     }
     return 0;
+}
+
+typedef struct {
+    const char *required_substr;
+    size_t      calls;
+} line_filter_test_ctx_t;
+
+static bool test_line_filter_cb(void *user_data, const webgrep_line_filter_candidate_t *cand) {
+    line_filter_test_ctx_t *fctx = (line_filter_test_ctx_t *)user_data;
+    if (!fctx || !cand) return true;
+    fctx->calls++;
+    if (!fctx->required_substr) return true;
+    return bytes_contains(
+        cand->bytes_ptr,
+        cand->bytes_len,
+        fctx->required_substr,
+        strlen(fctx->required_substr)
+    ) != 0;
+}
+
+typedef struct {
+    const char *allowed_suffix;
+    size_t      seen_entries;
+} archive_filter_test_ctx_t;
+
+static bool test_archive_entry_filter_cb(void *user_data, const webgrep_archive_entry_meta_t *meta) {
+    archive_filter_test_ctx_t *actx = (archive_filter_test_ctx_t *)user_data;
+    if (!actx || !meta) return true;
+    actx->seen_entries++;
+    if (!actx->allowed_suffix || !meta->path_ptr) return false;
+    size_t slen = strlen(actx->allowed_suffix);
+    if (meta->path_len < slen) return false;
+    return memcmp(meta->path_ptr + (meta->path_len - slen), actx->allowed_suffix, slen) == 0;
 }
 
 typedef struct {
@@ -540,7 +583,245 @@ int main(void) {
 
     webgrep_scratch_free(scratch);
     webgrep_matcher_free(stream_m);
-    printf("[16/16] Security exploits: reader overflow & archive traversal/symlink: PASS\n");
-    printf("=== ALL 16 C ABI TEST SECTIONS PASSED ===\n");
+    printf("[16/17] Security exploits: reader overflow & archive traversal/symlink: PASS\n");
+
+    /* 17. Multiline cross-line matching (literal, regex, regex_set, slice, streaming reader, archive) */
+    {
+        /* (a) Literal multiline */
+        webgrep_find_options_t ml_fopts = webgrep_find_options_default();
+        assert(ml_fopts.multiline == 0);
+        webgrep_matcher_t *ml_lit = NULL;
+        assert(webgrep_matcher_compile_literal((const uint8_t *)"alpha\nbeta", 10, &ml_fopts, &ml_lit) == WEBGREP_ERR_SYNTAX);
+        ml_fopts.multiline = 1;
+        assert(webgrep_matcher_compile_literal((const uint8_t *)"alpha\nbeta", 10, &ml_fopts, &ml_lit) == WEBGREP_OK);
+        assert(ml_lit != NULL);
+
+        const char *ml_doc = "line1\nxx alpha\nbeta yy\nline4\n";
+        webgrep_config_t ml_cfg = webgrep_config_default();
+        ml_cfg.multiline = 1;
+        memset(&lctx, 0, sizeof(lctx));
+        memset(&sum, 0, sizeof(sum));
+        assert(webgrep_search_slice(
+            ml_lit,
+            (const uint8_t *)ml_doc,
+            strlen(ml_doc),
+            &ml_cfg,
+            on_line_capture,
+            &lctx,
+            &sum
+        ) == WEBGREP_OK);
+        assert(sum.matched_lines == 1 && lctx.matched_lines == 1 && lctx.last_line_no == 2);
+
+        /* Chunked streaming reader (chunk_size = 5) on multiline input */
+        mem_reader_ctx_t ml_rctx = {
+            .data = (const uint8_t *)ml_doc,
+            .len = strlen(ml_doc),
+            .pos = 0,
+            .chunk_size = 5
+        };
+        memset(&lctx, 0, sizeof(lctx));
+        memset(&sum, 0, sizeof(sum));
+        assert(webgrep_search_reader(
+            ml_lit,
+            mem_read_cb,
+            &ml_rctx,
+            &ml_cfg,
+            on_line_capture,
+            &lctx,
+            &sum
+        ) == WEBGREP_OK);
+        assert(sum.matched_lines == 1 && lctx.matched_lines == 1 && lctx.last_line_no == 2);
+
+        /* TAR archive multiline search */
+        uint8_t ml_tar[2048];
+        memset(ml_tar, 0, sizeof(ml_tar));
+        write_tar_header(ml_tar, "dir/multiline.txt", strlen(ml_doc), '0', NULL);
+        memcpy(ml_tar + 512, ml_doc, strlen(ml_doc));
+        webgrep_tree_config_t ml_tcfg = webgrep_tree_config_default();
+        ml_tcfg.search.multiline = 1;
+        memset(&tsum, 0, sizeof(tsum));
+        memset(&lctx, 0, sizeof(lctx));
+        assert(webgrep_search_archive_slice(
+            ml_lit,
+            ml_tar,
+            sizeof(ml_tar),
+            &ml_tcfg,
+            on_line_capture,
+            &lctx,
+            &tsum
+        ) == WEBGREP_OK);
+        assert(tsum.matched_files == 1 && tsum.matched_lines == 1 && lctx.last_line_no == 2);
+        webgrep_matcher_free(ml_lit);
+
+        /* (b) Regex multiline + dot_all */
+        webgrep_regex_options_t ml_ropts = webgrep_regex_options_default();
+        ml_ropts.multiline = 1;
+        ml_ropts.dot_all = 1;
+        webgrep_matcher_t *ml_re = NULL;
+        assert(webgrep_matcher_compile_regex((const uint8_t *)"START.+?END", 11, &ml_ropts, &diag, &ml_re) == WEBGREP_OK);
+        const char *dot_doc = "h\nSTART\nmid\nEND\nt\n";
+        memset(&lctx, 0, sizeof(lctx));
+        memset(&sum, 0, sizeof(sum));
+        assert(webgrep_search_slice(ml_re, (const uint8_t *)dot_doc, strlen(dot_doc), &ml_cfg, on_line_capture, &lctx, &sum) == WEBGREP_OK);
+        assert(sum.matched_lines == 1 && lctx.last_line_no == 2);
+        webgrep_matcher_free(ml_re);
+
+        /* (c) RegexSet multiline */
+        webgrep_pattern_t ml_spats[2] = {
+            { (const uint8_t *)"alpha\\nbeta", 11 },
+            { (const uint8_t *)"START\\nmid",  10 }
+        };
+        webgrep_matcher_t *ml_rset = NULL;
+        assert(webgrep_matcher_compile_regex_set(ml_spats, 2, &ml_ropts, &diag, &ml_rset) == WEBGREP_OK);
+        memset(&lctx, 0, sizeof(lctx));
+        memset(&sum, 0, sizeof(sum));
+        assert(webgrep_search_slice(ml_rset, (const uint8_t *)ml_doc, strlen(ml_doc), &ml_cfg, on_line_capture, &lctx, &sum) == WEBGREP_OK);
+        assert(sum.matched_lines == 1 && lctx.last_pattern_id == 0 && lctx.last_line_no == 2);
+        webgrep_matcher_free(ml_rset);
+    }
+    printf("[17/18] Multiline cross-line matching (literal, regex, regex_set, slice, streaming, archive): PASS\n");
+
+    /* 18. Range, line_number_mode, pre-count line_filter, reverse tail search, probe_line_slice, & archive entry_filter */
+    {
+        /* (a) Zero-init {0} and default struct parity */
+        webgrep_config_t zero_cfg = {0};
+        webgrep_config_t def_cfg = webgrep_config_default();
+        assert(def_cfg.has_byte_range == 0 && def_cfg.has_byte_range_end == 0 && def_cfg.range_align_lines == 0);
+        assert(def_cfg.initial_line_number == 0 && def_cfg.line_number_mode == WEBGREP_LINE_NUM_AUTO);
+        assert(def_cfg.line_filter == NULL && def_cfg.line_filter_ctx == NULL);
+
+        webgrep_probe_options_t popts = webgrep_probe_options_default();
+        assert(popts.delimiter == '\n' && popts.strip_crlf == 1 && popts.max_line_bytes == 2u * 1024u * 1024u);
+
+        /* (b) NULL regex options Unicode folding parity: (?i)kelvin matches U+212A Kelvin sign "\xE2\x84\xAAelvin" */
+        webgrep_matcher_t *kelvin_re = NULL;
+        assert(webgrep_matcher_compile_regex((const uint8_t *)"(?i)kelvin", 10, NULL, &diag, &kelvin_re) == WEBGREP_OK);
+        const uint8_t kelvin_text[] = "sensor \xE2\x84\xAA""elvin ok\n";
+        assert(webgrep_find(kelvin_re, kelvin_text, sizeof(kelvin_text) - 1, 0, &cm) == 1);
+        assert(cm.start == 7 && cm.end == 15);
+        webgrep_matcher_free(kelvin_re);
+
+        /* (c) webgrep_probe_line_slice */
+        const char *pdoc = "row0\r\nrow1_payload\r\nrow2";
+        webgrep_line_probe_t probe_out;
+        memset(&probe_out, 0, sizeof(probe_out));
+        assert(webgrep_probe_line_slice((const uint8_t *)pdoc, strlen(pdoc), 9, NULL, &probe_out) == 1);
+        assert(probe_out.start_offset == 6 && probe_out.end_offset == 18 && probe_out.raw_end_offset == 20);
+        assert(probe_out.bytes_len == 12 && memcmp(probe_out.bytes_ptr, "row1_payload", 12) == 0);
+        assert(probe_out.truncated_left == 0 && probe_out.truncated_right == 0);
+        assert(webgrep_probe_line_slice((const uint8_t *)pdoc, strlen(pdoc), strlen(pdoc), NULL, &probe_out) == 0);
+        assert(webgrep_probe_line_slice(NULL, 5, 0, NULL, &probe_out) == WEBGREP_ERR_INVALID_ARG);
+
+        /* (d) byte_range, line_number_mode, initial_line_number, and pre-quota line_filter */
+        webgrep_matcher_t *hit_m = NULL;
+        assert(webgrep_matcher_compile_literal((const uint8_t *)"HIT", 3, NULL, &hit_m) == WEBGREP_OK);
+        const char *rdoc =
+            "000 HIT drop\n" /* 0..13 */
+            "111 HIT keep\n" /* 13..26 */
+            "222 HIT drop\n" /* 26..39 */
+            "333 HIT keep\n"; /* 39..52 */
+
+        /* Zero-init {0} config works seamlessly */
+        memset(&lctx, 0, sizeof(lctx));
+        memset(&sum, 0, sizeof(sum));
+        assert(webgrep_search_slice(hit_m, (const uint8_t *)rdoc, strlen(rdoc), &zero_cfg, on_line_capture, &lctx, &sum) == WEBGREP_OK);
+        assert(sum.matched_lines == 4 && lctx.matched_lines == 4);
+
+        /* Empty [0..0) range via has_byte_range_end = 1 */
+        webgrep_config_t rcfg = webgrep_config_default();
+        rcfg.has_byte_range = 1;
+        rcfg.has_byte_range_end = 1;
+        rcfg.byte_range_start = 0;
+        rcfg.byte_range_end = 0;
+        memset(&lctx, 0, sizeof(lctx));
+        memset(&sum, 0, sizeof(sum));
+        assert(webgrep_search_slice(hit_m, (const uint8_t *)rdoc, strlen(rdoc), &rcfg, on_line_capture, &lctx, &sum) == WEBGREP_OK);
+        assert(sum.matched_lines == 0 && lctx.matched_lines == 0);
+
+        /* Mid-file byte_range with range_align_lines = 1 and AUTO unknown vs initial_line_number vs FROM_ONE vs UNKNOWN */
+        rcfg = webgrep_config_default();
+        rcfg.has_byte_range = 1;
+        rcfg.byte_range_start = 5;  /* cuts inside line 1 -> aligned to 13 */
+        rcfg.byte_range_end = 30;   /* cuts inside line 3 -> aligned to 39 */
+        rcfg.range_align_lines = 1;
+        memset(&lctx, 0, sizeof(lctx));
+        memset(&sum, 0, sizeof(sum));
+        assert(webgrep_search_slice(hit_m, (const uint8_t *)rdoc, strlen(rdoc), &rcfg, on_line_capture, &lctx, &sum) == WEBGREP_OK);
+        assert(sum.matched_lines == 2 && lctx.first_offset == 13 && lctx.last_offset == 26);
+        assert(lctx.last_line_known == 0 && lctx.first_line_no == 0);
+
+        rcfg.initial_line_number = 100;
+        memset(&lctx, 0, sizeof(lctx));
+        assert(webgrep_search_slice(hit_m, (const uint8_t *)rdoc, strlen(rdoc), &rcfg, on_line_capture, &lctx, &sum) == WEBGREP_OK);
+        assert(lctx.last_line_known == 1 && lctx.first_line_no == 100 && lctx.last_line_no == 101);
+
+        rcfg.initial_line_number = 0;
+        rcfg.line_number_mode = WEBGREP_LINE_NUM_FROM_ONE;
+        memset(&lctx, 0, sizeof(lctx));
+        assert(webgrep_search_slice(hit_m, (const uint8_t *)rdoc, strlen(rdoc), &rcfg, on_line_capture, &lctx, &sum) == WEBGREP_OK);
+        assert(lctx.last_line_known == 1 && lctx.first_line_no == 1 && lctx.last_line_no == 2);
+
+        rcfg = webgrep_config_default();
+        rcfg.line_number_mode = WEBGREP_LINE_NUM_UNKNOWN;
+        memset(&lctx, 0, sizeof(lctx));
+        assert(webgrep_search_slice(hit_m, (const uint8_t *)rdoc, strlen(rdoc), &rcfg, on_line_capture, &lctx, &sum) == WEBGREP_OK);
+        assert(lctx.matched_lines == 4 && lctx.last_line_known == 0 && lctx.first_line_no == 0);
+
+        /* Pre-count line_filter: rejected "drop" lines do NOT consume max_count = 1 */
+        line_filter_test_ctx_t lf_ctx = { .required_substr = "keep", .calls = 0 };
+        webgrep_config_t fcfg = webgrep_config_default();
+        fcfg.max_count = 1;
+        fcfg.line_filter = test_line_filter_cb;
+        fcfg.line_filter_ctx = &lf_ctx;
+        memset(&lctx, 0, sizeof(lctx));
+        memset(&sum, 0, sizeof(sum));
+        assert(webgrep_search_slice(hit_m, (const uint8_t *)rdoc, strlen(rdoc), &fcfg, on_line_capture, &lctx, &sum) == WEBGREP_OK);
+        assert(lf_ctx.calls == 2 && sum.matched_lines == 1 && lctx.first_line_no == 2);
+
+        /* (e) webgrep_search_reverse_slice: newest-first + backward pagination with resume_at */
+        webgrep_config_t rev_cfg = webgrep_config_default();
+        rev_cfg.initial_line_number = 4;
+        rev_cfg.max_results = 2;
+        memset(&lctx, 0, sizeof(lctx));
+        memset(&sum, 0, sizeof(sum));
+        assert(webgrep_search_reverse_slice(hit_m, (const uint8_t *)rdoc, strlen(rdoc), &rev_cfg, on_line_capture, &lctx, &sum) == WEBGREP_OK);
+        assert(lctx.matched_lines == 2 && lctx.first_line_no == 4 && lctx.last_line_no == 3);
+        assert(sum.has_resume_at == 1 && sum.resume_at == 26);
+
+        /* Page 2 backward: [0 .. sum.resume_at) */
+        rev_cfg.has_byte_range = 1;
+        rev_cfg.has_byte_range_end = 1;
+        rev_cfg.byte_range_start = 0;
+        rev_cfg.byte_range_end = sum.resume_at;
+        rev_cfg.initial_line_number = 2;
+        memset(&lctx, 0, sizeof(lctx));
+        memset(&sum, 0, sizeof(sum));
+        assert(webgrep_search_reverse_slice(hit_m, (const uint8_t *)rdoc, strlen(rdoc), &rev_cfg, on_line_capture, &lctx, &sum) == WEBGREP_OK);
+        assert(lctx.matched_lines == 2 && lctx.first_line_no == 2 && lctx.last_line_no == 1);
+
+        /* (f) Archive entry_filter skips oversized non-.txt entry before max_entry_bytes enforcement */
+        uint8_t filt_tar[3072];
+        memset(filt_tar, 0, sizeof(filt_tar));
+        const char *oversized_bin = "HIT inside oversized 60-byte entry skipped before quota!!\n";
+        const char *small_txt = "HIT ok\n";
+        write_tar_header(filt_tar, "pkg/skip.bin", strlen(oversized_bin), '0', NULL);
+        memcpy(filt_tar + 512, oversized_bin, strlen(oversized_bin));
+        write_tar_header(filt_tar + 1024, "pkg/keep.txt", strlen(small_txt), '0', NULL);
+        memcpy(filt_tar + 1536, small_txt, strlen(small_txt));
+
+        archive_filter_test_ctx_t af_ctx = { .allowed_suffix = ".txt", .seen_entries = 0 };
+        webgrep_tree_config_t ftcfg = webgrep_tree_config_default();
+        ftcfg.max_entry_bytes = 24; /* oversized_bin (>24B) would trigger WEBGREP_ERR_ARCHIVE_LIMIT without entry_filter */
+        ftcfg.entry_filter = test_archive_entry_filter_cb;
+        ftcfg.entry_filter_ctx = &af_ctx;
+        memset(&tsum, 0, sizeof(tsum));
+        memset(&lctx, 0, sizeof(lctx));
+        assert(webgrep_search_archive_slice(hit_m, filt_tar, sizeof(filt_tar), &ftcfg, on_line_capture, &lctx, &tsum) == WEBGREP_OK);
+        assert(af_ctx.seen_entries == 2 && tsum.files_searched == 1 && tsum.matched_files == 1 && lctx.matched_lines == 1);
+
+        webgrep_matcher_free(hit_m);
+    }
+    printf("[18/18] Range, line_number_mode, line_filter, reverse tail, probe, & archive entry_filter: PASS\n");
+    printf("=== ALL 18 C ABI TEST SECTIONS PASSED ===\n");
     return 0;
 }

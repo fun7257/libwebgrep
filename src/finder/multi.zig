@@ -34,6 +34,8 @@ pub const Multi = struct {
     kind: Kind,
     ignore_case: bool,
     unicode_case: bool = false,
+    multiline: bool = false,
+    max_multiline_window: usize = 64 * 1024,
     empty_only: bool,
     /// Owned by the caller. Used for whole-line comparison and whole-word per-pattern verification without copying pattern bytes.
     patterns: []const []const u8,
@@ -68,9 +70,12 @@ pub const Multi = struct {
     ) (matcher.LimitError || error{ PatternHasNewline, OutOfMemory })!Multi {
         // Reject limit violations before allocating pair tables, Teddy, or the automaton.
         try matcher.checkPatternLimits(patterns, options);
+        var max_pat_len: usize = 0;
         for (patterns) |pat| {
-            if (std.mem.findScalar(u8, pat, '\n') != null) return error.PatternHasNewline;
+            if (!options.multiline and std.mem.findScalar(u8, pat, '\n') != null) return error.PatternHasNewline;
+            if (pat.len > max_pat_len) max_pat_len = pat.len;
         }
+        const ml_win = @max(options.max_multiline_window, max_pat_len);
         if (options.unicode_case and options.case != .sensitive and anyNeedsUnicodeFold(patterns, options)) {
             return initUnicodeFolded(allocator, patterns, options);
         }
@@ -80,6 +85,8 @@ pub const Multi = struct {
                     .kind = .{ .bytes = byteset.Set.init(patterns, ignore) },
                     .ignore_case = ignore,
                     .unicode_case = options.unicode_case,
+                    .multiline = options.multiline,
+                    .max_multiline_window = ml_win,
                     .empty_only = false,
                     .patterns = patterns,
                 };
@@ -90,6 +97,8 @@ pub const Multi = struct {
                         .kind = .{ .teddy = teddy_mod.Engine.init(patterns, ignore) },
                         .ignore_case = ignore,
                         .unicode_case = options.unicode_case,
+                        .multiline = options.multiline,
+                        .max_multiline_window = ml_win,
                         .empty_only = false,
                         .patterns = patterns,
                     };
@@ -100,6 +109,8 @@ pub const Multi = struct {
                     .kind = .{ .pairs = engine },
                     .ignore_case = ignore,
                     .unicode_case = options.unicode_case,
+                    .multiline = options.multiline,
+                    .max_multiline_window = ml_win,
                     .empty_only = false,
                     .patterns = patterns,
                 };
@@ -110,6 +121,8 @@ pub const Multi = struct {
                         .kind = .{ .teddy = teddy_mod.Engine.init(patterns, ignore) },
                         .ignore_case = ignore,
                         .unicode_case = options.unicode_case,
+                        .multiline = options.multiline,
+                        .max_multiline_window = ml_win,
                         .empty_only = false,
                         .patterns = patterns,
                     };
@@ -119,6 +132,8 @@ pub const Multi = struct {
                 .kind = .{ .ac = try aho.build(allocator, patterns, ignore) },
                 .ignore_case = ignore,
                 .unicode_case = options.unicode_case,
+                .multiline = options.multiline,
+                .max_multiline_window = ml_win,
                 .empty_only = onlyEmpty(patterns),
                 .patterns = patterns,
             };
@@ -134,9 +149,36 @@ pub const Multi = struct {
             } },
             .ignore_case = false,
             .unicode_case = options.unicode_case,
+            .multiline = options.multiline,
+            .max_multiline_window = ml_win,
             .empty_only = false,
             .patterns = patterns,
         };
+    }
+
+    pub fn isMultiline(self: *const Multi) bool {
+        return self.multiline;
+    }
+
+    pub fn multilineWindow(self: *const Multi) usize {
+        return self.max_multiline_window;
+    }
+
+    pub fn maxNewlines(self: *const Multi) ?u32 {
+        var max_nl: usize = 0;
+        for (self.patterns) |pat| {
+            const c = std.mem.count(u8, pat, "\n");
+            if (c > max_nl) max_nl = c;
+        }
+        return @intCast(max_nl);
+    }
+
+    pub inline fn watchedIsExact(self: *const Multi) bool {
+        return self.patterns.len <= 1;
+    }
+
+    pub inline fn watchedHasExactStart(self: *const Multi) bool {
+        return self.patterns.len <= 1;
     }
 
     /// Builds a multi-pattern finder from newline-separated pattern text. Each line is one pattern,
@@ -614,6 +656,12 @@ fn initUnicodeFolded(
         return res;
     }
 
+    var max_v_len: usize = 0;
+    for (owned_slices) |s| {
+        if (s.len > max_v_len) max_v_len = s.len;
+    }
+    const ml_win = @max(options.max_multiline_window, max_v_len);
+
     const flags = try allocator.dupe(bool, variant_flags.items);
     return .{
         .kind = .{ .mixed = .{
@@ -622,6 +670,8 @@ fn initUnicodeFolded(
         } },
         .ignore_case = false,
         .unicode_case = true,
+        .multiline = options.multiline,
+        .max_multiline_window = ml_win,
         .empty_only = false,
         .patterns = owned_slices,
         .owned_patterns = owned_slices,
@@ -636,6 +686,11 @@ fn initUnicodeFallback(
     patterns: []const []const u8,
     options: matcher.FindOptions,
 ) error{OutOfMemory}!Multi {
+    var max_pat_len: usize = 0;
+    for (patterns) |pat| {
+        if (pat.len > max_pat_len) max_pat_len = pat.len;
+    }
+    const ml_win = @max(options.max_multiline_window, max_pat_len *| 3);
     const flags = try allocator.alloc(bool, patterns.len);
     errdefer allocator.free(flags);
     for (patterns, flags) |pat, *flag| {
@@ -648,6 +703,8 @@ fn initUnicodeFallback(
         } },
         .ignore_case = false,
         .unicode_case = true,
+        .multiline = options.multiline,
+        .max_multiline_window = ml_win,
         .empty_only = false,
         .patterns = patterns,
     };

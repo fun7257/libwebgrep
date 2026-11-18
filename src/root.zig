@@ -54,8 +54,10 @@ pub const Outcome = sink_mod.Outcome;
 pub const LimitHit = sink_mod.LimitHit;
 /// Per-source soft error (`read_failed`), sanitized of any internal server paths.
 pub const SoftError = sink_mod.SoftError;
-/// Flow control returned by service event callbacks: `cont`, `pause`, or `stop`.
+/// Flow control returned by service event callbacks: `cont`, `pause`, or `stop` (plus `Flow.skipTo(offset)`).
 pub const Flow = sink_mod.Flow;
+/// Extended flow control action union (`cont`, `pause`, `stop`, `skip_to: u64`) returned by callbacks for in-stream byte jumps.
+pub const FlowAction = sink_mod.FlowAction;
 /// Final request summary emitted when the input finishes without pause or open live stream.
 pub const Summary = sink_mod.Summary;
 /// Periodic progress snapshot emitted at `progress_interval`.
@@ -67,6 +69,12 @@ pub const ResumeState = sink_mod.ResumeState;
 
 /// Binary handling policy. Defaults to `quit` (binary inputs are skipped by default).
 pub const BinaryPolicy = searcher.BinaryPolicy;
+/// Half-open byte range `[start, end)` within a source (`end == null` searches through EOF).
+pub const ByteRange = searcher.ByteRange;
+/// Line numbering policy (`auto`, `from_one`, or `unknown`) for mid-file range and reverse tail searches.
+pub const LineNumberMode = searcher.LineNumberMode;
+/// Candidate line inspected by `SearchConfig.line_filter` strictly before consuming `max_count`, `max_results`, or match counters.
+pub const LineFilterCandidate = searcher.LineFilterCandidate;
 /// Input character encoding (`auto` sniffs UTF-8/UTF-16 BOM or uses `charset` hint; also `utf8`, `utf16le`, `utf16be`, `gbk`, `latin1`, `none`).
 pub const Encoding = searcher.Encoding;
 /// In-process streaming decompression mode: `none`, `auto`, `gzip`, `zstd`, or `xz`.
@@ -81,14 +89,26 @@ pub const Scratch = searcher.Scratch;
 pub const searchSlice = searcher.searchSlice;
 /// Legacy callback entry point for searching a `std.Io.Reader`. Prefer `searchSource` for service workloads.
 pub const searchReader = searcher.searchReader;
+/// Legacy callback entry point for searching a `ByteRange` over a handle-free `RandomAccess` source without reading outside the range.
+pub const searchRange = searcher.searchRange;
 /// Service entry point: searches a `std.Io.Reader` with caller-assigned `source_id` and multi-tenant budgets.
 pub const searchSource = searcher.searchSource;
+/// Service entry point: searches a `ByteRange` over a handle-free `RandomAccess` source with multi-tenant budgets.
+pub const searchSourceRange = searcher.searchSourceRange;
 /// Resumes searching a `std.Io.Reader` from a previous `Flow.pause` state without re-emitting `begin`.
 pub const resumeSource = searcher.resumeSource;
 /// Service entry point: searches an in-memory slice with zero heap allocation when no transcoding is needed.
 pub const searchSourceSlice = searcher.searchSourceSlice;
 /// Resumes searching the same slice from a previous `Flow.pause` state without re-emitting `begin`.
 pub const resumeSourceSlice = searcher.resumeSourceSlice;
+/// Legacy callback entry point: searches an in-memory slice backward from the tail, emitting matches newest-first.
+pub const searchReverseSlice = searcher.searchReverseSlice;
+/// Service entry point: searches an in-memory slice backward from the tail with multi-tenant budgets.
+pub const searchSourceReverseSlice = searcher.searchSourceReverseSlice;
+/// Legacy callback entry point: searches backward over a handle-free `RandomAccess` source in O(tail) positional reads.
+pub const searchReverseAt = searcher.searchReverseAt;
+/// Service entry point: searches backward over a handle-free `RandomAccess` source with multi-tenant budgets.
+pub const searchSourceReverseAt = searcher.searchSourceReverseAt;
 /// Owned event structure yielded by `SourcePull.next()` and `ReaderPull.next()`.
 pub const PullEvent = searcher.PullEvent;
 /// Pull-based iterator type over service events for an in-memory slice.
@@ -99,6 +119,32 @@ pub const openSourcePull = searcher.openSourcePull;
 pub const ReaderPull = searcher.ReaderPull;
 /// Opens a true streaming pull-based iterator (`ReaderPull`) over a `*std.Io.Reader`.
 pub const openReaderPull = searcher.openReaderPull;
+
+/// Byte-offset line probing and handle-free positional `RandomAccess` module.
+pub const probe = @import("probe.zig");
+/// Handle-free, path-free positional byte reader interface (`read_at` callback + optional `size`).
+pub const RandomAccess = probe.RandomAccess;
+/// Configuration for byte-offset line probing (`delimiter`, `strip_crlf`, `max_line_bytes`, `window_chunk_bytes`).
+pub const ProbeOptions = probe.ProbeOptions;
+/// Extracted line or bounded window enclosing a probed byte offset, satisfying the partition invariant.
+pub const LineProbe = probe.LineProbe;
+/// Zero-allocation byte-offset line probe over an in-memory `haystack` slice.
+pub const probeLineSlice = probe.probeLineSlice;
+/// Zero-heap-allocation byte-offset line probe over `RandomAccess` into a caller-provided buffer.
+pub const probeLineAtBuf = probe.probeLineAtBuf;
+/// Allocator-backed byte-offset line probe over `RandomAccess`.
+pub const probeLineAt = probe.probeLineAt;
+
+/// Seekable compressed random-access module (`ZstdSeekTable` and `GzipIndex`).
+pub const seekable = @import("codec/seekable.zig");
+/// Zstandard Seekable Format (`0x184D2A5E` / `0x8F92EAB1`) frame index and O(log F) random-access reader.
+pub const ZstdSeekTable = seekable.ZstdSeekTable;
+/// Adapter wrapping `ZstdSeekTable` + compressed `RandomAccess` into an uncompressed `RandomAccess`.
+pub const SeekableZstdReader = seekable.SeekableZstdReader;
+/// Pure-Zig RFC 1951/1952 multi-member Gzip / Deflate checkpoint index and O(log C) random-access reader.
+pub const GzipIndex = seekable.GzipIndex;
+/// Adapter wrapping `GzipIndex` + compressed `RandomAccess` into an uncompressed `RandomAccess`.
+pub const IndexedGzipReader = seekable.IndexedGzipReader;
 
 test "default search configuration" {
     const cfg: SearchConfig = .{};
@@ -115,6 +161,11 @@ test "default search configuration" {
     try std.testing.expect(cfg.cancel == null);
     try std.testing.expect(!cfg.exists);
     try std.testing.expect(cfg.max_concurrency == null);
+    try std.testing.expect(cfg.byte_range == null);
+    try std.testing.expect(!cfg.range_align_lines);
+    try std.testing.expect(cfg.initial_line_number == null);
+    try std.testing.expectEqual(LineNumberMode.auto, cfg.line_number_mode);
+    try std.testing.expect(cfg.line_filter == null);
 }
 
 fn checkSearchFn(comptime F: type) !void {
@@ -135,12 +186,21 @@ test "public search entry points accept no filesystem handles or paths" {
     try std.testing.expect(!@hasDecl(@This(), "walker"));
     try checkSearchFn(@TypeOf(searchSlice));
     try checkSearchFn(@TypeOf(searchReader));
+    try checkSearchFn(@TypeOf(searchRange));
     try checkSearchFn(@TypeOf(searchSource));
+    try checkSearchFn(@TypeOf(searchSourceRange));
     try checkSearchFn(@TypeOf(resumeSource));
     try checkSearchFn(@TypeOf(searchSourceSlice));
     try checkSearchFn(@TypeOf(resumeSourceSlice));
+    try checkSearchFn(@TypeOf(searchReverseSlice));
+    try checkSearchFn(@TypeOf(searchSourceReverseSlice));
+    try checkSearchFn(@TypeOf(searchReverseAt));
+    try checkSearchFn(@TypeOf(searchSourceReverseAt));
     try checkSearchFn(@TypeOf(openSourcePull));
     try checkSearchFn(@TypeOf(openReaderPull));
+    try checkSearchFn(@TypeOf(probeLineSlice));
+    try checkSearchFn(@TypeOf(probeLineAtBuf));
+    try checkSearchFn(@TypeOf(probeLineAt));
     try checkSearchFn(@TypeOf(searchTree));
     try checkSearchFn(@TypeOf(searchArchiveSlice));
     try checkSearchFn(@TypeOf(searchArchive));
@@ -242,6 +302,12 @@ test {
 
 /// Worst-case linear-time Two-Way substring finder without heap allocation.
 pub const two_way = @import("finder/two_way.zig");
+/// N-gram / Trigram Bloom filter and zero-false-negative matcher pre-screener module.
+pub const bloom = @import("finder/bloom.zig");
+/// Configuration for `NgramBloom` (`bit_count`, `num_hashes`, `ngram_len`, `ascii_lower`).
+pub const BloomConfig = bloom.BloomConfig;
+/// Space-efficient N-gram / Trigram Bloom filter with zero-false-negative matcher pre-screening.
+pub const NgramBloom = bloom.NgramBloom;
 
 /// Abstract in-memory tree source interface for archive or virtual tree inputs.
 pub const source = @import("source.zig");
@@ -249,6 +315,8 @@ pub const source = @import("source.zig");
 pub const archive = @import("codec/archive.zig");
 /// Archive container format selector (`auto`, `tar`, `tar_gz`, `tar_zst`, `tar_xz`, `zip`).
 pub const ArchiveFormat = archive.ArchiveFormat;
+/// Entry metadata (`path`, `kind`, `size`, `compressed_size`, `mtime`) passed to `ArchiveOptions.entry_filter` before decompression.
+pub const ArchiveEntryMeta = archive.ArchiveEntryMeta;
 /// Safety and resource limits for in-memory archive unpacking.
 pub const ArchiveOptions = archive.ArchiveOptions;
 /// Error set returned when unpacking an archive fails or violates safety caps.
@@ -265,6 +333,12 @@ pub const searchTree = tree.searchTree;
 pub const searchArchiveSlice = tree.searchArchiveSlice;
 /// Unpacks an archive stream from `*std.Io.Reader` in memory and searches its virtual tree without touching disk.
 pub const searchArchive = tree.searchArchive;
+/// Generic path-free Chase-Lev work-stealing task scheduler module.
+pub const scheduler = @import("scheduler.zig");
+/// Configuration (`max_threads`, `stop`, `cancel`) for `Scheduler(Task, Context).run`.
+pub const SchedulerConfig = scheduler.SchedulerConfig;
+/// Generic Chase-Lev work-stealing scheduler parameterized over value type `Task` and shared `Context`.
+pub const Scheduler = scheduler.Scheduler;
 /// Byte-oriented glob matcher supporting nested brace expansion, rule caps, and ASCII case insensitivity.
 pub const walk_glob = @import("walk/glob.zig");
 /// In-memory gitignore/ignore rule parser and hierarchical matcher with fine-grained switches.
@@ -279,6 +353,11 @@ pub const walk_types = @import("walk/types.zig");
 pub const walk_list = @import("walk/list_dir.zig");
 
 test {
+    _ = @import("probe.zig");
+    _ = @import("codec/seekable.zig");
+    _ = @import("finder/bloom.zig");
+    _ = @import("scheduler.zig");
+    _ = @import("search/reverse.zig");
     _ = @import("source.zig");
     _ = @import("walk/glob.zig");
     _ = @import("walk/ignore.zig");

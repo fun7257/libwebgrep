@@ -154,6 +154,56 @@ static const Scenario SCENARIOS[] = {
         1, 0, 8, NULL, NULL,
         { "-c", "--no-config", "--no-ignore", "-F", "-j", "8", "req=04203afdc6de", NULL }
     },
+    {
+        "S16_log_multiline_regex",
+        "log.txt (514 MB) cross-line regex 'ERROR \\[http\\]...\\n...WARN \\[cache\\]' (-U -c, 12.5k hits)",
+        0, 0, 1, "log.txt", NULL,
+        {
+            "-c", "--no-config", "--no-unicode", "-U", "-j", "1",
+            "ERROR \\[http\\] req=[0-9a-f]{12}[^\n]*\n[0-9]{4}-[0-9]{2}-[0-9]{2}[^\n]*WARN \\[cache\\]",
+            NULL
+        }
+    },
+    {
+        "S16b_log_multiline_lines",
+        "log.txt (514 MB) cross-line regex 'ERROR \\[http\\]...\\n...WARN \\[cache\\]' (-U -n full subline output)",
+        0, 1, 1, "log.txt", NULL,
+        {
+            "-n", "--no-config", "--no-unicode", "-U", "-j", "1",
+            "ERROR \\[http\\] req=[0-9a-f]{12}[^\n]*\n[0-9]{4}-[0-9]{2}-[0-9]{2}[^\n]*WARN \\[cache\\]",
+            NULL
+        }
+    },
+    {
+        "S17_log_multiline_dotall",
+        "log.txt (514 MB) cross-line dotall 'req=04203afdc6de.{1,160}DEBUG \\[db\\]' (-U --multiline-dotall -c)",
+        0, 0, 1, "log.txt", NULL,
+        {
+            "-c", "--no-config", "--no-unicode", "-U", "--multiline-dotall", "-j", "1",
+            "req=04203afdc6de.{1,160}DEBUG \\[db\\]",
+            NULL
+        }
+    },
+    {
+        "S18_words_multiline_cross",
+        "words.txt (540 MB) cross-line regex 'zealtionou[^\\n]+\\n[a-z]+' (-U -c, 1197 hits)",
+        0, 0, 1, "words.txt", NULL,
+        {
+            "-c", "--no-config", "--no-unicode", "-U", "-j", "1",
+            "zealtionou[^\n]+\n[a-z]+",
+            NULL
+        }
+    },
+    {
+        "S19_dir_multiline_T8",
+        "zg-corpus/ (2.488 GB, 9 files, 8 threads) cross-line directory search (-U -c)",
+        1, 0, 8, NULL, NULL,
+        {
+            "-c", "--no-config", "--no-ignore", "--no-unicode", "-U", "-j", "8",
+            "req=04203afdc6de[^\n]*\n[0-9]{4}-[0-9]{2}-[0-9]{2}",
+            NULL
+        }
+    },
 };
 
 #define NUM_SCENARIOS (sizeof(SCENARIOS) / sizeof(SCENARIOS[0]))

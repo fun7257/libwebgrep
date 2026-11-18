@@ -33,6 +33,8 @@ const lineEnd = state_mod.lineEnd;
 const nextLine = state_mod.nextLine;
 const contentEnd = state_mod.contentEnd;
 const isMultilineMatcher = state_mod.isMultilineMatcher;
+const effectiveMultiline = state_mod.effectiveMultiline;
+const effectiveMultilineWindow = state_mod.effectiveMultilineWindow;
 const isStartAnchoredMatcher = state_mod.isStartAnchoredMatcher;
 const multilineWindow = state_mod.multilineWindow;
 const rememberBefore = ring_mod.rememberBefore;
@@ -54,7 +56,51 @@ pub fn needLineStart(comptime S: type, state: *const State, config: SearchConfig
         config.contains.len > 0 or
         config.excludes.len > 0 or
         config.contains_regexes.len > 0 or
-        config.excludes_regexes.len > 0;
+        config.excludes_regexes.len > 0 or
+        config.line_filter != null;
+}
+
+pub fn applyInBufferSkip(buf: []const u8, limit: usize, state: *State, config: SearchConfig) bool {
+    const target = state.pending_skip_to orelse return true;
+    const cur_abs = state.abs_base + @as(u64, state.pos);
+    if (target <= cur_abs) {
+        state.pending_skip_to = null;
+        return true;
+    }
+    state.after_left = 0;
+    state.ring.clear();
+    if (!state.from_reader) {
+        const buf_end_abs = state.abs_base + @as(u64, buf.len);
+        if (target <= buf_end_abs) {
+            const new_pos: usize = @intCast(target - state.abs_base);
+            state_mod.countLines(buf, new_pos, state, config);
+            state.pos = new_pos;
+            state.last_line_visited = new_pos;
+            state.remembered_until = new_pos;
+            state.pending_skip_to = null;
+            return new_pos < limit;
+        }
+        state_mod.countLines(buf, buf.len, state, config);
+        state.pos = buf.len;
+        state.last_line_visited = buf.len;
+        state.remembered_until = buf.len;
+        return false;
+    }
+    const lim_abs = state.abs_base + @as(u64, limit);
+    if (target <= lim_abs) {
+        const new_pos: usize = @intCast(target - state.abs_base);
+        state_mod.countLines(buf, new_pos, state, config);
+        state.pos = new_pos;
+        state.last_line_visited = new_pos;
+        state.remembered_until = new_pos;
+        state.pending_skip_to = null;
+        return new_pos < limit;
+    }
+    state_mod.countLines(buf, limit, state, config);
+    state.pos = limit;
+    state.last_line_visited = limit;
+    state.remembered_until = limit;
+    return false;
 }
 
 pub fn matchBuffer(
@@ -65,8 +111,22 @@ pub fn matchBuffer(
     state: *State,
     config: SearchConfig,
 ) SliceError!bool {
+    return matchBufferWithLimit(S, sink, matcher, buf, buf.len, false, state, config);
+}
+
+pub fn matchBufferWithLimit(
+    comptime S: type,
+    sink: *S,
+    matcher: anytype,
+    buf: []const u8,
+    limit: usize,
+    can_hold_zero: bool,
+    state: *State,
+    config: SearchConfig,
+) SliceError!bool {
     const need_ls = needLineStart(S, state, config);
-    while (state.pos < buf.len) {
+    var effective_limit = @min(limit, buf.len);
+    while (state.pos < effective_limit) {
         if (state.stopped) return false;
         if (state_mod.flagIsSet(config)) {
             state.stopped = true;
@@ -74,9 +134,24 @@ pub fn matchBuffer(
         }
         if (stopInMatch(state, config)) return false;
         if (!maybeProgress(S, sink, state, config)) return false;
+        if (state.pending_skip_to != null) {
+            if (!applyInBufferSkip(buf, effective_limit, state, config)) return false;
+            continue;
+        }
         if (config.invert) {
-            if (!try matchInvert(S, sink, matcher, buf, state, config)) break;
-        } else if (try findLineOpts(matcher, buf, state, config, need_ls)) |line| {
+            if (!try matchInvert(S, sink, matcher, buf, &effective_limit, can_hold_zero, state, config)) {
+                if (state.pending_skip_to != null) return false;
+                break;
+            }
+            if (state.pending_skip_to != null) {
+                if (!applyInBufferSkip(buf, effective_limit, state, config)) return false;
+                continue;
+            }
+        } else if (try findLineLimitOpts(matcher, buf, state, effective_limit, config, need_ls)) |line| {
+            if (effective_limit < buf.len and line.end > effective_limit and (line.start > 0 or can_hold_zero)) {
+                effective_limit = line.start;
+                break;
+            }
             if (state.abs_base + @as(u64, line.start) < config.resume_from) {
                 state.pos = line.end;
                 continue;
@@ -97,16 +172,41 @@ pub fn matchBuffer(
                 state.need_close = true;
                 return false;
             }
-            state.limit_count += 1;
             if (config.passthru) {
-                if (!try passthruTo(S, sink, matcher, buf, line.start, state, config)) return false;
+                if (!try passthruTo(S, sink, matcher, buf, line.start, state, config)) {
+                    if (state.pending_skip_to != null) {
+                        state.pos = state.last_line_visited;
+                        if (!applyInBufferSkip(buf, effective_limit, state, config)) return false;
+                        continue;
+                    }
+                    return false;
+                }
             } else if (beforeCount(config) > 0 or afterCount(config) > 0) {
-                if (!try afterContext(S, sink, matcher, buf, line.start, state, config)) return false;
-                if (!try beforeContext(S, sink, matcher, buf, line.start, state, config)) return false;
+                if (!try afterContext(S, sink, matcher, buf, line.start, state, config)) {
+                    if (state.pending_skip_to != null) {
+                        state.pos = state.last_line_visited;
+                        if (!applyInBufferSkip(buf, effective_limit, state, config)) return false;
+                        continue;
+                    }
+                    return false;
+                }
+                if (!try beforeContext(S, sink, matcher, buf, line.start, state, config)) {
+                    if (state.pending_skip_to != null) {
+                        state.pos = @intCast(@min(@as(u64, buf.len), state.last_abs_end -| state.abs_base));
+                        if (!applyInBufferSkip(buf, effective_limit, state, config)) return false;
+                        continue;
+                    }
+                    return false;
+                }
             }
+            state.limit_count += 1;
             state.pos = line.end;
-            const known = BufMatch{ .start = line.mstart, .end = line.mend, .pattern_id = line.mpid };
+            const known = BufMatch{ .start = line.mstart, .end = line.mend, .pattern_id = line.mpid, .single_match = line.single_match };
             if (!try sinkMatched(S, sink, matcher, buf, line.range(), known, state, config)) return false;
+            if (state.pending_skip_to != null) {
+                if (!applyInBufferSkip(buf, effective_limit, state, config)) return false;
+                continue;
+            }
         } else {
             if (config.stop_on_nonmatch and state.matched_lines > 0) {
                 state.pos = lineEnd(buf, state.pos, config);
@@ -119,14 +219,31 @@ pub fn matchBuffer(
     }
     if (state.stopped) return false;
     if (!maybeProgress(S, sink, state, config)) return false;
+    if (state.pending_skip_to != null) {
+        _ = applyInBufferSkip(buf, effective_limit, state, config);
+        if (state.pending_skip_to != null) return false;
+    }
+    const end_pos = if (state.exceeded(config)) buf.len else @max(effective_limit, state.pos);
     if (config.passthru and !state.exceeded(config)) {
-        if (!try passthruTo(S, sink, matcher, buf, buf.len, state, config)) return false;
+        if (!try passthruTo(S, sink, matcher, buf, end_pos, state, config)) {
+            if (state.pending_skip_to != null) {
+                state.pos = state.last_line_visited;
+                _ = applyInBufferSkip(buf, end_pos, state, config);
+            }
+            return false;
+        }
     } else {
-        if (!try afterContext(S, sink, matcher, buf, buf.len, state, config)) return false;
+        if (!try afterContext(S, sink, matcher, buf, end_pos, state, config)) {
+            if (state.pending_skip_to != null) {
+                state.pos = state.last_line_visited;
+                _ = applyInBufferSkip(buf, end_pos, state, config);
+            }
+            return false;
+        }
     }
     // Once the limit is reached, buffered after-context lines have just been emitted; do not read further chunks for subsequent lines.
     if (state.exceeded(config)) return false;
-    state.pos = buf.len;
+    state.pos = end_pos;
     return !state.stopped;
 }
 
@@ -136,45 +253,157 @@ pub const FoundLine = struct {
     mstart: usize,
     mend: usize,
     mpid: ?u32 = null,
+    single_match: bool = false,
 
     pub fn range(self: FoundLine) Range {
         return .{ .start = self.start, .end = self.end };
     }
 };
 
+pub inline fn bridgingProbeLimit(matcher: anytype, buf: []const u8, end: usize, config: SearchConfig) usize {
+    if (end >= buf.len) return buf.len;
+    if (!config.null_data) {
+        if (state_mod.effectiveMaxNewlines(matcher, config)) |max_nl| {
+            if (max_nl <= 8) {
+                var pe = end;
+                var rem: u32 = max_nl;
+                while (rem > 0 and pe < buf.len) : (rem -= 1) {
+                    pe = lineEnd(buf, pe, config);
+                }
+                return pe;
+            }
+        }
+    }
+    const ml_win = effectiveMultilineWindow(matcher, config);
+    if (ml_win > 0) {
+        const T = state_mod.MatcherType(@TypeOf(matcher));
+        const m_win: usize = if (@hasDecl(T, "multilineWindow")) matcher.multilineWindow() else ml_win;
+        return @min(buf.len, end +| @max(ml_win, m_win) +| 1);
+    }
+    return buf.len;
+}
+
+pub fn matchLineEnd(buf: []const u8, start: usize, hit: matcher_mod.Match, config: SearchConfig) usize {
+    const sep = cfg_mod.recordSep(config);
+    const probe = if (hit.end > hit.start and hit.end <= buf.len and buf[hit.end - 1] == sep)
+        hit.end - 1
+    else
+        @max(hit.end, start);
+    return lineEnd(buf, probe, config);
+}
+
 pub fn findLine(matcher: anytype, buf: []const u8, state: *State, config: SearchConfig) SliceError!?FoundLine {
-    return findLineOpts(matcher, buf, state, config, true);
+    return findLineLimitOpts(matcher, buf, state, buf.len, config, true);
 }
 
 pub fn findLineOpts(matcher: anytype, buf: []const u8, state: *State, config: SearchConfig, need_ls: bool) SliceError!?FoundLine {
+    return findLineLimitOpts(matcher, buf, state, buf.len, config, need_ls);
+}
+
+pub fn findLineLimitOpts(matcher: anytype, buf: []const u8, state: *State, limit: usize, config: SearchConfig, need_ls: bool) SliceError!?FoundLine {
     if (state.exceeded(config)) return null;
+    const is_ml = effectiveMultiline(matcher, config);
+    const max_start = @min(limit, buf.len);
     var pos = state.pos;
-    while (pos < buf.len) {
+    while (pos < max_start) {
         const found = if (config.whole_line)
             matcher.find(buf, pos, config.match_mode)
         else
-            nextMatch(matcher, buf, pos, config);
+            nextMatchCached(matcher, buf, pos, state, config);
         const hit = found orelse return null;
         if (hit.start > buf.len or hit.start < pos) return null;
-        if (!need_ls and hit.start < buf.len) {
-            const end = lineEnd(buf, hit.end, config);
+        if (!need_ls and (!is_ml or limit >= buf.len) and hit.start < max_start) {
+            var end = matchLineEnd(buf, pos, hit, config);
+            var single_match = false;
+            if (is_ml and !config.whole_line) {
+                single_match = true;
+                var cur = hit;
+                while (true) {
+                    const next_from = if (cur.end == cur.start) cur.end + 1 else cur.end;
+                    if (next_from >= end or next_from > buf.len) break;
+                    const probe_lim = bridgingProbeLimit(matcher, buf, end, config);
+                    const m2 = nextMatch(matcher, buf[0..probe_lim], next_from, config) orelse break;
+                    if (m2.start >= end) break;
+                    single_match = false;
+                    const end2 = matchLineEnd(buf, pos, m2, config);
+                    if (end2 > end) end = end2;
+                    cur = m2;
+                }
+            }
             return .{
                 .start = pos,
                 .end = end,
                 .mstart = hit.start,
                 .mend = hit.end,
                 .mpid = hit.pattern_id,
+                .single_match = single_match,
             };
         }
         const start = lineStart(buf, hit.start, config);
-        if (start == buf.len) {
-            pos = buf.len;
-            continue;
+        if (start >= max_start or start == buf.len) {
+            return null;
         }
-        const end = lineEnd(buf, @max(hit.end, start), config);
+        var end = matchLineEnd(buf, start, hit, config);
         if (end == start) {
             pos = @min(buf.len, start + 1);
             continue;
+        }
+        if (config.whole_line and is_ml) {
+            const ml_win = effectiveMultilineWindow(matcher, config);
+            const win_cap = if (ml_win > 0) @min(buf.len, start +| ml_win +| 2) else buf.len;
+            const max_lines: usize = if (!config.null_data)
+                (if (state_mod.effectiveMaxNewlines(matcher, config)) |mn| @as(usize, mn) + 1 else std.math.maxInt(usize))
+            else
+                std.math.maxInt(usize);
+            var cand_pos = start;
+            var lines_checked: usize = 0;
+            var matched_wl: ?FoundLine = null;
+            while (cand_pos < win_cap and lines_checked < max_lines) {
+                const cand_le = lineEnd(buf, cand_pos, config);
+                if (cand_le <= cand_pos) break;
+                lines_checked += 1;
+                const cand_ce = contentEnd(buf, .{ .start = start, .end = cand_le }, config);
+                if (ml_win > 0 and cand_ce - start > ml_win) break;
+                if (matchWholeLine(matcher, buf, start, cand_ce, config)) |wl| {
+                    if (linePassesFilters(buf, start, cand_ce, config)) {
+                        const first_sp = cfg_mod.Span{
+                            .start = 0,
+                            .end = cand_ce - start,
+                            .pattern_id = wl.pattern_id,
+                        };
+                        if (config.invert or linePassesUserFilter(buf, start, cand_ce, cand_le, first_sp, false, state, config)) {
+                            matched_wl = .{
+                                .start = start,
+                                .end = cand_le,
+                                .mstart = start,
+                                .mend = cand_ce,
+                                .mpid = wl.pattern_id,
+                            };
+                            if (config.match_mode == .earliest) break;
+                        }
+                    }
+                }
+                cand_pos = cand_le;
+            }
+            if (matched_wl) |found_wl| return found_wl;
+            pos = lineEnd(buf, start, config);
+            continue;
+        }
+        var single_match = false;
+        if (is_ml and !config.whole_line) {
+            single_match = true;
+            var cur = hit;
+            while (true) {
+                const next_from = if (cur.end == cur.start) cur.end + 1 else cur.end;
+                if (next_from >= end or next_from > buf.len) break;
+                const probe_lim = bridgingProbeLimit(matcher, buf, end, config);
+                const m2 = nextMatch(matcher, buf[0..probe_lim], next_from, config) orelse break;
+                if (m2.start >= end) break;
+                single_match = false;
+                const end2 = matchLineEnd(buf, start, m2, config);
+                if (end2 > end) end = end2;
+                cur = m2;
+            }
         }
         const content_end = contentEnd(buf, .{ .start = start, .end = end }, config);
         var wl_pid: ?u32 = hit.pattern_id;
@@ -189,12 +418,28 @@ pub fn findLineOpts(matcher: anytype, buf: []const u8, state: *State, config: Se
             pos = end;
             continue;
         }
+        if (!config.invert and config.line_filter != null) {
+            const raw_ms = if (config.whole_line) start else hit.start;
+            const raw_me = if (config.whole_line) content_end else hit.end;
+            const rel_s = @min(@max(raw_ms, start), content_end) - start;
+            const rel_e = @max(rel_s, @min(@max(raw_me, start), content_end) - start);
+            const first_sp = cfg_mod.Span{
+                .start = rel_s,
+                .end = rel_e,
+                .pattern_id = if (config.whole_line) wl_pid else hit.pattern_id,
+            };
+            if (!linePassesUserFilter(buf, start, content_end, end, first_sp, false, state, config)) {
+                pos = end;
+                continue;
+            }
+        }
         return .{
             .start = start,
             .end = end,
             .mstart = if (config.whole_line) start else hit.start,
             .mend = if (config.whole_line) content_end else hit.end,
             .mpid = if (config.whole_line) wl_pid else hit.pattern_id,
+            .single_match = single_match,
         };
     }
     return null;
@@ -206,6 +451,15 @@ const WordBoundedCtx = struct {
     }
 };
 
+pub inline fn nextMatchCached(matcher: anytype, buf: []const u8, pos: usize, state: *State, config: SearchConfig) ?matcher_mod.Match {
+    if (state.getCachedMatch(buf, pos)) |cached| {
+        return cached;
+    }
+    const m = nextMatch(matcher, buf, pos, config);
+    state.setCachedMatch(buf, pos, m);
+    return m;
+}
+
 pub fn nextMatch(matcher: anytype, buf: []const u8, pos: usize, config: SearchConfig) ?matcher_mod.Match {
     const T = state_mod.MatcherType(@TypeOf(matcher));
     if (config.whole_word and @hasDecl(T, "findAllowed")) {
@@ -213,6 +467,16 @@ pub fn nextMatch(matcher: anytype, buf: []const u8, pos: usize, config: SearchCo
             return matcher.findAllowed(buf, pos, config.match_mode, WordBoundedCtx{});
         }
         return matcher.findAllowed(buf, pos, config.match_mode, wordBounded);
+    }
+    if (config.whole_word) {
+        var cur = pos;
+        while (cur <= buf.len) {
+            const m = matcher.find(buf, cur, config.match_mode) orelse return null;
+            if (wordBounded(buf, m.start, m.end)) return m;
+            if (m.start >= buf.len) return null;
+            cur = m.start + 1;
+        }
+        return null;
     }
     return matcher.find(buf, pos, config.match_mode);
 }
@@ -339,6 +603,30 @@ pub fn linePassesFilters(buf: []const u8, start: usize, end: usize, config: Sear
     return true;
 }
 
+pub fn linePassesUserFilter(
+    buf: []const u8,
+    start: usize,
+    content_end: usize,
+    raw_end: usize,
+    first_match: cfg_mod.Span,
+    is_inverted: bool,
+    state: *const State,
+    config: SearchConfig,
+) bool {
+    const cb = config.line_filter orelse return true;
+    if (content_end < start or content_end > buf.len) return false;
+    const clamped_raw = @min(@max(raw_end, content_end), buf.len);
+    return cb(config.line_filter_ctx, .{
+        .bytes = buf[start..content_end],
+        .raw_bytes = buf[start..clamped_raw],
+        .absolute_offset = state.abs_base + @as(u64, start),
+        .first_match = first_sp: {
+            break :first_sp first_match;
+        },
+        .is_inverted = is_inverted,
+    });
+}
+
 /// Half-boundary check: inspects only the codepoints immediately outside the match, without requiring the match endpoints themselves to be word characters.
 pub fn wordBounded(haystack: []const u8, start: usize, end: usize) bool {
     if (start > haystack.len or end > haystack.len or start > end) return false;
@@ -352,34 +640,62 @@ pub fn matchInvert(
     sink: *S,
     matcher: anytype,
     buf: []const u8,
+    effective_limit: *usize,
+    can_hold_zero: bool,
     state: *State,
     config: SearchConfig,
 ) SliceError!bool {
     var found_nonmatch = false;
     var nonmatch_range: Range = .{ .start = 0, .end = 0 };
-    const gap: Range = if (try findLine(matcher, buf, state, config)) |line| blk: {
+    const gap: Range = if (try findLineLimitOpts(matcher, buf, state, effective_limit.*, config, true)) |line| blk: {
+        if (effective_limit.* < buf.len and line.end > effective_limit.* and (line.start > 0 or can_hold_zero)) {
+            effective_limit.* = line.start;
+            const g = Range{ .start = state.pos, .end = line.start };
+            state.pos = line.start;
+            break :blk g;
+        }
         const g = Range{ .start = state.pos, .end = line.start };
         state.pos = line.end;
         found_nonmatch = true;
         nonmatch_range = line.range();
         break :blk g;
     } else blk: {
-        const g = Range{ .start = state.pos, .end = buf.len };
-        state.pos = buf.len;
+        const g = Range{ .start = state.pos, .end = effective_limit.* };
+        state.pos = effective_limit.*;
         break :blk g;
     };
     if (gap.start < gap.end) {
         if (config.passthru) {
-            if (!try passthruTo(S, sink, matcher, buf, gap.start, state, config)) return false;
+            if (!try passthruTo(S, sink, matcher, buf, gap.start, state, config)) {
+                if (state.pending_skip_to != null) {
+                    state.pos = state.last_line_visited;
+                    return applyInBufferSkip(buf, effective_limit.*, state, config);
+                }
+                return false;
+            }
         } else if (beforeCount(config) > 0 or afterCount(config) > 0) {
-            if (!try afterContext(S, sink, matcher, buf, gap.start, state, config)) return false;
-            if (!try beforeContext(S, sink, matcher, buf, gap.start, state, config)) return false;
+            if (!try afterContext(S, sink, matcher, buf, gap.start, state, config)) {
+                if (state.pending_skip_to != null) {
+                    state.pos = state.last_line_visited;
+                    return applyInBufferSkip(buf, effective_limit.*, state, config);
+                }
+                return false;
+            }
+            if (!try beforeContext(S, sink, matcher, buf, gap.start, state, config)) {
+                if (state.pending_skip_to != null) {
+                    state.pos = @intCast(@min(@as(u64, buf.len), state.last_abs_end -| state.abs_base));
+                    return applyInBufferSkip(buf, effective_limit.*, state, config);
+                }
+                return false;
+            }
         }
         var cursor = gap.start;
         while (nextLine(buf, cursor, gap.end, config)) |line| {
             cursor = line.end;
             const content_end = contentEnd(buf, line, config);
-            if (!linePassesFilters(buf, line.start, content_end, config)) {
+            if (!linePassesFilters(buf, line.start, content_end, config) or
+                !linePassesUserFilter(buf, line.start, content_end, line.end, .{ .start = 0, .end = 0 }, true, state, config))
+            {
                 if (config.stop_on_nonmatch and state.matched_lines > 0) {
                     state.pos = line.end;
                     state.stopped = true;
@@ -388,11 +704,19 @@ pub fn matchInvert(
                 }
                 if (config.passthru) {
                     if (!try sinkContext(S, sink, matcher, buf, line, .after, state, config)) return false;
+                    if (state.pending_skip_to != null) {
+                        state.pos = cursor;
+                        return applyInBufferSkip(buf, effective_limit.*, state, config);
+                    }
                 }
                 continue;
             }
             state.limit_count += 1;
             if (!try sinkMatched(S, sink, matcher, buf, line, null, state, config)) return false;
+            if (state.pending_skip_to != null) {
+                state.pos = cursor;
+                return applyInBufferSkip(buf, effective_limit.*, state, config);
+            }
             if (state.exceeded(config)) return false;
         }
     }
@@ -404,6 +728,10 @@ pub fn matchInvert(
         }
         if (config.passthru) {
             if (!try sinkContext(S, sink, matcher, buf, nonmatch_range, .after, state, config)) return false;
+            if (state.pending_skip_to != null) {
+                state.pos = nonmatch_range.end;
+                return applyInBufferSkip(buf, effective_limit.*, state, config);
+            }
         }
     }
     return true;
@@ -423,6 +751,7 @@ pub fn passthruTo(
     while (nextLine(buf, cursor, upto, config)) |line| {
         cursor = line.end;
         if (!try sinkContext(S, sink, matcher, buf, line, .after, state, config)) return false;
+        if (state.pending_skip_to != null) return false;
     }
     return true;
 }
@@ -438,17 +767,74 @@ pub fn afterContext(
 ) SliceError!bool {
     if (state.after_left == 0) return true;
     const exceeded = state.exceeded(config);
+    const is_ml = effectiveMultiline(matcher, config);
     var cursor = state.last_line_visited;
     if (cursor > upto) return true;
+    var excluded_until: usize = 0;
     while (nextLine(buf, cursor, upto, config)) |line| {
         cursor = line.end;
-        if (exceeded and lineIsReportedHit(matcher, buf, line, config)) {
+        if (exceeded and is_ml) {
+            if (config.invert) {
+                if (line.start >= excluded_until) {
+                    var probe_state = state.*;
+                    probe_state.pos = line.start;
+                    probe_state.limit_count = 0;
+                    var probe_cfg = config;
+                    probe_cfg.max_count = null;
+                    probe_cfg.line_filter = null;
+                    if (try findLineLimitOpts(matcher, buf, &probe_state, line.end, probe_cfg, true)) |ml_line| {
+                        if (ml_line.start == line.start) excluded_until = @max(excluded_until, ml_line.end);
+                    }
+                }
+                const content_end = contentEnd(buf, line, config);
+                if (line.start >= excluded_until and
+                    linePassesFilters(buf, line.start, content_end, config) and
+                    linePassesUserFilter(buf, line.start, content_end, line.end, .{ .start = 0, .end = 0 }, true, state, config))
+                {
+                    const saved = state.after_left;
+                    state.pos = line.end;
+                    if (!try sinkMatched(S, sink, matcher, buf, line, null, state, config)) return false;
+                    if (state.pending_skip_to != null) return false;
+                    state.after_left = saved - 1;
+                } else {
+                    if (!try sinkContext(S, sink, matcher, buf, line, .after, state, config)) return false;
+                    if (state.pending_skip_to != null) return false;
+                }
+            } else {
+                var probe_state = state.*;
+                probe_state.pos = line.start;
+                probe_state.limit_count = 0;
+                var probe_cfg = config;
+                probe_cfg.max_count = null;
+                if (try findLineLimitOpts(matcher, buf, &probe_state, line.end, probe_cfg, true)) |ml_line| {
+                    if (ml_line.start == line.start and ml_line.end <= upto) {
+                        const saved = state.after_left;
+                        const spanned_raw = memchr.count(cfg_mod.width, buf, ml_line.start, ml_line.end, cfg_mod.recordSep(config));
+                        const dec: u32 = @intCast(@min(@as(u64, saved), @max(@as(u64, 1), spanned_raw)));
+                        cursor = ml_line.end;
+                        state.pos = ml_line.end;
+                        const known = BufMatch{ .start = ml_line.mstart, .end = ml_line.mend, .pattern_id = ml_line.mpid, .single_match = ml_line.single_match };
+                        if (!try sinkMatched(S, sink, matcher, buf, ml_line.range(), known, state, config)) return false;
+                        if (state.pending_skip_to != null) return false;
+                        state.after_left = saved - dec;
+                        if (state.after_left == 0) break;
+                        continue;
+                    }
+                }
+                if (!try sinkContext(S, sink, matcher, buf, line, .after, state, config)) return false;
+                if (state.pending_skip_to != null) return false;
+            }
+        } else if (exceeded and lineIsReportedHit(matcher, buf, line, state, config)) {
             const saved = state.after_left;
             state.pos = line.end;
-            const known = matchInLine(matcher, buf, line, config);
+            const known = if (config.invert) null else matchInLine(matcher, buf, line, config);
             if (!try sinkMatched(S, sink, matcher, buf, line, known, state, config)) return false;
+            if (state.pending_skip_to != null) return false;
             state.after_left = saved - 1;
-        } else if (!try sinkContext(S, sink, matcher, buf, line, .after, state, config)) return false;
+        } else {
+            if (!try sinkContext(S, sink, matcher, buf, line, .after, state, config)) return false;
+            if (state.pending_skip_to != null) return false;
+        }
         if (state.after_left == 0) break;
     }
     return true;
@@ -473,11 +859,23 @@ pub fn beforeContext(
 }
 
 
-pub fn lineIsReportedHit(matcher: anytype, buf: []const u8, line: Range, config: SearchConfig) bool {
+pub fn lineIsReportedHit(matcher: anytype, buf: []const u8, line: Range, state: *const State, config: SearchConfig) bool {
     const content_end = contentEnd(buf, line, config);
     if (!linePassesFilters(buf, line.start, content_end, config)) return false;
-    const hit = matchInLine(matcher, buf, line, config) != null;
-    return if (config.invert) !hit else hit;
+    const m_opt = matchInLine(matcher, buf, line, config);
+    const hit = m_opt != null;
+    const is_hit = if (config.invert) !hit else hit;
+    if (!is_hit) return false;
+    if (config.line_filter != null) {
+        const first_sp: cfg_mod.Span = if (!config.invert) blk: {
+            const m = m_opt.?;
+            const rel_s = @min(@max(m.start, line.start), content_end) - line.start;
+            const rel_e = @max(rel_s, @min(@max(m.end, line.start), content_end) - line.start);
+            break :blk .{ .start = rel_s, .end = rel_e, .pattern_id = m.pattern_id };
+        } else .{ .start = 0, .end = 0 };
+        if (!linePassesUserFilter(buf, line.start, content_end, line.end, first_sp, config.invert, state, config)) return false;
+    }
+    return true;
 }
 
 pub fn matchInLine(matcher: anytype, buf: []const u8, line: Range, config: SearchConfig) ?BufMatch {
@@ -486,7 +884,7 @@ pub fn matchInLine(matcher: anytype, buf: []const u8, line: Range, config: Searc
         const wl = matchWholeLine(matcher, buf, line.start, end, config) orelse return null;
         return .{ .start = line.start, .end = end, .pattern_id = wl.pattern_id };
     }
-    const line_buf = if (isMultilineMatcher(matcher)) buf else buf[0..@min(end, buf.len)];
+    const line_buf = if (effectiveMultiline(matcher, config)) buf else buf[0..@min(end, buf.len)];
     const found = nextMatch(matcher, line_buf, line.start, config) orelse return null;
     // An empty line's content end equals its start; an empty pattern still counts as a match here.
     if (found.start < line.start or found.start > end or found.end > line.end) return null;

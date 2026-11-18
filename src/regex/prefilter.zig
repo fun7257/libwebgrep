@@ -121,11 +121,7 @@ pub fn extractLiterals(self: anytype, pattern: []const u8, options: inst_mod.Reg
                 curr_lit.clearRetainingCapacity();
                 prefix_active = false;
                 exact_only = false;
-                if (c == '.' and fixed_offset != null) {
-                    fixed_offset.? += 1;
-                } else {
-                    fixed_offset = null;
-                }
+                fixed_offset = null;
                 i += 1;
             },
             '[' => {
@@ -137,14 +133,31 @@ pub fn extractLiterals(self: anytype, pattern: []const u8, options: inst_mod.Reg
                 curr_lit.clearRetainingCapacity();
                 prefix_active = false;
                 exact_only = false;
-                if (fixed_offset != null) fixed_offset.? += 1;
+                var class_fixed_one = !(self.ignore_case and self.unicode_case);
                 i += 1;
-                if (i < pattern.len and (pattern[i] == '^' or pattern[i] == '!')) i += 1;
+                if (i < pattern.len and (pattern[i] == '^' or pattern[i] == '!')) {
+                    class_fixed_one = false;
+                    i += 1;
+                }
                 if (i < pattern.len and pattern[i] == ']') i += 1;
                 while (i < pattern.len and pattern[i] != ']') {
-                    if (pattern[i] == '\\' and i + 1 < pattern.len) i += 2 else i += 1;
+                    if (pattern[i] >= 0x80) class_fixed_one = false;
+                    if (pattern[i] == '\\' and i + 1 < pattern.len) {
+                        const esc = pattern[i + 1];
+                        if (esc == 'D' or esc == 'W' or esc == 'S' or esc == 'p' or esc == 'P' or esc >= 0x80) {
+                            class_fixed_one = false;
+                        }
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
                 }
                 if (i < pattern.len) i += 1;
+                if (class_fixed_one and fixed_offset != null) {
+                    fixed_offset.? += 1;
+                } else {
+                    fixed_offset = null;
+                }
             },
             '\\' => {
                 if (i + 1 >= pattern.len) break;
@@ -169,7 +182,7 @@ pub fn extractLiterals(self: anytype, pattern: []const u8, options: inst_mod.Reg
                     continue;
                 }
                 const decoded: ?u8 = switch (next_c) {
-                    'n' => if (self.multiline) null else '\n',
+                    'n' => if (self.multiline) '\n' else null,
                     'r' => '\r',
                     't' => '\t',
                     'A', 'z', 'd', 'D', 'w', 'W', 's', 'S', 'b', 'B', '0' => null,
@@ -180,7 +193,13 @@ pub fn extractLiterals(self: anytype, pattern: []const u8, options: inst_mod.Reg
                         if (curr_lit.items.len == 0) curr_offset = fixed_offset orelse 0;
                         try curr_lit.append(self.allocator, lit_b);
                         if (prefix_active) try first_lit.append(self.allocator, lit_b);
-                        if (fixed_offset != null) fixed_offset.? += 1;
+                        if (fixed_offset != null) {
+                            if (self.ignore_case and self.unicode_case and (lit_b >= 0x80 or lit_b == 'k' or lit_b == 'K' or lit_b == 's' or lit_b == 'S')) {
+                                fixed_offset = null;
+                            } else {
+                                fixed_offset.? += 1;
+                            }
+                        }
                     }
                 } else {
                     if (curr_lit.items.len > best_lit.items.len) {
@@ -196,12 +215,18 @@ pub fn extractLiterals(self: anytype, pattern: []const u8, options: inst_mod.Reg
                 i += 2;
             },
             else => {
-                if (depth == 0 and c != '\n') {
+                if (depth == 0 and (c != '\n' or self.multiline)) {
                     const seq_len = utf8SeqLenAt(pattern, i, pattern.len);
                     if (curr_lit.items.len == 0) curr_offset = fixed_offset orelse 0;
                     try curr_lit.appendSlice(self.allocator, pattern[i .. i + seq_len]);
                     if (prefix_active) try first_lit.appendSlice(self.allocator, pattern[i .. i + seq_len]);
-                    if (fixed_offset != null) fixed_offset.? += seq_len;
+                    if (fixed_offset != null) {
+                        if (self.ignore_case and self.unicode_case and (seq_len > 1 or c == 'k' or c == 'K' or c == 's' or c == 'S')) {
+                            fixed_offset = null;
+                        } else {
+                            fixed_offset.? += seq_len;
+                        }
+                    }
                     i += seq_len;
                     continue;
                 } else {
@@ -227,6 +252,8 @@ pub fn extractLiterals(self: anytype, pattern: []const u8, options: inst_mod.Reg
         .max_pattern_count = options.max_pattern_count,
         .max_pattern_bytes = options.max_pattern_bytes,
         .max_unicode_variants = options.max_unicode_variants,
+        .multiline = self.multiline,
+        .max_multiline_window = self.max_multiline_window,
     };
 
     if (has_top_alt) {
@@ -238,7 +265,8 @@ pub fn extractLiterals(self: anytype, pattern: []const u8, options: inst_mod.Reg
         self.req_literal_bytes = try self.allocator.dupe(u8, first_lit.items);
         self.req_literal_offset = 0;
         self.req_is_prefix = true;
-        self.req_is_exact = exact_only and !self.multiline;
+        const max_first_exact = if (self.ignore_case and self.unicode_case) first_lit.items.len *| 3 else first_lit.items.len;
+        self.req_is_exact = exact_only and (!self.multiline or max_first_exact <= self.max_multiline_window);
         self.prefilter = Finder.init(self.req_literal_bytes, find_opts) catch null;
 
         // If another required literal of length >= 2 exists beyond the prefix literal (e.g., `ERROR.*timeout`), save it as tail_finder
@@ -317,7 +345,7 @@ pub fn extractRequiredPrefix(allocator: std.mem.Allocator, pattern: []const u8, 
                     break;
                 }
                 const lit_b: u8 = switch (next_c) {
-                    'n' => if (multiline) break else '\n',
+                    'n' => if (!multiline) break else '\n',
                     'r' => '\r',
                     't' => '\t',
                     else => next_c,
@@ -326,7 +354,7 @@ pub fn extractRequiredPrefix(allocator: std.mem.Allocator, pattern: []const u8, 
                 i += 2;
             },
             else => {
-                if (c == '\n') break;
+                if (c == '\n' and !multiline) break;
                 const seq_len = utf8SeqLenAt(pattern, i, pattern.len);
                 try prefix.appendSlice(allocator, pattern[i .. i + seq_len]);
                 i += seq_len;
@@ -357,6 +385,8 @@ pub fn tryExtractAltLiterals(self: anytype, pattern: []const u8, find_opts: matc
             }
             if (ch == '[') {
                 in_class = true;
+                if (j + 1 < inner.len and (inner[j + 1] == '^' or inner[j + 1] == '!')) j += 1;
+                if (j + 1 < inner.len and inner[j + 1] == ']') j += 1;
             } else if (ch == '(') {
                 depth += 1;
             } else if (ch == ')') {
@@ -394,6 +424,8 @@ pub fn tryExtractAltLiterals(self: anytype, pattern: []const u8, find_opts: matc
         }
         if (ch == '[') {
             in_class = true;
+            if (i + 1 < inner.len and (inner[i + 1] == '^' or inner[i + 1] == '!')) i += 1;
+            if (i + 1 < inner.len and inner[i + 1] == ']') i += 1;
         } else if (ch == '(') {
             depth += 1;
         } else if (ch == ')') {
@@ -453,7 +485,7 @@ pub fn tryExtractAltLiterals(self: anytype, pattern: []const u8, find_opts: matc
                         break;
                     }
                     const lit_b: u8 = switch (next_c) {
-                        'n' => if (self.multiline) {
+                        'n' => if (!self.multiline) {
                             br_exact = false;
                             break;
                         } else '\n',
@@ -465,7 +497,7 @@ pub fn tryExtractAltLiterals(self: anytype, pattern: []const u8, find_opts: matc
                     k += 2;
                 },
                 else => {
-                    if (c == '\n') {
+                    if (c == '\n' and !self.multiline) {
                         br_exact = false;
                         break;
                     }
@@ -478,6 +510,7 @@ pub fn tryExtractAltLiterals(self: anytype, pattern: []const u8, find_opts: matc
         if (!br_exact or k != br.len) all_exact = false;
         if (prefix_buf.items.len < 2) {
             for (prefixes.items) |s| self.allocator.free(s);
+            prefixes.deinit(self.allocator);
             return;
         }
         const duped = try self.allocator.dupe(u8, prefix_buf.items);
@@ -489,7 +522,12 @@ pub fn tryExtractAltLiterals(self: anytype, pattern: []const u8, find_opts: matc
     if (Multi.init(self.allocator, owned_slices, find_opts)) |m| {
         self.alt_literal_slices = owned_slices;
         self.alt_prefilter = m;
-        self.alt_is_exact = all_exact and !self.multiline;
+        var max_br_len: usize = 0;
+        for (owned_slices) |s| {
+            if (s.len > max_br_len) max_br_len = s.len;
+        }
+        const max_alt_exact = if (self.ignore_case and self.unicode_case) max_br_len *| 3 else max_br_len;
+        self.alt_is_exact = all_exact and (!self.multiline or max_alt_exact <= self.max_multiline_window);
     } else |_| {
         for (owned_slices) |s| self.allocator.free(s);
         self.allocator.free(owned_slices);

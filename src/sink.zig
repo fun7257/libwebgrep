@@ -22,11 +22,40 @@ pub const Span = struct {
     replacement: ?[]const u8 = null,
 };
 
-/// Flow control returned by callbacks. `bool` still means continue or stop; service entry points may also return this enum.
+/// Flow control returned by callbacks. `bool` still means continue or stop; service entry points may also return this enum or `FlowAction`.
 pub const Flow = enum {
     cont,
     pause,
     stop,
+
+    /// Request an in-stream jump to `target_offset` (absolute searchable byte offset).
+    pub fn skipTo(target_offset: u64) FlowAction {
+        return .{ .skip_to = target_offset };
+    }
+};
+
+/// Extended flow control action returned by callbacks, supporting in-stream byte offset jumps via `Flow.skipTo(offset)`.
+pub const FlowAction = union(enum) {
+    cont,
+    pause,
+    stop,
+    skip_to: u64,
+
+    pub fn fromFlow(f: Flow) FlowAction {
+        return switch (f) {
+            .cont => .cont,
+            .pause => .pause,
+            .stop => .stop,
+        };
+    }
+
+    pub fn toFlow(self: FlowAction) Flow {
+        return switch (self) {
+            .cont, .skip_to => .cont,
+            .pause => .pause,
+            .stop => .stop,
+        };
+    }
 };
 
 /// Counters needed to resume searching after a pause. Passed to `resumeSourceSlice` or `resumeSource`.
@@ -119,8 +148,10 @@ pub const BinaryStatus = enum {
 pub const LineEvent = struct {
     /// Caller-assigned source identifier, opaque to the library.
     source_id: []const u8,
-    /// 1-based line number, or record number in NUL-delimited mode.
+    /// 1-based line number, or record number in NUL-delimited mode (0 when `line_number_known` is false).
     line_number: u64,
+    /// True when `line_number` is known; false when searching a mid-file range or tail without scanning from offset 0 or supplying `initial_line_number`.
+    line_number_known: bool = true,
     /// 1-based byte column within `bytes`, or null if there is no match. Distinct from `u16_column`.
     column: ?u64 = null,
     /// 1-based UTF-16 column of the first match after sorting by start offset, or null if there is no match.
@@ -310,10 +341,10 @@ pub const AnySink = struct {
     }
 };
 
-/// Runtime-polymorphic Event sink for the service entry point (`Event` -> `Flow`).
+/// Runtime-polymorphic Event sink for the service entry point (`Event` -> `Flow` / `FlowAction`).
 pub const AnyEventSink = struct {
     ctx: *anyopaque,
-    event_fn: *const fn (ctx: *anyopaque, ev: Event) Flow,
+    action_fn: *const fn (ctx: *anyopaque, ev: Event) FlowAction,
 
     pub fn init(comptime S: type, ptr: anytype) AnyEventSink {
         const Base = switch (@typeInfo(S)) {
@@ -322,19 +353,20 @@ pub const AnyEventSink = struct {
         };
         if (Base == AnyEventSink) return ptr.*;
         const gen = struct {
-            fn call(ctx: *anyopaque, ev: Event) Flow {
+            fn call(ctx: *anyopaque, ev: Event) FlowAction {
                 const self: *Base = @ptrCast(@alignCast(ctx));
                 const ret = self.event(ev);
                 return switch (@TypeOf(ret)) {
                     bool => if (ret) .cont else .stop,
-                    Flow => ret,
-                    else => @compileError("Event sink .event(ev) must return bool or Flow"),
+                    Flow => FlowAction.fromFlow(ret),
+                    FlowAction => ret,
+                    else => @compileError("Event sink .event(ev) must return bool, Flow, or FlowAction"),
                 };
             }
         };
         return .{
             .ctx = @ptrCast(@constCast(ptr)),
-            .event_fn = &gen.call,
+            .action_fn = &gen.call,
         };
     }
 
@@ -343,7 +375,11 @@ pub const AnyEventSink = struct {
     }
 
     pub fn event(self: *AnyEventSink, ev: Event) Flow {
-        return self.event_fn(self.ctx, ev);
+        return self.action_fn(self.ctx, ev).toFlow();
+    }
+
+    pub fn eventAction(self: *AnyEventSink, ev: Event) FlowAction {
+        return self.action_fn(self.ctx, ev);
     }
 };
 
@@ -423,7 +459,10 @@ pub fn SliceIter(comptime M: type) type {
         }
 
         pub fn next(self: *Iter) ?Line {
-            if (self.done or self.pos > self.haystack.len) return null;
+            if (self.done or self.pos >= self.haystack.len) {
+                self.done = true;
+                return null;
+            }
             const found = self.matcher.find(self.haystack, self.pos, self.mode) orelse {
                 self.done = true;
                 return null;
@@ -433,10 +472,32 @@ pub fn SliceIter(comptime M: type) type {
                 self.done = true;
                 return null;
             }
-            const end = lineEnd(self.haystack, @max(found.end, start));
+            const probe = if (found.end > found.start and found.end <= self.haystack.len and self.haystack[found.end - 1] == '\n')
+                found.end - 1
+            else
+                @max(found.end, start);
+            var end = lineEnd(self.haystack, probe);
             if (end == start) {
                 self.done = true;
                 return null;
+            }
+            const T = matcher.BaseMatcherType(M);
+            const is_ml = if (@hasDecl(T, "isMultiline")) self.matcher.isMultiline() else false;
+            if (is_ml) {
+                var cur = found;
+                while (true) {
+                    const next_from = if (cur.end == cur.start) cur.end + 1 else cur.end;
+                    if (next_from >= end or next_from > self.haystack.len) break;
+                    const m2 = self.matcher.find(self.haystack, next_from, self.mode) orelse break;
+                    if (m2.start >= end) break;
+                    const probe2 = if (m2.end > m2.start and m2.end <= self.haystack.len and self.haystack[m2.end - 1] == '\n')
+                        m2.end - 1
+                    else
+                        @max(m2.end, start);
+                    const end2 = lineEnd(self.haystack, probe2);
+                    if (end2 > end) end = end2;
+                    cur = m2;
+                }
             }
             const content_end = withoutNewlineEnd(self.haystack, start, end);
             var number: ?u64 = null;
@@ -447,8 +508,8 @@ pub fn SliceIter(comptime M: type) type {
                 number = self.line_no;
             }
             self.pos = end;
-            const mstart = found.start - start;
-            const mend = @min(found.end, content_end) - start;
+            const mstart = @min(found.start, content_end) - start;
+            const mend = @max(mstart, @min(found.end, content_end) - start);
             const raw = self.haystack[start..content_end];
             const units = @import("codec/encoding.zig").utf16Span(raw, mstart, mend);
             return .{
@@ -464,6 +525,7 @@ pub fn SliceIter(comptime M: type) type {
                     .u16_start = units.start,
                     .u16_end = units.end,
                 },
+                .column = @as(u64, mstart) + 1,
                 .u16_column = units.start + 1,
                 .line_len = content_end - start,
             };

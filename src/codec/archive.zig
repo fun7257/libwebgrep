@@ -16,12 +16,22 @@ pub const ArchiveFormat = enum {
     zip,
 };
 
+pub const ArchiveEntryMeta = struct {
+    path: []const u8,
+    kind: source_mod.Kind,
+    size: u64,
+    compressed_size: u64,
+    mtime: ?i64 = null,
+};
+
 pub const ArchiveOptions = struct {
     format: ArchiveFormat = .auto,
     max_entries: usize = 10_000,
     max_entry_bytes: u64 = 64 * 1024 * 1024,
     max_total_bytes: u64 = 256 * 1024 * 1024,
     max_compression_ratio: u64 = 100,
+    entry_filter: ?*const fn (?*anyopaque, ArchiveEntryMeta) bool = null,
+    entry_filter_ctx: ?*anyopaque = null,
 };
 
 pub const ArchiveError = error{
@@ -36,6 +46,7 @@ const TempNode = struct {
     name: []const u8,
     kind: source_mod.Kind,
     bytes: []const u8 = &.{},
+    mtime: ?i64 = null,
     children: std.ArrayList(*TempNode) = .empty,
 };
 
@@ -231,6 +242,7 @@ fn ensureDirPath(
     arena_alloc: std.mem.Allocator,
     root: *TempNode,
     dir_path: []const u8,
+    leaf_mtime: ?i64,
 ) ArchiveError!*TempNode {
     var curr = root;
     var it = std.mem.splitScalar(u8, dir_path, '/');
@@ -257,6 +269,7 @@ fn ensureDirPath(
             curr = new_dir;
         }
     }
+    if (leaf_mtime) |m| curr.mtime = m;
     return curr;
 }
 
@@ -265,9 +278,10 @@ fn insertFile(
     root: *TempNode,
     clean_path: []const u8,
     payload: []const u8,
+    mtime: ?i64,
 ) ArchiveError!void {
     const parent, const base = if (std.mem.lastIndexOfScalar(u8, clean_path, '/')) |slash| blk: {
-        const dir = try ensureDirPath(arena_alloc, root, clean_path[0..slash]);
+        const dir = try ensureDirPath(arena_alloc, root, clean_path[0..slash], null);
         break :blk .{ dir, clean_path[slash + 1 ..] };
     } else .{ root, clean_path };
 
@@ -278,6 +292,7 @@ fn insertFile(
         if (std.mem.eql(u8, child.name, base)) {
             if (child.kind != .file) return error.CorruptArchive;
             child.bytes = payload;
+            child.mtime = mtime;
             return;
         }
     }
@@ -287,6 +302,7 @@ fn insertFile(
         .name = try arena_alloc.dupe(u8, base),
         .kind = .file,
         .bytes = payload,
+        .mtime = mtime,
     };
     try parent.children.append(arena_alloc, new_file);
 }
@@ -306,6 +322,7 @@ fn freezeTree(
             .kind = .directory,
             .bytes = &.{},
             .children = children,
+            .mtime = temp.mtime,
         };
     } else {
         node.* = .{
@@ -313,9 +330,93 @@ fn freezeTree(
             .kind = temp.kind,
             .bytes = temp.bytes,
             .children = &.{},
+            .mtime = temp.mtime,
         };
     }
     return node;
+}
+
+fn extractTarMtime(header_buf: *const [512]u8) ?i64 {
+    const raw = header_buf[136..148];
+    if ((raw[0] & 0x80) != 0) {
+        const val = std.mem.readInt(i64, raw[4..12], .big);
+        return if (val == 0) null else val;
+    }
+    const ltrimmed = std.mem.trimStart(u8, raw, "0 ");
+    const rtrimmed = std.mem.trimEnd(u8, ltrimmed, " \x00");
+    if (rtrimmed.len == 0) return null;
+    const parsed = std.fmt.parseInt(u64, rtrimmed, 8) catch return null;
+    return std.math.cast(i64, parsed);
+}
+
+/// Converts MS-DOS 16-bit time (`mod_time`) and 16-bit date (`mod_date`) into UTC Unix epoch seconds.
+pub fn dosDateTimeToUnix(mod_time: u16, mod_date: u16) i64 {
+    const year: i64 = 1980 + @as(i64, mod_date >> 9);
+    const raw_month: u32 = (mod_date >> 5) & 0x0F;
+    const month: u32 = std.math.clamp(raw_month, 1, 12);
+    const raw_day: u32 = mod_date & 0x1F;
+    const day: u32 = std.math.clamp(raw_day, 1, 31);
+
+    const hour: i64 = @min(@as(u16, 23), mod_time >> 11);
+    const minute: i64 = @min(@as(u16, 59), (mod_time >> 5) & 0x3F);
+    const second: i64 = @min(@as(u16, 59), (mod_time & 0x1F) * 2);
+
+    const y_adj: i64 = year - @as(i64, @intFromBool(month <= 2));
+    const era: i64 = @divFloor(y_adj, 400);
+    const yoe: u64 = @intCast(y_adj - era * 400);
+    const m_u64: u64 = month;
+    const d_u64: u64 = day;
+    const doy: u64 = (153 * (if (m_u64 > 2) m_u64 - 3 else m_u64 + 9) + 2) / 5 + d_u64 - 1;
+    const doe: u64 = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    const days: i64 = era * 146097 + @as(i64, @intCast(doe)) - 719468;
+
+    return days * 86400 + hour * 3600 + minute * 60 + second;
+}
+
+/// Converts UTC Unix epoch seconds into MS-DOS 16-bit time and date (clamped to 1980..2107).
+pub fn unixToDosDateTime(unix_sec: i64) struct { mod_time: u16, mod_date: u16 } {
+    const clamped = std.math.clamp(unix_sec, 315532800, 4354819199);
+    const days: i64 = @divFloor(clamped, 86400);
+    const rem_sec: u32 = @intCast(clamped - days * 86400);
+    const hour: u16 = @intCast(rem_sec / 3600);
+    const minute: u16 = @intCast((rem_sec % 3600) / 60);
+    const sec2: u16 = @intCast((rem_sec % 60) / 2);
+
+    const z: i64 = days + 719468;
+    const era: i64 = @divFloor(z, 146097);
+    const doe: u64 = @intCast(z - era * 146097);
+    const yoe: u64 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const y_base: i64 = @as(i64, @intCast(yoe)) + era * 400;
+    const doy: u64 = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const mp: u64 = (5 * doy + 2) / 153;
+    const d: u16 = @intCast(doy - (153 * mp + 2) / 5 + 1);
+    const m: u16 = @intCast(if (mp < 10) mp + 3 else mp - 9);
+    const y: i64 = y_base + @as(i64, @intFromBool(m <= 2));
+
+    const dos_year: u16 = @intCast(std.math.clamp(y - 1980, 0, 127));
+    const mod_date: u16 = (dos_year << 9) | (m << 5) | d;
+    const mod_time: u16 = (hour << 11) | (minute << 5) | sec2;
+    return .{ .mod_time = mod_time, .mod_date = mod_date };
+}
+
+fn parseZipExtendedTimestampMtime(extra: []const u8) ?i64 {
+    var pos: usize = 0;
+    while (pos + 4 <= extra.len) {
+        const tag = std.mem.readInt(u16, extra[pos..][0..2], .little);
+        const data_len = @as(usize, std.mem.readInt(u16, extra[pos + 2 ..][0..2], .little));
+        pos += 4;
+        if (data_len > extra.len - pos) break;
+        const data = extra[pos .. pos + data_len];
+        pos += data_len;
+        if (tag == 0x5455 and data.len >= 5) {
+            const ts_flags = data[0];
+            if ((ts_flags & 0x01) != 0) {
+                const unix_sec = std.mem.readInt(i32, data[1..][0..4], .little);
+                return @as(i64, unix_sec);
+            }
+        }
+    }
+    return null;
 }
 
 fn unpackTar(
@@ -357,6 +458,26 @@ fn unpackTar(
 
         const clean = (try sanitizeArchivePath(file.name)) orelse continue;
 
+        const entry_kind: source_mod.Kind = switch (file.kind) {
+            .directory => .directory,
+            .file => .file,
+            .sym_link => unreachable,
+        };
+        const mtime_val: ?i64 = extractTarMtime(&it.header_buffer);
+
+        if (options.entry_filter) |filter_fn| {
+            const meta = ArchiveEntryMeta{
+                .path = clean,
+                .kind = entry_kind,
+                .size = file.size,
+                .compressed_size = file.size,
+                .mtime = mtime_val,
+            };
+            if (!filter_fn(options.entry_filter_ctx, meta)) {
+                continue;
+            }
+        }
+
         entry_count += 1;
         if (entry_count > options.max_entries) return error.ArchiveLimit;
 
@@ -366,13 +487,13 @@ fn unpackTar(
 
         switch (file.kind) {
             .directory => {
-                _ = try ensureDirPath(arena_alloc, root, clean);
+                _ = try ensureDirPath(arena_alloc, root, clean, mtime_val);
             },
             .file => {
                 const payload = try arena_alloc.alloc(u8, @intCast(file.size));
                 reader.readSliceAll(payload) catch return error.CorruptArchive;
                 it.unread_file_bytes = 0;
-                try insertFile(arena_alloc, root, clean, payload);
+                try insertFile(arena_alloc, root, clean, payload, mtime_val);
             },
             .sym_link => unreachable,
         }
@@ -424,6 +545,8 @@ fn unpackZip(
 
         const flags = std.mem.readInt(u16, zip_bytes[cd_pos + 8 ..][0..2], .little);
         const method = std.mem.readInt(u16, zip_bytes[cd_pos + 10 ..][0..2], .little);
+        const mod_time = std.mem.readInt(u16, zip_bytes[cd_pos + 12 ..][0..2], .little);
+        const mod_date = std.mem.readInt(u16, zip_bytes[cd_pos + 14 ..][0..2], .little);
         const expected_crc32 = std.mem.readInt(u32, zip_bytes[cd_pos + 16 ..][0..4], .little);
         const comp_size = std.mem.readInt(u32, zip_bytes[cd_pos + 20 ..][0..4], .little);
         const uncomp_size = std.mem.readInt(u32, zip_bytes[cd_pos + 24 ..][0..4], .little);
@@ -437,10 +560,10 @@ fn unpackZip(
         const rec_end = std.math.add(usize, hdr_end, var_len) catch return error.CorruptArchive;
         if (rec_end > cd_end) return error.CorruptArchive;
 
-        const raw_name = zip_bytes[hdr_end .. hdr_end + name_len];
+        const name_end = hdr_end + @as(usize, name_len);
+        const raw_name = zip_bytes[hdr_end..name_end];
+        const extra_slice = zip_bytes[name_end .. name_end + @as(usize, extra_len)];
         cd_pos = rec_end;
-
-        if ((flags & 1) != 0) return error.UnsupportedFormat;
 
         // Check POSIX S_IFLNK (0o120000) in upper 16 bits of external_attr; skip symlinks.
         const unix_mode = (external_attr >> 16) & 0o170000;
@@ -451,11 +574,29 @@ fn unpackZip(
         const is_dir = (raw_name.len > 0 and raw_name[raw_name.len - 1] == '/') or (unix_mode == 0o040000);
         const clean = (try sanitizeArchivePath(raw_name)) orelse continue;
 
+        const mtime_val: ?i64 = parseZipExtendedTimestampMtime(extra_slice) orelse
+            if (mod_time != 0 or mod_date != 0) dosDateTimeToUnix(mod_time, mod_date) else null;
+
+        if (options.entry_filter) |filter_fn| {
+            const meta = ArchiveEntryMeta{
+                .path = clean,
+                .kind = if (is_dir) .directory else .file,
+                .size = @as(u64, uncomp_size),
+                .compressed_size = @as(u64, comp_size),
+                .mtime = mtime_val,
+            };
+            if (!filter_fn(options.entry_filter_ctx, meta)) {
+                continue;
+            }
+        }
+
+        if ((flags & 1) != 0) return error.UnsupportedFormat;
+
         entry_count += 1;
         if (entry_count > options.max_entries) return error.ArchiveLimit;
 
         if (is_dir) {
-            _ = try ensureDirPath(arena_alloc, root, clean);
+            _ = try ensureDirPath(arena_alloc, root, clean, mtime_val);
             continue;
         }
 
@@ -529,7 +670,7 @@ fn unpackZip(
         const actual_crc32 = std.hash.Crc32.hash(payload);
         if (actual_crc32 != expected_crc32) return error.CorruptArchive;
 
-        try insertFile(arena_alloc, root, clean, payload);
+        try insertFile(arena_alloc, root, clean, payload, mtime_val);
     }
 }
 
@@ -539,6 +680,8 @@ pub const TestArchiveEntry = struct {
     kind: enum { file, directory, symlink } = .file,
     link_target: []const u8 = "",
     zip_method: enum { store, deflate } = .store,
+    mtime: ?i64 = null,
+    zip_extended_timestamp: bool = true,
 };
 
 pub fn buildTestTarAlloc(allocator: std.mem.Allocator, entries: []const TestArchiveEntry) ![]u8 {
@@ -558,6 +701,19 @@ pub fn buildTestTarAlloc(allocator: std.mem.Allocator, entries: []const TestArch
         }
         const size: u64 = if (entry.kind == .file) entry.data.len else 0;
         try hdr.setSize(size);
+        if (entry.mtime) |ts| {
+            if (ts >= 0) {
+                const raw_hdr = std.mem.asBytes(&hdr);
+                var v: u64 = @intCast(ts);
+                var idx_oct: usize = 11;
+                while (idx_oct > 0) {
+                    idx_oct -= 1;
+                    raw_hdr[136 + idx_oct] = @intCast('0' + (v & 7));
+                    v >>= 3;
+                }
+                raw_hdr[147] = 0;
+            }
+        }
         if (entry.kind == .symlink) {
             try hdr.setLinkname(entry.link_target);
         }
@@ -603,12 +759,15 @@ pub fn buildTestZipAlloc(allocator: std.mem.Allocator, entries: []const TestArch
 
     const CdRec = struct {
         method: u16,
+        mod_time: u16,
+        mod_date: u16,
         crc32: u32,
         comp_size: u32,
         uncomp_size: u32,
         external_attr: u32,
         local_offset: u32,
         path: []const u8,
+        ext_mtime: ?i32,
     };
     var cd_recs = std.ArrayList(CdRec).empty;
     defer cd_recs.deinit(allocator);
@@ -626,11 +785,25 @@ pub fn buildTestZipAlloc(allocator: std.mem.Allocator, entries: []const TestArch
             break :blk .{ 8, comp_owned.? };
         } else .{ 0, raw_data };
 
+        var mod_time: u16 = 0;
+        var mod_date: u16 = 0;
+        var ext_mtime: ?i32 = null;
+        if (entry.mtime) |ts| {
+            const dos = unixToDosDateTime(ts);
+            mod_time = dos.mod_time;
+            mod_date = dos.mod_date;
+            if (entry.zip_extended_timestamp) {
+                ext_mtime = std.math.cast(i32, ts);
+            }
+        }
+
         // Local File Header (30 bytes)
         var lfh: [30]u8 = @splat(0);
         std.mem.writeInt(u32, lfh[0..4], 0x04034b50, .little);
         std.mem.writeInt(u16, lfh[4..6], 20, .little);
         std.mem.writeInt(u16, lfh[8..10], method, .little);
+        std.mem.writeInt(u16, lfh[10..12], mod_time, .little);
+        std.mem.writeInt(u16, lfh[12..14], mod_date, .little);
         std.mem.writeInt(u32, lfh[14..18], crc, .little);
         std.mem.writeInt(u32, lfh[18..22], @intCast(comp_slice.len), .little);
         std.mem.writeInt(u32, lfh[22..26], @intCast(raw_data.len), .little);
@@ -647,30 +820,45 @@ pub fn buildTestZipAlloc(allocator: std.mem.Allocator, entries: []const TestArch
 
         try cd_recs.append(allocator, .{
             .method = method,
+            .mod_time = mod_time,
+            .mod_date = mod_date,
             .crc32 = crc,
             .comp_size = @intCast(comp_slice.len),
             .uncomp_size = @intCast(raw_data.len),
             .external_attr = ext_attr,
             .local_offset = local_offset,
             .path = entry.path,
+            .ext_mtime = ext_mtime,
         });
     }
 
     const cd_offset: u32 = @intCast(out.items.len);
     for (cd_recs.items) |rec| {
+        const extra_len: u16 = if (rec.ext_mtime != null) 9 else 0;
         var cdh: [46]u8 = @splat(0);
         std.mem.writeInt(u32, cdh[0..4], 0x02014b50, .little);
         std.mem.writeInt(u16, cdh[4..6], 0x0314, .little); // UNIX, 2.0
         std.mem.writeInt(u16, cdh[6..8], 20, .little);
         std.mem.writeInt(u16, cdh[10..12], rec.method, .little);
+        std.mem.writeInt(u16, cdh[12..14], rec.mod_time, .little);
+        std.mem.writeInt(u16, cdh[14..16], rec.mod_date, .little);
         std.mem.writeInt(u32, cdh[16..20], rec.crc32, .little);
         std.mem.writeInt(u32, cdh[20..24], rec.comp_size, .little);
         std.mem.writeInt(u32, cdh[24..28], rec.uncomp_size, .little);
         std.mem.writeInt(u16, cdh[28..30], @intCast(rec.path.len), .little);
+        std.mem.writeInt(u16, cdh[30..32], extra_len, .little);
         std.mem.writeInt(u32, cdh[38..42], rec.external_attr, .little);
         std.mem.writeInt(u32, cdh[42..46], rec.local_offset, .little);
         try out.appendSlice(allocator, &cdh);
         try out.appendSlice(allocator, rec.path);
+        if (rec.ext_mtime) |ts_i32| {
+            var ext_ut: [9]u8 = undefined;
+            std.mem.writeInt(u16, ext_ut[0..2], 0x5455, .little);
+            std.mem.writeInt(u16, ext_ut[2..4], 5, .little);
+            ext_ut[4] = 0x01;
+            std.mem.writeInt(i32, ext_ut[5..9], ts_i32, .little);
+            try out.appendSlice(allocator, &ext_ut);
+        }
     }
     const cd_size: u32 = @intCast(out.items.len - cd_offset);
 

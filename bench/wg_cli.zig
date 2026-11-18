@@ -13,6 +13,8 @@ const CliArgs = struct {
     line_numbers: bool = false,
     fixed_strings: bool = false,
     ignore_case: bool = false,
+    multiline: bool = false,
+    multiline_dotall: bool = false,
     no_unicode: bool = false,
     no_ignore: bool = false,
     binary_policy: libwebgrep.BinaryPolicy = .quit,
@@ -32,10 +34,30 @@ const CountSink = struct {};
 
 const PrintSink = struct {
     out: *std.Io.Writer,
+    file_path: []const u8 = "",
     prefix_path: ?[]const u8 = null,
     line_numbers: bool = false,
 
     pub fn matched(self: *PrintSink, line: libwebgrep.Line) bool {
+        if (line.binary_status == .detected) return false;
+        if ((self.prefix_path != null or self.line_numbers) and std.mem.indexOfScalar(u8, line.bytes, '\n') != null) {
+            var it = std.mem.splitScalar(u8, line.bytes, '\n');
+            var idx: u64 = 0;
+            while (it.next()) |sub| : (idx += 1) {
+                if (self.prefix_path) |p| {
+                    self.out.writeAll(p) catch return false;
+                    self.out.writeByte(':') catch return false;
+                }
+                if (self.line_numbers) {
+                    if (line.number) |num| {
+                        self.out.print("{d}:", .{num + idx}) catch return false;
+                    }
+                }
+                self.out.writeAll(sub) catch return false;
+                self.out.writeByte('\n') catch return false;
+            }
+            return true;
+        }
         if (self.prefix_path) |p| {
             self.out.writeAll(p) catch return false;
             self.out.writeByte(':') catch return false;
@@ -47,6 +69,13 @@ const PrintSink = struct {
         }
         self.out.writeAll(line.bytes) catch return false;
         self.out.writeByte('\n') catch return false;
+        return true;
+    }
+
+    pub fn finish(self: *PrintSink, res: libwebgrep.Result) bool {
+        if (res.outcome == .binary_matched) {
+            self.out.print("Binary file {s} matches\n", .{self.file_path}) catch return false;
+        }
         return true;
     }
 };
@@ -70,10 +99,26 @@ const DirEventCtx = struct {
         } else {
             switch (ev) {
                 .match => |m| {
-                    if (self.line_numbers) {
+                    if (m.binary_status == .detected) return .cont;
+                    if (std.mem.indexOfScalar(u8, m.bytes, '\n') != null) {
+                        var it = std.mem.splitScalar(u8, m.bytes, '\n');
+                        var idx: u64 = 0;
+                        while (it.next()) |sub| : (idx += 1) {
+                            if (self.line_numbers) {
+                                self.out.print("{s}:{d}:{s}\n", .{ m.source_id, m.line_number + idx, sub }) catch return .stop;
+                            } else {
+                                self.out.print("{s}:{s}\n", .{ m.source_id, sub }) catch return .stop;
+                            }
+                        }
+                    } else if (self.line_numbers) {
                         self.out.print("{s}:{d}:{s}\n", .{ m.source_id, m.line_number, m.bytes }) catch return .stop;
                     } else {
                         self.out.print("{s}:{s}\n", .{ m.source_id, m.bytes }) catch return .stop;
+                    }
+                },
+                .end => |e| {
+                    if (e.outcome == .binary_matched) {
+                        self.out.print("Binary file {s} matches\n", .{e.source_id}) catch return .stop;
                     }
                 },
                 else => {},
@@ -158,6 +203,8 @@ fn searchOneFile(
 
     const cfg = libwebgrep.SearchConfig{
         .line_numbers = args.line_numbers,
+        .multiline = args.multiline,
+        .match_mode = if (args.multiline) .leftmost_first else .earliest,
         .binary = args.binary_policy,
         .buffer_size = libwebgrep.SearchConfig.optimalBufferSize(args.threads),
         .scratch_pool = scratch,
@@ -174,6 +221,7 @@ fn searchOneFile(
     } else {
         var psink = PrintSink{
             .out = stdout_writer,
+            .file_path = path,
             .prefix_path = null,
             .line_numbers = args.line_numbers,
         };
@@ -211,6 +259,18 @@ pub fn main(init: std.process.Init) !u8 {
             } else if (std.mem.eql(u8, arg, "-i") or std.mem.eql(u8, arg, "--ignore-case")) {
                 cli.ignore_case = true;
                 continue;
+            } else if (std.mem.eql(u8, arg, "-U") or std.mem.eql(u8, arg, "--multiline")) {
+                cli.multiline = true;
+                continue;
+            } else if (std.mem.eql(u8, arg, "--no-multiline")) {
+                cli.multiline = false;
+                continue;
+            } else if (std.mem.eql(u8, arg, "--multiline-dotall")) {
+                cli.multiline_dotall = true;
+                continue;
+            } else if (std.mem.eql(u8, arg, "--no-multiline-dotall")) {
+                cli.multiline_dotall = false;
+                continue;
             } else if (std.mem.eql(u8, arg, "-a") or std.mem.eql(u8, arg, "--text")) {
                 cli.binary_policy = .none;
                 continue;
@@ -247,6 +307,19 @@ pub fn main(init: std.process.Init) !u8 {
                 cli.threads = std.fmt.parseInt(u32, j_str, 10) catch return 2;
                 if (cli.threads == 0) cli.threads = 1;
                 continue;
+            } else if (arg.len > 2 and arg[0] == '-' and arg[1] != '-') {
+                for (arg[1..]) |ch| {
+                    switch (ch) {
+                        'c' => cli.count_only = true,
+                        'n' => cli.line_numbers = true,
+                        'F' => cli.fixed_strings = true,
+                        'i' => cli.ignore_case = true,
+                        'a' => cli.binary_policy = .none,
+                        'U' => cli.multiline = true,
+                        else => return 2,
+                    }
+                }
+                continue;
             } else if (arg.len > 1 and arg[0] == '-') {
                 return 2;
             }
@@ -268,15 +341,25 @@ pub fn main(init: std.process.Init) !u8 {
     const case_mode: libwebgrep.CaseMode = if (cli.ignore_case) .insensitive else .sensitive;
     var cm: CompiledMatcher = if (cli.fixed_strings) blk: {
         if (cli.patterns.items.len == 1) {
-            break :blk .{ .finder = try libwebgrep.Finder.init(cli.patterns.items[0], .{ .case = case_mode }) };
+            break :blk .{ .finder = libwebgrep.Finder.init(cli.patterns.items[0], .{
+                .case = case_mode,
+                .unicode_case = !cli.no_unicode,
+                .multiline = cli.multiline,
+            }) catch return 2 };
         } else {
-            break :blk .{ .multi = try libwebgrep.Multi.init(gpa, cli.patterns.items, .{ .case = case_mode }) };
+            break :blk .{ .multi = libwebgrep.Multi.init(gpa, cli.patterns.items, .{
+                .case = case_mode,
+                .unicode_case = !cli.no_unicode,
+                .multiline = cli.multiline,
+            }) catch return 2 };
         }
     } else blk: {
         if (cli.patterns.items.len == 1) {
             break :blk .{ .regex = libwebgrep.Regex.init(gpa, cli.patterns.items[0], .{
                 .case = case_mode,
                 .unicode_case = !cli.no_unicode,
+                .multiline = cli.multiline,
+                .dot_all = cli.multiline_dotall,
             }) catch return 2 };
         } else {
             var total_len: usize = 0;
@@ -302,6 +385,8 @@ pub fn main(init: std.process.Init) !u8 {
             break :blk .{ .regex = libwebgrep.Regex.init(gpa, joined, .{
                 .case = case_mode,
                 .unicode_case = !cli.no_unicode,
+                .multiline = cli.multiline,
+                .dot_all = cli.multiline_dotall,
             }) catch return 2 };
         }
     };
@@ -338,10 +423,16 @@ pub fn main(init: std.process.Init) !u8 {
                 .regex => |*r| r,
                 else => null,
             },
-            .find = .{ .case = case_mode },
+            .find = .{
+                .case = case_mode,
+                .unicode_case = !cli.no_unicode,
+                .multiline = cli.multiline,
+            },
             .roots = &roots,
             .search = .{
                 .line_numbers = cli.line_numbers,
+                .multiline = cli.multiline,
+                .match_mode = if (cli.multiline) .leftmost_first else .earliest,
                 .binary = cli.binary_policy,
                 .buffer_size = libwebgrep.SearchConfig.optimalBufferSize(cli.threads),
                 .max_concurrency = cli.threads,

@@ -304,6 +304,7 @@ fn benchRegex(gpa: std.mem.Allocator, tracker: *BenchTracker, buf: []u8) !void {
         "regex_captures",
         "regex_replace_template",
         "regex_set_matches",
+        "regex_multiline",
     })) return;
 
     fillAlphabet(buf);
@@ -349,6 +350,13 @@ fn benchRegex(gpa: std.mem.Allocator, tracker: *BenchTracker, buf: []u8) !void {
         defer re_set.deinit();
         var ctx = RegexSetCtx{ .data = buf, .set = &re_set };
         try report(tracker, "regex_set_matches", buf.len, 1, regexSetRun, &ctx);
+    }
+
+    if (tracker.wants("regex_multiline")) {
+        var re_ml = try internal.Regex.init(gpa, "你好世界_[0-9]+[^\n]*\\n?[a-z0-9]+grep", .{ .multiline = true });
+        defer re_ml.deinit();
+        var ctx = RegexCtx{ .data = buf, .re = &re_ml, .at = utf8_at };
+        try report(tracker, "regex_multiline", buf.len, utf8_at, regexRun, &ctx);
     }
 }
 

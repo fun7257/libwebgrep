@@ -94,6 +94,10 @@ pub const FindOptions = struct {
     max_pattern_bytes: ?usize = null,
     /// Maximum Unicode variants per pattern expanded during case-insensitive folding. Defaults to 64.
     max_unicode_variants: usize = 64,
+    /// Allow literal patterns to contain `\n` and match across line boundaries.
+    multiline: bool = false,
+    /// Maximum byte window for cross-line matches in streaming mode. Defaults to 64 KiB.
+    max_multiline_window: usize = 64 * 1024,
 };
 
 pub fn patternCountLimit(options: FindOptions) usize {
@@ -195,6 +199,10 @@ pub const AnyMatcher = struct {
         isMultiline: *const fn (ctx: *const anyopaque) bool,
         isStartAnchored: *const fn (ctx: *const anyopaque) bool,
         multilineWindow: *const fn (ctx: *const anyopaque) usize,
+        maxNewlines: *const fn (ctx: *const anyopaque) ?u32,
+        earliestPendingStart: *const fn (ctx: *const anyopaque, chunk: []const u8, from: usize) usize,
+        watchedIsExact: *const fn (ctx: *const anyopaque) bool,
+        watchedHasExactStart: *const fn (ctx: *const anyopaque) bool,
         resetStats: *const fn (ctx: *const anyopaque) void,
         is_capture_regex: bool = false,
     };
@@ -326,6 +334,44 @@ pub const AnyMatcher = struct {
                 return 256 * 1024;
             }
 
+            fn maxNewlinesFn(ctx: *const anyopaque) ?u32 {
+                const self = cast(ctx);
+                if (@hasDecl(Base, "maxNewlines")) {
+                    return self.maxNewlines();
+                }
+                if (@hasField(Base, "needle")) {
+                    return @intCast(std.mem.count(u8, self.needle, "\n"));
+                }
+                return null;
+            }
+
+            fn earliestPendingStartFn(ctx: *const anyopaque, chunk: []const u8, from_offset: usize) usize {
+                const self = cast(ctx);
+                if (@hasDecl(Base, "earliestPendingStart")) {
+                    return self.earliestPendingStart(chunk, from_offset);
+                }
+                return from_offset;
+            }
+
+            fn watchedIsExactFn(ctx: *const anyopaque) bool {
+                const self = cast(ctx);
+                if (@hasDecl(Base, "watchedIsExact")) {
+                    return self.watchedIsExact();
+                }
+                if (@hasField(Base, "insts") or @hasField(Base, "patterns")) {
+                    return false;
+                }
+                return @hasDecl(Base, "findWatched");
+            }
+
+            fn watchedHasExactStartFn(ctx: *const anyopaque) bool {
+                const self = cast(ctx);
+                if (@hasDecl(Base, "watchedHasExactStart")) {
+                    return self.watchedHasExactStart();
+                }
+                return watchedIsExactFn(ctx);
+            }
+
             fn resetStatsFn(ctx: *const anyopaque) void {
                 if (@hasDecl(Base, "resetStats")) {
                     cast(ctx).resetStats();
@@ -342,6 +388,10 @@ pub const AnyMatcher = struct {
                 .isMultiline = &isMultilineFn,
                 .isStartAnchored = &isStartAnchoredFn,
                 .multilineWindow = &multilineWindowFn,
+                .maxNewlines = &maxNewlinesFn,
+                .earliestPendingStart = &earliestPendingStartFn,
+                .watchedIsExact = &watchedIsExactFn,
+                .watchedHasExactStart = &watchedHasExactStartFn,
                 .resetStats = &resetStatsFn,
                 .is_capture_regex = @hasDecl(Base, "findCaptures") and (@hasField(Base, "group_count") or @hasField(Base, "num_captures")),
             };
@@ -422,6 +472,22 @@ pub const AnyMatcher = struct {
 
     pub fn multilineWindow(self: *const AnyMatcher) usize {
         return self.vtable.multilineWindow(self.ctx);
+    }
+
+    pub fn maxNewlines(self: *const AnyMatcher) ?u32 {
+        return self.vtable.maxNewlines(self.ctx);
+    }
+
+    pub fn earliestPendingStart(self: *const AnyMatcher, chunk: []const u8, from_offset: usize) usize {
+        return self.vtable.earliestPendingStart(self.ctx, chunk, from_offset);
+    }
+
+    pub fn watchedIsExact(self: *const AnyMatcher) bool {
+        return self.vtable.watchedIsExact(self.ctx);
+    }
+
+    pub fn watchedHasExactStart(self: *const AnyMatcher) bool {
+        return self.vtable.watchedHasExactStart(self.ctx);
     }
 
     pub fn resetStats(self: *const AnyMatcher) void {

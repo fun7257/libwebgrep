@@ -4438,6 +4438,2276 @@ test "policy limits: default limits apply when omitted and unconstrained custom 
     try testing.expectEqual(@as(u32, 48), parallel_mod.resolveConcurrency(1, 48));
 }
 
+test "multiline: Finder and Multi literal cross-line matching across all engines and CRLF" {
+    const alloc = testing.allocator;
+    const Multi = @import("../finder/multi.zig").Multi;
+
+    // 1. Default options reject \n in Finder and Multi
+    try testing.expectError(error.PatternHasNewline, Finder.init("alpha\nbeta", .{}));
+    try testing.expectError(error.PatternHasNewline, Multi.init(alloc, &.{ "ok", "alpha\nbeta" }, .{}));
+
+    // 2. Finder multiline: 2 lines, 3+ lines, CRLF
+    const f2 = try Finder.init("alpha\nbeta", .{ .multiline = true });
+    var bag = Bag{};
+    defer bag.deinit();
+    const res2 = try searchSourceSlice(Bag, &bag, "ml-f2", "header\nxx alpha\nbeta yy\nfooter\n", &f2, .{ .multiline = true });
+    try testing.expectEqual(@as(u64, 1), res2.matched_lines);
+    try testing.expectEqual(@as(u64, 1), res2.matches);
+    const m2 = bag.matchAt(0);
+    try testing.expectEqual(@as(u64, 2), m2.line_number);
+    try testing.expectEqual(@as(?u64, 4), m2.column);
+    try testing.expectEqualStrings("xx alpha\nbeta yy", m2.bytes);
+    try testing.expectEqual(@as(usize, 1), m2.matches.len);
+    try testing.expectEqualStrings("alpha\nbeta", m2.bytes[m2.matches[0].start..m2.matches[0].end]);
+
+    // 3+ lines
+    bag.reset();
+    const f3 = try Finder.init("one\ntwo\nthree", .{ .multiline = true });
+    const res3 = try searchSourceSlice(Bag, &bag, "ml-f3", "0\none\ntwo\nthree!\n4\n", &f3, .{ .multiline = true });
+    try testing.expectEqual(@as(u64, 1), res3.matched_lines);
+    const m3 = bag.matchAt(0);
+    try testing.expectEqual(@as(u64, 2), m3.line_number);
+    try testing.expectEqualStrings("one\ntwo\nthree!", m3.bytes);
+
+    // CRLF cross-line literal
+    bag.reset();
+    const fcrlf = try Finder.init("alpha\r\nbeta", .{ .multiline = true });
+    const rescrlf = try searchSourceSlice(Bag, &bag, "ml-crlf", "first\r\nalpha\r\nbeta\r\nlast\r\n", &fcrlf, .{ .multiline = true });
+    try testing.expectEqual(@as(u64, 1), rescrlf.matched_lines);
+    const mcrlf = bag.matchAt(0);
+    try testing.expectEqual(@as(u64, 2), mcrlf.line_number);
+    try testing.expectEqualStrings("alpha\r\nbeta", mcrlf.bytes);
+
+    // 3. Multi multiline across RarePair (2 patterns), Teddy (4 patterns), AhoCorasick (>32 patterns), and Unicode case folding
+    // RarePair
+    {
+        var m_pair = try Multi.init(alloc, &.{ "alpha\nbeta", "gamma\ndelta" }, .{ .multiline = true });
+        defer m_pair.deinit();
+        bag.reset();
+        const rp_res = try searchSourceSlice(Bag, &bag, "ml-pair", "line1\ngamma\ndelta\nline4\n", &m_pair, .{});
+        try testing.expectEqual(@as(u64, 1), rp_res.matched_lines);
+        try testing.expectEqual(@as(u32, 1), bag.matchAt(0).matches[0].pattern_id.?);
+        try testing.expectEqualStrings("gamma\ndelta", bag.matchAt(0).bytes);
+    }
+    // Teddy
+    {
+        var m_teddy = try Multi.init(alloc, &.{ "p1\nq1", "p2\nq2", "p3\nq3", "p4\nq4" }, .{ .multiline = true });
+        defer m_teddy.deinit();
+        bag.reset();
+        const td_res = try searchSourceSlice(Bag, &bag, "ml-teddy", "start\np3\nq3\nend\n", &m_teddy, .{});
+        try testing.expectEqual(@as(u64, 1), td_res.matched_lines);
+        try testing.expectEqual(@as(u32, 2), bag.matchAt(0).matches[0].pattern_id.?);
+        try testing.expectEqualStrings("p3\nq3", bag.matchAt(0).bytes);
+    }
+    // AhoCorasick (36 patterns)
+    {
+        var pat_bufs: [36][16]u8 = undefined;
+        var pat_slices: [36][]const u8 = undefined;
+        for (0..36) |i| {
+            pat_slices[i] = try std.fmt.bufPrint(&pat_bufs[i], "k{d:0>2}\nv{d:0>2}", .{ i, i });
+        }
+        var m_ac = try Multi.init(alloc, &pat_slices, .{ .multiline = true });
+        defer m_ac.deinit();
+        bag.reset();
+        const ac_res = try searchSourceSlice(Bag, &bag, "ml-ac", "head\nk34\nv34\ntail\n", &m_ac, .{});
+        try testing.expectEqual(@as(u64, 1), ac_res.matched_lines);
+        try testing.expectEqual(@as(u32, 34), bag.matchAt(0).matches[0].pattern_id.?);
+    }
+    // Unicode case folding with cross-line pattern
+    {
+        var m_uni = try Multi.init(alloc, &.{ "δ\nε", "ω\nψ" }, .{
+            .case = .insensitive,
+            .unicode_case = true,
+            .multiline = true,
+        });
+        defer m_uni.deinit();
+        bag.reset();
+        const uni_res = try searchSourceSlice(Bag, &bag, "ml-uni", "0\nΔ\nΕ\n3\n", &m_uni, .{});
+        try testing.expectEqual(@as(u64, 1), uni_res.matched_lines);
+        try testing.expectEqualStrings("Δ\nΕ", bag.matchAt(0).bytes);
+    }
+}
+
+test "multiline: Regex, RegexSet, scoped (?m:...), dot_all, anchors, and SIMD cross-line prefilter" {
+    const alloc = testing.allocator;
+    const Regex = regex_mod.Regex;
+    const RegexSet = regex_mod.RegexSet;
+
+    var bag = Bag{};
+    defer bag.deinit();
+
+    // 1. \n escape and raw \n in Regex
+    {
+        var re_esc = try Regex.init(alloc, "foo\\nbar", .{ .multiline = true });
+        defer re_esc.deinit();
+        const res = try searchSourceSlice(Bag, &bag, "re-esc", "a\nfoo\nbar\nb\n", &re_esc, .{});
+        try testing.expectEqual(@as(u64, 1), res.matched_lines);
+        try testing.expectEqualStrings("foo\nbar", bag.matchAt(0).bytes);
+    }
+    {
+        bag.reset();
+        var re_raw = try Regex.init(alloc, "foo\nbar", .{ .multiline = true });
+        defer re_raw.deinit();
+        const res = try searchSourceSlice(Bag, &bag, "re-raw", "a\nfoo\nbar\nb\n", &re_raw, .{});
+        try testing.expectEqual(@as(u64, 1), res.matched_lines);
+        try testing.expectEqualStrings("foo\nbar", bag.matchAt(0).bytes);
+    }
+
+    // 2. dot_all = true and (?s) across lines
+    {
+        bag.reset();
+        var re_dot = try Regex.init(alloc, "BEGIN.+?END", .{ .multiline = true, .dot_all = true });
+        defer re_dot.deinit();
+        const res = try searchSourceSlice(Bag, &bag, "re-dot", "0\nBEGIN\nmid\nEND\n4\n", &re_dot, .{});
+        try testing.expectEqual(@as(u64, 1), res.matched_lines);
+        try testing.expectEqual(@as(u64, 2), bag.matchAt(0).line_number);
+        try testing.expectEqualStrings("BEGIN\nmid\nEND", bag.matchAt(0).bytes);
+    }
+
+    // 3. ^ and $ matching internal line boundaries across lines
+    {
+        bag.reset();
+        var re_anc = try Regex.init(alloc, "^first$\\n^second$", .{ .multiline = true });
+        defer re_anc.deinit();
+        const res = try searchSourceSlice(Bag, &bag, "re-anc", "prefix\nfirst\nsecond\nsuffix\n", &re_anc, .{});
+        try testing.expectEqual(@as(u64, 1), res.matched_lines);
+        try testing.expectEqual(@as(u64, 2), bag.matchAt(0).line_number);
+        try testing.expectEqualStrings("first\nsecond", bag.matchAt(0).bytes);
+    }
+
+    // 4. Scoped (?m:...) inline flag enables multiline without top-level options.multiline
+    {
+        bag.reset();
+        var re_scoped = try Regex.init(alloc, "(?m:alpha\\nbeta)", .{});
+        defer re_scoped.deinit();
+        try testing.expect(re_scoped.isMultiline());
+        const res = try searchSourceSlice(Bag, &bag, "re-scoped", "x\nalpha\nbeta\ny\n", &re_scoped, .{});
+        try testing.expectEqual(@as(u64, 1), res.matched_lines);
+        try testing.expectEqualStrings("alpha\nbeta", bag.matchAt(0).bytes);
+    }
+
+    // 5. Regex with cross-line literal prefilter ("START\n[0-9]+\nEND" and "FOO\nBAR|BAZ\nQUX")
+    {
+        bag.reset();
+        var re_pre = try Regex.init(alloc, "START\\n[0-9]+\\nEND", .{ .multiline = true });
+        defer re_pre.deinit();
+        try testing.expect(re_pre.prefilter != null);
+        const res = try searchSourceSlice(Bag, &bag, "re-pre1", "pad\nSTART\n12345\nEND\n", &re_pre, .{});
+        try testing.expectEqual(@as(u64, 1), res.matched_lines);
+        try testing.expectEqualStrings("START\n12345\nEND", bag.matchAt(0).bytes);
+
+        bag.reset();
+        var re_alt = try Regex.init(alloc, "FOO\\nBAR|BAZ\\nQUX", .{ .multiline = true });
+        defer re_alt.deinit();
+        try testing.expect(re_alt.alt_prefilter != null);
+        const res_alt = try searchSourceSlice(Bag, &bag, "re-pre2", "0\nBAZ\nQUX\n3\n", &re_alt, .{});
+        try testing.expectEqual(@as(u64, 1), res_alt.matched_lines);
+        try testing.expectEqualStrings("BAZ\nQUX", bag.matchAt(0).bytes);
+    }
+
+    // 6. RegexSet cross-line matching via searchSourceSlice and matches()
+    {
+        bag.reset();
+        var rset = try RegexSet.init(alloc, &.{ "alpha\\n[0-9]+", "beta\\ngamma" }, .{ .multiline = true });
+        defer rset.deinit();
+        var ids: [4]u32 = undefined;
+        const n_ids = rset.matches("xx alpha\n42 yy beta\ngamma zz", &ids);
+        try testing.expectEqual(@as(usize, 2), n_ids);
+        try testing.expectEqual(@as(u32, 0), ids[0]);
+        try testing.expectEqual(@as(u32, 1), ids[1]);
+
+        const res_set = try searchSourceSlice(Bag, &bag, "rset-ml", "line1\nalpha\n42\nline4\nbeta\ngamma\n", &rset, .{});
+        try testing.expectEqual(@as(u64, 2), res_set.matched_lines);
+        try testing.expectEqual(@as(u64, 2), bag.matchAt(0).line_number);
+        try testing.expectEqualStrings("alpha\n42", bag.matchAt(0).bytes);
+        try testing.expectEqual(@as(u64, 5), bag.matchAt(1).line_number);
+        try testing.expectEqualStrings("beta\ngamma", bag.matchAt(1).bytes);
+    }
+}
+
+test "multiline: edge cases (trailing newline, bridging matches, context, invert, passthru, whole_word, whole_line, replacement, UTF-16, pause/resume)" {
+    const alloc = testing.allocator;
+    const Regex = regex_mod.Regex;
+
+    var bag = Bag{};
+    defer bag.deinit();
+
+    // 1. Trailing \n in match: "alpha\n" on "alpha\nbeta\n" emits ONLY line 1 ("alpha"), NOT "alpha\nbeta"
+    {
+        const f_trail = try Finder.init("alpha\n", .{ .multiline = true });
+        const res = try searchSourceSlice(Bag, &bag, "trail-nl", "alpha\nbeta\n", &f_trail, .{ .multiline = true });
+        try testing.expectEqual(@as(u64, 1), res.matched_lines);
+        try testing.expectEqual(@as(u64, 1), bag.matchAt(0).line_number);
+        try testing.expectEqualStrings("alpha", bag.matchAt(0).bytes);
+        try testing.expectEqual(@as(usize, 1), bag.matchAt(0).matches.len);
+        try testing.expectEqual(@as(usize, 0), bag.matchAt(0).matches[0].start);
+        try testing.expectEqual(@as(usize, 5), bag.matchAt(0).matches[0].end);
+    }
+
+    // 2. Bridging matches:
+    // (a) "foo\nbar foo\nbar\ntail\n" with "foo\nbar" -> 1 MatchEvent (line 1, bytes="foo\nbar foo\nbar", 2 Spans)
+    {
+        bag.reset();
+        const f_bridge = try Finder.init("foo\nbar", .{ .multiline = true });
+        const res = try searchSourceSlice(Bag, &bag, "bridge-1", "foo\nbar foo\nbar\ntail\n", &f_bridge, .{ .multiline = true });
+        try testing.expectEqual(@as(u64, 1), res.matched_lines);
+        try testing.expectEqual(@as(u64, 2), res.matches);
+        const m = bag.matchAt(0);
+        try testing.expectEqual(@as(u64, 1), m.line_number);
+        try testing.expectEqualStrings("foo\nbar foo\nbar", m.bytes);
+        try testing.expectEqual(@as(usize, 2), m.matches.len);
+        try testing.expectEqualStrings("foo\nbar", m.bytes[m.matches[0].start..m.matches[0].end]);
+        try testing.expectEqualStrings("foo\nbar", m.bytes[m.matches[1].start..m.matches[1].end]);
+    }
+    // (b) "foo\nbar\nbar\n" with "\nbar" -> 1 MatchEvent (line 1, bytes="foo\nbar\nbar", 2 Spans)
+    {
+        bag.reset();
+        const f_bridge2 = try Finder.init("\nbar", .{ .multiline = true });
+        const res = try searchSourceSlice(Bag, &bag, "bridge-2", "foo\nbar\nbar\n", &f_bridge2, .{ .multiline = true });
+        try testing.expectEqual(@as(u64, 1), res.matched_lines);
+        try testing.expectEqual(@as(u64, 2), res.matches);
+        const m = bag.matchAt(0);
+        try testing.expectEqual(@as(u64, 1), m.line_number);
+        try testing.expectEqualStrings("foo\nbar\nbar", m.bytes);
+        try testing.expectEqual(@as(usize, 2), m.matches.len);
+    }
+
+    // 3. Context lines (-B, -A, -C) and context_break around a 3-line multiline match
+    {
+        const f3 = try Finder.init("m1\nm2\nm3", .{ .multiline = true });
+        var rec = Rec{};
+        defer rec.deinit(alloc);
+        const hay = "c1\nm1\nm2\nm3\nc5\ngap6\nc7\nm1\nm2\nm3\nc11\n";
+        const res = try searchSlice(Rec, &rec, hay, "ctx", &f3, .{
+            .line_numbers = true,
+            .multiline = true,
+            .before = 1,
+            .after = 1,
+        });
+        try testing.expectEqual(@as(u64, 2), res.matched_lines);
+        try testing.expectEqual(@as(u32, 1), rec.breaks);
+        try testing.expectEqualStrings(
+            \\1-c1
+            \\2:m1
+            \\m2
+            \\m3
+            \\5-c5
+            \\7-c7
+            \\8:m1
+            \\m2
+            \\m3
+            \\11-c11
+            \\
+        , rec.text.items);
+    }
+
+    // 4. invert (-v), passthru, max_count, whole_word (-w), whole_line (-x), contains/excludes
+    {
+        const f_ml = try Finder.init("a\nb", .{ .multiline = true });
+        // invert
+        var rec_inv = Rec{};
+        defer rec_inv.deinit(alloc);
+        _ = try searchSlice(Rec, &rec_inv, "keep1\na\nb\nkeep4\n", "inv", &f_ml, .{
+            .line_numbers = true,
+            .multiline = true,
+            .invert = true,
+        });
+        try testing.expectEqualStrings("1:keep1\n4:keep4\n", rec_inv.text.items);
+
+        // passthru
+        var rec_pass = Rec{};
+        defer rec_pass.deinit(alloc);
+        _ = try searchSlice(Rec, &rec_pass, "ctx1\na\nb\nctx4\n", "pass", &f_ml, .{
+            .line_numbers = true,
+            .multiline = true,
+            .passthru = true,
+        });
+        try testing.expectEqualStrings("1-ctx1\n2:a\nb\n4-ctx4\n", rec_pass.text.items);
+
+        // whole_word (-w) across lines
+        bag.reset();
+        _ = try searchSourceSlice(Bag, &bag, "ww", "xa\nb\na\nby\na\nb\n", &f_ml, .{
+            .multiline = true,
+            .whole_word = true,
+        });
+        try testing.expectEqual(@as(u64, 1), bag.kindCount(.match));
+        try testing.expectEqual(@as(u64, 5), bag.matchAt(0).line_number);
+
+        // whole_line (-x) across lines
+        bag.reset();
+        _ = try searchSourceSlice(Bag, &bag, "wl", "xx a\nb\na\nb yy\na\nb\n", &f_ml, .{
+            .multiline = true,
+            .whole_line = true,
+        });
+        try testing.expectEqual(@as(u64, 1), bag.kindCount(.match));
+        try testing.expectEqual(@as(u64, 5), bag.matchAt(0).line_number);
+        try testing.expectEqualStrings("a\nb", bag.matchAt(0).bytes);
+
+        // contains & excludes on multiline block
+        bag.reset();
+        _ = try searchSourceSlice(Bag, &bag, "ce", "a\nb skip\na\nb keep\n", &f_ml, .{
+            .multiline = true,
+            .contains = &.{"keep"},
+            .excludes = &.{"skip"},
+        });
+        try testing.expectEqual(@as(u64, 1), bag.kindCount(.match));
+        try testing.expectEqual(@as(u64, 3), bag.matchAt(0).line_number);
+        try testing.expectEqualStrings("a\nb keep", bag.matchAt(0).bytes);
+    }
+
+    // 5. Replacement ($1 across lines) & UTF-16 u16_start/u16_end
+    {
+        var re_cap = try Regex.init(alloc, "키=([0-9]+)\\n값=([a-z]+)", .{ .multiline = true });
+        defer re_cap.deinit();
+        const CapSink = struct {
+            replaced: [64]u8 = undefined,
+            replaced_len: usize = 0,
+            u16_start: usize = 0,
+            u16_end: usize = 0,
+            pub fn event(self: *@This(), ev: Event) bool {
+                if (ev == .match) {
+                    const m = ev.match;
+                    if (m.replaced) |r| {
+                        self.replaced_len = @min(r.len, self.replaced.len);
+                        @memcpy(self.replaced[0..self.replaced_len], r[0..self.replaced_len]);
+                    }
+                    if (m.matches.len > 0) {
+                        self.u16_start = m.matches[0].u16_start;
+                        self.u16_end = m.matches[0].u16_end;
+                    }
+                }
+                return true;
+            }
+        };
+        var cs = CapSink{};
+        const res = try searchSourceSlice(CapSink, &cs, "rep-ml", "😀 키=42\n값=ok!\n", &re_cap, .{
+            .multiline = true,
+            .replacement = "$1:$2",
+            .allocator = alloc,
+        });
+        try testing.expectEqual(@as(u64, 1), res.matched_lines);
+        try testing.expectEqualStrings("😀 42:ok!", cs.replaced[0..cs.replaced_len]);
+        // "😀 " is 2 UTF-16 code units (surrogate pair) + 1 space = 3
+        try testing.expectEqual(@as(usize, 3), cs.u16_start);
+        try testing.expect(cs.u16_end > cs.u16_start);
+    }
+
+    // 6. Flow.pause + resumeSourceSlice / resumeSource across multiline matches
+    {
+        const f_ml = try Finder.init("a\nb", .{ .multiline = true });
+        const PauseSink = struct {
+            hits: usize = 0,
+            pause_first: bool = true,
+            last_line: u64 = 0,
+            pub fn event(self: *@This(), ev: Event) Flow {
+                if (ev == .match) {
+                    self.hits += 1;
+                    self.last_line = ev.match.line_number;
+                    if (self.pause_first and self.hits == 1) return .pause;
+                }
+                return .cont;
+            }
+        };
+        const hay = "0\na\nb\n3\na\nb\n6\n";
+        var ps = PauseSink{};
+        const r1 = try searchSourceSlice(PauseSink, &ps, "pause-slice", hay, &f_ml, .{ .multiline = true });
+        try testing.expect(r1.paused);
+        try testing.expectEqual(@as(usize, 1), ps.hits);
+        try testing.expectEqual(@as(u64, 2), ps.last_line);
+
+        ps.pause_first = false;
+        const r2 = try resumeSourceSlice(PauseSink, &ps, "pause-slice", hay, &f_ml, .{ .multiline = true }, r1);
+        try testing.expect(!r2.paused);
+        try testing.expectEqual(@as(usize, 2), ps.hits);
+        try testing.expectEqual(@as(u64, 5), ps.last_line);
+        try testing.expectEqual(@as(u64, 2), r2.matched_lines);
+
+        // Streaming pause + resumeSource
+        var ps_stream = PauseSink{};
+        var reader1 = std.Io.Reader.fixed(hay);
+        const sr1 = try searchSource(PauseSink, alloc, &ps_stream, &reader1, "pause-stream", &f_ml, .{
+            .multiline = true,
+            .buffer_size = 8,
+            .max_multiline_window = 8,
+        });
+        try testing.expect(sr1.paused);
+        try testing.expectEqual(@as(usize, 1), ps_stream.hits);
+        ps_stream.pause_first = false;
+        var reader2 = std.Io.Reader.fixed(hay);
+        const sr2 = try resumeSource(PauseSink, alloc, &ps_stream, &reader2, "pause-stream", &f_ml, .{
+            .multiline = true,
+            .buffer_size = 8,
+            .max_multiline_window = 8,
+        }, sr1);
+        try testing.expect(!sr2.paused);
+        try testing.expectEqual(@as(usize, 2), ps_stream.hits);
+        try testing.expectEqual(@as(u64, 5), ps_stream.last_line);
+    }
+}
+
+test "multiline: adversarial streaming chunk boundaries (1, 3, 7, 17 bytes) and binary NUL handling" {
+    const alloc = testing.allocator;
+    const Regex = regex_mod.Regex;
+
+    const hay =
+        "line01 header\n" ++
+        "line02 start foo\nbar middle foo\nbar end\n" ++
+        "line05 nonmatch\n" ++
+        "line06 alpha\nbeta\ngamma tail\n" ++
+        "line09 footer\n";
+
+    var re = try Regex.init(alloc, "foo\\nbar|alpha\\nbeta\\ngamma", .{
+        .multiline = true,
+        .max_multiline_window = 32,
+    });
+    defer re.deinit();
+
+    const cfg = SearchConfig{
+        .multiline = true,
+        .max_multiline_window = 32,
+        .buffer_size = 16,
+        .before = 1,
+        .after = 1,
+        .binary = .none,
+        .encoding = .none,
+    };
+
+    var ref_bag = Bag{};
+    defer ref_bag.deinit();
+    const ref_res = try searchSourceSlice(Bag, &ref_bag, "adv-ml", hay, &re, cfg);
+    try testing.expectEqual(@as(u64, 2), ref_res.matched_lines);
+    try testing.expectEqual(@as(u64, 3), ref_res.matches);
+
+    const chunk_sizes = [_]usize{ 1, 3, 7, 17 };
+    for (chunk_sizes) |cs| {
+        // 1. searchSource with artificial_limit = cs
+        var rbuf: [64]u8 = undefined;
+        var t_reader = std.testing.Reader.init(&rbuf, &.{.{ .buffer = hay }});
+        t_reader.artificial_limit = .limited(cs);
+
+        var stream_bag = Bag{};
+        defer stream_bag.deinit();
+        const stream_res = try searchSource(Bag, alloc, &stream_bag, &t_reader.interface, "adv-ml", &re, cfg);
+        try testing.expectEqual(ref_res.matched_lines, stream_res.matched_lines);
+        try testing.expectEqual(ref_res.matches, stream_res.matches);
+        try testing.expectEqual(ref_bag.items.items.len, stream_bag.items.items.len);
+
+        for (ref_bag.items.items, stream_bag.items.items) |exp, got| {
+            try testing.expectEqual(exp.kind, got.kind);
+            if (exp.kind == .match or exp.kind == .context) {
+                try testing.expectEqual(exp.line_number, got.line_number);
+                try testing.expectEqual(exp.offset, got.offset);
+                try testing.expectEqualStrings(exp.bytes, got.bytes);
+                try testing.expectEqual(exp.matches.len, got.matches.len);
+                for (exp.matches, got.matches) |em, gm| {
+                    try testing.expectEqual(em.start, gm.start);
+                    try testing.expectEqual(em.end, gm.end);
+                }
+            }
+        }
+
+        // 2. openReaderPull with artificial_limit = cs
+        var rbuf2: [64]u8 = undefined;
+        var t_reader2 = std.testing.Reader.init(&rbuf2, &.{.{ .buffer = hay }});
+        t_reader2.artificial_limit = .limited(cs);
+
+        var rpull = try searcher.openReaderPull(alloc, &re, "adv-ml", &t_reader2.interface, cfg);
+        defer rpull.deinit();
+        var idx: usize = 0;
+        while (try rpull.next()) |pev| : (idx += 1) {
+            const exp = ref_bag.items.items[idx];
+            if (pev.kind == .match or pev.kind == .context) {
+                try testing.expectEqual(exp.line_number, pev.line_number);
+                try testing.expectEqual(exp.offset, pev.absolute_offset);
+                try testing.expectEqualStrings(exp.bytes, pev.bytes);
+                try testing.expectEqual(exp.matches.len, pev.spans.len);
+            }
+        }
+        try testing.expectEqual(ref_bag.items.items.len, idx);
+    }
+
+    // Binary NUL byte detection before, inside, and after a cross-line match under .quit, .report, and .none
+    const f_ml = try Finder.init("A\nB", .{ .multiline = true });
+    const bin_before = "x\x00y\nA\nB\n";
+    const bin_inside = "A\n\x00B\nA\nB\n";
+    const bin_after = "A\nB\nx\x00y\n";
+
+    // .quit
+    {
+        var r1 = std.Io.Reader.fixed(bin_before);
+        var rec1 = Rec{};
+        defer rec1.deinit(alloc);
+        const res1 = try searchReader(Rec, alloc, &rec1, &r1, "b1", &f_ml, .{ .multiline = true, .binary = .quit, .buffer_size = 8, .max_multiline_window = 8 });
+        try testing.expectEqual(Outcome.binary_quit, res1.outcome);
+        try testing.expectEqual(@as(u64, 0), res1.matched_lines);
+
+        var r2 = std.Io.Reader.fixed(bin_after);
+        var rec2 = Rec{};
+        defer rec2.deinit(alloc);
+        const res2 = try searchReader(Rec, alloc, &rec2, &r2, "b2", &f_ml, .{ .multiline = true, .binary = .quit, .buffer_size = 8, .max_multiline_window = 8 });
+        try testing.expectEqual(Outcome.binary_quit, res2.outcome);
+        try testing.expectEqual(@as(u64, 1), res2.matched_lines);
+    }
+    // .report
+    {
+        var r_rep = std.Io.Reader.fixed(bin_inside);
+        var rec_rep = Rec{};
+        defer rec_rep.deinit(alloc);
+        const res_rep = try searchReader(Rec, alloc, &rec_rep, &r_rep, "brep", &f_ml, .{ .multiline = true, .binary = .report, .buffer_size = 8, .max_multiline_window = 8 });
+        try testing.expectEqual(Outcome.binary_matched, res_rep.outcome);
+        try testing.expect(res_rep.matched_lines >= 1);
+    }
+    // .none
+    {
+        var r_none = std.Io.Reader.fixed(bin_inside);
+        var rec_none = Rec{};
+        defer rec_none.deinit(alloc);
+        const res_none = try searchReader(Rec, alloc, &rec_none, &r_none, "bnone", &f_ml, .{ .multiline = true, .binary = .none, .buffer_size = 8, .max_multiline_window = 8 });
+        try testing.expectEqual(Outcome.complete, res_none.outcome);
+        try testing.expectEqual(@as(u64, 1), res_none.matched_lines);
+    }
+
+    // Regression 1: gatherSpans / replacement with trailing \r?\n delimiter matches (\r|\n, alpha|\n, foo\n)
+    {
+        var re_crlf = try Regex.init(alloc, "\\r|\\n", .{ .multiline = true });
+        defer re_crlf.deinit();
+        var bag_crlf = Bag{};
+        defer bag_crlf.deinit();
+        const res_crlf = try searchSourceSlice(Bag, &bag_crlf, "reg-crlf", "alpha\r\n", &re_crlf, .{ .multiline = true });
+        try testing.expectEqual(@as(u64, 1), res_crlf.matched_lines);
+        try testing.expectEqual(@as(usize, 1), bag_crlf.matchAt(0).matches.len);
+        try testing.expectEqual(@as(usize, 5), bag_crlf.matchAt(0).matches[0].start);
+        try testing.expectEqual(@as(usize, 5), bag_crlf.matchAt(0).matches[0].end);
+
+        const RepCapture = struct {
+            replaced: [64]u8 = undefined,
+            len: usize = 0,
+            spans: usize = 0,
+            pub fn event(self: *@This(), ev: Event) bool {
+                if (ev == .match) {
+                    self.spans = ev.match.matches.len;
+                    if (ev.match.replaced) |r| {
+                        self.len = @min(r.len, self.replaced.len);
+                        @memcpy(self.replaced[0..self.len], r[0..self.len]);
+                    }
+                }
+                return true;
+            }
+        };
+
+        var re_anl = try Regex.init(alloc, "alpha|\\n", .{ .multiline = true });
+        defer re_anl.deinit();
+        var rc1 = RepCapture{};
+        _ = try searchSourceSlice(RepCapture, &rc1, "reg-anl", "alpha beta\n", &re_anl, .{
+            .multiline = true,
+            .replacement = "X",
+            .allocator = alloc,
+        });
+        try testing.expectEqual(@as(usize, 1), rc1.spans);
+        try testing.expectEqualStrings("X beta", rc1.replaced[0..rc1.len]);
+
+        var re_foonl = try Regex.init(alloc, "foo\\n|foo", .{ .multiline = true });
+        defer re_foonl.deinit();
+        var rc2 = RepCapture{};
+        _ = try searchSourceSlice(RepCapture, &rc2, "reg-foonl", "foo bar foo\n", &re_foonl, .{
+            .multiline = true,
+            .replacement = "X",
+            .allocator = alloc,
+        });
+        try testing.expectEqual(@as(usize, 2), rc2.spans);
+        try testing.expectEqualStrings("X bar X", rc2.replaced[0..rc2.len]);
+
+        var re_foonl2 = try Regex.init(alloc, "foo\\n", .{ .multiline = true });
+        defer re_foonl2.deinit();
+        var rc3 = RepCapture{};
+        const r_fnl2 = try searchSourceSlice(RepCapture, &rc3, "reg-foonl2", "foo\nbar foo\n", &re_foonl2, .{
+            .multiline = true,
+            .replacement = "X",
+            .allocator = alloc,
+        });
+        try testing.expectEqual(@as(u64, 2), r_fnl2.matched_lines);
+        try testing.expectEqual(@as(usize, 1), rc3.spans);
+        try testing.expectEqualStrings("bar X", rc3.replaced[0..rc3.len]);
+    }
+
+    // Regression 2: Count-only searchReader (!need_ls) across streaming horizon with bridged multiline match
+    {
+        const CountOnlySink = struct {};
+        const f_bridge = try Finder.init("foo\nbar", .{ .multiline = true });
+        const bridge_doc = "header123\nfoo\nbar foo\nbar\ntail\n";
+
+        var csink_slice = CountOnlySink{};
+        const slice_cnt = try searchSlice(CountOnlySink, &csink_slice, bridge_doc, "cnt-slice", &f_bridge, .{
+            .multiline = true,
+            .line_numbers = false,
+            .max_multiline_window = 10,
+            .buffer_size = 12,
+        });
+        try testing.expectEqual(@as(u64, 1), slice_cnt.matched_lines);
+
+        for ([_]usize{ 1, 3, 5, 11 }) |chunk_sz| {
+            var rbuf: [64]u8 = undefined;
+            var t_reader = std.testing.Reader.init(&rbuf, &.{.{ .buffer = bridge_doc }});
+            t_reader.artificial_limit = .limited(chunk_sz);
+            var csink_stream = CountOnlySink{};
+            const stream_cnt = try searchReader(CountOnlySink, alloc, &csink_stream, &t_reader.interface, "cnt-stream", &f_bridge, .{
+                .multiline = true,
+                .line_numbers = false,
+                .max_multiline_window = 10,
+                .buffer_size = 12,
+            });
+            try testing.expectEqual(slice_cnt.matched_lines, stream_cnt.matched_lines);
+            try testing.expectEqual(slice_cnt.matches, stream_cnt.matches);
+        }
+    }
+}
+
+test "multiline: soundness audit regressions (UTF-8 loop collapse, fused NUL leftmost_first, ReaderPull canFuse, EOF & zero-offset holdback)" {
+    const alloc = testing.allocator;
+    const Regex = regex_mod.Regex;
+    const Multi = @import("../finder/multi.zig").Multi;
+
+    // 1. UTF-8 multi-byte codepoint atomicity vs byte-exact loop peephole optimization:
+    //    - Lazy [^a]+? on "©" (0xC2 0xA9) must match full 2-byte codepoint, not 1 byte.
+    //    - (?m)^.+.$ on 1-codepoint "©" must NOT match (only 1 codepoint, not >= 2).
+    //    - ^[^z]+\B on 1-codepoint "α" (0xCE 0xB1) must NOT match mid-codepoint.
+    //    - foo[^\n]+ in .earliest mode on "foo©" must match full "foo©" (0..5), not "foo\xC2" (0..4).
+    //    - Top-level (?m)foo\nbar(?-m)baz must set isMultiline() == true.
+    //    - Greedy [^\n]*\n / [^\n]+\n followed by ASCII still collapses to byte-exact DFA.
+    {
+        var re_lazy = try Regex.init(alloc, "[^a]+?", .{});
+        defer re_lazy.deinit();
+        const m_lazy = re_lazy.find("©", 0, .leftmost_first).?;
+        try testing.expectEqual(@as(usize, 0), m_lazy.start);
+        try testing.expectEqual(@as(usize, 2), m_lazy.end);
+
+        var re_two = try Regex.init(alloc, "(?m)^.+.$", .{});
+        defer re_two.deinit();
+        try testing.expect(re_two.find("©", 0, .leftmost_first) == null);
+        try testing.expect(re_two.find("©!", 0, .leftmost_first) != null);
+
+        var re_nwb = try Regex.init(alloc, "^[^z]+\\B", .{});
+        defer re_nwb.deinit();
+        try testing.expect(re_nwb.find("α", 0, .leftmost_first) == null);
+
+        var re_earl = try Regex.init(alloc, "foo[^\\n]+", .{});
+        defer re_earl.deinit();
+        const m_earl = re_earl.find("foo©", 0, .earliest).?;
+        try testing.expectEqual(@as(usize, 0), m_earl.start);
+        try testing.expectEqual(@as(usize, 5), m_earl.end);
+
+        var re_scoped_m = try Regex.init(alloc, "(?m)^foo\\nbar$(?-m)baz", .{});
+        defer re_scoped_m.deinit();
+        try testing.expect(re_scoped_m.isMultiline());
+
+        var re_s16 = try Regex.init(alloc, "ERROR \\[http\\][^\\n]*\\n[^\\n]*WARN \\[cache\\]", .{ .multiline = true });
+        defer re_s16.deinit();
+        try testing.expect(re_s16.dfa_is_exact);
+
+        var re_s18 = try Regex.init(alloc, "zealtionou[^\\n]+\\n[a-z]+", .{ .multiline = true });
+        defer re_s18.deinit();
+        try testing.expect(re_s18.dfa_is_exact);
+    }
+
+    // 2. Multiline fused NUL check (default binary = .quit) with .leftmost_first alternation:
+    //    On "a\nbb\n", findWatched (.earliest) sees "b" on line 2 first, but leftmost_first
+    //    must still find "a\nbb" starting on line 1 across slice, streaming, and ReaderPull.
+    {
+        const hay = "a\nbb\ntail\n";
+        var m_alt = try Multi.init(alloc, &.{ "a\nbb", "b" }, .{ .multiline = true });
+        defer m_alt.deinit();
+        var re_alt = try Regex.init(alloc, "a\\nbb|b", .{ .multiline = true });
+        defer re_alt.deinit();
+
+        const cfg = SearchConfig{
+            .multiline = true,
+            .max_multiline_window = 16,
+            .buffer_size = 8,
+            .binary = .quit,
+            .match_mode = .leftmost_first,
+        };
+
+        var bag_m = Bag{};
+        defer bag_m.deinit();
+        const res_m = try searchSourceSlice(Bag, &bag_m, "fuse-m", hay, &m_alt, cfg);
+        try testing.expectEqual(@as(u64, 1), res_m.matched_lines);
+        try testing.expectEqual(@as(u64, 1), bag_m.matchAt(0).line_number);
+        try testing.expectEqualStrings("a\nbb", bag_m.matchAt(0).bytes);
+        try testing.expectEqual(@as(usize, 0), bag_m.matchAt(0).matches[0].start);
+        try testing.expectEqual(@as(usize, 4), bag_m.matchAt(0).matches[0].end);
+
+        var bag_re = Bag{};
+        defer bag_re.deinit();
+        const res_re = try searchSourceSlice(Bag, &bag_re, "fuse-re", hay, &re_alt, cfg);
+        try testing.expectEqual(@as(u64, 1), res_re.matched_lines);
+        try testing.expectEqual(@as(u64, 1), bag_re.matchAt(0).line_number);
+        try testing.expectEqualStrings("a\nbb", bag_re.matchAt(0).bytes);
+
+        var r1 = std.Io.Reader.fixed(hay);
+        var bag_sr = Bag{};
+        defer bag_sr.deinit();
+        const res_sr = try searchSource(Bag, alloc, &bag_sr, &r1, "fuse-sr", &re_alt, cfg);
+        try testing.expectEqual(@as(u64, 1), res_sr.matched_lines);
+        try testing.expectEqualStrings("a\nbb", bag_sr.matchAt(0).bytes);
+    }
+
+    // 3. ReaderPull / openReaderPull cross-chunk multiline parity with default binary = .quit (canFuse active)
+    //    plus zero-offset cross-chunk bridging match holdback.
+    {
+        const hay = "foo\nbar foo\nbar\nalpha\nbeta\n";
+        var re = try Regex.init(alloc, "foo\\nbar|alpha\\nbeta", .{
+            .multiline = true,
+            .max_multiline_window = 32,
+        });
+        defer re.deinit();
+
+        const cfg = SearchConfig{
+            .multiline = true,
+            .max_multiline_window = 32,
+            .buffer_size = 8,
+            .binary = .quit,
+        };
+
+        var ref_bag = Bag{};
+        defer ref_bag.deinit();
+        const ref_res = try searchSourceSlice(Bag, &ref_bag, "pull-fuse", hay, &re, cfg);
+        try testing.expectEqual(@as(u64, 2), ref_res.matched_lines);
+        try testing.expectEqual(@as(u64, 3), ref_res.matches);
+
+        for ([_]usize{ 1, 3, 5, 8 }) |cs| {
+            var rbuf: [64]u8 = undefined;
+            var t_reader = std.testing.Reader.init(&rbuf, &.{.{ .buffer = hay }});
+            t_reader.artificial_limit = .limited(cs);
+
+            var stream_bag = Bag{};
+            defer stream_bag.deinit();
+            const sres = try searchSource(Bag, alloc, &stream_bag, &t_reader.interface, "pull-fuse", &re, cfg);
+            try testing.expectEqual(ref_res.matched_lines, sres.matched_lines);
+            try testing.expectEqual(ref_res.matches, sres.matches);
+            try testing.expectEqualStrings("foo\nbar foo\nbar", stream_bag.matchAt(0).bytes);
+            try testing.expectEqualStrings("alpha\nbeta", stream_bag.matchAt(1).bytes);
+
+            var rbuf2: [64]u8 = undefined;
+            var t_reader2 = std.testing.Reader.init(&rbuf2, &.{.{ .buffer = hay }});
+            t_reader2.artificial_limit = .limited(cs);
+
+            var rpull = try searcher.openReaderPull(alloc, &re, "pull-fuse", &t_reader2.interface, cfg);
+            defer rpull.deinit();
+            var idx: usize = 0;
+            while (try rpull.next()) |pev| : (idx += 1) {
+                const exp = ref_bag.items.items[idx];
+                try testing.expectEqualStrings(@tagName(exp.kind), @tagName(pev.kind));
+                if (pev.kind == .match) {
+                    try testing.expectEqual(exp.line_number, pev.line_number);
+                    try testing.expectEqualStrings(exp.bytes, pev.bytes);
+                    try testing.expectEqual(exp.matches.len, pev.spans.len);
+                }
+            }
+            try testing.expectEqual(ref_bag.items.items.len, idx);
+        }
+    }
+
+    // 4. bridgingProbeLimit end-of-text (\z) safety when config.max_multiline_window < matcher.multilineWindow(),
+    //    plus Unicode 1->3 byte case-fold ('k' <-> 'K') earliestPendingStart streaming holdback.
+    {
+        var re_z = try Regex.init(alloc, "start|foo(\\nbar)+\\z", .{
+            .multiline = true,
+            .max_multiline_window = 64,
+        });
+        defer re_z.deinit();
+        var bag_z = Bag{};
+        defer bag_z.deinit();
+        const res_z = try searchSourceSlice(Bag, &bag_z, "probe-z", "start foo\nbar\n1234567890\n", &re_z, .{
+            .multiline = true,
+            .max_multiline_window = 3,
+            .match_mode = .leftmost_first,
+        });
+        try testing.expectEqual(@as(u64, 1), res_z.matched_lines);
+        try testing.expectEqual(@as(u64, 1), res_z.matches);
+        try testing.expectEqualStrings("start foo", bag_z.matchAt(0).bytes);
+
+        var re_kelvin = try Regex.init(alloc, "key\\nval", .{
+            .multiline = true,
+            .case = .insensitive,
+            .unicode_case = true,
+            .max_multiline_window = 32,
+        });
+        defer re_kelvin.deinit();
+        const kelvin_hay = "pad\nKey\nval\n";
+        for ([_]usize{ 1, 3, 5 }) |cs| {
+            var rbuf: [64]u8 = undefined;
+            var t_reader = std.testing.Reader.init(&rbuf, &.{.{ .buffer = kelvin_hay }});
+            t_reader.artificial_limit = .limited(cs);
+            var bag_k = Bag{};
+            defer bag_k.deinit();
+            const res_k = try searchSource(Bag, alloc, &bag_k, &t_reader.interface, "kelvin-stream", &re_kelvin, .{
+                .multiline = true,
+                .max_multiline_window = 32,
+                .buffer_size = 8,
+            });
+            try testing.expectEqual(@as(u64, 1), res_k.matched_lines);
+            try testing.expectEqualStrings("Key\nval", bag_k.matchAt(0).bytes);
+        }
+    }
+}
+
+test "fuzz: multiline differential oracle (Regex DFA/prefilter/watched vs pure NFA, Finder/Multi, RegexSet)" {
+    const alloc = testing.allocator;
+    const Regex = regex_mod.Regex;
+    const RegexSet = regex_mod.RegexSet;
+    const Multi = @import("../finder/multi.zig").Multi;
+
+    // --- Part 1: Deterministic Reproducers for ALL #55, #56, and #58 Findings ---
+
+    // #55 F1a: Fast Path 3 interior required literal max window (over-window W=10 & premature truncation W=14)
+    {
+        var re_over = try Regex.init(alloc, "[a-z\\n]+ERROR[a-z\\n]+", .{
+            .multiline = true,
+            .max_multiline_window = 10,
+        });
+        defer re_over.deinit();
+        var re_over_nfa = try Regex.init(alloc, "[a-z\\n]+ERROR[a-z\\n]+", .{
+            .multiline = true,
+            .max_multiline_window = 10,
+            .max_dfa_states = 0,
+            .aot_dfa_max_insts = 0,
+        });
+        defer re_over_nfa.deinit();
+
+        const over_hay = "aaaaa\naaaaERRORbb\nbb";
+        const m_lf = re_over.find(over_hay, 0, .leftmost_first).?;
+        const m_nfa = re_over_nfa.find(over_hay, 0, .leftmost_first).?;
+        try testing.expect(m_lf.end - m_lf.start <= 10);
+        try testing.expectEqual(m_nfa.start, m_lf.start);
+        try testing.expectEqual(m_nfa.end, m_lf.end);
+
+        var nul: ?usize = null;
+        const m_w = re_over.findWatched(over_hay, 0, &nul).?;
+        try testing.expect(nul == null);
+        try testing.expect(m_w.end - m_w.start <= 10);
+
+        var re_trunc = try Regex.init(alloc, "[a-z]+ERROR[a-z]*", .{
+            .multiline = true,
+            .max_multiline_window = 14,
+        });
+        defer re_trunc.deinit();
+        const trunc_hay = "99ERROR99aERRORbbbbbb";
+        const mt = re_trunc.find(trunc_hay, 0, .leftmost_first).?;
+        try testing.expectEqual(@as(usize, 9), mt.start);
+        try testing.expectEqual(@as(usize, 21), mt.end);
+        var nul2: ?usize = null;
+        const mtw = re_trunc.findWatched(trunc_hay, 0, &nul2).?;
+        try testing.expectEqual(@as(usize, 9), mtw.start);
+        try testing.expectEqual(@as(usize, 21), mtw.end);
+    }
+
+    // #55 F1b: Fast Path 2 / 4, runWithDfaGeneric (>=8 restarts), RegexSet.find, and 3x Unicode req_is_exact window
+    {
+        var re_alt = try Regex.init(alloc, "FOO[0-9]+|BAR[a-z]+", .{
+            .multiline = true,
+            .max_multiline_window = 10,
+        });
+        defer re_alt.deinit();
+        const m_alt = re_alt.find("FOO_BARabcdefg", 0, .leftmost_first).?;
+        try testing.expectEqual(@as(usize, 4), m_alt.start);
+        try testing.expectEqual(@as(usize, 14), m_alt.end);
+
+        var rs_alt = try RegexSet.init(alloc, &.{ "FOO[0-9]+", "BAR[a-z]+" }, .{
+            .multiline = true,
+            .max_multiline_window = 10,
+        });
+        defer rs_alt.deinit();
+        const m_rs = rs_alt.find("FOO_BARabcdefg", 0, .leftmost_first).?;
+        try testing.expectEqual(@as(usize, 4), m_rs.start);
+        try testing.expectEqual(@as(usize, 14), m_rs.end);
+        try testing.expectEqual(@as(?u32, 1), m_rs.pattern_id);
+
+        var re_restarts = try Regex.init(alloc, "[0-9][a-z\\n]{8}", .{
+            .multiline = true,
+            .max_multiline_window = 10,
+        });
+        defer re_restarts.deinit();
+        const m_rst = re_restarts.find("1a!2a!3a!4a!5a!6a!7a!8aaaa9bcdefgh\n", 0, .leftmost_first).?;
+        try testing.expectEqual(@as(usize, 26), m_rst.start);
+        try testing.expectEqual(@as(usize, 35), m_rst.end);
+
+        var re_eszett = try Regex.init(alloc, "ßßß", .{
+            .multiline = true,
+            .case = .insensitive,
+            .unicode_case = true,
+            .max_multiline_window = 7,
+        });
+        defer re_eszett.deinit();
+        // "ẞẞẞ" is 9 UTF-8 bytes (> window 7) and must NOT exceed max_multiline_window!
+        try testing.expect(re_eszett.find("ẞẞẞ", 0, .leftmost_first) == null);
+    }
+
+    // #55 F2: Lockstep NFA gen_table shadowing under max_multiline_window = 5
+    {
+        var re_shadow = try Regex.init(alloc, "[x\\n]+[e]nd", .{
+            .multiline = true,
+            .max_multiline_window = 5,
+        });
+        defer re_shadow.deinit();
+        const ms = re_shadow.find("xxxxxxend", 0, .leftmost_first).?;
+        try testing.expectEqual(@as(usize, 4), ms.start);
+        try testing.expectEqual(@as(usize, 9), ms.end);
+
+        var rs_shadow = try RegexSet.init(alloc, &.{"[x\\n]+END"}, .{
+            .multiline = true,
+            .max_multiline_window = 5,
+        });
+        defer rs_shadow.deinit();
+        var shadow_ids: [4]u32 = undefined;
+        try testing.expectEqual(@as(usize, 1), rs_shadow.matches("xxxxxxEND", &shadow_ids));
+        try testing.expectEqual(@as(u32, 0), shadow_ids[0]);
+        const mrs = rs_shadow.find("xxxxxxEND", 0, .leftmost_first).?;
+        try testing.expectEqual(@as(usize, 4), mrs.start);
+        try testing.expectEqual(@as(usize, 9), mrs.end);
+    }
+
+    // #55 F3 + #56 F14 + #58 #2: findWatched alt_prefilter & in-match NUL detection
+    {
+        var re_lp = try Regex.init(alloc, "LONG_PREFIX\\n[0-9]+|NG_[0-9]+", .{ .multiline = true });
+        defer re_lp.deinit();
+        var nul: ?usize = null;
+        const mlp = re_lp.findWatched("LONG_PREFIX\n123", 0, &nul).?;
+        try testing.expect(nul == null);
+        try testing.expectEqual(@as(usize, 0), mlp.start);
+        try testing.expectEqual(@as(usize, 15), mlp.end);
+
+        var re_bc = try Regex.init(alloc, "a\\nbcd1|bc[89]", .{ .multiline = true });
+        defer re_bc.deinit();
+        var bc_bag = Bag{};
+        defer bc_bag.deinit();
+        const bc_res = try searchSourceSlice(Bag, &bc_bag, "bc", "a\nbcd1\n", &re_bc, .{ .multiline = true });
+        try testing.expectEqual(@as(u64, 1), bc_res.matched_lines);
+
+        var re_nul = try Regex.init(alloc, "BEGIN.*END", .{ .multiline = true, .dot_all = true });
+        defer re_nul.deinit();
+        var nul_at: ?usize = null;
+        try testing.expect(re_nul.findWatched("BEGIN\x00END", 0, &nul_at) == null);
+        try testing.expectEqual(@as(?usize, 5), nul_at);
+    }
+
+    // #55 F4, F5, F6, F7, F8, F9 + #58 #1 & #3:
+    // .earliest greediness, 'k'/'K' & 's'/'ſ' Unicode NFA/classes, (?i)FOO(?-i)bar in RegexSet,
+    // explicit (?-m) anchor scope, single-line \r windowLimit, [^\D]/[^\W]/[^\S], RegexSet.findAllowed, []|]
+    {
+        var re_greedy = try Regex.init(alloc, "ERR[0-9]+", .{ .multiline = true });
+        defer re_greedy.deinit();
+        var nul_g: ?usize = null;
+        const mg1 = re_greedy.find("ERR123", 0, .earliest).?;
+        const mg2 = re_greedy.findWatched("ERR123", 0, &nul_g).?;
+        try testing.expectEqual(@as(usize, 6), mg1.end);
+        try testing.expectEqual(mg1.end, mg2.end);
+
+        var re_cap_k = try Regex.init(alloc, "(key)\\nval", .{ .multiline = true, .case = .insensitive, .unicode_case = true });
+        defer re_cap_k.deinit();
+        try testing.expect(re_cap_k.find("pad\nKey\nval\n", 0, .leftmost_first) != null);
+        try testing.expect(re_cap_k.acceptsSpan("Key\nval", .leftmost_first));
+
+        var re_k_plus = try Regex.init(alloc, "key\\nval+", .{ .multiline = true, .case = .insensitive, .unicode_case = true });
+        defer re_k_plus.deinit();
+        try testing.expect(re_k_plus.find("Key\nvalll", 0, .leftmost_first) != null);
+
+        var re_long_s = try Regex.init(alloc, "status\\n1", .{ .multiline = true, .case = .insensitive, .unicode_case = true });
+        defer re_long_s.deinit();
+        try testing.expect(re_long_s.find("ſtatus\n1", 0, .leftmost_first) != null);
+
+        var re_mixed_cls = try Regex.init(alloc, "(?i)[kα]", .{ .unicode_case = true });
+        defer re_mixed_cls.deinit();
+        try testing.expect(re_mixed_cls.isMatch("K"));
+
+        var rs_inline_i = try RegexSet.init(alloc, &.{"(?i)FOO(?-i)bar"}, .{});
+        defer rs_inline_i.deinit();
+        try testing.expect(rs_inline_i.isMatch("foobar"));
+        try testing.expect(!rs_inline_i.isMatch("fooBAR"));
+
+        var re_neg_m = try Regex.init(alloc, "(?m)000\\n(?-m:^alpha)", .{});
+        defer re_neg_m.deinit();
+        try testing.expect(re_neg_m.find("000\nalpha\n", 0, .leftmost_first) == null);
+
+        var re_cr = try Regex.init(alloc, "a+bar\\r", .{});
+        defer re_cr.deinit();
+        const mcr = re_cr.find("aaabar\r\n", 0, .leftmost_first).?;
+        try testing.expectEqual(@as(usize, 0), mcr.start);
+        try testing.expectEqual(@as(usize, 7), mcr.end);
+
+        var re_dneg = try Regex.init(alloc, "^[^\\D]+$", .{});
+        defer re_dneg.deinit();
+        try testing.expect(re_dneg.isMatch("0123456789"));
+        try testing.expect(!re_dneg.isMatch("你好"));
+        try testing.expect(!re_dneg.isMatch("😀"));
+
+        var re_wneg = try Regex.init(alloc, "^[^\\W]+$", .{});
+        defer re_wneg.deinit();
+        try testing.expect(re_wneg.isMatch("azAZ09_"));
+        try testing.expect(!re_wneg.isMatch("你好"));
+
+        var re_sneg = try Regex.init(alloc, "^[^\\S]+$", .{});
+        defer re_sneg.deinit();
+        try testing.expect(re_sneg.isMatch(" \t"));
+        try testing.expect(!re_sneg.isMatch("😀"));
+
+        var rs_ww = try RegexSet.init(alloc, &.{ "foo", "foobar" }, .{});
+        defer rs_ww.deinit();
+        var ww_bag = Bag{};
+        defer ww_bag.deinit();
+        const ww_res = try searchSourceSlice(Bag, &ww_bag, "ww", "foobar\n", &rs_ww, .{ .whole_word = true });
+        try testing.expectEqual(@as(u64, 1), ww_res.matched_lines);
+        try testing.expectEqual(@as(?u32, 1), ww_bag.matchAt(0).matches[0].pattern_id);
+
+        var re_cls_pipe = try Regex.init(alloc, "\\A[]|]x", .{});
+        defer re_cls_pipe.deinit();
+        try testing.expect(re_cls_pipe.find("|x", 0, .leftmost_first) != null);
+        try testing.expect(re_cls_pipe.find("z|x", 0, .leftmost_first) == null);
+    }
+
+    // #56 F1..F12 Pipeline Reproducers:
+    {
+        // F1: .binary = .report fused findWatched
+        var m_rep = try Multi.init(alloc, &.{ "a\nbb", "b" }, .{ .multiline = true });
+        defer m_rep.deinit();
+        var rep_bag = Bag{};
+        defer rep_bag.deinit();
+        const rep_res = try searchSourceSlice(Bag, &rep_bag, "f1", "a\nbb\n", &m_rep, .{
+            .multiline = true,
+            .binary = .report,
+            .match_mode = .leftmost_first,
+        });
+        try testing.expectEqual(@as(u64, 1), rep_res.matched_lines);
+        try testing.expectEqual(@as(u64, 1), rep_bag.matchAt(0).line_number);
+
+        // F2 & F10 & F12: $1 capture replacement consuming \r?\n, by-value Regex in ReaderPull, gatherSpans \b
+        var re_rep = try Regex.init(alloc, "(foo)\\r?\\n", .{ .multiline = true });
+        defer re_rep.deinit();
+        var pull_crlf = openSourcePull(alloc, &re_rep, "f2", "foo\r\n", .{
+            .multiline = true,
+            .replacement = "[$1]",
+            .allocator = alloc,
+        });
+        defer pull_crlf.deinit();
+        var saw_f2 = false;
+        while (try pull_crlf.next()) |ev| {
+            if (ev.kind == .match) {
+                try testing.expectEqualStrings("[foo]", ev.replaced.?);
+                saw_f2 = true;
+            }
+        }
+        try testing.expect(saw_f2);
+
+        // F10: By-value Regex in openReaderPull
+        var re_by_val = try Regex.init(alloc, "id=([0-9]+)", .{});
+        defer re_by_val.deinit();
+        var fixed_bv = std.Io.Reader.fixed("user id=777 ok\n");
+        var rpull_bv = try searcher.openReaderPull(alloc, re_by_val, "f10", &fixed_bv, .{
+            .replacement = "<$1>",
+            .allocator = alloc,
+        });
+        defer rpull_bv.deinit();
+        var saw_f10 = false;
+        while (try rpull_bv.next()) |ev| {
+            if (ev.kind == .match) {
+                try testing.expectEqualStrings("user <777> ok", ev.replaced.?);
+                saw_f10 = true;
+            }
+        }
+        try testing.expect(saw_f10);
+
+        // F12: gatherSpans intermediate zero-width \b match
+        var re_zw_mid = try Regex.init(alloc, "bar|\\b|foo", .{ .multiline = true });
+        defer re_zw_mid.deinit();
+        var pull_f12 = openSourcePull(alloc, &re_zw_mid, "f12", "bar! foo\n", .{
+            .multiline = true,
+            .replacement = "X",
+            .allocator = alloc,
+        });
+        defer pull_f12.deinit();
+        while (try pull_f12.next()) |ev| {
+            if (ev.kind == .match) {
+                try testing.expectEqualStrings("XX! Xfoo", ev.replaced.?);
+            }
+        }
+
+        var re_zw_mid2 = try Regex.init(alloc, "bar|foo|\\b", .{ .multiline = true });
+        defer re_zw_mid2.deinit();
+        var pull_f12b = openSourcePull(alloc, &re_zw_mid2, "f12b", "bar! foo\n", .{
+            .multiline = true,
+            .match_mode = .leftmost_first,
+            .replacement = "X",
+            .allocator = alloc,
+        });
+        defer pull_f12b.deinit();
+        while (try pull_f12b.next()) |ev| {
+            if (ev.kind == .match) {
+                try testing.expectEqualStrings("XX! X", ev.replaced.?);
+            }
+        }
+
+        // F3: Count-only EOF zero-width (?m)$ and \z
+        const EmptyCountSink = struct {};
+        var re_eof_z = try Regex.init(alloc, "\\z", .{ .multiline = true });
+        defer re_eof_z.deinit();
+        var csink = EmptyCountSink{};
+        const z_cnt = try searchSlice(EmptyCountSink, &csink, "abc", "f3", &re_eof_z, .{ .multiline = true, .binary = .quit });
+        try testing.expectEqual(@as(u64, 1), z_cnt.matched_lines);
+
+        // F4: whole_line (-x) multiline
+        var m_wl = try Multi.init(alloc, &.{ "bar", "foo bar\nbaz" }, .{ .multiline = true });
+        defer m_wl.deinit();
+        var wl_bag = Bag{};
+        defer wl_bag.deinit();
+        const wl_res = try searchSourceSlice(Bag, &wl_bag, "f4", "foo bar\nbaz\n", &m_wl, .{
+            .multiline = true,
+            .whole_line = true,
+            .match_mode = .earliest,
+        });
+        try testing.expectEqual(@as(u64, 1), wl_res.matched_lines);
+        try testing.expectEqualStrings("foo bar\nbaz", wl_bag.matchAt(0).bytes);
+
+        // F5: Cross-line match bridging into ultra-long line (max_line_len = 32, buffer_size = 48)
+        const f_long_ml = try Finder.init("ALPHA\nBETA", .{ .multiline = true });
+        const long_ml_doc = "ALPHA\nBETAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n";
+        const long_ml_cfg = SearchConfig{
+            .multiline = true,
+            .max_line_len = 32,
+            .buffer_size = 48,
+            .binary = .none,
+        };
+        var sl_cnt = EmptyCountSink{};
+        const r_sl = try searchSlice(EmptyCountSink, &sl_cnt, long_ml_doc, "f5s", &f_long_ml, long_ml_cfg);
+        try testing.expectEqual(@as(u64, 1), r_sl.matched_lines);
+
+        var rbuf5: [64]u8 = undefined;
+        var tr5 = std.testing.Reader.init(&rbuf5, &.{.{ .buffer = long_ml_doc }});
+        tr5.artificial_limit = .limited(11);
+        var sr_cnt = EmptyCountSink{};
+        const r_sr = try searchReader(EmptyCountSink, alloc, &sr_cnt, &tr5.interface, "f5r", &f_long_ml, long_ml_cfg);
+        try testing.expectEqual(@as(u64, 1), r_sr.matched_lines);
+
+        // F6: \A streaming incomplete line 2 & -A after-context
+        var re_anc = try Regex.init(alloc, "\\Afoo\\nbar", .{ .multiline = true, .max_multiline_window = 16 });
+        defer re_anc.deinit();
+        const anc_doc = "foo\nbar_rest_of_line_2\nc1\nc2\n";
+        var rbuf6: [64]u8 = undefined;
+        var tr6 = std.testing.Reader.init(&rbuf6, &.{.{ .buffer = anc_doc }});
+        tr6.artificial_limit = .limited(16);
+        var anc_bag = Bag{};
+        defer anc_bag.deinit();
+        const anc_res = try searchSource(Bag, alloc, &anc_bag, &tr6.interface, "f6", &re_anc, .{
+            .multiline = true,
+            .max_multiline_window = 16,
+            .buffer_size = 16,
+            .after = 2,
+        });
+        try testing.expectEqual(@as(u64, 1), anc_res.matched_lines);
+        try testing.expectEqualStrings("foo\nbar_rest_of_line_2", anc_bag.matchAt(0).bytes);
+        try testing.expectEqual(@as(usize, 2), anc_bag.kindCount(.context));
+
+        // F7: SliceIter zero-width EOF termination + populated .column
+        const f_empty = try Finder.init("", .{});
+        var sit = sink_mod.SliceIter(*const Finder).init("abc", &f_empty);
+        const first_it = sit.next().?;
+        try testing.expectEqual(@as(?u64, 1), first_it.column);
+        try testing.expect(sit.next() == null);
+
+        // F9: afterContext with max_count + invert + multiline
+        const f_ab = try Finder.init("a\nb", .{ .multiline = true });
+        var rec_f9 = Rec{};
+        defer rec_f9.deinit(alloc);
+        const res_f9 = try searchSlice(Rec, &rec_f9, "ok\na\nb\n", "f9", &f_ab, .{
+            .multiline = true,
+            .invert = true,
+            .max_count = 1,
+            .after = 2,
+            .line_numbers = true,
+        });
+        try testing.expectEqual(@as(u64, 1), res_f9.matched_lines);
+        try testing.expectEqualStrings("1:ok\n2-a\n3-b\n", rec_f9.text.items);
+
+        // F11: Flow.pause on .context preserves resume_line
+        const PauseOnCtx = struct {
+            paused_once: bool = false,
+            last_match_ln: u64 = 0,
+            pub fn event(self: *@This(), ev: Event) Flow {
+                switch (ev) {
+                    .context => {
+                        if (!self.paused_once) {
+                            self.paused_once = true;
+                            return .pause;
+                        }
+                    },
+                    .match => |m| self.last_match_ln = m.line_number,
+                    else => {},
+                }
+                return .cont;
+            }
+        };
+        const f_hit = try Finder.init("HIT", .{});
+        var pctx = PauseOnCtx{};
+        const pdoc = "c1\nHIT1\na1\na2\nHIT2\n";
+        const p1 = try searchSourceSlice(PauseOnCtx, &pctx, "f11", pdoc, &f_hit, .{ .after = 2 });
+        try testing.expect(p1.paused);
+        const p2 = try resumeSourceSlice(PauseOnCtx, &pctx, "f11", pdoc, &f_hit, .{ .after = 2 }, p1);
+        try testing.expect(!p2.paused);
+        try testing.expectEqual(@as(u64, 5), pctx.last_match_ln);
+    }
+
+    // --- Part 2: Randomized PRNG Multiline Differential Oracle (DFA/Prefilter/Watched vs Pure NFA & RegexSet) ---
+    {
+        const Spec = struct {
+            pat: []const u8,
+            win: usize,
+            ci: bool = false,
+            dot_all: bool = false,
+        };
+        const specs = [_]Spec{
+            .{ .pat = "[a-d\\n]+ab[a-d\\n]*", .win = 9 },
+            .{ .pat = "ab[0-3\\n]+|cd[a-d]+", .win = 11 },
+            .{ .pat = "[a-d\\n]+[c]d", .win = 6 },
+            .{ .pat = "(?i)ka\\n[b-d]+", .win = 12, .ci = true },
+            .{ .pat = "(?i)sa[0-3\\n]+b", .win = 10, .ci = true },
+            .{ .pat = "a.*b", .win = 10, .dot_all = true },
+            .{ .pat = "(?m)^[a-d]+\\n[0-3]+$", .win = 16 },
+            .{ .pat = "ab\\r?\\ncd|[0-3]{2}\\n[a-d]{2}", .win = 14 },
+        };
+
+        const tokens = [_][]const u8{
+            "a", "b", "c", "d", "0", "1", "2", "\n", "\r\n", " ", "ab", "cd", "\u{212A}", "\u{017F}",
+        };
+
+        var prng = std.Random.DefaultPrng.init(0x5EED_CAFE_2026);
+        const rand = prng.random();
+
+        for (specs) |sp| {
+            const fast_opts = regex_mod.RegexOptions{
+                .multiline = true,
+                .dot_all = sp.dot_all,
+                .case = if (sp.ci) .insensitive else .sensitive,
+                .unicode_case = true,
+                .max_multiline_window = sp.win,
+            };
+            var nfa_opts = fast_opts;
+            nfa_opts.max_dfa_states = 0;
+            nfa_opts.aot_dfa_max_insts = 0;
+
+            var re_fast = try Regex.init(alloc, sp.pat, fast_opts);
+            defer re_fast.deinit();
+            var re_nfa = try Regex.init(alloc, sp.pat, nfa_opts);
+            defer re_nfa.deinit();
+
+            var hay_buf: [96]u8 = undefined;
+            for (0..32) |_| {
+                var hlen: usize = 0;
+                const tok_cnt = rand.intRangeAtMost(usize, 4, 24);
+                for (0..tok_cnt) |_| {
+                    const tok = tokens[rand.uintLessThan(usize, tokens.len)];
+                    if (hlen + tok.len > hay_buf.len) break;
+                    @memcpy(hay_buf[hlen .. hlen + tok.len], tok);
+                    hlen += tok.len;
+                }
+                const hay = hay_buf[0..hlen];
+
+                for ([_]matcher_mod.MatchMode{ .earliest, .leftmost_first }) |mode| {
+                    var pos: usize = 0;
+                    while (pos <= hay.len) : (pos += 1) {
+                        if (pos > 0 and pos < hay.len and (hay[pos] & 0xC0) == 0x80) continue; // UTF-8 boundary
+                        const mf = re_fast.find(hay, pos, mode);
+                        const mn = re_nfa.find(hay, pos, mode);
+                        try testing.expectEqual(mn != null, mf != null);
+                        if (mn) |en| {
+                            const ef = mf.?;
+                            try testing.expect(ef.end - ef.start <= sp.win);
+                            try testing.expectEqual(en.start, ef.start);
+                            try testing.expectEqual(en.end, ef.end);
+                        }
+                    }
+                }
+
+                var nul_w: ?usize = null;
+                const mw = re_fast.findWatched(hay, 0, &nul_w);
+                try testing.expect(nul_w == null);
+                const mn0 = re_nfa.find(hay, 0, .earliest);
+                try testing.expectEqual(mn0 != null, mw != null);
+            }
+        }
+
+        // Differential check for RegexSet.matches & Multi.find across randomized multiline inputs
+        var rs_ora = try RegexSet.init(alloc, &.{
+            "[a-d\\n]+ab[a-d\\n]*",
+            "ab[0-3\\n]+|cd[a-d]+",
+            "[a-d\\n]+[c]d",
+            "(?m)^[a-d]+\\n[0-3]+$",
+        }, .{ .multiline = true, .max_multiline_window = 10 });
+        defer rs_ora.deinit();
+
+        var nfa0 = try Regex.init(alloc, "[a-d\\n]+ab[a-d\\n]*", .{ .multiline = true, .max_multiline_window = 10, .max_dfa_states = 0, .aot_dfa_max_insts = 0 });
+        defer nfa0.deinit();
+        var nfa1 = try Regex.init(alloc, "ab[0-3\\n]+|cd[a-d]+", .{ .multiline = true, .max_multiline_window = 10, .max_dfa_states = 0, .aot_dfa_max_insts = 0 });
+        defer nfa1.deinit();
+        var nfa2 = try Regex.init(alloc, "[a-d\\n]+[c]d", .{ .multiline = true, .max_multiline_window = 10, .max_dfa_states = 0, .aot_dfa_max_insts = 0 });
+        defer nfa2.deinit();
+        var nfa3 = try Regex.init(alloc, "(?m)^[a-d]+\\n[0-3]+$", .{ .multiline = true, .max_multiline_window = 10, .max_dfa_states = 0, .aot_dfa_max_insts = 0 });
+        defer nfa3.deinit();
+        const nfas = [_]*const Regex{ &nfa0, &nfa1, &nfa2, &nfa3 };
+
+        var m_ora = try Multi.init(alloc, &.{ "ab\nc", "cd\n0", "a\r\nb" }, .{ .multiline = true, .max_multiline_window = 8 });
+        defer m_ora.deinit();
+
+        var hay_buf2: [96]u8 = undefined;
+        for (0..40) |_| {
+            var hlen: usize = 0;
+            const tok_cnt = rand.intRangeAtMost(usize, 5, 24);
+            for (0..tok_cnt) |_| {
+                const tok = tokens[rand.uintLessThan(usize, tokens.len)];
+                if (hlen + tok.len > hay_buf2.len) break;
+                @memcpy(hay_buf2[hlen .. hlen + tok.len], tok);
+                hlen += tok.len;
+            }
+            const hay = hay_buf2[0..hlen];
+
+            var got_ids: [8]u32 = undefined;
+            const got_n = rs_ora.matches(hay, &got_ids);
+            var exp_ids: [8]u32 = undefined;
+            var exp_n: usize = 0;
+            for (nfas, 0..) |rptr, idx| {
+                if (rptr.isMatch(hay)) {
+                    exp_ids[exp_n] = @intCast(idx);
+                    exp_n += 1;
+                }
+            }
+            try testing.expectEqualSlices(u32, exp_ids[0..exp_n], got_ids[0..got_n]);
+            try testing.expectEqual(exp_n > 0, rs_ora.find(hay, 0, .leftmost_first) != null);
+
+            const m_hit = m_ora.find(hay, 0, .leftmost_first);
+            const has_lit = (std.mem.indexOf(u8, hay, "ab\nc") != null) or
+                (std.mem.indexOf(u8, hay, "cd\n0") != null) or
+                (std.mem.indexOf(u8, hay, "a\r\nb") != null);
+            try testing.expectEqual(has_lit, m_hit != null);
+        }
+    }
+}
+
+fn encodeAsciiAsUtf16WithBomAlloc(alloc: std.mem.Allocator, ascii_text: []const u8, little_endian: bool) ![]u8 {
+    const out = try alloc.alloc(u8, 2 + ascii_text.len * 2);
+    if (little_endian) {
+        out[0] = 0xFF;
+        out[1] = 0xFE;
+        for (ascii_text, 0..) |b, i| {
+            out[2 + i * 2] = b;
+            out[2 + i * 2 + 1] = 0;
+        }
+    } else {
+        out[0] = 0xFE;
+        out[1] = 0xFF;
+        for (ascii_text, 0..) |b, i| {
+            out[2 + i * 2] = 0;
+            out[2 + i * 2 + 1] = b;
+        }
+    }
+    return out;
+}
+
+test "multiline: 5-way pipeline equivalence matrix (slice quit/report/none vs chunked searchSource vs ReaderPull)" {
+    const alloc = testing.allocator;
+    const Regex = regex_mod.Regex;
+
+    const assert5Way = struct {
+        fn check(matcher_ptr: anytype, hay: []const u8, base_cfg: SearchConfig) !void {
+            var cfg_quit = base_cfg;
+            cfg_quit.binary = .quit;
+            cfg_quit.allocator = alloc;
+
+            var ref_bag = Bag{};
+            defer ref_bag.deinit();
+            const ref_res = try searchSourceSlice(Bag, &ref_bag, "m5", hay, matcher_ptr, cfg_quit);
+
+            // (2) & (3) slice .report and .none on non-binary text must emit identical events
+            for ([_]BinaryPolicy{ .report, .none }) |pol| {
+                var c = cfg_quit;
+                c.binary = pol;
+                var b = Bag{};
+                defer b.deinit();
+                const r = try searchSourceSlice(Bag, &b, "m5", hay, matcher_ptr, c);
+                try testing.expectEqual(ref_res.matched_lines, r.matched_lines);
+                try testing.expectEqual(ref_res.matches, r.matches);
+                try testing.expectEqual(ref_bag.items.items.len, b.items.items.len);
+            }
+
+            // (4) searchSource & (5) openReaderPull across chunk sizes 1, 2, 3, 7, 19, 64
+            for ([_]usize{ 1, 2, 3, 7, 19, 64 }) |cs| {
+                var rbuf1: [128]u8 = undefined;
+                var tr1 = std.testing.Reader.init(&rbuf1, &.{.{ .buffer = hay }});
+                tr1.artificial_limit = .limited(cs);
+
+                var stream_bag = Bag{};
+                defer stream_bag.deinit();
+                const sres = try searchSource(Bag, alloc, &stream_bag, &tr1.interface, "m5", matcher_ptr, cfg_quit);
+                try testing.expectEqual(ref_res.matched_lines, sres.matched_lines);
+                try testing.expectEqual(ref_res.matches, sres.matches);
+                try testing.expectEqual(ref_bag.items.items.len, stream_bag.items.items.len);
+                for (ref_bag.items.items, stream_bag.items.items) |exp, got| {
+                    try testing.expectEqual(exp.kind, got.kind);
+                    if (exp.kind == .match or exp.kind == .context) {
+                        try testing.expectEqual(exp.line_number, got.line_number);
+                        try testing.expectEqualStrings(exp.bytes, got.bytes);
+                        try testing.expectEqual(exp.matches.len, got.matches.len);
+                    }
+                }
+
+                var rbuf2: [128]u8 = undefined;
+                var tr2 = std.testing.Reader.init(&rbuf2, &.{.{ .buffer = hay }});
+                tr2.artificial_limit = .limited(cs);
+
+                var rpull = try searcher.openReaderPull(alloc, matcher_ptr, "m5", &tr2.interface, cfg_quit);
+                defer rpull.deinit();
+                var idx: usize = 0;
+                while (try rpull.next()) |pev| : (idx += 1) {
+                    const exp = ref_bag.items.items[idx];
+                    if (pev.kind == .match or pev.kind == .context) {
+                        try testing.expectEqual(exp.line_number, pev.line_number);
+                        try testing.expectEqualStrings(exp.bytes, pev.bytes);
+                        try testing.expectEqual(exp.matches.len, pev.spans.len);
+                    }
+                }
+                try testing.expectEqual(ref_bag.items.items.len, idx);
+            }
+        }
+    }.check;
+
+    // 1. 7-line multi-chunk bridging chain ("hit\nhit" across 7 consecutive lines = 1 bridged MatchEvent with 6 matches) + -B/-A context
+    {
+        const f_chain = try Finder.init("hit\nhit", .{ .multiline = true });
+        const chain_doc = "c0\nc1\nhit\nhit\nhit\nhit\nhit\nhit\nhit\na0\na1\nsep\nhit\nhit\ntail\n";
+        try assert5Way(&f_chain, chain_doc, .{
+            .multiline = true,
+            .max_multiline_window = 24,
+            .buffer_size = 16,
+            .before = 2,
+            .after = 2,
+        });
+    }
+
+    // 2. Invert (-v), passthru, whole_line (-x), whole_word (-w), CRLF, and $1 replacement
+    {
+        var re_pair = try Regex.init(alloc, "([a-z]+)\\r?\\n([0-9]+)", .{
+            .multiline = true,
+            .max_multiline_window = 32,
+        });
+        defer re_pair.deinit();
+        const crlf_doc = "hdr\r\nkey\r\n42\r\nmid\r\nfoo_bar\r\n99\r\nend\r\n";
+
+        try assert5Way(&re_pair, crlf_doc, .{
+            .multiline = true,
+            .max_multiline_window = 32,
+            .buffer_size = 16,
+            .replacement = "$2=$1",
+        });
+        try assert5Way(&re_pair, crlf_doc, .{
+            .multiline = true,
+            .max_multiline_window = 32,
+            .buffer_size = 16,
+            .invert = true,
+            .context = 1,
+        });
+        try assert5Way(&re_pair, crlf_doc, .{
+            .multiline = true,
+            .max_multiline_window = 32,
+            .buffer_size = 16,
+            .passthru = true,
+        });
+        try assert5Way(&re_pair, crlf_doc, .{
+            .multiline = true,
+            .max_multiline_window = 32,
+            .buffer_size = 16,
+            .whole_line = true,
+        });
+        try assert5Way(&re_pair, crlf_doc, .{
+            .multiline = true,
+            .max_multiline_window = 32,
+            .buffer_size = 16,
+            .whole_word = true,
+        });
+    }
+
+    // 3. UTF-16LE BOM, UTF-16BE BOM, Gzip streaming multiline, and Flow.pause / resume
+    {
+        const f_ml = try Finder.init("ALPHA\nBETA", .{ .multiline = true });
+        const plain = "row1\nALPHA\nBETA\nrow4\nALPHA\nBETA\nrow7\n";
+
+        const u16le = try encodeAsciiAsUtf16WithBomAlloc(alloc, plain, true);
+        defer alloc.free(u16le);
+        try assert5Way(&f_ml, u16le, .{ .multiline = true, .buffer_size = 24 });
+
+        const u16be = try encodeAsciiAsUtf16WithBomAlloc(alloc, plain, false);
+        defer alloc.free(u16be);
+        try assert5Way(&f_ml, u16be, .{ .multiline = true, .buffer_size = 24 });
+
+        const gz = try decompress.compressGzipStoredAlloc(alloc, plain);
+        defer alloc.free(gz);
+        try assert5Way(&f_ml, gz, .{ .multiline = true, .compression = .gzip, .buffer_size = 24 });
+
+        // Flow.pause + resumeSourceSlice across multiline blocks
+        const PauseFirstMatch = struct {
+            paused_once: bool = false,
+            hits: usize = 0,
+            last_ln: u64 = 0,
+            pub fn event(self: *@This(), ev: Event) Flow {
+                if (ev == .match) {
+                    self.hits += 1;
+                    self.last_ln = ev.match.line_number;
+                    if (!self.paused_once) {
+                        self.paused_once = true;
+                        return .pause;
+                    }
+                }
+                return .cont;
+            }
+        };
+        var ps = PauseFirstMatch{};
+        const r1 = try searchSourceSlice(PauseFirstMatch, &ps, "ml-pause", plain, &f_ml, .{ .multiline = true });
+        try testing.expect(r1.paused);
+        try testing.expectEqual(@as(usize, 1), ps.hits);
+        const r2 = try resumeSourceSlice(PauseFirstMatch, &ps, "ml-pause", plain, &f_ml, .{ .multiline = true }, r1);
+        try testing.expect(!r2.paused);
+        try testing.expectEqual(@as(usize, 2), ps.hits);
+        try testing.expectEqual(@as(u64, 5), ps.last_ln);
+    }
+}
+
+const TrackingRandomSource = struct {
+    data: []const u8,
+    min_offset: u64 = std.math.maxInt(u64),
+    max_end_offset: u64 = 0,
+    bytes_read: u64 = 0,
+    calls: usize = 0,
+    skipped_lo: u64 = 0,
+    skipped_hi: u64 = 0,
+    touched_skipped_region: bool = false,
+
+    fn randomAccess(self: *TrackingRandomSource) searcher.RandomAccess {
+        return .{
+            .ctx = self,
+            .read_at = readAtFn,
+            .size = @intCast(self.data.len),
+        };
+    }
+
+    fn readAtFn(ctx: ?*anyopaque, offset: u64, dest: []u8) anyerror!usize {
+        const self: *TrackingRandomSource = @ptrCast(@alignCast(ctx.?));
+        self.calls += 1;
+        if (offset >= self.data.len or dest.len == 0) return 0;
+        const off: usize = @intCast(offset);
+        const n = @min(dest.len, self.data.len - off);
+        @memcpy(dest[0..n], self.data[off .. off + n]);
+        if (offset < self.min_offset) self.min_offset = offset;
+        if (offset + n > self.max_end_offset) self.max_end_offset = offset + n;
+        if (self.skipped_hi > self.skipped_lo) {
+            if (offset < self.skipped_hi and offset + n > self.skipped_lo) {
+                self.touched_skipped_region = true;
+            }
+        }
+        self.bytes_read += n;
+        return n;
+    }
+};
+
+test "primitives: end-to-end P0-1, P0-2, P1-1, P1-2, P2-2a and cross-primitive seekable + bloom + scheduler + probe + archive workflow" {
+    const alloc = testing.allocator;
+    const probe_mod = @import("../probe.zig");
+    const seekable_mod = @import("../codec/seekable.zig");
+    const bloom_mod = @import("../finder/bloom.zig");
+    const scheduler_mod = @import("../scheduler.zig");
+    const archive_mod = @import("../codec/archive.zig");
+    const tree_mod = @import("tree.zig");
+
+    // -------------------------------------------------------------------------
+    // 1. [P0-1] & [P0-2]: Seekable Byte-Range Search + LineNumberMode
+    //    Proves [0, start) is NEVER read via searchSourceRange / read_at / seek_input!
+    // -------------------------------------------------------------------------
+    {
+        var big_log = std.ArrayList(u8).empty;
+        defer big_log.deinit(alloc);
+        var line_starts = std.ArrayList(u64).empty;
+        defer line_starts.deinit(alloc);
+
+        var row_tmp: [64]u8 = undefined;
+        for (0..200) |idx| {
+            try line_starts.append(alloc, @intCast(big_log.items.len));
+            const s = try std.fmt.bufPrint(&row_tmp, "row={d:0>4} token={s}\n", .{
+                idx + 1,
+                if (idx == 5 or idx == 120 or idx == 122 or idx == 195) "TARGET" else "normal",
+            });
+            try big_log.appendSlice(alloc, s);
+        }
+
+        const f_target = try Finder.init("TARGET", .{});
+        const range_start = line_starts.items[118];
+        const range_end = line_starts.items[125];
+
+        var track = TrackingRandomSource{ .data = big_log.items };
+
+        // Default .auto mid-file range: [0, range_start) is NEVER read, limit_hit == .none, partial == false, line_number_known == false!
+        const KnownRecorder = struct {
+            count: usize = 0,
+            first_ln: u64 = 999,
+            last_ln: u64 = 999,
+            all_known: bool = true,
+            any_known: bool = false,
+            pub fn event(self: *@This(), ev: Event) bool {
+                if (ev == .match) {
+                    if (self.count == 0) self.first_ln = ev.match.line_number;
+                    self.last_ln = ev.match.line_number;
+                    self.all_known = self.all_known and ev.match.line_number_known;
+                    self.any_known = self.any_known or ev.match.line_number_known;
+                    self.count += 1;
+                }
+                return true;
+            }
+        };
+
+        var krec = KnownRecorder{};
+        const r_auto = try searcher.searchSourceRange(
+            KnownRecorder,
+            alloc,
+            &krec,
+            track.randomAccess(),
+            .{ .start = range_start, .end = range_end },
+            "p0-range",
+            &f_target,
+            .{ .buffer_size = 64 },
+        );
+        try testing.expectEqual(Outcome.complete, r_auto.outcome);
+        try testing.expectEqual(sink_mod.LimitHit.none, r_auto.limit_hit);
+        try testing.expect(!r_auto.partial);
+        try testing.expectEqual(@as(u64, 2), r_auto.matched_lines);
+        try testing.expect(track.min_offset >= range_start);
+        try testing.expect(track.max_end_offset <= range_end);
+        try testing.expect(!krec.any_known);
+        try testing.expectEqual(@as(u64, 0), krec.first_ln);
+
+        // With initial_line_number = 119 -> exact line numbers 121 and 123, line_number_known == true!
+        var krec_init = KnownRecorder{};
+        _ = try searcher.searchSourceRange(
+            KnownRecorder,
+            alloc,
+            &krec_init,
+            track.randomAccess(),
+            .{ .start = range_start, .end = range_end },
+            "p0-range-ln",
+            &f_target,
+            .{ .buffer_size = 64, .initial_line_number = 119 },
+        );
+        try testing.expect(krec_init.all_known);
+        try testing.expectEqual(@as(u64, 121), krec_init.first_ln);
+        try testing.expectEqual(@as(u64, 123), krec_init.last_ln);
+
+        // range_align_lines = true + stream_offset test
+        var pre_positioned = std.Io.Reader.fixed(big_log.items[@intCast(range_start)..]);
+        var krec_stream = KnownRecorder{};
+        const r_so = try searchSource(KnownRecorder, alloc, &krec_stream, &pre_positioned, "p0-so", &f_target, .{
+            .byte_range = .{ .start = range_start + 3, .end = line_starts.items[122] + 5 },
+            .range_align_lines = true,
+            .stream_offset = range_start,
+            .line_number_mode = .unknown,
+        });
+        // range_start + 3 skips line 119 -> starts at line 120; end inside line 123 extends through end of line 123 -> finds idx 120 & 122!
+        try testing.expectEqual(@as(u64, 2), r_so.matched_lines);
+        try testing.expect(!krec_stream.any_known);
+    }
+
+    // -------------------------------------------------------------------------
+    // 2. [P1-1]: Pre-Count / Pre-Quota line_filter (slice, reader, long line, invert)
+    // -------------------------------------------------------------------------
+    {
+        const FilterState = struct {
+            seen: usize = 0,
+            fn acceptKeep(ctx: ?*anyopaque, cand: searcher.LineFilterCandidate) bool {
+                const self: *@This() = @ptrCast(@alignCast(ctx.?));
+                self.seen += 1;
+                return std.mem.indexOf(u8, cand.bytes, "ALLOW") != null;
+            }
+        };
+
+        const f_hit = try Finder.init("HIT", .{});
+        const fdoc = "ctx0\nHIT DENY 1\nctx1\nHIT DENY 2\nctx2\nHIT ALLOW 3\nctx3\n";
+        var fstate = FilterState{};
+        var fbag = Bag{};
+        defer fbag.deinit();
+        const fres = try searchSourceSlice(Bag, &fbag, "p1-lf", fdoc, &f_hit, .{
+            .max_count = 1,
+            .max_results = 1,
+            .before = 1,
+            .line_filter = FilterState.acceptKeep,
+            .line_filter_ctx = &fstate,
+        });
+        // Denied hits MUST NOT consume max_count/max_results, increment matched_lines/matches, or emit before-context!
+        try testing.expectEqual(@as(usize, 3), fstate.seen);
+        try testing.expectEqual(@as(u64, 1), fres.matched_lines);
+        try testing.expectEqual(@as(u64, 1), fres.matches);
+        try testing.expectEqual(@as(usize, 1), fbag.kindCount(.context));
+        try testing.expectEqualStrings("ctx2", fbag.items.items[1].bytes);
+        try testing.expectEqualStrings("HIT ALLOW 3", fbag.matchAt(0).bytes);
+
+        // Long line (> max_line_len = 24) pre-quota line_filter in streaming searchSource
+        const long_fdoc = "HIT DENY pppppppppppppppppppppppppppppp\nHIT ALLOW pppppppppppppppppppppppppppppp\n";
+        var fstate2 = FilterState{};
+        var lreader = std.Io.Reader.fixed(long_fdoc);
+        var fbag2 = Bag{};
+        defer fbag2.deinit();
+        const fres2 = try searchSource(Bag, alloc, &fbag2, &lreader, "p1-long-lf", &f_hit, .{
+            .max_line_len = 24,
+            .buffer_size = 32,
+            .max_count = 1,
+            .line_filter = FilterState.acceptKeep,
+            .line_filter_ctx = &fstate2,
+        });
+        try testing.expectEqual(@as(u64, 1), fres2.matched_lines);
+        try testing.expectEqual(@as(u64, 2), fbag2.matchAt(0).line_number);
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. [P1-2]: Reverse Tail Search (slice & O(tail) RandomAccess, CRLF, multiline, pagination)
+    // -------------------------------------------------------------------------
+    {
+        var tail_doc = std.ArrayList(u8).empty;
+        defer tail_doc.deinit(alloc);
+        var tmp: [64]u8 = undefined;
+        for (0..400) |idx| {
+            const s = try std.fmt.bufPrint(&tmp, "seq={d:0>4} level={s}\r\n", .{
+                idx + 1,
+                if (idx % 10 == 0) "ERR" else "OK",
+            });
+            try tail_doc.appendSlice(alloc, s);
+        }
+
+        const f_err = try Finder.init("ERR", .{});
+        var track_rev = TrackingRandomSource{ .data = tail_doc.items };
+
+        const RevBag = struct {
+            lines: std.ArrayList([]u8) = .empty,
+            nums: std.ArrayList(u64) = .empty,
+            fn deinit(self: *@This(), a: std.mem.Allocator) void {
+                for (self.lines.items) |l| a.free(l);
+                self.lines.deinit(a);
+                self.nums.deinit(a);
+            }
+            pub fn event(self: *@This(), ev: Event) bool {
+                if (ev == .match) {
+                    self.lines.append(testing.allocator, testing.allocator.dupe(u8, ev.match.bytes) catch unreachable) catch unreachable;
+                    self.nums.append(testing.allocator, ev.match.line_number) catch unreachable;
+                }
+                return true;
+            }
+        };
+
+        // O(tail) max_count = 2 on 400-line source: must read ONLY the tail (min_offset > 0)!
+        var rbag = RevBag{};
+        defer rbag.deinit(alloc);
+        const rev_tail = try searcher.searchSourceReverseAt(
+            RevBag,
+            alloc,
+            &rbag,
+            track_rev.randomAccess(),
+            "rev-tail",
+            &f_err,
+            .{ .buffer_size = 512, .max_count = 2, .initial_line_number = 400 },
+        );
+        try testing.expectEqual(@as(u64, 2), rev_tail.matched_lines);
+        try testing.expect(track_rev.min_offset > 0);
+        try testing.expectEqualSlices(u64, &.{ 391, 381 }, rbag.nums.items);
+
+        // Full backward pagination via max_results = 15 across small chunks must match searchSourceReverseSlice 100%!
+        var full_slice_rev = RevBag{};
+        defer full_slice_rev.deinit(alloc);
+        _ = try searcher.searchSourceReverseSlice(RevBag, &full_slice_rev, "rev-s", tail_doc.items, &f_err, .{
+            .initial_line_number = 400,
+        });
+        try testing.expectEqual(@as(usize, 40), full_slice_rev.lines.items.len);
+
+        var paged_rev = RevBag{};
+        defer paged_rev.deinit(alloc);
+        var cur_end: ?u64 = null;
+        while (true) {
+            const page = try searcher.searchSourceReverseAt(
+                RevBag,
+                alloc,
+                &paged_rev,
+                track_rev.randomAccess(),
+                "rev-page",
+                &f_err,
+                .{
+                    .buffer_size = 256,
+                    .byte_range = .{ .start = 0, .end = cur_end },
+                    .max_results = 15,
+                    .line_number_mode = .unknown,
+                },
+            );
+            if (page.limit_hit == .max_results and page.resume_at != null) {
+                cur_end = page.resume_at;
+            } else break;
+        }
+        try testing.expectEqual(full_slice_rev.lines.items.len, paged_rev.lines.items.len);
+        for (full_slice_rev.lines.items, paged_rev.lines.items) |e_line, g_line| {
+            try testing.expectEqualStrings(e_line, g_line);
+        }
+
+        // Multiline reverse tail search
+        const f_ml_rev = try Finder.init("BEGIN\nEND", .{ .multiline = true });
+        const ml_rev_doc = "0\nBEGIN\nEND\nmid\nBEGIN\nEND\ntail\n";
+        var ml_rbag = RevBag{};
+        defer ml_rbag.deinit(alloc);
+        const ml_ra_slice: []const u8 = ml_rev_doc;
+        _ = try searcher.searchSourceReverseAt(
+            RevBag,
+            alloc,
+            &ml_rbag,
+            probe_mod.RandomAccess.fromSlice(&ml_ra_slice),
+            "rev-ml",
+            &f_ml_rev,
+            .{ .multiline = true, .max_multiline_window = 16, .buffer_size = 16, .initial_line_number = 7 },
+        );
+        try testing.expectEqualSlices(u64, &.{ 5, 2 }, ml_rbag.nums.items);
+    }
+
+    // -------------------------------------------------------------------------
+    // 4. [P2-2a]: Flow.skipTo(offset) across slice, seekable read_at, and unseekable stream
+    // -------------------------------------------------------------------------
+    {
+        var skip_doc = std.ArrayList(u8).empty;
+        defer skip_doc.deinit(alloc);
+        try skip_doc.appendSlice(alloc, "HIT_START\n"); // 0..10
+        const mid_pad: [8192]u8 = @splat('.');
+        try skip_doc.appendSlice(alloc, &mid_pad);
+        try skip_doc.append(alloc, '\n'); // 10..8203
+        const tail_off: u64 = @intCast(skip_doc.items.len);
+        try skip_doc.appendSlice(alloc, "HIT_TAIL\n");
+
+        const SkipSink = struct {
+            jump_to: u64,
+            hits: usize = 0,
+            last_known: bool = true,
+            last_ln: u64 = 0,
+            pub fn event(self: *@This(), ev: Event) sink_mod.FlowAction {
+                if (ev == .match) {
+                    self.hits += 1;
+                    self.last_known = ev.match.line_number_known;
+                    self.last_ln = ev.match.line_number;
+                    if (self.hits == 1) return Flow.skipTo(self.jump_to);
+                }
+                return .cont;
+            }
+        };
+
+        const f_hit = try Finder.init("HIT_", .{});
+
+        // (a) Slice jump preserves exact line number (line 3)!
+        var ss_slice = SkipSink{ .jump_to = tail_off };
+        const res_skip_slice = try searchSourceSlice(SkipSink, &ss_slice, "skip-s", skip_doc.items, &f_hit, .{});
+        try testing.expectEqual(@as(u64, 2), res_skip_slice.matched_lines);
+        try testing.expect(ss_slice.last_known);
+        try testing.expectEqual(@as(u64, 3), ss_slice.last_ln);
+
+        // (b) Seekable read_at jump with small 256B buffer NEVER reads the middle [1024..7500) region!
+        var track_skip = TrackingRandomSource{
+            .data = skip_doc.items,
+            .skipped_lo = 1024,
+            .skipped_hi = 7500,
+        };
+        var dummy_reader = std.Io.Reader.fixed("");
+        var ss_ra = SkipSink{ .jump_to = tail_off };
+        const res_skip_ra = try searchSource(SkipSink, alloc, &ss_ra, &dummy_reader, "skip-ra", &f_hit, .{
+            .buffer_size = 256,
+            .read_at = TrackingRandomSource.readAtFn,
+            .read_at_ctx = &track_skip,
+        });
+        try testing.expectEqual(@as(u64, 2), res_skip_ra.matched_lines);
+        try testing.expect(!track_skip.touched_skipped_region);
+        try testing.expect(!ss_ra.last_known);
+
+        // (c) Unseekable stream drains cleanly to target_offset
+        var unseek_r = std.Io.Reader.fixed(skip_doc.items);
+        var ss_unseek = SkipSink{ .jump_to = tail_off };
+        const res_skip_unseek = try searchSource(SkipSink, alloc, &ss_unseek, &unseek_r, "skip-u", &f_hit, .{
+            .buffer_size = 256,
+        });
+        try testing.expectEqual(@as(u64, 2), res_skip_unseek.matched_lines);
+    }
+
+    // -------------------------------------------------------------------------
+    // 5. Cross-Primitive Workflow: ZstdSeekTable + GzipIndex + NgramBloom + Scheduler + probeLineAt + Archive entry_filter
+    // -------------------------------------------------------------------------
+    {
+        const shard0_plain = "2026-11-18 INFO boot ok\n2026-11-18 INFO steady state\n";
+        const shard1_plain = "2026-11-18 INFO warmup\n2026-11-18 CRITICAL_NEEDLE_777 db_timeout\n2026-11-18 INFO recovered\n";
+
+        const zst_shard0 = try seekable_mod.compressSeekableZstdAlloc(alloc, shard0_plain, 32);
+        defer alloc.free(zst_shard0);
+        var zst_tab0 = try seekable_mod.ZstdSeekTable.parseFromSlice(alloc, zst_shard0);
+        defer zst_tab0.deinit(alloc);
+
+        const gz_shard1 = try seekable_mod.compressMultiMemberGzipAlloc(alloc, &.{ shard1_plain[0..23], shard1_plain[23..] });
+        defer alloc.free(gz_shard1);
+        var gz_idx1 = try seekable_mod.GzipIndex.buildFromSlice(alloc, gz_shard1, 16);
+        defer gz_idx1.deinit(alloc);
+
+        var bloom0 = try bloom_mod.NgramBloom.init(alloc, .{});
+        defer bloom0.deinit();
+        bloom0.addSlice(shard0_plain);
+
+        var bloom1 = try bloom_mod.NgramBloom.init(alloc, .{});
+        defer bloom1.deinit();
+        bloom1.addSlice(shard1_plain);
+
+        const needle_finder = try Finder.init("critical_needle_777", .{ .case = .insensitive, .unicode_case = true });
+
+        const WorkCtx = struct {
+            alloc: std.mem.Allocator,
+            zst_bytes: []const u8,
+            zst_table: *const seekable_mod.ZstdSeekTable,
+            gz_bytes: []const u8,
+            gz_index: *const seekable_mod.GzipIndex,
+            b0: *const bloom_mod.NgramBloom,
+            b1: *const bloom_mod.NgramBloom,
+            finder: *const Finder,
+            bloom_skips: std.atomic.Value(u32) = .init(0),
+            found_hits: std.atomic.Value(u32) = .init(0),
+            probed_ok: std.atomic.Value(bool) = .init(false),
+
+            pub fn run(self: *@This(), shard_id: u32, _: anytype) !void {
+                if (shard_id == 0) {
+                    if (!self.b0.mayContainMatcher(self.finder)) {
+                        _ = self.bloom_skips.fetchAdd(1, .acq_rel);
+                        return;
+                    }
+                    const raw_ra = probe_mod.RandomAccess.fromSlice(&self.zst_bytes);
+                    const zr = seekable_mod.SeekableZstdReader.init(self.alloc, raw_ra, self.zst_table);
+                    const Empty = struct {
+                        pub fn event(_: *@This(), _: Event) bool {
+                            return true;
+                        }
+                    };
+                    var es = Empty{};
+                    const res = try searcher.searchSourceRange(Empty, self.alloc, &es, zr.randomAccess(), .{ .start = 0, .end = null }, "s0", self.finder, .{});
+                    _ = self.found_hits.fetchAdd(@intCast(res.matched_lines), .acq_rel);
+                } else {
+                    if (!self.b1.mayContainMatcher(self.finder)) {
+                        _ = self.bloom_skips.fetchAdd(1, .acq_rel);
+                        return;
+                    }
+                    const raw_ra = probe_mod.RandomAccess.fromSlice(&self.gz_bytes);
+                    const gr = seekable_mod.IndexedGzipReader.init(self.alloc, raw_ra, self.gz_index);
+                    const HitOffset = struct {
+                        off: ?u64 = null,
+                        pub fn event(h: *@This(), ev: Event) bool {
+                            if (ev == .match) h.off = ev.match.absolute_offset + 5;
+                            return true;
+                        }
+                    };
+                    var ho = HitOffset{};
+                    const res = try searcher.searchSourceReverseAt(HitOffset, self.alloc, &ho, gr.randomAccess(), "s1", self.finder, .{});
+                    _ = self.found_hits.fetchAdd(@intCast(res.matched_lines), .acq_rel);
+                    if (ho.off) |probe_off| {
+                        var lp = (try probe_mod.probeLineAt(self.alloc, gr.randomAccess(), probe_off, .{})).?;
+                        defer lp.deinit(self.alloc);
+                        if (std.mem.eql(u8, lp.bytes, "2026-11-18 CRITICAL_NEEDLE_777 db_timeout")) {
+                            self.probed_ok.store(true, .release);
+                        }
+                    }
+                }
+            }
+        };
+
+        var wctx = WorkCtx{
+            .alloc = alloc,
+            .zst_bytes = zst_shard0,
+            .zst_table = &zst_tab0,
+            .gz_bytes = gz_shard1,
+            .gz_index = &gz_idx1,
+            .b0 = &bloom0,
+            .b1 = &bloom1,
+            .finder = &needle_finder,
+        };
+        try scheduler_mod.Scheduler(u32, WorkCtx).run(alloc, std.testing.io, .{ .max_threads = 2 }, &wctx, &.{ 0, 1 });
+        try testing.expectEqual(@as(u32, 1), wctx.bloom_skips.load(.acquire));
+        try testing.expectEqual(@as(u32, 1), wctx.found_hits.load(.acquire));
+        try testing.expect(wctx.probed_ok.load(.acquire));
+
+        // Also verify Archive entry_filter integration in tree.searchArchiveSlice
+        const zip_bytes = try archive_mod.buildTestZipAlloc(alloc, &.{
+            .{ .path = "logs/old.log", .data = "CRITICAL_NEEDLE_777 old\n", .mtime = 1_600_000_000, .zip_method = .deflate },
+            .{ .path = "logs/recent.log", .data = "CRITICAL_NEEDLE_777 fresh\n", .mtime = 1_750_000_000, .zip_method = .deflate },
+        });
+        defer alloc.free(zip_bytes);
+
+        const MtimeFilter = struct {
+            fn allowRecent(_: ?*anyopaque, meta: archive_mod.ArchiveEntryMeta) bool {
+                if (meta.mtime) |ts| return ts >= 1_700_000_000;
+                return false;
+            }
+        };
+        var abag = Bag{};
+        defer abag.deinit();
+        const asum = try tree_mod.searchArchiveSlice(Bag, alloc, std.testing.io, &abag, zip_bytes, &needle_finder, .{
+            .archive = .{ .entry_filter = MtimeFilter.allowRecent },
+        });
+        try testing.expectEqual(@as(u64, 1), asum.searches);
+        try testing.expectEqual(@as(u64, 1), asum.matched_lines);
+        try testing.expectEqualStrings("CRITICAL_NEEDLE_777 fresh", abag.matchAt(0).bytes);
+    }
+}
+
+test "regressions: carbon final review items 1, 3, 4, 6, and 7" {
+    const alloc = testing.allocator;
+    const archive_mod = @import("../codec/archive.zig");
+    const tree_mod = @import("tree.zig");
+
+    // -------------------------------------------------------------------------
+    // Item 1: Regex.findWatched Fast Path 3 (!req_is_prefix) when an earlier
+    // required-literal occurrence fails the suffix DFA check and a match starts
+    // before hit.start + req_prefix_shift and anchors on a later hit2.
+    // -------------------------------------------------------------------------
+    {
+        var re = try regex_mod.Regex.init(alloc, "[0-9][a-zA-Z_]*ERROR_[0-9]+", .{});
+        defer re.deinit();
+        const input = "9ERROR_xERROR_1\n";
+        var nul: ?usize = null;
+        const m_watched = re.findWatched(input, 0, &nul).?;
+        try testing.expectEqual(@as(usize, 0), m_watched.start);
+        try testing.expectEqual(@as(usize, 15), m_watched.end);
+        try testing.expectEqual(@as(?usize, null), nul);
+
+        var bag = Bag{};
+        defer bag.deinit();
+        const res = try searchSourceSlice(Bag, &bag, "item1", input, &re, .{ .binary = .quit });
+        try testing.expectEqual(@as(u64, 1), res.matched_lines);
+        try testing.expectEqualStrings("9ERROR_xERROR_1", bag.matchAt(0).bytes);
+    }
+
+    // -------------------------------------------------------------------------
+    // Item 3: Flow.skipTo(target) in slice search when !direct_sink
+    // (e.g., match_mode = .leftmost_first or progress_interval != null)
+    // must jump to target instead of clearing pending_skip_to and stopping!
+    // -------------------------------------------------------------------------
+    {
+        const doc = "HIT_1\nHIT_2\nHIT_3\n"; // HIT_1: 0..6, HIT_2: 6..12, HIT_3: 12..18
+        const f_hit = try Finder.init("HIT_", .{});
+
+        const IndirectSkipSink = struct {
+            jump_to: u64,
+            lines: std.ArrayList(u64) = .empty,
+            fn deinit(self: *@This(), a: std.mem.Allocator) void {
+                self.lines.deinit(a);
+            }
+            pub fn event(self: *@This(), ev: Event) sink_mod.FlowAction {
+                if (ev == .match) {
+                    self.lines.append(testing.allocator, ev.match.line_number) catch unreachable;
+                    if (self.lines.items.len == 1) return Flow.skipTo(self.jump_to);
+                }
+                return .cont;
+            }
+        };
+
+        var sink1 = IndirectSkipSink{ .jump_to = 12 };
+        defer sink1.deinit(alloc);
+        const res1 = try searchSourceSlice(IndirectSkipSink, &sink1, "item3-lf", doc, &f_hit, .{
+            .match_mode = .leftmost_first,
+            .progress_interval = 4,
+        });
+        try testing.expectEqual(Outcome.complete, res1.outcome);
+        try testing.expectEqual(@as(u64, 2), res1.matched_lines);
+        try testing.expectEqualSlices(u64, &.{ 1, 3 }, sink1.lines.items);
+    }
+
+    // -------------------------------------------------------------------------
+    // Item 4: Flow.skipTo(target) inside searchArchiveSlice / searchTree must
+    // perform intra-file jumps without aborting the file, remaining files, or .summary!
+    // -------------------------------------------------------------------------
+    {
+        const zip_bytes = try archive_mod.buildTestZipAlloc(alloc, &.{
+            .{ .path = "a.txt", .data = "HIT_A1\nHIT_A2\nHIT_A3\n", .zip_method = .store },
+            .{ .path = "b.txt", .data = "HIT_B1\n", .zip_method = .store },
+        });
+        defer alloc.free(zip_bytes);
+
+        const TreeSkipSink = struct {
+            matches: std.ArrayList([]u8) = .empty,
+            saw_summary: bool = false,
+            fn deinit(self: *@This(), a: std.mem.Allocator) void {
+                for (self.matches.items) |m| a.free(m);
+                self.matches.deinit(a);
+            }
+            pub fn event(self: *@This(), ev: Event) sink_mod.FlowAction {
+                switch (ev) {
+                    .match => |m| {
+                        self.matches.append(testing.allocator, testing.allocator.dupe(u8, m.bytes) catch unreachable) catch unreachable;
+                        if (std.mem.eql(u8, m.bytes, "HIT_A1")) {
+                            // Jump past HIT_A2 (7..14) directly to HIT_A3 (offset 14)
+                            return Flow.skipTo(14);
+                        }
+                    },
+                    .summary => self.saw_summary = true,
+                    else => {},
+                }
+                return .cont;
+            }
+        };
+
+        const f_hit = try Finder.init("HIT_", .{});
+        var tsink = TreeSkipSink{};
+        defer tsink.deinit(alloc);
+        const tsum = try tree_mod.searchArchiveSlice(TreeSkipSink, alloc, std.testing.io, &tsink, zip_bytes, &f_hit, .{});
+        try testing.expect(tsink.saw_summary);
+        try testing.expectEqual(@as(u64, 2), tsum.searches);
+        try testing.expectEqual(@as(u64, 2), tsum.searches_with_match);
+        try testing.expectEqual(@as(u64, 3), tsum.matched_lines);
+        try testing.expectEqual(@as(usize, 3), tsink.matches.items.len);
+        try testing.expectEqualStrings("HIT_A1", tsink.matches.items[0]);
+        try testing.expectEqualStrings("HIT_A3", tsink.matches.items[1]);
+        try testing.expectEqualStrings("HIT_B1", tsink.matches.items[2]);
+    }
+
+    // -------------------------------------------------------------------------
+    // Item 6: Reverse search Flow.skipTo line-number accounting + binary = .report
+    // with max_count when an earlier line in the window contains a NUL byte.
+    // -------------------------------------------------------------------------
+    {
+        const f_any = try Finder.init("o", .{});
+        // (a) Mid-line skipTo(8) on "hello\nworld\n" (offset 8 is inside "world\n", line 2):
+        // truncating to [0..8) ("hello\nwo") must keep line 1 as line 1!
+        const RevSkipBeginSink = struct {
+            nums: std.ArrayList(u64) = .empty,
+            fn deinit(self: *@This(), a: std.mem.Allocator) void {
+                self.nums.deinit(a);
+            }
+            pub fn event(self: *@This(), ev: Event) sink_mod.FlowAction {
+                switch (ev) {
+                    .begin => return Flow.skipTo(8),
+                    .match => |m| self.nums.append(testing.allocator, m.line_number) catch unreachable,
+                    else => {},
+                }
+                return .cont;
+            }
+        };
+        var rsb = RevSkipBeginSink{};
+        defer rsb.deinit(alloc);
+        _ = try searcher.searchSourceReverseSlice(RevSkipBeginSink, &rsb, "rev-skip-begin", "hello\nworld\n", &f_any, .{
+            .initial_line_number = 2,
+        });
+        try testing.expectEqualSlices(u64, &.{ 2, 1 }, rsb.nums.items);
+
+        // (b) Cross-window backward skipTo in searchSourceReverseSlice with small buffer_size
+        var rev_doc = std.ArrayList(u8).empty;
+        defer rev_doc.deinit(alloc);
+        var line_offs = std.ArrayList(u64).empty;
+        defer line_offs.deinit(alloc);
+        var buf: [32]u8 = undefined;
+        for (0..20) |i| {
+            try line_offs.append(alloc, @intCast(rev_doc.items.len));
+            const s = try std.fmt.bufPrint(&buf, "row_{d:0>2}_HIT\n", .{i + 1});
+            try rev_doc.appendSlice(alloc, s);
+        }
+        const f_hit = try Finder.init("HIT", .{});
+        const RevCrossWindowSkip = struct {
+            target: u64,
+            nums: std.ArrayList(u64) = .empty,
+            fn deinit(self: *@This(), a: std.mem.Allocator) void {
+                self.nums.deinit(a);
+            }
+            pub fn event(self: *@This(), ev: Event) sink_mod.FlowAction {
+                if (ev == .match) {
+                    self.nums.append(testing.allocator, ev.match.line_number) catch unreachable;
+                    if (self.nums.items.len == 1) return Flow.skipTo(self.target);
+                }
+                return .cont;
+            }
+        };
+        // Jump from line 20 back to end of line 5 (line_offs[5]) across 64-byte windows
+        var rcw = RevCrossWindowSkip{ .target = line_offs.items[5] };
+        defer rcw.deinit(alloc);
+        _ = try searcher.searchSourceReverseSlice(RevCrossWindowSkip, &rcw, "rev-cw", rev_doc.items, &f_hit, .{
+            .buffer_size = 64,
+            .initial_line_number = 20,
+        });
+        try testing.expectEqualSlices(u64, &.{ 20, 5, 4, 3, 2, 1 }, rcw.nums.items);
+
+        // (c) Reverse search with .binary = .report and .max_count = 1 when an earlier line has NUL
+        const rev_bin_doc = "bad\x00HIT_OLD\ngood_HIT_NEW\n";
+        var bin_bag = Bag{};
+        defer bin_bag.deinit();
+        const rev_bin_res = try searcher.searchSourceReverseSlice(Bag, &bin_bag, "rev-bin", rev_bin_doc, &f_hit, .{
+            .binary = .report,
+            .max_count = 1,
+        });
+        try testing.expectEqual(@as(u64, 1), rev_bin_res.matched_lines);
+        try testing.expectEqual(@as(?u64, null), rev_bin_res.binary_offset);
+        try testing.expectEqual(BinaryStatus.none, bin_bag.matchAt(0).status);
+        try testing.expectEqual(BinaryStatus.none, bin_bag.find(.end).status);
+        try testing.expectEqualStrings("good_HIT_NEW", bin_bag.matchAt(0).bytes);
+    }
+
+    // -------------------------------------------------------------------------
+    // Item 7: Flow.skipTo with line_number_mode = .from_one across seekable read_at
+    // (must mark line_number_known = false) vs unseekable sequential drain
+    // (must count newlines across drained bytes so line_number stays exact).
+    // -------------------------------------------------------------------------
+    {
+        var skip_doc = std.ArrayList(u8).empty;
+        defer skip_doc.deinit(alloc);
+        try skip_doc.appendSlice(alloc, "HIT_START\n"); // line 1 (0..10)
+        for (0..100) |_| {
+            try skip_doc.appendSlice(alloc, "filler_line_padding_0123456789\n"); // lines 2..101 (3100 bytes)
+        }
+        const tail_off: u64 = @intCast(skip_doc.items.len);
+        try skip_doc.appendSlice(alloc, "HIT_TAIL\n"); // line 102
+
+        const FromOneSkipSink = struct {
+            jump_to: u64,
+            hits: usize = 0,
+            last_known: bool = true,
+            last_ln: u64 = 999,
+            pub fn event(self: *@This(), ev: Event) sink_mod.FlowAction {
+                if (ev == .match) {
+                    self.hits += 1;
+                    self.last_known = ev.match.line_number_known;
+                    self.last_ln = ev.match.line_number;
+                    if (self.hits == 1) return Flow.skipTo(self.jump_to);
+                }
+                return .cont;
+            }
+        };
+
+        const f_hit = try Finder.init("HIT_", .{});
+
+        // (a) Seekable read_at with .line_number_mode = .from_one: jumping skips bytes -> line_number_known = false, line_number = 0
+        var track_ra = TrackingRandomSource{ .data = skip_doc.items };
+        var dummy_r = std.Io.Reader.fixed("");
+        var sink_ra = FromOneSkipSink{ .jump_to = tail_off };
+        const res_ra = try searchSource(FromOneSkipSink, alloc, &sink_ra, &dummy_r, "item7-ra", &f_hit, .{
+            .buffer_size = 256,
+            .line_number_mode = .from_one,
+            .read_at = TrackingRandomSource.readAtFn,
+            .read_at_ctx = &track_ra,
+        });
+        try testing.expectEqual(@as(u64, 2), res_ra.matched_lines);
+        try testing.expect(!sink_ra.last_known);
+        try testing.expectEqual(@as(u64, 0), sink_ra.last_ln);
+
+        // (b) Unseekable sequential stream drain: draining counts newlines -> line_number_known = true, line_number = 102
+        var unseek_r = std.Io.Reader.fixed(skip_doc.items);
+        var sink_unseek = FromOneSkipSink{ .jump_to = tail_off };
+        const res_unseek = try searchSource(FromOneSkipSink, alloc, &sink_unseek, &unseek_r, "item7-unseek", &f_hit, .{
+            .buffer_size = 256,
+            .line_number_mode = .from_one,
+        });
+        try testing.expectEqual(@as(u64, 2), res_unseek.matched_lines);
+        try testing.expect(sink_unseek.last_known);
+        try testing.expectEqual(@as(u64, 102), sink_unseek.last_ln);
+    }
+}
+
+
 test {
     _ = @import("challenger_test.zig");
 }

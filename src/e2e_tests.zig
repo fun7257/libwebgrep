@@ -194,6 +194,7 @@ const SearchConfig = struct {
             .replacement = self.replacement,
             .whole_word = self.whole_word,
             .whole_line = self.line_regexp or self.whole_line,
+            .multiline = self.multiline,
             .match_mode = if (self.replacement != null) .leftmost_first else self.match_mode,
             .contains = self.contains,
             .excludes = self.excludes,

@@ -26,22 +26,29 @@ See [Non-Goals](#non-goals) for capabilities intentionally excluded from the cor
 | :--- | :--- | :--- | :--- | :--- |
 | **`searchSourceSlice`** | `[]const u8` | Yes (auto-populated when `null`) | Push (`Event` callback) | Zero allocation when no transcoding/decompression is needed |
 | **`searchSource`** | `*std.Io.Reader` | Yes (auto-populated when `null`) | Push (`Event` callback) | Rolling buffer + optional context/decode buffers (reusable via `scratch`) |
+| **`searchSourceRange`** | `RandomAccess` + `ByteRange` | Yes (auto-populated when `null`) | Push (`Event` callback) | Positional reads restricted to `[start, end)` without reading outside the range |
+| **`searchSourceReverseSlice`** | `[]const u8` | Yes (auto-populated when `null`) | Push (`Event` callback) | Reverse tail scan emitting matches newest-first |
+| **`searchSourceReverseAt`** | `RandomAccess` | Yes (auto-populated when `null`) | Push (`Event` callback) | `O(tail)` reverse positional reads emitting matches newest-first |
 | **`resumeSourceSlice`** | `[]const u8` + `Result` | Yes (auto-populated when `null`) | Push (`Event` callback) | Same as `searchSourceSlice`, resumes from `previous.resume_at` |
 | **`openSourcePull`** | `[]const u8` | Yes (auto-populated when `null`) | Pull (`SourcePull.next()`) | Copies event payloads into caller's `allocator` until `deinit()` |
 | **`searchSlice`** | `[]const u8` | No (`null` means unbounded) | Legacy (`Line` callbacks) | Zero allocation when no transcoding/decompression is needed |
 | **`searchReader`** | `*std.Io.Reader` | No (`null` means unbounded) | Legacy (`Line` callbacks) | Rolling buffer + optional context/decode buffers |
+| **`searchRange`** | `RandomAccess` + `ByteRange` | No (`null` means unbounded) | Legacy (`Line` callbacks) | Positional reads restricted to `[start, end)` |
+| **`searchReverseSlice`** | `[]const u8` | No (`null` means unbounded) | Legacy (`Line` callbacks) | Reverse tail scan emitting matches newest-first |
+| **`searchReverseAt`** | `RandomAccess` | No (`null` means unbounded) | Legacy (`Line` callbacks) | `O(tail)` reverse positional reads emitting matches newest-first |
 
-Matchers passed to any search function can be `*Finder` (single literal), `*Multi` (multi-literal OR), or `*Regex` (linear-time regular expression). Each search call invokes `matcher.resetStats()` at the start of a stream.
+Matchers passed to any search function can be `*Finder` (single literal), `*Multi` (multi-literal OR), `*Regex` (linear-time regular expression), `*RegexSet` (multi-regex set), or `AnyMatcher`. Each search call invokes `matcher.resetStats()` at the start of a stream.
 
 A service sink `S` implements:
 
 ```zig
-pub fn event(self: *S, ev: libwebgrep.Event) libwebgrep.Flow // or bool
+pub fn event(self: *S, ev: libwebgrep.Event) libwebgrep.Flow // or bool, or libwebgrep.FlowAction
 ```
 
-- Returning `true` or `Flow.cont` continues scanning.
-- Returning `false` or `Flow.stop` stops scanning the current source and still emits `end`.
-- Returning `Flow.pause` pauses immediately without emitting `end` or `summary` and sets `Result.paused = true`; pass that `Result` to `resumeSourceSlice` to continue from the exact byte offset without re-emitting `begin`.
+- Returning `true`, `Flow.cont`, or `FlowAction.cont` continues scanning.
+- Returning `Flow.skipTo(target_offset)` (`FlowAction{ .skip_to = target_offset }`) jumps directly to `target_offset` in the searchable stream (using `read_at`/`seek_input` when available, or draining unseekable streams without scanning skipped bytes).
+- Returning `false`, `Flow.stop`, or `FlowAction.stop` stops scanning the current source and still emits `end`.
+- Returning `Flow.pause` or `FlowAction.pause` pauses immediately without emitting `end` or `summary` and sets `Result.paused = true`; pass that `Result` to `resumeSourceSlice` or `resumeSource` to continue from the exact byte offset without re-emitting `begin`.
 
 Events are delivered synchronously one by one without batching multiple lines in memory. Borrowed slices are valid only until the callback returns.
 
@@ -168,16 +175,131 @@ pub fn searchReader(
 
 Legacy callback entry point over a `*std.Io.Reader` stream without default service budgets. Prefer `searchSource` for service workloads.
 
+### searchRange
+
+```zig
+pub fn searchRange(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    sink: *S,
+    source: RandomAccess,
+    range: ByteRange,
+    name: []const u8,
+    matcher: anytype,
+    config: SearchConfig,
+) ReadError!Result
+```
+
+Legacy callback entry point that searches `range` (`[start, end)`) over a handle-free `RandomAccess` source using positional `read_at` calls without reading bytes outside `[start, end)` (except local line alignment when `range_align_lines = true`).
+
+### searchSourceRange
+
+```zig
+pub fn searchSourceRange(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    sink: *S,
+    source: RandomAccess,
+    range: ByteRange,
+    source_id: []const u8,
+    matcher: anytype,
+    config: SearchConfig,
+) ReadError!Result
+```
+
+Service entry point that searches `range` (`[start, end)`) over a handle-free `RandomAccess` source with default multi-tenant budgets. When `range` completes normally without hitting a budget, `Result.limit_hit` is `.none` and `Result.partial` is `false`.
+
+### searchReverseSlice
+
+```zig
+pub fn searchReverseSlice(
+    comptime S: type,
+    sink: *S,
+    haystack: []const u8,
+    name: []const u8,
+    matcher: anytype,
+    config: SearchConfig,
+) SliceError!Result
+```
+
+Legacy callback entry point that scans `haystack` (or `config.byte_range`) backward from the tail in bounded chunks, emitting matching lines newest-first (highest byte offset first).
+
+### searchSourceReverseSlice
+
+```zig
+pub fn searchSourceReverseSlice(
+    comptime S: type,
+    sink: *S,
+    source_id: []const u8,
+    haystack: []const u8,
+    matcher: anytype,
+    config: SearchConfig,
+) SliceError!Result
+```
+
+Service entry point for reverse tail search over an in-memory slice. When stopped by `max_results` or `Flow.pause`, `Result.resume_at` holds the byte offset of the last emitted line so the next page can continue backward with `byte_range = .{ .start = 0, .end = prev.resume_at }`.
+
+### searchReverseAt
+
+```zig
+pub fn searchReverseAt(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    sink: *S,
+    source: RandomAccess,
+    name: []const u8,
+    matcher: anytype,
+    config: SearchConfig,
+) ReadError!Result
+```
+
+Legacy callback entry point that scans backward from the end of `source` (or `config.byte_range`) in `O(tail)` positional reads without scanning from byte 0.
+
+### searchSourceReverseAt
+
+```zig
+pub fn searchSourceReverseAt(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    sink: *S,
+    source: RandomAccess,
+    source_id: []const u8,
+    matcher: anytype,
+    config: SearchConfig,
+) ReadError!Result
+```
+
+Service entry point for `O(tail)` reverse search over a `RandomAccess` source with default multi-tenant budgets.
+
 ### Flow
 
 ```zig
-pub const Flow = enum { cont, pause, stop };
+pub const Flow = enum {
+    cont,
+    pause,
+    stop,
+    pub fn skipTo(target_offset: u64) FlowAction
+};
 ```
 
 Flow control returned by service `event` callbacks:
 - `cont`: Continue scanning.
 - `pause`: Pause immediately, record `Result.resume_state` and `Result.resume_at`, and suppress `end` and `summary` so the caller can resume later via `resumeSourceSlice` or `resumeSource`.
 - `stop`: Stop scanning this source and emit `end`.
+- `Flow.skipTo(target_offset)`: Returns `FlowAction{ .skip_to = target_offset }` to jump to `target_offset` within the current source.
+
+### FlowAction
+
+```zig
+pub const FlowAction = union(enum) {
+    cont,
+    pause,
+    stop,
+    skip_to: u64,
+};
+```
+
+Extended flow control action union returned by `event` (or legacy `matched` / `begin`) callbacks. Forward searches ignore `skip_to` targets at or behind the current cursor and advance directly via slice indexing, buffered jumps, `read_at`/`seek_input`, or unseekable stream draining; reverse searches jump backward to `target < current_line_offset`. When jumping across uncounted bytes without an explicit line number, `line_number_known` automatically transitions to `false` under `LineNumberMode.auto`.
 
 ### AnySink
 
@@ -193,15 +315,7 @@ Constructs a `VTable` for legacy sink type `S` at comptime without heap allocati
 
 ### AnyEventSink
 
-Runtime-polymorphic wrapper for service event sinks (`ctx: *anyopaque` and `vtable: *const AnyEventSink.VTable`), allowing heterogeneous `Event` sinks (`searchSourceSlice`, `searchSource`, `searchTree`, `searchArchiveSlice`) to share a single monomorphized pipeline instance (`AnyEventSink.init(S, &sink)`).
-
-### anyEventSinkVtable
-
-```zig
-pub fn anyEventSinkVtable(comptime S: type) *const AnyEventSink.VTable
-```
-
-Constructs a static comptime `VTable` for a service sink type `S` implementing `pub fn event(self: *S, ev: Event) Flow` (or `bool`).
+Runtime-polymorphic wrapper for service event sinks (`ctx: *anyopaque` and `action_fn: *const fn (ctx: *anyopaque, ev: Event) FlowAction`), allowing heterogeneous `Event` sinks (`searchSourceSlice`, `searchSource`, `searchTree`, `searchArchiveSlice`) to share a single monomorphized pipeline instance (`AnyEventSink.init(S, &sink)` or `AnyEventSink.from(&sink)`).
 
 ### PullEvent
 
@@ -282,11 +396,98 @@ Sources with zero matches still emit begin and end (`matched_lines = 0`, `matche
 
 ### source
 
-Re-exports `src/source.zig`, an abstract virtual/in-memory tree interface (`Kind`, `Entry`, `VTable`, `Source`, `Node`, `Memory`) for virtual trees and unpacked archives. `Memory` maintains per-handle read/list cursors, supports slot reuse on `close`, and rejects `..` path traversal.
+Re-exports `src/source.zig`, an abstract virtual/in-memory tree interface (`Kind`, `Entry`, `VTable`, `Source`, `Node`, `Memory`) for virtual trees and unpacked archives. `Node` carries optional `mtime: ?i64 = null` Unix modification timestamps, and `Memory` maintains per-handle read/list cursors, supports slot reuse on `close`, and rejects `..` path traversal.
+
+### probe
+
+Re-exports `src/probe.zig`, providing handle-free `RandomAccess` and O(line) byte-offset line extraction (`ProbeOptions`, `LineProbe`, `probeLineSlice`, `probeLineAtBuf`, `probeLineAt`).
+
+### RandomAccess
+
+```zig
+pub const RandomAccess = struct {
+    ctx: ?*anyopaque = null,
+    read_at: *const fn (?*anyopaque, u64, []u8) anyerror!usize,
+    size: ?u64 = null,
+    pub fn readAt(self: RandomAccess, offset: u64, dest: []u8) anyerror!usize
+    pub fn readAtFull(self: RandomAccess, offset: u64, dest: []u8) anyerror!usize
+    pub fn fromSlice(slice: *const []const u8) RandomAccess
+};
+```
+
+Handle-free, path-free positional byte reader abstraction used by `probeLineAt*`, `searchRange`, `searchSourceRange`, `searchReverseAt`, `searchSourceReverseAt`, `ZstdSeekTable`, and `GzipIndex`.
+
+### ProbeOptions
+
+Configuration for byte-offset line probing (`delimiter: u8 = '\n'`, `strip_crlf: bool = true`, `max_line_bytes: usize = 2 MiB`, `window_chunk_bytes: usize = 4096`).
+
+### LineProbe
+
+Extracted line or bounded window enclosing a probed `offset` (`start_offset`, `end_offset`, `raw_end_offset`, `bytes`, `truncated_left`, `truncated_right`, `owned`, `deinit`). Guarantees the partition invariant `start_offset <= offset < raw_end_offset`.
+
+### probeLineSlice
+
+```zig
+pub fn probeLineSlice(haystack: []const u8, offset: u64, options: ProbeOptions) ?LineProbe
+```
+
+Zero-allocation byte-offset line probe over an in-memory `haystack` slice (`null` if empty or `offset >= haystack.len`).
+
+### probeLineAtBuf
+
+```zig
+pub fn probeLineAtBuf(source: RandomAccess, offset: u64, buf: []u8, options: ProbeOptions) !?LineProbe
+```
+
+Zero-heap-allocation byte-offset line probe over `RandomAccess`, writing extracted bytes into caller-supplied `buf`.
+
+### probeLineAt
+
+```zig
+pub fn probeLineAt(allocator: std.mem.Allocator, source: RandomAccess, offset: u64, options: ProbeOptions) !?LineProbe
+```
+
+Allocator-backed byte-offset line probe over `RandomAccess`. Call `lp.deinit(allocator)` to release `owned`.
+
+### seekable
+
+Re-exports `src/codec/seekable.zig`, providing seekable compressed random access over Zstandard Seekable Format streams (`ZstdSeekTable`, `SeekableZstdReader`, `compressSeekableZstdAlloc`) and multi-member / multi-block Gzip streams (`GzipIndex`, `IndexedGzipReader`, `compressMultiMemberGzipAlloc`).
+
+### ZstdSeekTable
+
+Parses (`parseFromSlice`, tail-only `parseFromRandomAccess`), builds (`buildFromSlice`), serializes (`serializeAlloc`), binary-searches (`locateOffset` in `O(log F)`), and reads (`readAt`) Zstandard Seekable Format (`0x184D2A5E` / `0x8F92EAB1`) streams with XXH64 checksum verification and decompression-ratio guards.
+
+### SeekableZstdReader
+
+```zig
+pub const SeekableZstdReader = struct {
+    pub fn init(allocator: std.mem.Allocator, source: RandomAccess, table: *const ZstdSeekTable) SeekableZstdReader
+    pub fn readAt(self: *const SeekableZstdReader, uncomp_offset: u64, dest: []u8) anyerror!usize
+    pub fn randomAccess(self: *const SeekableZstdReader) RandomAccess
+};
+```
+
+Adapter wrapping a parsed `ZstdSeekTable` and a compressed `RandomAccess` source into an uncompressed `RandomAccess` view for `probeLineAt`, `searchSourceRange`, and `searchSourceReverseAt`.
+
+### GzipIndex
+
+Pure-Zig RFC 1951/1952 multi-member Gzip & Deflate block checkpoint index (`buildFromSlice`, streaming `buildFromReader`, CRC32-protected `serializeAlloc` / `deserialize`, `O(log C)` `locateOffset`, and checkpoint-resuming `readAt`).
+
+### IndexedGzipReader
+
+```zig
+pub const IndexedGzipReader = struct {
+    pub fn init(allocator: std.mem.Allocator, source: RandomAccess, index: *const GzipIndex) IndexedGzipReader
+    pub fn readAt(self: *const IndexedGzipReader, uncomp_offset: u64, dest: []u8) anyerror!usize
+    pub fn randomAccess(self: *const IndexedGzipReader) RandomAccess
+};
+```
+
+Adapter wrapping a `GzipIndex` and a compressed `RandomAccess` source into an uncompressed `RandomAccess` view for `probeLineAt`, `searchSourceRange`, and `searchSourceReverseAt`.
 
 ### archive
 
-Re-exports `src/codec/archive.zig`, providing zero-disk-landing in-memory archive unpacking (`ArchiveFormat`, `ArchiveOptions`, `ArchiveError`, `ArchiveTree`) for `.tar` (USTAR, GNU `@LongLink`, PAX `path=`/`size=`), `.tar.gz`/`.tgz`, `.tar.zst`, `.tar.xz`, and `.zip` (Store & Deflate).
+Re-exports `src/codec/archive.zig`, providing zero-disk-landing in-memory archive unpacking (`ArchiveFormat`, `ArchiveEntryMeta`, `ArchiveOptions`, `ArchiveError`, `ArchiveTree`) for `.tar` (USTAR, GNU `@LongLink`, PAX `path=`/`size=`), `.tar.gz`/`.tgz`, `.tar.zst`, `.tar.xz`, and `.zip` (Store & Deflate).
 
 ### ArchiveFormat
 
@@ -295,6 +496,20 @@ pub const ArchiveFormat = enum { auto, tar, tar_gz, tar_zst, tar_xz, zip };
 ```
 
 Archive container format selector (`auto` sniffs magic bytes for `.zip`, `.tar.gz`, `.tar.zst`, `.tar.xz`, and `.tar`).
+
+### ArchiveEntryMeta
+
+```zig
+pub const ArchiveEntryMeta = struct {
+    path: []const u8,
+    kind: source.Kind,
+    size: u64,
+    compressed_size: u64,
+    mtime: ?i64 = null,
+};
+```
+
+Sanitized archive entry metadata passed to `ArchiveOptions.entry_filter` strictly before decompression, payload allocation, or entry/byte quota accounting.
 
 ### ArchiveOptions
 
@@ -305,6 +520,7 @@ Archive container format selector (`auto` sniffs magic bytes for `.zip`, `.tar.g
 | `max_entry_bytes` | `u64` | `64 MiB` | Maximum uncompressed bytes for a single entry (`error.ArchiveLimit`) |
 | `max_total_bytes` | `u64` | `256 MiB` | Maximum total uncompressed bytes across the archive (`error.ArchiveLimit`) |
 | `max_compression_ratio` | `u64` | `100` | Maximum decompression expansion ratio (`error.ArchiveLimit`) |
+| `entry_filter` / `entry_filter_ctx` | `?fn` / `?*anyopaque` | `null` | Optional pre-decompression callback `(ctx, ArchiveEntryMeta) -> bool`; returning `false` skips the entry before decompression and quota checks |
 
 ### ArchiveError
 
@@ -386,7 +602,7 @@ Unpacks an archive stream from `reader` into an in-memory `ArchiveTree` and sear
 
 `libwebgrep` provides four interchangeable matcher types (`Finder`, `Multi`, `Regex`, and `RegexSet`) plus the type-erased `AnyMatcher`, all sharing the same lock-free `*const` matcher protocol.
 
-Literal patterns (`Finder` and `Multi`) cannot contain `\n` (returning `error.PatternHasNewline` before scanning). An empty literal pattern `""` produces a zero-width match `[0, 0)` once per line.
+Literal patterns (`Finder` and `Multi`) cannot contain `\n` by default (returning `error.PatternHasNewline` before scanning) unless `FindOptions.multiline = true`. An empty literal pattern `""` produces a zero-width match `[0, 0)` once per line.
 
 Pattern count defaults to `1024` (`default_max_pattern_count`), and total pattern bytes default to `256 KiB` (`default_max_pattern_bytes`). Both limits can be configured or raised freely via `FindOptions.max_pattern_count` and `FindOptions.max_pattern_bytes`. Exceeding the configured limit returns `error.PatternCountExceeded` or `error.PatternBytesExceeded` before allocating any tables.
 
@@ -401,8 +617,7 @@ Single-literal SIMD finder (`src/finder/finder.zig`).
 ```zig
 pub fn init(pattern: []const u8, options: FindOptions) !Finder
 pub fn find(self: *const Finder, haystack: []const u8, start: usize, mode: MatchMode) ?Match
-pub fn findWatched(self: *const Finder, haystack: []const u8, start: usize, mode: MatchMode, nul_at: *?usize) ?Match
-pub fn acceptsSpan(self: *const Finder, span: []const u8) bool
+pub fn findWatched(self: *const Finder, haystack: []const u8, start: usize, nul: *?usize) ?Match
 pub fn requiredLiteral(self: *const Finder) ?RequiredLiteral
 pub fn resetStats(self: *const Finder) void
 ```
@@ -422,7 +637,8 @@ pub fn init(allocator: std.mem.Allocator, patterns: []const []const u8, options:
 pub fn initFromText(allocator: std.mem.Allocator, text: []const u8, options: FindOptions) !Multi
 pub fn deinit(self: *Multi) void
 pub fn find(self: *const Multi, haystack: []const u8, start: usize, mode: MatchMode) ?Match
-pub fn acceptsSpan(self: *const Multi, span: []const u8) bool
+pub fn findWatched(self: *const Multi, haystack: []const u8, start: usize, nul: *?usize) ?Match
+pub fn acceptsSpan(self: *const Multi, span: []const u8, mode: MatchMode) bool
 pub fn isEmpty(self: *const Multi) bool
 pub fn engineName(self: *const Multi) []const u8
 pub fn resetStats(self: *const Multi) void
@@ -434,7 +650,7 @@ Automatically dispatches across four SIMD-accelerated engines based on pattern c
 3. `Teddy`: 8-bucket Slim Teddy nibble-mask SIMD lookup (`vtbl` / `pshufb` / `vpshufb`) with 2-phase fingerprint verification (`<= 32` patterns).
 4. `AhoCorasick`: Byte-equivalence-compressed dense DFA with 64-byte high-nibble bucket bitmap SIMD skip loop at `state == 0`.
 
-Every `Match` returned by `Multi.find` carries the exact 0-based `pattern_id: u32` of the winning pattern (breaking ties by smaller `pattern_id`). Once constructed, `Multi` is completely immutable (`*const Multi`) and lock-free to share across concurrent threads.
+Every `Match` returned by `Multi.find` carries the exact 0-based `pattern_id: ?u32` of the winning pattern (breaking ties by smaller `pattern_id`). Once constructed, `Multi` is completely immutable (`*const Multi`) and lock-free to share across concurrent threads.
 
 ### multi
 
@@ -449,11 +665,11 @@ pub fn init(allocator: std.mem.Allocator, pattern: []const u8, options: RegexOpt
 pub fn initDiagnostic(allocator: std.mem.Allocator, pattern: []const u8, options: RegexOptions, diag: ?*CompileDiagnostic) !Regex
 pub fn deinit(self: *Regex) void
 pub fn find(self: *const Regex, haystack: []const u8, start: usize, mode: MatchMode) ?Match
-pub fn findWithScratch(self: *const Regex, haystack: []const u8, start: usize, mode: MatchMode, scratch: ?*RegexScratch) ?Match
-pub fn findWatched(self: *const Regex, haystack: []const u8, start: usize, mode: MatchMode, nul_at: *?usize) ?Match
+pub fn findWithScratch(self: *const Regex, haystack: []const u8, start: usize, mode: MatchMode, scratch: *RegexScratch) ?Match
+pub fn findWatched(self: *const Regex, haystack: []const u8, start: usize, nul: *?usize) ?Match
 pub fn findCaptures(self: *const Regex, haystack: []const u8, start: usize, mode: MatchMode) ?Captures
 pub fn extractCaptures(self: *const Regex, haystack: []const u8, match_span: Match) Captures
-pub fn acceptsSpan(self: *const Regex, span: []const u8) bool
+pub fn acceptsSpan(self: *const Regex, span: []const u8, mode: MatchMode) bool
 pub fn requiredLiteral(self: *const Regex) ?RequiredLiteral
 pub fn resetStats(self: *const Regex) void
 ```
@@ -537,7 +753,7 @@ Populated by `Regex.initDiagnostic` and `RegexSet.initDiagnostic` when compilati
 ```zig
 pub const Captures = struct {
     match: Match,
-    groups: [9]?Match = .{null} ** 9,
+    groups: [9]?Match = @splat(null),
     pub fn fullMatch(self: Captures) Match
     pub fn group(self: Captures, index: usize) ?Match
     pub fn slice(self: Captures, haystack: []const u8, index: usize) ?[]const u8
@@ -557,18 +773,11 @@ pub const AnyMatcher = struct {
     ctx: *const anyopaque,
     vtable: *const VTable,
     pub fn init(comptime M: type, matcher_ptr: anytype) AnyMatcher
+    pub fn from(matcher_ptr: anytype) AnyMatcher
 };
 ```
 
 Runtime-polymorphic, immutable (`*const anyopaque`) matcher wrapper for `Finder`, `Multi`, `Regex`, `RegexSet`, or custom matchers. Reduces compile-time monomorphization bloat by allowing all search entry points to compile once against `AnyMatcher`.
-
-### anyMatcherVtable
-
-```zig
-pub fn anyMatcherVtable(comptime M: type) *const AnyMatcher.VTable
-```
-
-Builds the static comptime `AnyMatcher.VTable` for matcher type `M` without heap allocation.
 
 ### MatchMode
 
@@ -577,7 +786,7 @@ Builds the static comptime `AnyMatcher.VTable` for matcher type `M` without heap
 
 ### Match
 
-Half-open byte range `{ start: usize, end: usize, pattern_id: u32 = 0 }` relative to the `haystack` slice passed to `find`. `pattern_id` identifies the 0-based index of the matching pattern in `Multi` and `RegexSet` (`0` for single-pattern `Finder` and `Regex`).
+Half-open byte range `{ start: usize, end: usize, pattern_id: ?u32 = null }` relative to the `haystack` slice passed to `find`. `pattern_id` identifies the 0-based index of the matching pattern in `Multi` and `RegexSet` (`null` for single-pattern `Finder` and `Regex`).
 
 ### CaseMode
 
@@ -589,7 +798,9 @@ Half-open byte range `{ start: usize, end: usize, pattern_id: u32 = 0 }` relativ
 | :--- | :--- | :--- | :--- |
 | `case` | `CaseMode` | `.sensitive` | Case sensitivity mode (`sensitive`, `insensitive`, `smart`) |
 | `unicode_case` | `bool` | `false` | Enables Unicode Simple Case Folding expansion in `Finder` and `Multi` |
-| `frequency` | `?*const [256]u8` | `null` | Optional custom byte frequency rank table for anchor selection |
+| `multiline` | `bool` | `false` | Allows literal patterns to contain `\n` and match across lines within `max_multiline_window` |
+| `max_multiline_window` | `usize` | `64 * 1024` | Maximum byte span for a cross-line match (`64 KiB` default, caller configurable) |
+| `frequency` | `?[256]u8` | `null` | Optional custom byte frequency rank table for anchor selection |
 | `prefilter_fp_threshold` | `f32` | `0.80` | Threshold (`< 1.0` enables adaptive fallback to `TwoWay` on patterns `> 32` bytes) |
 | `max_pattern_count` | `?usize` | `null` | Optional pattern count cap (defaults to `1024`, caller configurable) |
 | `max_pattern_bytes` | `?usize` | `null` | Optional total pattern bytes cap (defaults to `256 KiB`, caller configurable) |
@@ -597,7 +808,7 @@ Half-open byte range `{ start: usize, end: usize, pattern_id: u32 = 0 }` relativ
 
 ### matcher
 
-Re-exports `src/matcher.zig`, defining `MatchMode`, `Match`, `RequiredLiteral`, `CaseMode`, `FindOptions`, `AnyMatcher`, `anyMatcherVtable`, `default_max_pattern_count` (`1024`), `default_max_pattern_bytes` (`256 KiB`), and `checkPatternLimits`.
+Re-exports `src/matcher.zig`, defining `MatchMode`, `Match`, `RequiredLiteral`, `CaseMode`, `FindOptions`, `AnyMatcher`, `default_max_pattern_count` (`1024`), `default_max_pattern_bytes` (`256 KiB`), and `checkPatternLimits`.
 
 ### RequiredLiteral
 
@@ -610,6 +821,18 @@ Re-exports `src/finder/memchr.zig`. Vectorized single-byte primitives (`find`, `
 ### two_way
 
 Re-exports `src/finder/two_way.zig`. Crochemore-Perrin worst-case linear-time substring search (`TwoWay.init(pattern, fold)` and `find(haystack, start)`) with zero allocation and ASCII case folding by default (`Fold.sensitive` or `Fold.ascii`).
+
+### bloom
+
+Re-exports `src/finder/bloom.zig`, providing Kirsch-Mitzenmacher N-gram / Trigram Bloom indexing and zero-false-negative matcher pre-screening (`BloomConfig`, `NgramBloom`).
+
+### BloomConfig
+
+Configuration for `NgramBloom` (`bit_count: u32 = 16384`, `num_hashes: u8 = 3`, `ngram_len: u8 = 3`, `ascii_lower: bool = true`).
+
+### NgramBloom
+
+Space-efficient N-gram / Trigram Bloom filter supporting `init`, zero-allocation `initBorrowed`, `addSlice`, chunk-bridging `Writer` (`writer().addChunk`), CRC32-protected `serializeAlloc` / `deserialize`, `merge`, `estimatedFillRatio`, and zero-false-negative pre-screeners (`mayContainLiteral`, `mayContainRequired`, `mayContainFinder`, `mayContainMulti`, `mayContainRegex`, `mayContainRegexSet`, `mayContainMatcher`) across `sensitive`, `insensitive`, `smart`, and Unicode Simple Case Folding (`k`/`K`, `s`/`ſ`, `ß`/`ẞ`).
 
 ---
 
@@ -700,7 +923,8 @@ pub const Event = union(enum) {
 | Field | Type | Description |
 | :--- | :--- | :--- |
 | `source_id` | `[]const u8` | Caller-assigned opaque source identifier |
-| `line_number` | `u64` | 1-based line number (or record number when `null_data = true`) |
+| `line_number` | `u64` | 1-based line number (or record number when `null_data = true`; `0` when `line_number_known == false`) |
+| `line_number_known` | `bool` | `true` when `line_number` is exact; `false` when starting mid-file or in reverse tail search without scanning from offset 0 or supplying `initial_line_number` |
 | `column` | `?u64` | 1-based byte column of the first match (`null` when no match) |
 | `u16_column` | `?u64` | 1-based UTF-16 code-unit column of the first match (`null` when no match) |
 | `absolute_offset` | `u64` | 0-based byte offset of the line start in the searchable UTF-8 stream |
@@ -715,6 +939,8 @@ pub const Event = union(enum) {
 | `window_start` | `u64` | Starting byte offset of `bytes` within the original line |
 | `binary_status` | `BinaryStatus` | Binary status for this line (`none`, `detected`, `suppressed`) |
 
+When cross-line matching is active (`multiline = true`), a `LineEvent` (or legacy `Line`) that spans multiple physical lines contains the contiguous multi-line block in `bytes` (preserving internal `\n` delimiters and stripping only the final line's trailing delimiter), reports the 1-based `line_number` of the first spanned line, and merges any subsequent match starting on the final spanned line that extends onto further lines into the same event within a bounded sliding window (`max_multiline_window`).
+
 ### Line
 
 Legacy callback line struct (`searchSlice` / `searchReader`), carrying `bytes`, `text`, `raw`, `replaced`, `offset`, `raw_offset`, `number` (`?u64`), `match` (`?Match`), `matches` (`[]const Span`), `column`, `u16_column`, `binary_status`, `truncated`, `line_len`, and `window_start`.
@@ -727,7 +953,7 @@ Legacy callback line struct (`searchSlice` / `searchReader`), carrying `bytes`, 
 | `end` | `usize` | Exclusive 0-based end byte offset relative to `bytes` |
 | `u16_start` | `usize` | Inclusive 0-based UTF-16 code-unit start offset on `text` |
 | `u16_end` | `usize` | Exclusive 0-based UTF-16 code-unit end offset on `text` |
-| `pattern_id` | `u32` | 0-based pattern index that produced this match (`Multi` / `RegexSet`, `0` for single pattern) |
+| `pattern_id` | `?u32` | 0-based pattern index that produced this match (`Multi` / `RegexSet`, `null` for single pattern) |
 | `replacement` | `?[]const u8` | Replacement template slice when `SearchConfig.replacement != null` |
 
 ### EndEvent
@@ -804,10 +1030,20 @@ All multi-tenant budgets are configured via `SearchConfig` and enforced determin
 
 | Field | Type | Struct Default | Service Default / Behavior | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| `line_numbers` | `bool` | `false` | Forced `true` on service entry | Enables 1-based line numbers |
+| `line_numbers` | `bool` | `false` | `line_number_mode != .unknown` on service entry | Enables 1-based line numbers |
+| `initial_line_number` | `?u64` | `null` | `null` | Explicit starting 1-based line number for `byte_range` or last line number in reverse tail search |
+| `line_number_mode` | `LineNumberMode` | `.auto` | `.auto` | Line numbering policy (`.auto`, `.from_one`, `.unknown`) |
+| `byte_range` | `?ByteRange` | `null` | `null` | Half-open byte range `[start, end)` to search without scanning outside the range |
+| `range_align_lines` | `bool` | `false` | `false` | Aligns `byte_range.start > 0` forward to the next line start and extends `byte_range.end` through the end of a cut line |
+| `seek_input` / `seek_ctx` | `?fn` / `?*anyopaque` | `null` | `null` | Optional seek callback `(ctx, offset)` for `byte_range`, `resume_from`, and `Flow.skipTo` |
+| `read_at` / `read_at_ctx` | `?fn` / `?*anyopaque` | `null` | `null` | Optional positional read callback `(ctx, offset, dest) -> usize` for zero-seek range and jump I/O |
+| `stream_offset` | `?u64` | `null` | `null` | Declares that `*std.Io.Reader` is already positioned at this absolute byte offset |
+| `line_filter` / `line_filter_ctx` | `?fn` / `?*anyopaque` | `null` | `null` | Synchronous pre-count / pre-quota predicate `(ctx, LineFilterCandidate) -> bool` evaluated strictly before `max_count`, `max_results`, `matched_lines`, `matches`, and context |
 | `invert` | `bool` | `false` | `false` | Emits lines that do not match |
 | `whole_word` | `bool` | `false` | `false` | Half-boundary word check (ASCII + Unicode word characters) |
 | `whole_line` | `bool` | `false` | `false` | Requires entire line content to match |
+| `multiline` | `bool` | `false` | `false` | Enables cross-line (`-U`) search semantics across line boundaries |
+| `max_multiline_window` | `?usize` | `null` | Matcher's window (`64 KiB` default) | Optional override for the maximum cross-line lookahead window in bytes |
 | `contains` | `[]const []const u8` | `&.{}` | `&.{}` | Every listed literal must appear on the line (AND) |
 | `excludes` | `[]const []const u8` | `&.{}` | `&.{}` | None of the listed literals may appear on the line (NOT) |
 | `filter_case_insensitive` | `bool` | `false` | `false` | Enables ASCII case-insensitive matching for `contains` and `excludes` |
@@ -857,6 +1093,42 @@ All multi-tenant budgets are configured via `SearchConfig` and enforced determin
 | `close_input` / `close_ctx` | `?fn` / `?*anyopaque` | `null` | `null` | Callback to close upstream on early termination |
 | `clock` / `clock_ctx` | `?fn` / `?*anyopaque` | `null` | `null` | Custom monotonic clock hook for deterministic testing |
 | `log` / `log_ctx` | `?fn` / `?*anyopaque` | `null` | `null` | Diagnostic log callback (never written to terminal) |
+
+### ByteRange
+
+```zig
+pub const ByteRange = struct {
+    start: u64 = 0,
+    end: ?u64 = null,
+};
+```
+
+Half-open byte range `[start, end)` within a source (`end == null` searches through EOF). Used by `SearchConfig.byte_range`, `searchRange`, and `searchSourceRange`.
+
+### LineNumberMode
+
+```zig
+pub const LineNumberMode = enum { auto, from_one, unknown };
+```
+
+Controls line number tracking:
+- `.auto`: Computes exact 1-based line numbers when starting at byte 0 or when `initial_line_number` / `continuation` is supplied; marks line numbers unknown (`Line.number = null`, `LineEvent.line_number_known = false`) when starting mid-file or in reverse tail search without scanning from byte 0.
+- `.from_one`: Counts lines starting at `1` from the start of the searched range (unless overridden by `initial_line_number`).
+- `.unknown`: Never computes line numbers (`Line.number = null`, `LineEvent.line_number = 0`, `LineEvent.line_number_known = false`).
+
+### LineFilterCandidate
+
+```zig
+pub const LineFilterCandidate = struct {
+    bytes: []const u8,
+    raw_bytes: []const u8,
+    absolute_offset: u64,
+    first_match: Span,
+    is_inverted: bool = false,
+};
+```
+
+Candidate line passed to `SearchConfig.line_filter` after primary pattern and `whole_word`/`whole_line`/`contains`/`excludes` checks pass, and strictly before `max_count`, `max_results`, `matched_lines`, `matches`, or context buffers are affected. Returning `false` rejects the line with zero quota impact.
 
 ---
 
@@ -912,16 +1184,40 @@ Re-exports `src/walk/types.zig`. Maps file type names (e.g. `zig`, `rust`, `py`,
 
 Re-exports `src/walk/list_dir.zig`. Batched directory entry iterator (`Lister`) over an opened `std.Io.Dir`.
 
+### scheduler
+
+Re-exports `src/scheduler.zig`, providing a generic path-free, handle-free Chase-Lev work-stealing task scheduler (`SchedulerConfig`, `Scheduler`, `max_threads_hard_cap`, `resolveWorkerCount`).
+
+### SchedulerConfig
+
+```zig
+pub const SchedulerConfig = struct {
+    max_threads: ?u32 = null,
+    stop: ?*const std.atomic.Value(bool) = null,
+    cancel: ?*const std.atomic.Value(bool) = null,
+};
+```
+
+Configuration for `Scheduler(Task, Context).run`. `max_threads == null` or `<= 1` runs inline on the calling thread with zero mutex or `Io.Group` overhead; `max_threads > 1` runs up to `64` Chase-Lev workers.
+
+### Scheduler
+
+```zig
+pub fn Scheduler(comptime Task: type, comptime Context: type) type
+```
+
+Generic Chase-Lev work-stealing scheduler executing `initial_tasks` and recursively spawned `handle.spawn(subtask)` items across worker deques (`LIFO` local pop for cache locality, `FIFO` peer steal, `handle.stop()`, `handle.isStopped()`, `handle.isCancelled()`).
+
 ---
 
 ## C ABI (`include/webgrep.h`)
 
-When built with `-Dc-lib=true` (`zig build -Dc-lib=true -Doptimize=ReleaseFast`), `libwebgrep` produces static (`libwebgrep.a`) and shared (`libwebgrep.so` / `.dylib`) libraries exposing the zero-libc C ABI declared in `include/webgrep.h`:
-- `wg_version()`
-- `wg_matcher_create_literal`, `wg_matcher_create_multi`, `wg_matcher_create_regex`, `wg_matcher_destroy`, `wg_matcher_find`
-- `wg_regex_set_create`, `wg_regex_set_destroy`, `wg_regex_set_matches`
-- `wg_scratch_create`, `wg_scratch_destroy`
-- `wg_search_slice`
+`zig build` installs static (`libwebgrep.a`) and shared (`libwebgrep.so` / `.dylib`) libraries along with `include/webgrep.h`, exposing 20 C ABI functions (`callconv(.c)`):
+- `webgrep_version`, `webgrep_find_options_default`, `webgrep_regex_options_default`, `webgrep_config_default`, `webgrep_tree_config_default`, `webgrep_probe_options_default`
+- `webgrep_matcher_compile_literal`, `webgrep_matcher_compile_multi`, `webgrep_matcher_compile_regex`, `webgrep_matcher_compile_regex_set`, `webgrep_matcher_free`
+- `webgrep_scratch_new`, `webgrep_scratch_free`
+- `webgrep_find`, `webgrep_regex_set_matches`, `webgrep_probe_line_slice`
+- `webgrep_search_slice`, `webgrep_search_reader`, `webgrep_search_reverse_slice`, `webgrep_search_archive_slice`
 
 ---
 
@@ -1065,6 +1361,19 @@ test "API documentation example" {
     try std.testing.expectEqual(@as(usize, 1), re_set.matches("code=ERR_404", &set_ids));
     try std.testing.expectEqual(@as(u32, 1), set_ids[0]);
 
+    // Cross-line (multiline) literal & regex search
+    const ml_finder = try libwebgrep.Finder.init("alpha\nbeta", .{ .multiline = true });
+    var ml_sink = Recorder{};
+    const ml_res = try libwebgrep.searchSourceSlice(
+        Recorder,
+        &ml_sink,
+        "ml-1",
+        "header\nalpha\nbeta\nfooter\n",
+        &ml_finder,
+        .{ .multiline = true },
+    );
+    try std.testing.expectEqual(@as(u64, 1), ml_res.matched_lines);
+
     // 4. Streaming Reader search + Slice & Streaming Pull iterators
     var reader = std.Io.Reader.fixed("stream NEEDLE line\n");
     var stream_sink = Recorder{};
@@ -1107,6 +1416,42 @@ test "API documentation example" {
     );
     try std.testing.expect(libwebgrep.walk_glob.matchGlobs(globs, "src/MAIN.ZIG", "MAIN.ZIG", false));
     try std.testing.expect(!libwebgrep.walk_glob.matchGlobs(globs, "src/generated.c", "generated.c", false));
+
+    // 6. Byte-offset line probe, RandomAccess range search, reverse tail search, and NgramBloom pre-screening
+    const probed = libwebgrep.probeLineSlice(input, 17, .{}).?;
+    try std.testing.expectEqualStrings("hello NEEDLE world", probed.bytes);
+
+    var bloom_filter = try libwebgrep.NgramBloom.init(allocator, .{});
+    defer bloom_filter.deinit();
+    bloom_filter.addSlice(input);
+    try std.testing.expect(bloom_filter.mayContainMatcher(&finder));
+
+    const input_slice: []const u8 = input;
+    const ra = libwebgrep.RandomAccess.fromSlice(&input_slice);
+    var range_sink = Recorder{};
+    const range_res = try libwebgrep.searchSourceRange(
+        Recorder,
+        allocator,
+        &range_sink,
+        ra,
+        .{ .start = 11, .end = 30 },
+        "range-1",
+        &finder,
+        .{ .initial_line_number = 2 },
+    );
+    try std.testing.expectEqual(@as(u64, 1), range_res.matched_lines);
+
+    var rev_sink = Recorder{};
+    const rev_res = try libwebgrep.searchSourceReverseSlice(
+        Recorder,
+        &rev_sink,
+        "rev-1",
+        log_slice,
+        &many,
+        .{ .max_count = 1 },
+    );
+    try std.testing.expectEqual(@as(u64, 1), rev_res.matched_lines);
+    try std.testing.expectEqual(@as(u32, 1), rev_sink.last_pattern_id);
 }
 ```
 

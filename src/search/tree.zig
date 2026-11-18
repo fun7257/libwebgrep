@@ -458,6 +458,7 @@ fn FileSinkAdapter(comptime S: type) type {
     return struct {
         inner: *S,
         bridge: if (is_event) pull_mod.EventBridge(S) else void,
+        last_action: sink_mod.FlowAction = .cont,
         stopped_by_sink: bool = false,
 
         const Self = @This();
@@ -474,120 +475,113 @@ fn FileSinkAdapter(comptime S: type) type {
         }
 
         pub fn control(self: *Self) sink_mod.Flow {
-            if (is_event) return self.bridge.control();
-            if (@hasDecl(S, "control")) return self.inner.control();
-            return if (self.stopped_by_sink) .stop else .cont;
+            return self.controlAction().toFlow();
+        }
+
+        pub fn controlAction(self: *Self) sink_mod.FlowAction {
+            if (is_event) return self.bridge.controlAction();
+            if (@hasDecl(S, "controlAction")) return self.inner.controlAction();
+            if (@hasDecl(S, "control")) return sink_mod.FlowAction.fromFlow(self.inner.control());
+            return self.last_action;
+        }
+
+        fn recordAction(self: *Self, action: sink_mod.FlowAction) bool {
+            self.last_action = action;
+            switch (action) {
+                .cont => return true,
+                .skip_to => return false,
+                .pause, .stop => {
+                    self.stopped_by_sink = true;
+                    return false;
+                },
+            }
         }
 
         pub fn begin(self: *Self, name: []const u8) bool {
             if (is_event) {
-                const keep = self.bridge.begin(name);
-                if (!keep) self.stopped_by_sink = true;
-                return keep;
+                _ = self.bridge.begin(name);
+                return self.recordAction(self.bridge.controlAction());
             }
             if (@hasDecl(S, "begin")) {
-                const keep = self.inner.begin(name);
-                if (!keep) self.stopped_by_sink = true;
-                return keep;
+                return self.recordAction(state_mod.callSinkAction(S, "begin", self.inner, .{name}));
             }
             return true;
         }
 
         pub fn matched(self: *Self, line: sink_mod.Line) bool {
             if (is_event) {
-                const keep = self.bridge.matched(line);
-                if (!keep) self.stopped_by_sink = true;
-                return keep;
+                _ = self.bridge.matched(line);
+                return self.recordAction(self.bridge.controlAction());
             }
             if (@hasDecl(S, "matched")) {
-                const keep = self.inner.matched(line);
-                if (!keep) self.stopped_by_sink = true;
-                return keep;
+                return self.recordAction(state_mod.callSinkAction(S, "matched", self.inner, .{line}));
             }
             return true;
         }
 
         pub fn context(self: *Self, line: sink_mod.Line) bool {
             if (is_event) {
-                const keep = self.bridge.context(line);
-                if (!keep) self.stopped_by_sink = true;
-                return keep;
+                _ = self.bridge.context(line);
+                return self.recordAction(self.bridge.controlAction());
             }
             if (@hasDecl(S, "context")) {
-                const keep = self.inner.context(line);
-                if (!keep) self.stopped_by_sink = true;
-                return keep;
+                return self.recordAction(state_mod.callSinkAction(S, "context", self.inner, .{line}));
             }
             return true;
         }
 
         pub fn contextBreak(self: *Self) bool {
             if (is_event) {
-                const keep = self.bridge.contextBreak();
-                if (!keep) self.stopped_by_sink = true;
-                return keep;
+                _ = self.bridge.contextBreak();
+                return self.recordAction(self.bridge.controlAction());
             }
             if (@hasDecl(S, "contextBreak")) {
-                const keep = self.inner.contextBreak();
-                if (!keep) self.stopped_by_sink = true;
-                return keep;
+                return self.recordAction(state_mod.callSinkAction(S, "contextBreak", self.inner, .{}));
             }
             return true;
         }
 
         pub fn binary(self: *Self, offset: u64) bool {
             if (!is_event and @hasDecl(S, "binary")) {
-                const keep = self.inner.binary(offset);
-                if (!keep) self.stopped_by_sink = true;
-                return keep;
+                return self.recordAction(state_mod.callSinkAction(S, "binary", self.inner, .{offset}));
             }
             return true;
         }
 
         pub fn progress(self: *Self, bytes_searched: u64, match_count: u64, matched_lines: u64) bool {
             if (is_event) {
-                const keep = self.bridge.progress(bytes_searched, match_count, matched_lines);
-                if (!keep) self.stopped_by_sink = true;
-                return keep;
+                _ = self.bridge.progress(bytes_searched, match_count, matched_lines);
+                return self.recordAction(self.bridge.controlAction());
             }
             if (@hasDecl(S, "progress")) {
-                const keep = self.inner.progress(bytes_searched, match_count, matched_lines);
-                if (!keep) self.stopped_by_sink = true;
-                return keep;
+                return self.recordAction(state_mod.callSinkAction(S, "progress", self.inner, .{ bytes_searched, match_count, matched_lines }));
             }
             return true;
         }
 
         pub fn heartbeat(self: *Self, bytes_searched: u64, match_count: u64, matched_lines: u64) bool {
             if (is_event) {
-                const keep = self.bridge.heartbeat(bytes_searched, match_count, matched_lines);
-                if (!keep) self.stopped_by_sink = true;
-                return keep;
+                _ = self.bridge.heartbeat(bytes_searched, match_count, matched_lines);
+                return self.recordAction(self.bridge.controlAction());
             }
             if (@hasDecl(S, "heartbeat")) {
-                const keep = self.inner.heartbeat(bytes_searched, match_count, matched_lines);
-                if (!keep) self.stopped_by_sink = true;
-                return keep;
+                return self.recordAction(state_mod.callSinkAction(S, "heartbeat", self.inner, .{ bytes_searched, match_count, matched_lines }));
             }
             return true;
         }
 
         pub fn finish(self: *Self, result: sink_mod.Result) bool {
             if (is_event) {
-                const keep = self.bridge.finish(result);
-                if (!keep) self.stopped_by_sink = true;
-                return keep;
+                _ = self.bridge.finish(result);
+                return self.recordAction(self.bridge.controlAction());
             }
             if (@hasDecl(S, "finish")) {
                 const Ret = @typeInfo(@TypeOf(@field(S, "finish"))).@"fn".return_type.?;
-                if (Ret == bool) {
-                    const keep = self.inner.finish(result);
-                    if (!keep) self.stopped_by_sink = true;
-                    return keep;
-                } else {
+                if (Ret == void) {
                     self.inner.finish(result);
                     return true;
                 }
+                return self.recordAction(state_mod.callSinkAction(S, "finish", self.inner, .{result}));
             }
             return true;
         }

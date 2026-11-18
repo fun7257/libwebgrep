@@ -121,6 +121,20 @@ typedef enum webgrep_limit_hit_e {
     WEBGREP_LIMIT_CANCELLED          = 5
 } webgrep_limit_hit_t;
 
+/** Line numbering policy for mid-file range and reverse tail searches. */
+typedef enum webgrep_line_number_mode_e {
+    WEBGREP_LINE_NUM_AUTO     = 0,
+    WEBGREP_LINE_NUM_FROM_ONE = 1,
+    WEBGREP_LINE_NUM_UNKNOWN  = 2
+} webgrep_line_number_mode_t;
+
+/** Archive entry kind reported to `webgrep_archive_entry_filter_cb`. */
+typedef enum webgrep_entry_kind_e {
+    WEBGREP_ENTRY_FILE      = 0,
+    WEBGREP_ENTRY_DIRECTORY = 1,
+    WEBGREP_ENTRY_OTHER     = 2
+} webgrep_entry_kind_t;
+
 /* ============================================================================
  * Opaque Handles
  * ========================================================================= */
@@ -145,6 +159,8 @@ typedef struct webgrep_pattern_s {
 typedef struct webgrep_find_options_s {
     int      case_mode;
     uint8_t  unicode_case;
+    uint8_t  multiline;
+    size_t   max_multiline_window;
     size_t   max_patterns;
     size_t   max_pattern_bytes;
     size_t   max_unicode_variants;
@@ -211,38 +227,104 @@ typedef struct webgrep_line_event_s {
     size_t                matches_len;
     uint8_t               is_context;
     uint8_t               truncated;
+    uint8_t               line_number_known;
 } webgrep_line_event_t;
 
-/** Search configuration for slice and streaming searches. */
+/** Candidate line passed to `webgrep_line_filter_cb` before consuming quota or counters. */
+typedef struct webgrep_line_filter_candidate_s {
+    const uint8_t *bytes_ptr;
+    size_t         bytes_len;
+    const uint8_t *raw_bytes_ptr;
+    size_t         raw_bytes_len;
+    uint64_t       absolute_offset;
+    webgrep_span_t first_match;
+    uint8_t        is_inverted;
+} webgrep_line_filter_candidate_t;
+
+/**
+ * Pre-count / pre-quota line filter callback.
+ * Borrowed pointers inside `cand` are valid only until this callback returns.
+ * Return `true` to accept the line, or `false` to reject it strictly before `max_count`,
+ * `max_results`, `matched_lines`, `matches`, or context emission.
+ */
+typedef bool (*webgrep_line_filter_cb)(void *user_data, const webgrep_line_filter_candidate_t *cand);
+
+/** Archive entry metadata passed to `webgrep_archive_entry_filter_cb` before decompression. */
+typedef struct webgrep_archive_entry_meta_s {
+    const uint8_t *path_ptr;
+    size_t         path_len;
+    int32_t        kind;
+    uint64_t       size;
+    uint64_t       compressed_size;
+    int64_t        mtime;
+    uint8_t        has_mtime;
+} webgrep_archive_entry_meta_t;
+
+/**
+ * Pre-decompression archive entry filter callback.
+ * Return `true` to unpack and search the entry, or `false` to skip it before decompression or quota checks.
+ */
+typedef bool (*webgrep_archive_entry_filter_cb)(void *user_data, const webgrep_archive_entry_meta_t *meta);
+
+/** Options for byte-offset line probing (`NULL` uses defaults: `delimiter = '\n'`, `strip_crlf = 1`, `max_line_bytes = 2 MiB`). */
+typedef struct webgrep_probe_options_s {
+    uint8_t delimiter;
+    uint8_t strip_crlf;
+    size_t  max_line_bytes;
+} webgrep_probe_options_t;
+
+/** Extracted line (or bounded window) enclosing a probed byte offset. */
+typedef struct webgrep_line_probe_s {
+    uint64_t       start_offset;
+    uint64_t       end_offset;
+    uint64_t       raw_end_offset;
+    const uint8_t *bytes_ptr;
+    size_t         bytes_len;
+    uint8_t        truncated_left;
+    uint8_t        truncated_right;
+} webgrep_line_probe_t;
+
+/** Search configuration for slice, streaming, and reverse tail searches. */
 typedef struct webgrep_config_s {
-    webgrep_scratch_t *scratch;
-    const uint8_t     *replacement_ptr;
-    size_t             replacement_len;
-    uint32_t           before_context;
-    uint32_t           after_context;
-    uint64_t           max_count;
-    uint64_t           max_results;
-    uint64_t           max_bytes;
-    size_t             max_decode_bytes;
-    size_t             buffer_size;
-    size_t             max_line_len;
-    int                encoding;
-    int                compression;
-    int                binary_mode;
-    int                match_mode;
-    uint8_t            invert_match;
-    uint8_t            passthru;
-    uint8_t            line_number;
-    uint8_t            column;
-    uint8_t            whole_word;
-    uint8_t            line_regexp;
-    uint32_t           max_context_lines;
-    uint64_t           max_compression_ratio;
-    uint64_t           time_budget_ns;
-    uint64_t           max_output_bytes;
+    webgrep_scratch_t     *scratch;
+    const uint8_t         *replacement_ptr;
+    size_t                 replacement_len;
+    uint32_t               before_context;
+    uint32_t               after_context;
+    uint64_t               max_count;
+    uint64_t               max_results;
+    uint64_t               max_bytes;
+    size_t                 max_decode_bytes;
+    size_t                 buffer_size;
+    size_t                 max_line_len;
+    int                    encoding;
+    int                    compression;
+    int                    binary_mode;
+    int                    match_mode;
+    uint8_t                invert_match;
+    uint8_t                passthru;
+    uint8_t                line_number;
+    uint8_t                column;
+    uint8_t                whole_word;
+    uint8_t                line_regexp;
+    uint8_t                multiline;
+    size_t                 max_multiline_window;
+    uint32_t               max_context_lines;
+    uint64_t               max_compression_ratio;
+    uint64_t               time_budget_ns;
+    uint64_t               max_output_bytes;
+    uint8_t                has_byte_range;
+    uint8_t                has_byte_range_end;
+    uint8_t                range_align_lines;
+    int32_t                line_number_mode;
+    uint64_t               byte_range_start;
+    uint64_t               byte_range_end;
+    uint64_t               initial_line_number;
+    webgrep_line_filter_cb line_filter;
+    void                  *line_filter_ctx;
 } webgrep_config_t;
 
-/** Summary populated by `webgrep_search_slice` and `webgrep_search_reader`. */
+/** Summary populated by `webgrep_search_slice`, `webgrep_search_reader`, and `webgrep_search_reverse_slice`. */
 typedef struct webgrep_summary_s {
     uint64_t matched_lines;
     uint64_t matches;
@@ -253,26 +335,30 @@ typedef struct webgrep_summary_s {
     uint8_t  partial;
     uint8_t  binary_detected;
     int      limit_hit;
+    uint64_t resume_at;
+    uint8_t  has_resume_at;
 } webgrep_summary_t;
 
 /** Tree & in-memory archive search configuration. */
 typedef struct webgrep_tree_config_s {
-    webgrep_config_t search;
-    int              format;
-    size_t           max_entries;
-    uint64_t         max_entry_bytes;
-    uint64_t         max_total_bytes;
-    uint64_t         max_compression_ratio;
-    size_t           max_depth;
-    size_t           max_concurrency;
-    uint8_t          hidden;
-    uint8_t          skip_git;
-    uint8_t          respect_gitignore;
-    uint8_t          respect_ignore;
-    size_t           max_ignore_file_bytes;
-    size_t           max_glob_rules;
-    size_t           max_glob_rule_len;
-    size_t           max_glob_brace_depth;
+    webgrep_config_t                search;
+    int                             format;
+    size_t                          max_entries;
+    uint64_t                        max_entry_bytes;
+    uint64_t                        max_total_bytes;
+    uint64_t                        max_compression_ratio;
+    size_t                          max_depth;
+    size_t                          max_concurrency;
+    uint8_t                         hidden;
+    uint8_t                         skip_git;
+    uint8_t                         respect_gitignore;
+    uint8_t                         respect_ignore;
+    size_t                          max_ignore_file_bytes;
+    size_t                          max_glob_rules;
+    size_t                          max_glob_rule_len;
+    size_t                          max_glob_brace_depth;
+    webgrep_archive_entry_filter_cb entry_filter;
+    void                           *entry_filter_ctx;
 } webgrep_tree_config_t;
 
 /** Summary populated by `webgrep_search_archive_slice`. */
@@ -307,7 +393,7 @@ typedef int (*webgrep_line_cb)(const webgrep_line_event_t *ev, void *userdata);
 typedef int (*webgrep_read_cb)(uint8_t *buf, size_t cap, size_t *out_n, void *userdata);
 
 /* ============================================================================
- * Exported C ABI Functions (17 Functions)
+ * Exported C ABI Functions (20 Functions)
  * ========================================================================= */
 
 /** 1. Returns the null-terminated semantic version string ("0.5.0"). */
@@ -425,6 +511,38 @@ int webgrep_search_archive_slice(
     webgrep_line_cb              on_line,
     void                        *userdata,
     webgrep_tree_summary_t      *out_summary
+);
+
+/** 18. Returns default byte-offset line probe options by value. */
+webgrep_probe_options_t webgrep_probe_options_default(void);
+
+/**
+ * 19. Zero-allocation byte-offset line probe over `data_ptr[0..data_len]`.
+ * Pass `opts = NULL` for default options (`delimiter = '\n'`, `strip_crlf = 1`, `max_line_bytes = 2 MiB`).
+ * Borrowed `out_probe->bytes_ptr` points directly into `data_ptr`.
+ * Returns 1 if `offset < data_len` (populating `*out_probe`), 0 if empty or `offset >= data_len`,
+ * or < 0 (`WEBGREP_ERR_INVALID_ARG`) on invalid arguments.
+ */
+int webgrep_probe_line_slice(
+    const uint8_t                 *data_ptr,
+    size_t                         data_len,
+    uint64_t                       offset,
+    const webgrep_probe_options_t *opts,
+    webgrep_line_probe_t          *out_probe
+);
+
+/**
+ * 20. Searches an in-memory byte slice backward from the end (or `cfg->byte_range`),
+ * invoking `on_line` for each matching line in newest-first (reverse) order.
+ */
+int webgrep_search_reverse_slice(
+    const webgrep_matcher_t *matcher,
+    const uint8_t           *data_ptr,
+    size_t                   data_len,
+    const webgrep_config_t  *cfg,
+    webgrep_line_cb          on_line,
+    void                    *userdata,
+    webgrep_summary_t       *out_summary
 );
 
 #ifdef __cplusplus

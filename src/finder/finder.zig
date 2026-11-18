@@ -16,6 +16,8 @@ pub const Finder = struct {
     pattern: []const u8,
     ignore_case: bool,
     unicode_folded: bool = false,
+    multiline: bool = false,
+    max_multiline_window: usize = 64 * 1024,
     kind: Kind,
     fp_threshold: f32,
     /// Number of candidates seen by packed pair during this lifetime. Can be cleared with `resetStats`.
@@ -33,7 +35,7 @@ pub const Finder = struct {
 
     pub fn init(pattern: []const u8, options: matcher.FindOptions) (matcher.LimitError || error{PatternHasNewline})!Finder {
         try matcher.checkPatternLimits(&.{pattern}, options);
-        if (std.mem.findScalar(u8, pattern, '\n') != null) return error.PatternHasNewline;
+        if (!options.multiline and std.mem.findScalar(u8, pattern, '\n') != null) return error.PatternHasNewline;
 
         const ignore_case = switch (options.case) {
             .sensitive => false,
@@ -50,14 +52,38 @@ pub const Finder = struct {
             else => .{ .pair = packed_pair.PackedPair.init(pattern, rank, ignore_case) },
         };
 
+        const min_win = if (unicode_folded) pattern.len *| 3 else pattern.len;
+
         return .{
             .pattern = pattern,
             .ignore_case = ignore_case,
             .unicode_folded = unicode_folded,
+            .multiline = options.multiline,
+            .max_multiline_window = @max(options.max_multiline_window, min_win),
             .kind = kind,
             .fp_threshold = options.prefilter_fp_threshold,
             .two_way = two_way.TwoWay.init(pattern, fold),
         };
+    }
+
+    pub fn isMultiline(self: *const Finder) bool {
+        return self.multiline;
+    }
+
+    pub fn multilineWindow(self: *const Finder) usize {
+        return self.max_multiline_window;
+    }
+
+    pub fn maxNewlines(self: *const Finder) ?u32 {
+        return @intCast(std.mem.count(u8, self.pattern, "\n"));
+    }
+
+    pub inline fn watchedIsExact(_: *const Finder) bool {
+        return true;
+    }
+
+    pub inline fn watchedHasExactStart(_: *const Finder) bool {
+        return true;
     }
 
     /// For a single literal, `earliest` and `leftmost_first` produce the same match.

@@ -27,7 +27,7 @@ const releaseQueue = state_mod.releaseQueue;
 const noteRejected = state_mod.noteRejected;
 const spanFrom = format_mod.spanFrom;
 const sinkBreakAt = format_mod.sinkBreakAt;
-const sinkLine = format_mod.sinkLine;
+const sinkLineAction = format_mod.sinkLineAction;
 const matchInLine = line_matcher_mod.matchInLine;
 
 pub const Preview = struct {
@@ -228,12 +228,23 @@ pub fn emitRing(
             state.ring.clear();
             return false;
         }
-        const keep = sinkLine(
+        const borrowed_ok = !state.ring.owned and !withheld and slot.src_start <= slot.src_end and slot.src_end <= buf.len;
+        const raw_buf = if (borrowed_ok) buf else shown;
+        const buf_offset = if (borrowed_ok) slot.src_start else 0;
+        const line_end_in_buf = if (borrowed_ok)
+            @min(buf.len, slot.src_start + @as(usize, @intCast(@min(slot.end_abs -| slot.abs, @as(u64, buf.len)))))
+        else
+            shown.len;
+        const action = sinkLineAction(
             S,
             "context",
             sink,
             state,
             shown,
+            raw_buf,
+            buf_offset,
+            line_end_in_buf,
+            config.match_mode,
             span,
             &none,
             slot.abs,
@@ -246,10 +257,29 @@ pub fn emitRing(
         releaseQueue(state);
         state.last_abs_end = slot.end_abs;
         state.has_sunk = true;
-        if (!keep) {
-            noteRejected(S, state, sink);
-            state.ring.clear();
-            return false;
+        switch (action) {
+            .cont => {},
+            .skip_to => |target| {
+                if (target > slot.end_abs) {
+                    state.after_left = 0;
+                    state.ring.clear();
+                    state.pending_skip_to = target;
+                    return false;
+                }
+            },
+            .pause => {
+                state.paused = true;
+                state.resume_at = slot.end_abs;
+                state.resume_line = if (slot.number) |n| n + 1 else 0;
+                state.stopped = true;
+                state.ring.clear();
+                return false;
+            },
+            .stop => {
+                state.stopped = true;
+                state.ring.clear();
+                return false;
+            },
         }
     }
     state.ring.clear();

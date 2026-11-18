@@ -37,6 +37,7 @@ const countLines = state_mod.countLines;
 const stopInMatch = state_mod.stopInMatch;
 const maybeProgress = state_mod.maybeProgress;
 const callOpt = state_mod.callOpt;
+const callSinkAction = state_mod.callSinkAction;
 const regex_mod = @import("../regex.zig");
 const Preview = ring_mod.Preview;
 const previewLine = ring_mod.previewLine;
@@ -70,6 +71,25 @@ pub fn growSpans(alloc: ?std.mem.Allocator, store: []Span, heap: *[]Span, n: usi
     return heap.*;
 }
 
+fn instsHaveNonEmptyConstraint(insts: []const regex_mod.Inst) bool {
+    for (insts) |inst| {
+        switch (inst) {
+            .byte, .class, .unicode_class, .any, .assert => return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn isPureEmptyPattern(matcher: anytype) bool {
+    const T = state_mod.MatcherType(@TypeOf(matcher));
+    if (@hasField(T, "pattern")) return matcher.pattern.len == 0;
+    if (@hasField(T, "empty_only")) return matcher.empty_only;
+    if (T == regex_mod.Regex) return !instsHaveNonEmptyConstraint(matcher.insts);
+    if (T == regex_mod.RegexSet) return matcher.pattern_count > 0 and !instsHaveNonEmptyConstraint(matcher.insts);
+    return false;
+}
+
 /// Non-overlapping matches on this line, relative to the preview window and sorted by start offset.
 /// An empty pattern records only a single zero-width span to avoid spinning at every byte.
 pub fn gatherSpans(
@@ -94,22 +114,25 @@ pub fn gatherSpans(
         }
         return store[0..n];
     }
+    const is_ml = state_mod.effectiveMultiline(matcher, config);
     const content_end = contentEnd(buf, line, config);
-    const line_buf = if (isMultilineMatcher(matcher)) buf else buf[0..@min(content_end, buf.len)];
+    const line_buf = if (is_ml) buf else buf[0..@min(content_end, buf.len)];
+    const scan_end = if (is_ml) @min(line.end, line_buf.len) else @min(content_end, line_buf.len);
     const win_lo = preview.start;
     const win_hi = preview.end;
     var pos = line.start;
     if (known) |k| {
-        const kmend = @min(k.end, content_end);
-        const kempty = k.start == kmend;
-        const kin_win = k.start >= win_lo and k.start < win_hi;
-        const kempty_at_pt = kempty and k.start == win_lo and win_lo == win_hi;
+        const kmstart = @min(@max(k.start, line.start), content_end);
+        const kmend = @max(kmstart, @min(k.end, content_end));
+        const kempty = k.start == k.end;
+        const kin_win = kmstart >= win_lo and (kmstart < win_hi or (!kempty and kmstart == win_hi and !preview.truncated));
+        const kempty_at_pt = kempty and kmstart == win_lo and win_lo == win_hi;
         if (kin_win or kempty_at_pt) {
             if (kempty_at_pt) {
                 store[0] = .{ .start = 0, .end = 0, .pattern_id = k.pattern_id };
             } else {
                 store[0] = .{
-                    .start = k.start - win_lo,
+                    .start = kmstart - win_lo,
                     .end = @min(kmend, win_hi) - win_lo,
                     .pattern_id = k.pattern_id,
                 };
@@ -118,29 +141,37 @@ pub fn gatherSpans(
         }
         pos = if (k.end > k.start) k.end else k.start + 1;
     }
-    while (pos <= content_end and pos <= line_buf.len) {
+    const skip_rest = (if (known) |k| k.single_match else false) or isPureEmptyPattern(matcher);
+    while (!skip_rest and pos <= scan_end) {
         if (stopInMatch(state, config)) break;
-        const found = nextMatch(matcher, line_buf, pos, config) orelse break;
-        if (found.start < pos or found.start > buf.len or found.start > content_end) break;
-        if (found.start == content_end and found.end > content_end) break;
-        const mend = @min(found.end, content_end);
-        const empty = found.start == mend;
-        const in_window = found.start >= win_lo and found.start < win_hi;
-        const empty_at_point = empty and found.start == win_lo and win_lo == win_hi;
+        const found = (if (is_ml) line_matcher_mod.nextMatchCached(matcher, line_buf, pos, state, config) else nextMatch(matcher, line_buf, pos, config)) orelse break;
+        if (found.start < pos or found.start > scan_end) break;
+        if (found.start >= content_end) break;
+        if (is_ml and found.end > line.end) break;
+        const fstart = @min(@max(found.start, line.start), content_end);
+        const fend = @max(fstart, @min(found.end, content_end));
+        const raw_empty = found.start == found.end;
+        const in_window = fstart >= win_lo and (fstart < win_hi or (!raw_empty and fstart == win_hi and !preview.truncated));
+        const empty_at_point = raw_empty and fstart == win_lo and win_lo == win_hi;
         if (in_window or empty_at_point) {
             if (n == store.len) store = try growSpans(alloc, store, heap, n);
             if (empty_at_point) {
                 store[n] = .{ .start = 0, .end = 0, .pattern_id = found.pattern_id };
             } else {
                 store[n] = .{
-                    .start = found.start - win_lo,
-                    .end = @min(mend, win_hi) - win_lo,
+                    .start = fstart - win_lo,
+                    .end = @min(fend, win_hi) - win_lo,
                     .pattern_id = found.pattern_id,
                 };
             }
             n += 1;
         }
-        if (empty or found.end <= pos) break;
+        if (raw_empty) {
+            if (found.start >= scan_end) break;
+            pos = found.start + 1;
+            continue;
+        }
+        if (found.end <= pos) break;
         pos = found.end;
     }
     if (n == 0) {
@@ -154,12 +185,16 @@ pub fn gatherSpans(
     return store[0..n];
 }
 
-pub fn sinkLine(
+pub fn sinkLineAction(
     comptime S: type,
     comptime name: []const u8,
     sink: *S,
     state: *State,
     bytes: []const u8,
+    raw_buf: []const u8,
+    buf_offset: usize,
+    line_end: usize,
+    match_mode: matcher_mod.MatchMode,
     span: ?Span,
     matches: []Span,
     offset: u64,
@@ -168,8 +203,8 @@ pub fn sinkLine(
     line_len: u64,
     window_start: u64,
     replacement: ?[]const u8,
-) bool {
-    if (comptime !@hasDecl(S, name)) return true;
+) sink_mod.FlowAction {
+    if (comptime !@hasDecl(S, name)) return .cont;
     var one: [1]Span = undefined;
     var multi = matches;
     if (multi.len == 0) {
@@ -180,8 +215,30 @@ pub fn sinkLine(
     }
     var scratch: [1024]u8 = undefined;
     var replace_scratch: [4096]u8 = undefined;
-    const line = buildLine(state, &scratch, &replace_scratch, bytes, span, multi, offset, number, truncated, line_len, window_start, replacement);
-    return callOpt(S, name, sink, .{line});
+    const line = buildLine(state, &scratch, &replace_scratch, bytes, raw_buf, buf_offset, line_end, match_mode, span, multi, offset, number, truncated, line_len, window_start, replacement);
+    return callSinkAction(S, name, sink, .{line});
+}
+
+pub fn sinkLine(
+    comptime S: type,
+    comptime name: []const u8,
+    sink: *S,
+    state: *State,
+    bytes: []const u8,
+    raw_buf: []const u8,
+    buf_offset: usize,
+    line_end: usize,
+    match_mode: matcher_mod.MatchMode,
+    span: ?Span,
+    matches: []Span,
+    offset: u64,
+    number: ?u64,
+    truncated: bool,
+    line_len: u64,
+    window_start: u64,
+    replacement: ?[]const u8,
+) bool {
+    return sinkLineAction(S, name, sink, state, bytes, raw_buf, buf_offset, line_end, match_mode, span, matches, offset, number, truncated, line_len, window_start, replacement) == .cont;
 }
 
 pub fn buildLine(
@@ -189,6 +246,10 @@ pub fn buildLine(
     scratch: []u8,
     replace_scratch: []u8,
     bytes: []const u8,
+    raw_buf: []const u8,
+    buf_offset: usize,
+    line_end: usize,
+    match_mode: matcher_mod.MatchMode,
     span: ?Span,
     matches: []Span,
     offset: u64,
@@ -240,7 +301,7 @@ pub fn buildLine(
         u16_column = units.start + 1;
     }
     const replaced: ?[]const u8 = if (replacement) |repl|
-        if (matches.len > 0) buildReplaced(state, replace_scratch, bytes, matches, &match, repl) else null
+        if (matches.len > 0) buildReplaced(state, replace_scratch, bytes, raw_buf, buf_offset, line_end, match_mode, matches, &match, repl) else null
     else
         null;
     const column: ?u64 = if (matches.len > 0) @as(u64, matches[0].start) + 1 else null;
@@ -291,6 +352,7 @@ pub fn advanceUtf16Span(
 pub fn expandReplacementTemplate(
     repl: []const u8,
     bytes: []const u8,
+    cap_source: []const u8,
     from: usize,
     to: usize,
     caps: ?regex_mod.Captures,
@@ -319,9 +381,9 @@ pub fn expandReplacementTemplate(
             const g: usize = next - '0';
             if (caps) |c| {
                 if (c.group(g)) |sp| {
-                    const gfrom = @min(sp.start, bytes.len);
-                    const gto = @min(@max(sp.end, gfrom), bytes.len);
-                    const seg = bytes[gfrom..gto];
+                    const gfrom = @min(sp.start, cap_source.len);
+                    const gto = @min(@max(sp.end, gfrom), cap_source.len);
+                    const seg = cap_source[gfrom..gto];
                     if (dest) |d| if (seg.len > 0) @memcpy(d[written .. written + seg.len], seg);
                     written += seg.len;
                 }
@@ -335,9 +397,9 @@ pub fn expandReplacementTemplate(
                 written += seg.len;
             } else if (caps) |c| {
                 if (c.group(g)) |sp| {
-                    const gfrom = @min(sp.start, bytes.len);
-                    const gto = @min(@max(sp.end, gfrom), bytes.len);
-                    const seg = bytes[gfrom..gto];
+                    const gfrom = @min(sp.start, cap_source.len);
+                    const gto = @min(@max(sp.end, gfrom), cap_source.len);
+                    const seg = cap_source[gfrom..gto];
                     if (dest) |d| if (seg.len > 0) @memcpy(d[written .. written + seg.len], seg);
                     written += seg.len;
                 }
@@ -352,10 +414,57 @@ pub fn expandReplacementTemplate(
     return written;
 }
 
+fn extractMatchCaptures(
+    re: *const regex_mod.Regex,
+    bytes: []const u8,
+    raw_slice: []const u8,
+    buf_offset: usize,
+    from: usize,
+    to: usize,
+    match_mode: matcher_mod.MatchMode,
+    used_bytes_fallback: *bool,
+) regex_mod.Captures {
+    used_bytes_fallback.* = false;
+    if (buf_offset + to <= raw_slice.len) {
+        const abs_from = buf_offset + from;
+        var abs_to = buf_offset + to;
+        if (to == bytes.len and abs_to < raw_slice.len) {
+            if (re.findReadOnly(raw_slice, abs_from, match_mode)) |full_m| {
+                if (full_m.start == abs_from and full_m.end >= abs_to) {
+                    abs_to = @min(full_m.end, raw_slice.len);
+                } else if (match_mode != .leftmost_first) {
+                    if (re.findReadOnly(raw_slice, abs_from, .leftmost_first)) |lm| {
+                        if (lm.start == abs_from and lm.end >= abs_to) {
+                            abs_to = @min(lm.end, raw_slice.len);
+                        }
+                    }
+                }
+            }
+        }
+        const caps = re.extractCaptures(raw_slice, .{ .start = abs_from, .end = abs_to });
+        var any_group = false;
+        for (caps.groups) |g| {
+            if (g != null) {
+                any_group = true;
+                break;
+            }
+        }
+        if (any_group or re.num_captures == 0 or (buf_offset == 0 and raw_slice.len == bytes.len)) {
+            return caps;
+        }
+    }
+    used_bytes_fallback.* = true;
+    return re.extractCaptures(bytes, .{ .start = from, .end = to });
+}
+
 pub fn buildReplaced(
     state: *State,
     scratch: []u8,
     bytes: []const u8,
+    raw_buf: []const u8,
+    buf_offset: usize,
+    line_end: usize,
+    match_mode: matcher_mod.MatchMode,
     matches: []Span,
     match_out: *?Span,
     repl: []const u8,
@@ -396,19 +505,28 @@ pub fn buildReplaced(
         return dest[0..out];
     }
 
+    const raw_end = @min(@max(line_end, buf_offset +| bytes.len), raw_buf.len);
+    const raw_slice = raw_buf[0..raw_end];
+
     var caps_cache: [32]?regex_mod.Captures = undefined;
+    var fallback_cache: [32]bool = undefined;
     var need: usize = 0;
     var cursor: usize = 0;
     for (matches, 0..) |item, idx| {
         const from = @min(item.start, bytes.len);
         const to = @min(@max(item.end, from), bytes.len);
         if (from > cursor) need += from - cursor;
+        var used_fb = false;
         const caps: ?regex_mod.Captures = if (state.capture_regex) |re|
-            re.extractCaptures(bytes, .{ .start = from, .end = to })
+            extractMatchCaptures(re, bytes, raw_slice, buf_offset, from, to, match_mode, &used_fb)
         else
             null;
-        if (idx < caps_cache.len) caps_cache[idx] = caps;
-        need += expandReplacementTemplate(repl, bytes, from, to, caps, null);
+        if (idx < caps_cache.len) {
+            caps_cache[idx] = caps;
+            fallback_cache[idx] = used_fb;
+        }
+        const cap_src = if (used_fb) bytes else raw_slice;
+        need += expandReplacementTemplate(repl, bytes, cap_src, from, to, caps, null);
         cursor = @max(cursor, to);
     }
     if (cursor < bytes.len) need += bytes.len - cursor;
@@ -423,14 +541,17 @@ pub fn buildReplaced(
             @memcpy(dest[out .. out + seg.len], seg);
             out += seg.len;
         }
-        const caps: ?regex_mod.Captures = if (idx < caps_cache.len)
-            caps_cache[idx]
-        else if (state.capture_regex) |re|
-            re.extractCaptures(bytes, .{ .start = from, .end = to })
+        var used_fb = false;
+        const caps: ?regex_mod.Captures = if (idx < caps_cache.len) blk: {
+            used_fb = fallback_cache[idx];
+            break :blk caps_cache[idx];
+        } else if (state.capture_regex) |re|
+            extractMatchCaptures(re, bytes, raw_slice, buf_offset, from, to, match_mode, &used_fb)
         else
             null;
+        const cap_src = if (used_fb) bytes else raw_slice;
         const exp_start = out;
-        out += expandReplacementTemplate(repl, bytes, from, to, caps, dest[exp_start..]);
+        out += expandReplacementTemplate(repl, bytes, cap_src, from, to, caps, dest[exp_start..]);
         item.replacement = dest[exp_start..out];
         cursor = @max(cursor, to);
     }
@@ -513,6 +634,7 @@ pub fn sinkMatched(
         state.matched_lines += 1;
         state.matches += 1;
         state.results_out += 1;
+        countLines(buf, line.end, state, config);
         if (!maybeProgress(S, sink, state, config)) return false;
         if (!noteHitLimit(state, config, state.abs_base + line.end)) return false;
         return !state.paused;
@@ -537,12 +659,16 @@ pub fn sinkMatched(
         config,
     );
     if (!try guardLine(state, config, bytes.len)) return false;
-    const keep = sinkLine(
+    const action = sinkLineAction(
         S,
         "matched",
         sink,
         state,
         bytes,
+        if (withheld) bytes else buf,
+        if (withheld) 0 else preview.start,
+        if (withheld) 0 else line.end,
+        config.match_mode,
         if (withheld) null else preview.span,
         matches,
         line_abs,
@@ -553,24 +679,41 @@ pub fn sinkMatched(
         if (withheld) null else config.replacement,
     );
     releaseQueue(state);
+    const line_end_abs = state.abs_base + @as(u64, line.end);
     state.last_line_visited = line.end;
-    state.last_abs_end = state.abs_base + line.end;
+    state.last_abs_end = line_end_abs;
     state.remembered_until = @max(state.remembered_until, line.end);
     state.after_left = afterCount(config);
     state.has_sunk = true;
     state.matched_lines += 1;
     state.matches += if (matches.len > 0) @as(u64, @intCast(matches.len)) else 1;
     state.results_out += 1;
-    if (!keep) {
-        if (isPause(S, sink)) {
-            state.resume_at = state.abs_base + @as(u64, line.end);
-            state.resume_line = nextLineNumber(state, buf, line, config);
-        }
-        noteRejected(S, state, sink);
+    var keep = true;
+    switch (action) {
+        .cont => {},
+        .skip_to => |target| {
+            if (target > line_end_abs) {
+                state.after_left = 0;
+                state.ring.clear();
+                state.pending_skip_to = target;
+            }
+        },
+        .pause => {
+            state.paused = true;
+            state.resume_at = line_end_abs;
+            state.resume_line = if (state.line_number != null) nextLineNumber(state, buf, line, config) else 0;
+            state.stopped = true;
+            keep = false;
+        },
+        .stop => {
+            state.stopped = true;
+            keep = false;
+        },
     }
+    countLines(buf, line.end, state, config);
     if (state.paused) return false;
-    if (!maybeProgress(S, sink, state, config)) return false;
-    if (!noteHitLimit(state, config, state.abs_base + line.end)) return false;
+    if (keep and !maybeProgress(S, sink, state, config)) return false;
+    if (!noteHitLimit(state, config, line_end_abs)) return false;
     return keep and !state.paused;
 }
 
@@ -605,12 +748,16 @@ pub fn sinkContext(
         config,
     );
     if (!try guardLine(state, config, bytes.len)) return false;
-    const keep = sinkLine(
+    const action = sinkLineAction(
         S,
         "context",
         sink,
         state,
         bytes,
+        if (withheld) bytes else buf,
+        if (withheld) 0 else preview.start,
+        if (withheld) 0 else line.end,
+        config.match_mode,
         if (withheld) null else preview.span,
         matches,
         line_abs,
@@ -621,13 +768,34 @@ pub fn sinkContext(
         if (withheld) null else config.replacement,
     );
     releaseQueue(state);
+    const line_end_abs = state.abs_base + @as(u64, line.end);
     state.last_line_visited = line.end;
-    state.last_abs_end = state.abs_base + line.end;
+    state.last_abs_end = line_end_abs;
     state.remembered_until = @max(state.remembered_until, line.end);
     if (kind == .after and state.after_left > 0) state.after_left -= 1;
     state.has_sunk = true;
-    if (!keep) noteRejected(S, state, sink);
-    return keep and !state.paused;
+    switch (action) {
+        .cont => return true,
+        .skip_to => |target| {
+            if (target > line_end_abs) {
+                state.after_left = 0;
+                state.ring.clear();
+                state.pending_skip_to = target;
+            }
+            return true;
+        },
+        .pause => {
+            state.paused = true;
+            state.resume_at = line_end_abs;
+            state.resume_line = if (state.line_number != null) nextLineNumber(state, buf, line, config) else 0;
+            state.stopped = true;
+            return false;
+        },
+        .stop => {
+            state.stopped = true;
+            return false;
+        },
+    }
 }
 
 pub fn sinkBreakAt(
@@ -640,19 +808,42 @@ pub fn sinkBreakAt(
     if (config.passthru) return true;
     const any_context = beforeCount(config) > 0 or afterCount(config) > 0;
     if (!any_context or !state.has_sunk or line_abs <= state.last_abs_end) return true;
-    const keep = callOpt(S, "contextBreak", sink, .{});
-    if (!keep) noteRejected(S, state, sink);
-    return keep and !state.paused;
+    const action = callSinkAction(S, "contextBreak", sink, .{});
+    switch (action) {
+        .cont => return true,
+        .skip_to => |target| {
+            if (target > line_abs) {
+                state.after_left = 0;
+                state.ring.clear();
+                state.pending_skip_to = target;
+                return false;
+            }
+            return true;
+        },
+        .pause => {
+            state.paused = true;
+            state.resume_at = line_abs;
+            state.resume_line = state.line_number orelse 0;
+            state.stopped = true;
+            return false;
+        },
+        .stop => {
+            state.stopped = true;
+            return false;
+        },
+    }
 }
 
 
 pub fn spanFrom(buf: []const u8, line: Range, content_end: usize, known: ?BufMatch) ?Span {
     const m = known orelse return null;
     _ = buf;
-    if (m.start < line.start or m.start > content_end) return null;
+    if (m.start < line.start or m.start > line.end) return null;
+    const ms = @min(m.start, content_end);
+    const me = @max(ms, @min(m.end, content_end));
     return .{
-        .start = m.start - line.start,
-        .end = @min(m.end, content_end) - line.start,
+        .start = ms - line.start,
+        .end = me - line.start,
         .pattern_id = m.pattern_id,
     };
 }

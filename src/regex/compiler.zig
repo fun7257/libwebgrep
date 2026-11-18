@@ -48,6 +48,9 @@ pub const Compiler = struct {
     unicode_ranges: std.ArrayList(UnicodeRangeList) = .empty,
     has_lazy: bool = false,
     has_alt: bool = false,
+    saw_scoped_m: bool = false,
+    saw_ignore_case: bool = false,
+    explicit_neg_m: bool = false,
     diag: ?*CompileDiagnostic = null,
     pattern_index: ?usize = null,
     match_inst: Inst = .match,
@@ -187,6 +190,8 @@ pub const Compiler = struct {
     }
 
     pub fn compile(self: *Compiler) Error!Frag {
+        const base_idx = self.insts.items.len;
+        if (self.ignore_case) self.saw_ignore_case = true;
         if (findInvalidUtf8Offset(self.pattern)) |bad_pos| {
             return self.fail(error.RegexSyntax, .invalid_utf8, bad_pos, "pattern contains invalid UTF-8 byte sequence");
         }
@@ -199,7 +204,154 @@ pub const Compiler = struct {
         }
         const match_pc = try self.emit(self.match_inst);
         self.patch(body.end, match_pc);
+        self.optimizeByteExactLoops(base_idx);
         return .{ .start = body.start, .end = match_pc };
+    }
+
+    fn requiresAsciiFollow(items: []const Inst, start_pc: u32) bool {
+        var stack: [64]u32 = undefined;
+        var visited: [64]u32 = undefined;
+        var sp: usize = 0;
+        var visited_len: usize = 0;
+        var saw_consumer = false;
+
+        stack[0] = start_pc;
+        sp = 1;
+        while (sp > 0) {
+            sp -= 1;
+            const pc = stack[sp];
+            if (pc >= items.len) return false;
+            var already = false;
+            for (visited[0..visited_len]) |v| {
+                if (v == pc) {
+                    already = true;
+                    break;
+                }
+            }
+            if (already) continue;
+            if (visited_len >= visited.len) return false;
+            visited[visited_len] = pc;
+            visited_len += 1;
+
+            switch (items[pc]) {
+                .jmp => |t| {
+                    if (sp >= stack.len) return false;
+                    stack[sp] = t;
+                    sp += 1;
+                },
+                .split => |s| {
+                    if (sp + 2 > stack.len) return false;
+                    stack[sp] = s.out1;
+                    stack[sp + 1] = s.out2;
+                    sp += 2;
+                },
+                .save => |sv| {
+                    if (sp >= stack.len) return false;
+                    stack[sp] = sv.out;
+                    sp += 1;
+                },
+                .byte => |by| {
+                    if (by.b >= 0x80) return false;
+                    saw_consumer = true;
+                },
+                .class => |cl| {
+                    if (cl.utf8_negated or cl.set.bits[2] != 0 or cl.set.bits[3] != 0) return false;
+                    saw_consumer = true;
+                },
+                .any, .any_cont, .unicode_class, .assert, .match, .match_id => return false,
+            }
+        }
+        return saw_consumer;
+    }
+
+    fn optimizeByteExactLoops(self: *Compiler, base_idx: usize) void {
+        const effective_ml = self.multiline or self.saw_scoped_m;
+        const items = self.insts.items;
+        if (items.len < base_idx + 7) return;
+        var pc: usize = items.len - 3;
+        while (pc >= base_idx + 4) : (pc -= 1) {
+            const end_jmp_pc: u32 = @intCast(pc - 4);
+            const cont1_pc: u32 = @intCast(pc - 3);
+            const cont2_pc: u32 = @intCast(pc - 2);
+            const cont3_pc: u32 = @intCast(pc - 1);
+            const atom_pc: u32 = @intCast(pc);
+            const exit_jmp_pc: u32 = @intCast(pc + 1);
+            const split_pc: u32 = @intCast(pc + 2);
+
+            const end_target = switch (items[pc - 4]) {
+                .jmp => |t| t,
+                else => {
+                    if (pc == base_idx + 4) break;
+                    continue;
+                },
+            };
+            if (end_target != split_pc) {
+                if (pc == base_idx + 4) break;
+                continue;
+            }
+            const ok_cont = blk: {
+                switch (items[pc - 3]) {
+                    .any_cont => |ac| if (ac.out != end_jmp_pc) break :blk false,
+                    else => break :blk false,
+                }
+                switch (items[pc - 2]) {
+                    .any_cont => |ac| if (ac.out != cont1_pc) break :blk false,
+                    else => break :blk false,
+                }
+                switch (items[pc - 1]) {
+                    .any_cont => |ac| if (ac.out != cont2_pc) break :blk false,
+                    else => break :blk false,
+                }
+                break :blk true;
+            };
+            if (!ok_cont) {
+                if (pc == base_idx + 4) break;
+                continue;
+            }
+            const exit_target = switch (items[pc + 1]) {
+                .jmp => |t| t,
+                else => {
+                    if (pc == base_idx + 4) break;
+                    continue;
+                },
+            };
+            const is_greedy_loop = switch (items[pc + 2]) {
+                .split => |sp| sp.out1 == atom_pc and sp.out2 == exit_jmp_pc,
+                else => false,
+            };
+            if (!is_greedy_loop) {
+                if (pc == base_idx + 4) break;
+                continue;
+            }
+
+            var collapsed_set: ByteSet = undefined;
+            const can_collapse_atom = switch (items[pc]) {
+                .class => |cl| blk: {
+                    if (!cl.utf8_negated) break :blk false;
+                    if (cl.out != end_jmp_pc or cl.cont1 != cont1_pc or cl.cont2 != cont2_pc or cl.cont3 != cont3_pc) break :blk false;
+                    collapsed_set = cl.set;
+                    if (!effective_ml) collapsed_set.clear('\n');
+                    break :blk true;
+                },
+                .any => |an| blk: {
+                    if (!effective_ml) break :blk false;
+                    if (an.out != end_jmp_pc or an.cont1 != cont1_pc or an.cont2 != cont2_pc or an.cont3 != cont3_pc) break :blk false;
+                    collapsed_set = ByteSet{};
+                    collapsed_set.invert();
+                    if (!an.allow_nl) collapsed_set.clear('\n');
+                    break :blk true;
+                },
+                else => false,
+            };
+            if (can_collapse_atom and requiresAsciiFollow(items, exit_target)) {
+                items[pc] = .{ .class = .{ .set = collapsed_set, .out = split_pc } };
+                items[pc - 4] = .{ .jmp = 0 };
+                items[pc - 3] = .{ .jmp = 0 };
+                items[pc - 2] = .{ .jmp = 0 };
+                items[pc - 1] = .{ .jmp = 0 };
+            }
+            if (pc == base_idx + 4) break;
+        }
     }
 
     fn parseAlt(self: *Compiler) Error!Frag {
@@ -450,6 +602,7 @@ pub const Compiler = struct {
                     self.pos += 1;
                     var new_i = self.ignore_case;
                     var new_m = self.multiline;
+                    var new_neg_m = self.explicit_neg_m;
                     var new_s = self.dot_all;
                     var neg = false;
                     var saw_flag = false;
@@ -467,6 +620,7 @@ pub const Compiler = struct {
                             },
                             'm' => {
                                 new_m = !neg;
+                                new_neg_m = neg;
                                 saw_flag = true;
                                 self.pos += 1;
                             },
@@ -482,7 +636,10 @@ pub const Compiler = struct {
                         self.pos += 1;
                         self.ignore_case = new_i;
                         self.multiline = new_m;
+                        self.explicit_neg_m = new_neg_m;
                         self.dot_all = new_s;
+                        if (new_i) self.saw_ignore_case = true;
+                        if (new_m) self.saw_scoped_m = true;
                         const nop = try self.emit(.{ .jmp = 0 });
                         return .{ .start = nop, .end = nop };
                     }
@@ -490,15 +647,20 @@ pub const Compiler = struct {
                         self.pos += 1;
                         const saved_i = self.ignore_case;
                         const saved_m = self.multiline;
+                        const saved_neg_m = self.explicit_neg_m;
                         const saved_s = self.dot_all;
                         self.ignore_case = new_i;
                         self.multiline = new_m;
+                        self.explicit_neg_m = new_neg_m;
                         self.dot_all = new_s;
+                        if (new_i) self.saw_ignore_case = true;
+                        if (new_m) self.saw_scoped_m = true;
                         self.depth += 1;
                         defer {
                             self.depth -= 1;
                             self.ignore_case = saved_i;
                             self.multiline = saved_m;
+                            self.explicit_neg_m = saved_neg_m;
                             self.dot_all = saved_s;
                         }
                         const inner = try self.parseAlt();
@@ -513,9 +675,11 @@ pub const Compiler = struct {
                     }
                     return self.fail(error.RegexSyntax, .invalid_inline_flags, paren_pos, "invalid inline flags in '(?...)'");
                 }
+                if (self.multiline) self.saw_scoped_m = true;
                 const group_id = self.groupForPos(paren_pos);
                 const saved_i = self.ignore_case;
                 const saved_m = self.multiline;
+                const saved_neg_m = self.explicit_neg_m;
                 const saved_s = self.dot_all;
                 self.depth += 1;
                 const inner = blk: {
@@ -525,6 +689,7 @@ pub const Compiler = struct {
                 self.depth -= 1;
                 self.ignore_case = saved_i;
                 self.multiline = saved_m;
+                self.explicit_neg_m = saved_neg_m;
                 self.dot_all = saved_s;
                 if (self.pos >= self.pattern.len or self.pattern[self.pos] != ')') {
                     return self.fail(error.RegexSyntax, .unclosed_group, paren_pos, "unclosed group parenthesis '('");
@@ -557,12 +722,14 @@ pub const Compiler = struct {
             },
             '^' => {
                 self.pos += 1;
-                const pc = try self.emit(.{ .assert = .{ .kind = .start_line, .out = 0 } });
+                const kind: AssertKind = if (self.explicit_neg_m) .start_input else .start_line;
+                const pc = try self.emit(.{ .assert = .{ .kind = kind, .out = 0 } });
                 return .{ .start = pc, .end = pc };
             },
             '$' => {
                 self.pos += 1;
-                const pc = try self.emit(.{ .assert = .{ .kind = .end_line, .out = 0 } });
+                const kind: AssertKind = if (self.explicit_neg_m) .end_input else .end_line;
+                const pc = try self.emit(.{ .assert = .{ .kind = kind, .out = 0 } });
                 return .{ .start = pc, .end = pc };
             },
             '[' => return self.parseClass(),
@@ -577,6 +744,7 @@ pub const Compiler = struct {
                 return self.fail(error.RegexSyntax, .invalid_escape, self.pos, "unexpected token in atom");
             },
             else => {
+                if (self.multiline) self.saw_scoped_m = true;
                 if (c >= 0x80) {
                     const seq_len = utf8SeqLenAt(self.pattern, self.pos, self.pattern.len);
                     if (seq_len > 1) {
@@ -585,6 +753,11 @@ pub const Compiler = struct {
                         self.pos += seq_len;
                         return self.emitCodepoint(cp, raw);
                     }
+                }
+                if (self.ignore_case and self.unicode_case and (c == 'k' or c == 'K' or c == 's' or c == 'S')) {
+                    const raw = self.pattern[self.pos .. self.pos + 1];
+                    self.pos += 1;
+                    return self.emitCodepoint(c, raw);
                 }
                 self.pos += 1;
                 const pc = try self.emit(.{ .byte = .{ .b = c, .ignore_case = self.ignore_case, .out = 0 } });
@@ -707,6 +880,10 @@ pub const Compiler = struct {
                     '0' => 0,
                     else => c,
                 };
+                if (self.ignore_case and self.unicode_case and (b == 'k' or b == 'K' or b == 's' or b == 'S')) {
+                    const raw = &[1]u8{b};
+                    return self.emitCodepoint(b, raw);
+                }
                 const pc = try self.emit(.{ .byte = .{ .b = b, .ignore_case = self.ignore_case, .out = 0 } });
                 return .{ .start = pc, .end = pc };
             },
@@ -774,6 +951,16 @@ pub const Compiler = struct {
             const c = self.pattern[self.pos];
             if (c == ']' and !first) {
                 self.pos += 1;
+                if (self.ignore_case and self.unicode_case and has_byte_set and set.bits[2] == 0 and set.bits[3] == 0) {
+                    if (set.contains('k') or set.contains('K')) {
+                        try unicode_list.append(self.allocator, .{ .start = 0x212A, .end = 0x212A });
+                        has_unicode_ranges = true;
+                    }
+                    if (set.contains('s') or set.contains('S')) {
+                        try unicode_list.append(self.allocator, .{ .start = 0x017F, .end = 0x017F });
+                        has_unicode_ranges = true;
+                    }
+                }
                 if (has_unicode_ranges) {
                     const owned_ranges = try sortAndMergeRanges(self.allocator, &unicode_list);
                     errdefer self.allocator.free(owned_ranges);
@@ -783,19 +970,39 @@ pub const Compiler = struct {
                 if (negated) {
                     set.invert();
                     if (!self.multiline) set.clear('\n');
-                    const end_jmp = try self.emit(.{ .jmp = 0 });
-                    const cont1 = try self.emit(.{ .any_cont = .{ .out = end_jmp } });
-                    const cont2 = try self.emit(.{ .any_cont = .{ .out = cont1 } });
-                    const cont3 = try self.emit(.{ .any_cont = .{ .out = cont2 } });
-                    const pc = try self.emit(.{ .class = .{
-                        .set = set,
-                        .out = end_jmp,
-                        .utf8_negated = true,
-                        .cont1 = cont1,
-                        .cont2 = cont2,
-                        .cont3 = cont3,
-                    } });
-                    return .{ .start = pc, .end = end_jmp };
+                    const utf8_neg = (set.bits[2] == std.math.maxInt(u64) and set.bits[3] == std.math.maxInt(u64));
+                    if (utf8_neg) {
+                        const end_jmp = try self.emit(.{ .jmp = 0 });
+                        const cont1 = try self.emit(.{ .any_cont = .{ .out = end_jmp } });
+                        const cont2 = try self.emit(.{ .any_cont = .{ .out = cont1 } });
+                        const cont3 = try self.emit(.{ .any_cont = .{ .out = cont2 } });
+                        const pc = try self.emit(.{ .class = .{
+                            .set = set,
+                            .out = end_jmp,
+                            .utf8_negated = true,
+                            .cont1 = cont1,
+                            .cont2 = cont2,
+                            .cont3 = cont3,
+                        } });
+                        return .{ .start = pc, .end = end_jmp };
+                    }
+                    if (self.ignore_case and self.unicode_case and set.bits[2] == 0 and set.bits[3] == 0) {
+                        var added_fold = false;
+                        if (set.contains('k') or set.contains('K')) {
+                            try unicode_list.append(self.allocator, .{ .start = 0x212A, .end = 0x212A });
+                            added_fold = true;
+                        }
+                        if (set.contains('s') or set.contains('S')) {
+                            try unicode_list.append(self.allocator, .{ .start = 0x017F, .end = 0x017F });
+                            added_fold = true;
+                        }
+                        if (added_fold) {
+                            const owned_ranges = try sortAndMergeRanges(self.allocator, &unicode_list);
+                            errdefer self.allocator.free(owned_ranges);
+                            const range_idx = try self.addUnicodeRangeList(owned_ranges, true);
+                            return self.emitUnicodeClassInst(range_idx, false, set, true);
+                        }
+                    }
                 }
                 const pc = try self.emit(.{ .class = .{ .set = set, .out = 0 } });
                 return .{ .start = pc, .end = pc };

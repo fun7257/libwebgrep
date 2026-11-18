@@ -12,6 +12,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const platform = @import("io/platform.zig");
 const matcher_mod = @import("matcher.zig");
+const probe_mod = @import("probe.zig");
 const sink_mod = @import("sink.zig");
 
 pub const config_mod = @import("search/config.zig");
@@ -22,10 +23,14 @@ pub const line_matcher_mod = @import("search/line_matcher.zig");
 pub const long_line_mod = @import("search/long_line.zig");
 pub const pull_mod = @import("search/pull.zig");
 pub const pipeline_mod = @import("search/pipeline.zig");
+pub const reverse_mod = @import("search/reverse.zig");
 
 pub const Encoding = config_mod.Encoding;
 pub const Compression = config_mod.Compression;
 pub const BinaryPolicy = config_mod.BinaryPolicy;
+pub const ByteRange = config_mod.ByteRange;
+pub const LineNumberMode = config_mod.LineNumberMode;
+pub const LineFilterCandidate = config_mod.LineFilterCandidate;
 pub const SearchConfig = config_mod.SearchConfig;
 pub const Scratch = config_mod.Scratch;
 pub const Outcome = config_mod.Outcome;
@@ -37,6 +42,8 @@ pub const Event = config_mod.Event;
 pub const LineEvent = config_mod.LineEvent;
 pub const EndEvent = config_mod.EndEvent;
 pub const Flow = config_mod.Flow;
+pub const FlowAction = sink_mod.FlowAction;
+pub const RandomAccess = probe_mod.RandomAccess;
 pub const Summary = config_mod.Summary;
 pub const Progress = config_mod.Progress;
 pub const Heartbeat = config_mod.Heartbeat;
@@ -48,6 +55,10 @@ pub const SourcePull = pull_mod.SourcePull;
 pub const openSourcePull = pull_mod.openSourcePull;
 pub const ReaderPull = pull_mod.ReaderPull;
 pub const openReaderPull = pull_mod.openReaderPull;
+pub const searchReverseSlice = reverse_mod.searchReverseSlice;
+pub const searchSourceReverseSlice = reverse_mod.searchSourceReverseSlice;
+pub const searchReverseAt = reverse_mod.searchReverseAt;
+pub const searchSourceReverseAt = reverse_mod.searchSourceReverseAt;
 
 const serviceConfig = config_mod.serviceConfig;
 const bufferWindow = config_mod.bufferWindow;
@@ -113,25 +124,103 @@ pub fn searchFile(
     matcher_mod.validateMatcher(@TypeOf(matcher));
     resetStats(matcher);
     if (comptime build_options.window_map) {
-        const window_map = @import("io/window_map.zig");
-        if (try window_map.open(io, file, bufferWindow(config))) |opened| {
-            var ctx = opened;
-            defer ctx.close();
-            return drive(S, allocator, sink, matcher, config, name, window_map.readBytes, &ctx);
+        if (config.byte_range == null and config.resume_from == 0 and config.read_at == null and config.seek_input == null and config.stream_offset == null) {
+            const window_map = @import("io/window_map.zig");
+            if (try window_map.open(io, file, bufferWindow(config))) |opened| {
+                var ctx = opened;
+                defer ctx.close();
+                return drive(S, allocator, sink, matcher, config, name, window_map.readBytes, &ctx);
+            }
         }
     }
-    platform.adviseSequentialFile(file);
-    const Ctx = struct { io: std.Io, file: std.Io.File, offset: u64 = 0 };
-    var ctx = Ctx{ .io = io, .file = file };
-    return drive(S, allocator, sink, matcher, config, name, struct {
+    if (config.byte_range == null and config.resume_from == 0) {
+        platform.adviseSequentialFile(file);
+    }
+    const Ctx = struct {
+        io: std.Io,
+        file: std.Io.File,
+        offset: u64 = 0,
         fn read(raw: *anyopaque, dest: []u8) ReadError!usize {
-            const c: *Ctx = @ptrCast(@alignCast(raw));
+            const c: *@This() = @ptrCast(@alignCast(raw));
             var iov = [_][]u8{dest};
             const n = try c.file.readPositional(c.io, &iov, c.offset);
             c.offset += n;
             return n;
         }
-    }.read, &ctx);
+        fn readAt(raw: ?*anyopaque, offset: u64, dest: []u8) anyerror!usize {
+            const c: *@This() = @ptrCast(@alignCast(raw.?));
+            var iov = [_][]u8{dest};
+            const n = try c.file.readPositional(c.io, &iov, offset);
+            c.offset = offset + n;
+            return n;
+        }
+    };
+    var ctx = Ctx{ .io = io, .file = file, .offset = state_mod.effectiveRangeStart(config) };
+    var cfg = config;
+    if (cfg.read_at == null and cfg.seek_input == null) {
+        cfg.read_at = Ctx.readAt;
+        cfg.read_at_ctx = &ctx;
+    }
+    return drive(S, allocator, sink, matcher, cfg, name, Ctx.read, &ctx);
+}
+
+/// Searches `range` (`[start, end)`) over a handle-free, path-free `probe.RandomAccess` source without reading outside the range.
+pub fn searchRange(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    sink: *S,
+    source: probe_mod.RandomAccess,
+    range: ByteRange,
+    name: []const u8,
+    matcher: anytype,
+    config: SearchConfig,
+) ReadError!Result {
+    matcher_mod.validateMatcher(@TypeOf(matcher));
+    resetStats(matcher);
+    const Adapter = struct {
+        ra: probe_mod.RandomAccess,
+        cursor: u64 = 0,
+        fn read(raw: *anyopaque, dest: []u8) ReadError!usize {
+            const a: *@This() = @ptrCast(@alignCast(raw));
+            const n = a.ra.readAt(a.cursor, dest) catch return error.ReadFailed;
+            a.cursor += n;
+            return n;
+        }
+        fn readAt(raw: ?*anyopaque, offset: u64, dest: []u8) anyerror!usize {
+            const a: *@This() = @ptrCast(@alignCast(raw.?));
+            return a.ra.readAt(offset, dest);
+        }
+    };
+    var cfg = config;
+    cfg.byte_range = range;
+    var adapter = Adapter{ .ra = source, .cursor = state_mod.effectiveRangeStart(cfg) };
+    if (cfg.read_at == null) {
+        cfg.read_at = Adapter.readAt;
+        cfg.read_at_ctx = &adapter;
+    }
+    return drive(S, allocator, sink, matcher, cfg, name, Adapter.read, &adapter);
+}
+
+/// Service entry point: searches `range` (`[start, end)`) over a handle-free, path-free `probe.RandomAccess` source.
+pub fn searchSourceRange(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    sink: *S,
+    source: probe_mod.RandomAccess,
+    range: ByteRange,
+    source_id: []const u8,
+    matcher: anytype,
+    config: SearchConfig,
+) ReadError!Result {
+    const cfg = serviceConfig(config);
+    var bridge = EventBridge(S){
+        .inner = sink,
+        .source_id = source_id,
+        .config = cfg,
+    };
+    const result = try searchRange(EventBridge(S), allocator, &bridge, source, range, "", matcher, cfg);
+    emitSummary(S, sink, source_id, cfg, result);
+    return result;
 }
 
 /// Service entry point: searches an in-memory byte slice.
@@ -233,5 +322,6 @@ test {
     _ = long_line_mod;
     _ = pull_mod;
     _ = pipeline_mod;
+    _ = reverse_mod;
     _ = @import("search/tests.zig");
 }

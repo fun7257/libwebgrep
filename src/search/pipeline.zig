@@ -75,6 +75,22 @@ const pumpLong = long_line_mod.pumpLong;
 const makeRoom = long_line_mod.makeRoom;
 const compactBuf = long_line_mod.compactBuf;
 
+fn setDecoderRawMidStream(decoder: *encoding.Decoder, config: SearchConfig) void {
+    const saved_in = decoder.in;
+    const saved_raw = decoder.raw_buf;
+    const saved_max_in = decoder.max_in;
+    const saved_map = decoder.offset_map;
+    if (encoding.resolveHint(config.encoding, config.charset) == .auto) {
+        decoder.* = encoding.Decoder.init(.none);
+    } else {
+        decoder.* = encoding.Decoder.initWithHint(config.encoding, config.charset);
+    }
+    decoder.in = saved_in;
+    decoder.raw_buf = saved_raw;
+    decoder.max_in = saved_max_in;
+    decoder.offset_map = saved_map;
+}
+
 pub const Prepared = struct {
     bytes: []const u8,
     owned: []u8 = &.{},
@@ -366,7 +382,8 @@ pub fn searchPrepared(
     defer if (config.scratch_pool == null and state.ring.heap_slots.len != 0) {
         if (pool_alloc) |alloc| alloc.free(state.ring.heap_slots);
     };
-    if (config.line_numbers) state.line_number = 1;
+    const eff_start_slice = state_mod.effectiveRangeStart(config);
+    state_mod.initLineNumber(&state, config, eff_start_slice);
     restoreCounters(&state, config);
     if (prepared.decompress_limit_hit) {
         _ = callOpt(S, "begin", sink, .{name});
@@ -379,26 +396,48 @@ pub fn searchPrepared(
         return finishSink(S, sink, &state, config);
     }
     const view = budgetView(haystack, prepared.base_searchable_offset, &state, config);
-    if (!callOpt(S, "begin", sink, .{name})) {
-        noteRejected(S, &state, sink);
-        if (state.paused) {
+    switch (state_mod.callSinkAction(S, "begin", sink, .{name})) {
+        .cont => {},
+        .skip_to => |target| {
+            if (target > state.abs_base) state.pending_skip_to = target;
+        },
+        .pause => {
+            state.paused = true;
+            state.stopped = true;
             state.resume_at = state.abs_base;
-            state.resume_line = state.line_number orelse 1;
-        }
-        return finishSink(S, sink, &state, config);
+            state.resume_line = state.line_number orelse 0;
+            return finishSink(S, sink, &state, config);
+        },
+        .stop => {
+            state.stopped = true;
+            return finishSink(S, sink, &state, config);
+        },
     }
     if (rejectEmptyResults(&state, config)) return finishSink(S, sink, &state, config);
     if (stopForBudget(&state, config)) return finishSink(S, sink, &state, config);
+    if (state.pending_skip_to != null) {
+        _ = line_matcher_mod.applyInBufferSkip(view, view.len, &state, config);
+        state.pending_skip_to = null;
+    }
 
     if (watchesBinary(config) and config.binary == .quit and canFuse(matcher, config, &state)) {
+        const is_ml = state_mod.effectiveMultiline(matcher, config);
+        const ml_win = if (is_ml) state_mod.effectiveMultilineWindow(matcher, config) else 0;
+        const watched_exact = state_mod.watchedMatchIsExact(matcher, config);
+        const watched_exact_start = state_mod.watchedMatchHasExactStart(matcher, config);
         const need_ls = line_matcher_mod.needLineStart(S, &state, config);
-        const direct_sink = ((comptime !@hasDecl(S, "matched")) or config.match_mode == .earliest) and
-            config.resume_from == 0 and !config.files_without_match;
+        const direct_sink = !is_ml and ((comptime !@hasDecl(S, "matched")) or config.match_mode == .earliest) and
+            config.resume_from == 0 and !config.files_without_match and config.line_filter == null;
         while (state.pos < view.len and !state.stopped) {
             if (state.exceeded(config) or flagIsSet(config) or stopInMatch(&state, config) or !maybeProgress(S, sink, &state, config)) {
                 if (state.exceeded(config)) state.need_close = true;
                 state.stopped = true;
                 break;
+            }
+            if (state.pending_skip_to != null) {
+                _ = line_matcher_mod.applyInBufferSkip(view, view.len, &state, config);
+                state.pending_skip_to = null;
+                continue;
             }
             var nul_at: ?usize = null;
             const found = if (comptime @hasDecl(state_mod.MatcherType(@TypeOf(matcher)), "findWatched"))
@@ -409,9 +448,20 @@ pub fn searchPrepared(
                 const safe_end = lineStart(view, nul, config);
                 if (safe_end > state.pos) {
                     if (!try matchBuffer(S, sink, matcher, view[0..safe_end], &state, config)) {
-                        state.stopped = true;
-                        break;
+                        if (state.pending_skip_to != null) {
+                            _ = line_matcher_mod.applyInBufferSkip(view, view.len, &state, config);
+                            state.pending_skip_to = null;
+                            if (state.pos > nul) continue;
+                        } else {
+                            state.stopped = true;
+                            break;
+                        }
                     }
+                }
+                if (state.pending_skip_to != null) {
+                    _ = line_matcher_mod.applyInBufferSkip(view, view.len, &state, config);
+                    state.pending_skip_to = null;
+                    if (state.pos > nul) continue;
                 }
                 noteBinary(&state, config, state.abs_base + nul);
                 _ = callOpt(S, "binary", sink, .{state.nul_offset.?});
@@ -423,15 +473,138 @@ pub fn searchPrepared(
                 if (flagIsSet(config) or stopInMatch(&state, config) or !maybeProgress(S, sink, &state, config)) state.stopped = true;
                 break;
             };
+            if (is_ml) {
+                const saved_pos = state.pos;
+                const saved_ln = state.line_number;
+                const saved_llc = state.last_line_counted;
+                if (watched_exact) {
+                    state.setCachedMatch(view, state.pos, hit);
+                }
+                const safe_from = if (watched_exact_start) hit.start else @max(state.pos, hit.start -| ml_win);
+                if (config.progress_interval == null or config.progress_interval.? == 0) {
+                    const ls = if (need_ls or safe_from >= view.len) lineStart(view, safe_from, config) else safe_from;
+                    if (ls > state.pos) {
+                        if (need_ls) countLines(view, ls, &state, config);
+                        state.pos = ls;
+                    }
+                }
+                if (try line_matcher_mod.findLineLimitOpts(matcher, view, &state, hit.start + 1, config, need_ls)) |line| {
+                    if (memchr.find(width, view[hit.start..line.end], 0, 0)) |rel| {
+                        const nul = hit.start + rel;
+                        const safe_end = lineStart(view, nul, config);
+                        state.pos = saved_pos;
+                        state.line_number = saved_ln;
+                        state.last_line_counted = saved_llc;
+                        if (safe_end > state.pos) {
+                            if (!try matchBuffer(S, sink, matcher, view[0..safe_end], &state, config)) {
+                                if (state.pending_skip_to != null) {
+                                    _ = line_matcher_mod.applyInBufferSkip(view, view.len, &state, config);
+                                    state.pending_skip_to = null;
+                                    if (state.pos > nul) continue;
+                                } else {
+                                    state.stopped = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (state.pending_skip_to != null) {
+                            _ = line_matcher_mod.applyInBufferSkip(view, view.len, &state, config);
+                            state.pending_skip_to = null;
+                            if (state.pos > nul) continue;
+                        }
+                        noteBinary(&state, config, state.abs_base + nul);
+                        _ = callOpt(S, "binary", sink, .{state.nul_offset.?});
+                        if (state.hit_byte_cap) noteLimit(&state, .max_bytes);
+                        return finishSink(S, sink, &state, config);
+                    }
+                    if (state.abs_base + @as(u64, line.start) < config.resume_from) {
+                        state.pos = line.end;
+                        continue;
+                    }
+                    if (config.files_without_match) {
+                        state.limit_count += 1;
+                        state.matched_lines += 1;
+                        state.matches += 1;
+                        state.results_out += 1;
+                        state.pos = line.end;
+                        state.stopped = true;
+                        state.need_close = true;
+                        break;
+                    }
+                    state.limit_count += 1;
+                    state.pos = line.end;
+                    const known = state_mod.BufMatch{ .start = line.mstart, .end = line.mend, .pattern_id = line.mpid, .single_match = line.single_match };
+                    if (!try format_mod.sinkMatched(S, sink, matcher, view, line.range(), known, &state, config)) {
+                        state.stopped = true;
+                        break;
+                    }
+                    if (state.pending_skip_to != null) {
+                        _ = line_matcher_mod.applyInBufferSkip(view, view.len, &state, config);
+                        state.pending_skip_to = null;
+                    }
+                    if (state.exceeded(config)) {
+                        state.stopped = true;
+                        state.need_close = true;
+                        break;
+                    }
+                    continue;
+                } else {
+                    const first_le = lineEnd(view, safe_from, config);
+                    const nul_check_end = @max(hit.start, first_le);
+                    if (nul_check_end > hit.start) {
+                        if (memchr.find(width, view[hit.start..nul_check_end], 0, 0)) |rel| {
+                            const nul = hit.start + rel;
+                            const safe_end = lineStart(view, nul, config);
+                            state.pos = saved_pos;
+                            state.line_number = saved_ln;
+                            state.last_line_counted = saved_llc;
+                            if (safe_end > state.pos) {
+                                if (!try matchBuffer(S, sink, matcher, view[0..safe_end], &state, config)) {
+                                    if (state.pending_skip_to != null) {
+                                        _ = line_matcher_mod.applyInBufferSkip(view, view.len, &state, config);
+                                        state.pending_skip_to = null;
+                                        if (state.pos > nul) continue;
+                                    } else {
+                                        state.stopped = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (state.pending_skip_to != null) {
+                                _ = line_matcher_mod.applyInBufferSkip(view, view.len, &state, config);
+                                state.pending_skip_to = null;
+                                if (state.pos > nul) continue;
+                            }
+                            noteBinary(&state, config, state.abs_base + nul);
+                            _ = callOpt(S, "binary", sink, .{state.nul_offset.?});
+                            if (state.hit_byte_cap) noteLimit(&state, .max_bytes);
+                            return finishSink(S, sink, &state, config);
+                        }
+                    }
+                    state.pos = @max(first_le, safe_from + 1);
+                    continue;
+                }
+            }
             const hit_line_end = lineEnd(view, @max(hit.end, hit.start), config);
             if (memchr.find(width, view[hit.start..hit_line_end], 0, 0)) |rel| {
                 const nul = hit.start + rel;
                 const safe_end = lineStart(view, nul, config);
                 if (safe_end > state.pos) {
                     if (!try matchBuffer(S, sink, matcher, view[0..safe_end], &state, config)) {
-                        state.stopped = true;
-                        break;
+                        if (state.pending_skip_to != null) {
+                            _ = line_matcher_mod.applyInBufferSkip(view, view.len, &state, config);
+                            state.pending_skip_to = null;
+                            if (state.pos > nul) continue;
+                        } else {
+                            state.stopped = true;
+                            break;
+                        }
                     }
+                }
+                if (state.pending_skip_to != null) {
+                    _ = line_matcher_mod.applyInBufferSkip(view, view.len, &state, config);
+                    state.pending_skip_to = null;
+                    if (state.pos > nul) continue;
                 }
                 noteBinary(&state, config, state.abs_base + nul);
                 _ = callOpt(S, "binary", sink, .{state.nul_offset.?});
@@ -450,6 +623,10 @@ pub fn searchPrepared(
                     state.stopped = true;
                     break;
                 }
+                if (state.pending_skip_to != null) {
+                    _ = line_matcher_mod.applyInBufferSkip(view, view.len, &state, config);
+                    state.pending_skip_to = null;
+                }
                 if (state.exceeded(config)) {
                     state.stopped = true;
                     state.need_close = true;
@@ -465,8 +642,17 @@ pub fn searchPrepared(
                 }
             }
             if (!try matchBuffer(S, sink, matcher, view[0..hit_line_end], &state, config)) {
+                if (state.pending_skip_to != null) {
+                    _ = line_matcher_mod.applyInBufferSkip(view, view.len, &state, config);
+                    state.pending_skip_to = null;
+                    continue;
+                }
                 state.stopped = true;
                 break;
+            }
+            if (state.pending_skip_to != null) {
+                _ = line_matcher_mod.applyInBufferSkip(view, view.len, &state, config);
+                state.pending_skip_to = null;
             }
         }
         const consumed_w = (!state.stopped or state.pos >= view.len) and !state.output_blocked;
@@ -479,13 +665,24 @@ pub fn searchPrepared(
     if (watchesBinary(config)) {
         var nul_at: ?usize = null;
         if (view.len > 0 and canFuse(matcher, config, &state)) {
-            const found = if (comptime @hasDecl(state_mod.MatcherType(@TypeOf(matcher)), "findWatched")) matcher.findWatched(view, 0, &nul_at) else unreachable;
+            const is_ml = state_mod.effectiveMultiline(matcher, config);
+            const ml_win = if (is_ml) state_mod.effectiveMultilineWindow(matcher, config) else 0;
+            const found = if (comptime @hasDecl(state_mod.MatcherType(@TypeOf(matcher)), "findWatched")) matcher.findWatched(view, state.pos, &nul_at) else unreachable;
             if (nul_at == null) {
                 if (found) |hit| {
                     if (memchr.find(width, view[hit.start..], 0, 0)) |rel| {
                         nul_at = hit.start + rel;
-                    } else if (config.progress_interval == null or config.progress_interval.? == 0) {
-                        state.pos = lineStart(view, hit.start, config);
+                    } else {
+                        if (state_mod.watchedMatchIsExact(matcher, config)) {
+                            state.setCachedMatch(view, state.pos, hit);
+                        }
+                        if (config.progress_interval == null or config.progress_interval.? == 0) {
+                            const safe_hit = if (!is_ml or state_mod.watchedMatchHasExactStart(matcher, config))
+                                hit.start
+                            else
+                                @max(state.pos, hit.start -| ml_win);
+                            state.pos = lineStart(view, safe_hit, config);
+                        }
                     }
                 } else {
                     skip_match = true;
@@ -495,25 +692,45 @@ pub fn searchPrepared(
         } else {
             nul_at = memchr.find(width, view, 0, 0);
         }
-        if (nul_at) |nul| {
+        if (nul_at) |initial_nul| {
             if (config.binary == .quit) {
-                const safe_end = lineStart(view, nul, config);
-                if (safe_end > state.pos) {
-                    if (!try matchBuffer(S, sink, matcher, view[0..safe_end], &state, config)) {
-                        state.stopped = true;
+                var cur_nul: ?usize = initial_nul;
+                while (cur_nul) |nul| {
+                    const safe_end = lineStart(view, nul, config);
+                    if (safe_end > state.pos) {
+                        if (!try matchBuffer(S, sink, matcher, view[0..safe_end], &state, config)) {
+                            if (state.pending_skip_to != null) {
+                                _ = line_matcher_mod.applyInBufferSkip(view, view.len, &state, config);
+                                state.pending_skip_to = null;
+                            } else {
+                                state.stopped = true;
+                                break;
+                            }
+                        }
                     }
-                }
-                if (!state.stopped) {
+                    if (state.pending_skip_to != null) {
+                        _ = line_matcher_mod.applyInBufferSkip(view, view.len, &state, config);
+                        state.pending_skip_to = null;
+                    }
+                    if (state.pos > nul) {
+                        cur_nul = if (state.pos < view.len) memchr.find(width, view, state.pos, 0) else null;
+                        continue;
+                    }
                     noteBinary(&state, config, state.abs_base + nul);
                     _ = callOpt(S, "binary", sink, .{state.nul_offset.?});
                     state.stopped = true;
+                    if (state.hit_byte_cap) noteLimit(&state, .max_bytes);
+                    return finishSink(S, sink, &state, config);
                 }
-                if (state.hit_byte_cap) noteLimit(&state, .max_bytes);
-                return finishSink(S, sink, &state, config);
+                if (state.stopped) {
+                    if (state.hit_byte_cap) noteLimit(&state, .max_bytes);
+                    return finishSink(S, sink, &state, config);
+                }
+            } else {
+                noteBinary(&state, config, state.abs_base + initial_nul);
+                const cont = callOpt(S, "binary", sink, .{state.nul_offset.?});
+                if (!cont) state.stopped = true;
             }
-            noteBinary(&state, config, state.abs_base + nul);
-            const cont = callOpt(S, "binary", sink, .{state.nul_offset.?});
-            if (!cont) state.stopped = true;
         }
     }
 
@@ -521,7 +738,13 @@ pub fn searchPrepared(
         if (skip_match) {
             if (flagIsSet(config) or stopInMatch(&state, config) or !maybeProgress(S, sink, &state, config)) state.stopped = true;
         } else {
-            if (!try matchBuffer(S, sink, matcher, view, &state, config)) state.stopped = true;
+            if (!try matchBuffer(S, sink, matcher, view, &state, config)) {
+                if (state.pending_skip_to != null) {
+                    state.pending_skip_to = null;
+                } else {
+                    state.stopped = true;
+                }
+            }
         }
     }
     const consumed = (!state.stopped or state.pos >= view.len) and !state.output_blocked;
@@ -630,20 +853,43 @@ pub fn drive(
             if (seen.len != 0) pool_alloc.free(seen);
         }
     }
-    if (config.line_numbers) state.line_number = 1;
+    const eff_start = state_mod.effectiveRangeStart(config);
+    if (config.byte_range != null or config.stream_offset != null) {
+        state.is_range_search = true;
+        state.range_base_offset = eff_start;
+    }
+    state_mod.initLineNumber(&state, config, eff_start);
     restoreCounters(&state, config);
-    if (!callOpt(S, "begin", sink, .{name})) {
-        noteRejected(S, &state, sink);
-        if (state.paused) {
-            state.resume_at = state.abs_base;
-            state.resume_line = state.line_number orelse 1;
-        }
+    switch (state_mod.callSinkAction(S, "begin", sink, .{name})) {
+        .cont => {},
+        .skip_to => |target| {
+            if (target > eff_start) state.pending_skip_to = target;
+        },
+        .pause => {
+            state.paused = true;
+            state.stopped = true;
+            state.abs_base = eff_start;
+            state.resume_at = eff_start;
+            state.resume_line = state.line_number orelse 0;
+            return finishSink(S, sink, &state, config);
+        },
+        .stop => {
+            state.stopped = true;
+            state.abs_base = eff_start;
+            return finishSink(S, sink, &state, config);
+        },
+    }
+    if (rejectEmptyResults(&state, config)) {
+        state.abs_base = eff_start;
+        state.resume_at = eff_start;
         return finishSink(S, sink, &state, config);
     }
-    if (rejectEmptyResults(&state, config)) return finishSink(S, sink, &state, config);
 
-    const initial = if (isMultilineMatcher(matcher))
-        @max(bufferWindow(config), multilineWindow(matcher, config))
+    const is_ml = state_mod.effectiveMultiline(matcher, config);
+    const ml_win = if (is_ml) state_mod.effectiveMultilineWindow(matcher, config) else 0;
+    const hold_limit = if (is_ml and ml_win > 0) state_mod.multilineHoldLimit(config, ml_win) else cfg_mod.lineHoldLimit(config);
+    const initial = if (is_ml)
+        @max(bufferWindow(config), ml_win)
     else
         bufferWindow(config);
     const cap0 = @max(initial, 1);
@@ -698,10 +944,12 @@ pub fn drive(
         .state = &state,
         .config = config,
         .sink = @ptrCast(sink),
+        .raw_cursor = config.stream_offset orelse 0,
     };
     var decompressed_stream: ?[]u8 = null;
     defer if (decompressed_stream) |ds| allocator.free(ds);
     var decompressed_pos: usize = 0;
+    var decompressed_end: usize = 0;
 
     if (config.compression != .none) {
         var sniff_buf: [6]u8 = undefined;
@@ -801,10 +1049,376 @@ pub fn drive(
                     return finishSink(S, sink, &state, config);
                 },
             }
+            if (decompressed_stream) |ds| decompressed_end = ds.len;
+        }
+    }
+
+    const range_end: ?u64 = if (config.byte_range) |br| br.end else null;
+    const sep = cfg_mod.recordSep(config);
+    var range_eof = false;
+    var extending_past_range_end = false;
+
+    if (decompressed_stream) |ds| {
+        decompressed_end = ds.len;
+        if (eff_start > 0 or range_end != null) {
+            var s_idx: usize = @intCast(@min(eff_start, @as(u64, ds.len)));
+            if (config.range_align_lines and config.continuation == null and eff_start > 0 and s_idx > 0 and s_idx < ds.len and ds[s_idx - 1] != sep) {
+                s_idx = if (memchr.find(width, ds, s_idx, sep)) |d| d + 1 else ds.len;
+            }
+            var e_idx: usize = ds.len;
+            if (range_end) |re_end| {
+                const raw_e: usize = @intCast(@min(re_end, @as(u64, ds.len)));
+                if (raw_e <= s_idx) {
+                    e_idx = s_idx;
+                } else if (config.range_align_lines and raw_e < ds.len and ds[raw_e - 1] != sep) {
+                    e_idx = if (memchr.find(width, ds, raw_e, sep)) |d| d + 1 else ds.len;
+                } else {
+                    e_idx = raw_e;
+                }
+            }
+            decompressed_pos = s_idx;
+            decompressed_end = e_idx;
+            state.abs_base = @intCast(s_idx);
+            if (state.is_range_search) state.range_base_offset = state.abs_base;
+            if (s_idx > 0) setDecoderRawMidStream(&decoder, config);
+            if (s_idx >= e_idx) range_eof = true;
+        }
+    } else if (eff_start > 0) {
+        const align_start = config.range_align_lines and config.continuation == null;
+        if (config.read_at != null or config.seek_input != null) {
+            setDecoderRawMidStream(&decoder, config);
+            const check_prev = align_start and eff_start > 0;
+            const seek_target = if (check_prev) eff_start - 1 else eff_start;
+            if (config.read_at == null) {
+                if (config.seek_input) |seek_fn| {
+                    seek_fn(config.seek_ctx, seek_target) catch |err| {
+                        state.soft_error = .read_failed;
+                        logDetail(config, name, err);
+                        state.need_close = true;
+                        return finishSink(S, sink, &state, config);
+                    };
+                }
+            }
+            upstream.raw_cursor = seek_target;
+            state.abs_base = eff_start;
+            if (check_prev) {
+                var prev_b: [1]u8 = undefined;
+                const prev_n = readUpstream(S, readFn, &upstream, prev_b[0..1]) catch |err| {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    state.soft_error = .read_failed;
+                    logDetail(config, name, err);
+                    state.need_close = true;
+                    return finishSink(S, sink, &state, config);
+                };
+                if (prev_n == 0) {
+                    range_eof = true;
+                } else if (prev_b[0] != sep) {
+                    while (!stopForBudget(&state, config)) {
+                        var max_align = buf.len;
+                        if (range_end) |re_end| {
+                            if (state.abs_base >= re_end) {
+                                range_eof = true;
+                                break;
+                            }
+                            const rem_r = re_end - state.abs_base;
+                            if (@as(u64, max_align) > rem_r) max_align = @intCast(rem_r);
+                        }
+                        if (scanRemaining(&state, config)) |left| {
+                            if (left == 0) {
+                                noteLimit(&state, .max_bytes);
+                                break;
+                            }
+                            if (max_align > left) max_align = left;
+                        }
+                        const rn = readUpstream(S, readFn, &upstream, buf[0..max_align]) catch |err| {
+                            if (err == error.OutOfMemory) return error.OutOfMemory;
+                            state.soft_error = .read_failed;
+                            logDetail(config, name, err);
+                            state.need_close = true;
+                            return finishSink(S, sink, &state, config);
+                        };
+                        state.bytes_read += rn;
+                        if (rn == 0) {
+                            range_eof = true;
+                            break;
+                        }
+                        if (memchr.find(width, buf[0..rn], 0, sep)) |nl_rel| {
+                            const drop = nl_rel + 1;
+                            state.abs_base += drop;
+                            const rem = rn - drop;
+                            if (rem > 0) std.mem.copyForwards(u8, buf[0..rem], buf[drop..rn]);
+                            filled = rem;
+                            break;
+                        }
+                        state.abs_base += rn;
+                    }
+                    if (state.limit_hit != .none) return finishSink(S, sink, &state, config);
+                }
+            }
+            if (state.is_range_search) state.range_base_offset = state.abs_base;
+        } else if (upstream.raw_cursor == eff_start) {
+            setDecoderRawMidStream(&decoder, config);
+            state.abs_base = eff_start;
+            if (align_start) {
+                while (!stopForBudget(&state, config)) {
+                    var max_align = buf.len;
+                    if (range_end) |re_end| {
+                        if (state.abs_base >= re_end) {
+                            range_eof = true;
+                            break;
+                        }
+                        const rem_r = re_end - state.abs_base;
+                        if (@as(u64, max_align) > rem_r) max_align = @intCast(rem_r);
+                    }
+                    if (scanRemaining(&state, config)) |left| {
+                        if (left == 0) {
+                            noteLimit(&state, .max_bytes);
+                            break;
+                        }
+                        if (max_align > left) max_align = left;
+                    }
+                    const rn = readUpstream(S, readFn, &upstream, buf[0..max_align]) catch |err| {
+                        if (err == error.OutOfMemory) return error.OutOfMemory;
+                        state.soft_error = .read_failed;
+                        logDetail(config, name, err);
+                        state.need_close = true;
+                        return finishSink(S, sink, &state, config);
+                    };
+                    state.bytes_read += rn;
+                    if (rn == 0) {
+                        range_eof = true;
+                        break;
+                    }
+                    if (memchr.find(width, buf[0..rn], 0, sep)) |nl_rel| {
+                        const drop = nl_rel + 1;
+                        state.abs_base += drop;
+                        const rem = rn - drop;
+                        if (rem > 0) std.mem.copyForwards(u8, buf[0..rem], buf[drop..rn]);
+                        filled = rem;
+                        break;
+                    }
+                    state.abs_base += rn;
+                }
+                if (state.limit_hit != .none) return finishSink(S, sink, &state, config);
+            }
+            if (state.is_range_search) state.range_base_offset = state.abs_base;
+        } else {
+            var cur_decoded: u64 = upstream.raw_cursor;
+            var prev_b: u8 = sep;
+            while (cur_decoded < eff_start and !stopForBudget(&state, config)) {
+                var max_skip = buf.len;
+                if (!state.is_range_search) {
+                    if (scanRemaining(&state, config)) |left| {
+                        if (left == 0) {
+                            noteLimit(&state, .max_bytes);
+                            break;
+                        }
+                        if (max_skip > left) max_skip = left;
+                    }
+                }
+                var skip_read_bytes: u64 = 0;
+                const pulled_skip = decoder.pull(pool_alloc, struct {
+                    fn read(ctx: *anyopaque, out: []u8) anyerror!usize {
+                        return readUpstream(S, readFn, ctx, out);
+                    }
+                }.read, &upstream, bufferWindow(config), buf[0..max_skip], &skip_read_bytes) catch |err| {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    if (err == error.DecodeLimit) return error.DecodeLimit;
+                    state.soft_error = .read_failed;
+                    logDetail(config, name, err);
+                    state.need_close = true;
+                    return finishSink(S, sink, &state, config);
+                };
+                if (!state.is_range_search) state.bytes_read += skip_read_bytes;
+                if (cur_decoded + pulled_skip.n >= eff_start) {
+                    const cut: usize = @intCast(eff_start - cur_decoded);
+                    if (cut > 0) prev_b = buf[cut - 1];
+                    const rem = pulled_skip.n - cut;
+                    if (rem > 0) std.mem.copyForwards(u8, buf[0..rem], buf[cut..pulled_skip.n]);
+                    filled = rem;
+                    if (state.is_range_search) state.bytes_read += rem;
+                    cur_decoded = eff_start;
+                    if (pulled_skip.eof and filled == 0) range_eof = true;
+                    break;
+                }
+                if (pulled_skip.n > 0) prev_b = buf[pulled_skip.n - 1];
+                cur_decoded += pulled_skip.n;
+                if (pulled_skip.eof) {
+                    range_eof = true;
+                    break;
+                }
+            }
+            if (state.limit_hit != .none) return finishSink(S, sink, &state, config);
+            state.abs_base = cur_decoded;
+            if (!range_eof and align_start and prev_b != sep) {
+                while (true) {
+                    const check_len: usize = if (range_end) |re_end|
+                        @intCast(@min(@as(u64, filled), re_end -| state.abs_base))
+                    else
+                        filled;
+                    if (memchr.find(width, buf[0..check_len], 0, sep)) |nl_rel| {
+                        const drop = nl_rel + 1;
+                        const rem = filled - drop;
+                        if (rem > 0) std.mem.copyForwards(u8, buf[0..rem], buf[drop..filled]);
+                        filled = rem;
+                        state.abs_base += drop;
+                        break;
+                    }
+                    if (range_end) |re_end| {
+                        if (state.abs_base + @as(u64, check_len) >= re_end) {
+                            filled = 0;
+                            state.abs_base = re_end;
+                            range_eof = true;
+                            break;
+                        }
+                    }
+                    state.abs_base += filled;
+                    filled = 0;
+                    if (stopForBudget(&state, config)) break;
+                    var align_read: u64 = 0;
+                    const p_al = decoder.pull(pool_alloc, struct {
+                        fn read(ctx: *anyopaque, out: []u8) anyerror!usize {
+                            return readUpstream(S, readFn, ctx, out);
+                        }
+                    }.read, &upstream, bufferWindow(config), buf, &align_read) catch |err| {
+                        if (err == error.OutOfMemory) return error.OutOfMemory;
+                        if (err == error.DecodeLimit) return error.DecodeLimit;
+                        state.soft_error = .read_failed;
+                        logDetail(config, name, err);
+                        state.need_close = true;
+                        return finishSink(S, sink, &state, config);
+                    };
+                    state.bytes_read += align_read;
+                    filled = p_al.n;
+                    if (p_al.eof and filled == 0) {
+                        range_eof = true;
+                        break;
+                    }
+                }
+                if (state.limit_hit != .none) return finishSink(S, sink, &state, config);
+            }
+            if (state.is_range_search) state.range_base_offset = state.abs_base;
+        }
+    }
+
+    if (range_end) |re_end| {
+        if (state.abs_base >= re_end) {
+            filled = 0;
+            state.scanned_all = !state.output_blocked and state.soft_error == null;
+            return finishSink(S, sink, &state, config);
         }
     }
 
     while (!state.stopped) {
+        if (state.pending_skip_to) |skip_target| {
+            state.pending_skip_to = null;
+            state.after_left = 0;
+            state.ring.clear();
+            if (skip_target > state.abs_base + @as(u64, state.pos)) {
+                if (range_end) |re_end| {
+                    if (skip_target >= re_end and (!config.range_align_lines or skip_target > re_end)) {
+                        filled = 0;
+                        state.pos = 0;
+                        state.abs_base = re_end;
+                        state.scanned_all = !state.output_blocked and state.soft_error == null;
+                        break;
+                    }
+                }
+                const cur_buf_end = state.abs_base + @as(u64, filled);
+                if (skip_target <= cur_buf_end) {
+                    const drop: usize = @intCast(skip_target - state.abs_base);
+                    countLines(buf[0..filled], drop, &state, config);
+                    const rem = filled - drop;
+                    if (drop > 0 and rem > 0) std.mem.copyForwards(u8, buf[0..rem], buf[drop..filled]);
+                    filled = rem;
+                    state.pos = 0;
+                    state.last_line_visited = 0;
+                    state.last_line_counted = 0;
+                    state.remembered_until = 0;
+                    state.abs_base = skip_target;
+                    state.bytes_searched = @max(state.bytes_searched, state_mod.searchedSpanAt(&state, config, state.abs_base));
+                } else {
+                    countLines(buf[0..filled], filled, &state, config);
+                    filled = 0;
+                    state.pos = 0;
+                    state.last_line_visited = 0;
+                    state.last_line_counted = 0;
+                    state.remembered_until = 0;
+                    if (decompressed_stream) |ds| {
+                        const clamped_t: usize = @intCast(@min(skip_target, @as(u64, decompressed_end)));
+                        if (clamped_t > decompressed_pos) {
+                            if (state.line_number) |ln| {
+                                state.line_number = ln + memchr.count(width, ds, decompressed_pos, clamped_t, sep);
+                            }
+                        }
+                        decompressed_pos = clamped_t;
+                        state.abs_base = @intCast(clamped_t);
+                        setDecoderRawMidStream(&decoder, config);
+                        if (clamped_t >= decompressed_end) range_eof = true;
+                    } else if (config.read_at != null) {
+                        state.line_number = null;
+                        state.resume_line = 0;
+                        setDecoderRawMidStream(&decoder, config);
+                        upstream.raw_cursor = skip_target;
+                        state.abs_base = skip_target;
+                    } else if (config.seek_input) |seek_fn| {
+                        state.line_number = null;
+                        state.resume_line = 0;
+                        seek_fn(config.seek_ctx, skip_target) catch |err| {
+                            state.soft_error = .read_failed;
+                            logDetail(config, name, err);
+                            state.need_close = true;
+                            break;
+                        };
+                        setDecoderRawMidStream(&decoder, config);
+                        upstream.raw_cursor = skip_target;
+                        state.abs_base = skip_target;
+                    } else {
+                        var cur_off = cur_buf_end;
+                        while (cur_off < skip_target and !stopForBudget(&state, config)) {
+                            var sk_bytes: u64 = 0;
+                            const p_sk = decoder.pull(pool_alloc, struct {
+                                fn read(ctx: *anyopaque, out: []u8) anyerror!usize {
+                                    return readUpstream(S, readFn, ctx, out);
+                                }
+                            }.read, &upstream, bufferWindow(config), buf, &sk_bytes) catch |err| {
+                                if (err == error.OutOfMemory) return error.OutOfMemory;
+                                if (err == error.DecodeLimit) return error.DecodeLimit;
+                                state.soft_error = .read_failed;
+                                logDetail(config, name, err);
+                                state.need_close = true;
+                                break;
+                            };
+                            if (!state.is_range_search) state.bytes_read += sk_bytes;
+                            if (cur_off + p_sk.n >= skip_target) {
+                                const cut: usize = @intCast(skip_target - cur_off);
+                                if (state.line_number) |ln| {
+                                    state.line_number = ln + memchr.count(width, buf, 0, cut, sep);
+                                }
+                                const rem = p_sk.n - cut;
+                                if (rem > 0) std.mem.copyForwards(u8, buf[0..rem], buf[cut..p_sk.n]);
+                                filled = rem;
+                                if (state.is_range_search) state.bytes_read += rem;
+                                cur_off = skip_target;
+                                if (p_sk.eof and filled == 0) range_eof = true;
+                                break;
+                            }
+                            if (state.line_number) |ln| {
+                                state.line_number = ln + memchr.count(width, buf, 0, p_sk.n, sep);
+                            }
+                            cur_off += p_sk.n;
+                            if (p_sk.eof) {
+                                range_eof = true;
+                                break;
+                            }
+                        }
+                        if (state.soft_error != null or state.limit_hit != .none) break;
+                        state.abs_base = cur_off;
+                    }
+                    state.bytes_searched = @max(state.bytes_searched, state_mod.searchedSpanAt(&state, config, state.abs_base));
+                }
+            }
+        }
         if (state.exceeded(config)) {
             state.stopped = true;
             break;
@@ -814,62 +1428,140 @@ pub fn drive(
             break;
         }
         if (stopForBudget(&state, config)) break;
-        if (filled == buf.len) {
-            if (try grow(stream_alloc, buf, config)) |next| {
+        if (range_end) |re_end| {
+            if (!extending_past_range_end and state.abs_base >= re_end) {
+                state.scanned_all = !state.output_blocked and state.soft_error == null;
+                break;
+            }
+            if (filled > 0 and state.abs_base + @as(u64, filled) >= re_end) {
+                if (!config.range_align_lines) {
+                    filled = @intCast(re_end - state.abs_base);
+                    range_eof = true;
+                } else if (state.abs_base < re_end) {
+                    const rel_re: usize = @intCast(re_end - state.abs_base);
+                    if (buf[rel_re - 1] == sep) {
+                        filled = rel_re;
+                        range_eof = true;
+                    } else if (memchr.find(width, buf[0..filled], rel_re, sep)) |nl_idx| {
+                        filled = nl_idx + 1;
+                        range_eof = true;
+                    } else {
+                        extending_past_range_end = true;
+                    }
+                } else if (memchr.find(width, buf[0..filled], 0, sep)) |nl_idx| {
+                    filled = nl_idx + 1;
+                    range_eof = true;
+                }
+            }
+        }
+        if (!range_eof and filled == buf.len) {
+            if (try state_mod.growWithLimit(stream_alloc, buf, hold_limit)) |next| {
                 buf = next;
                 if (stream_slot) |slot| slot.* = buf;
             } else if (!try makeRoom(S, pool_alloc, sink, matcher, &buf, &filled, &hold, &seen, &state, config)) {
                 state.stopped = true;
                 break;
             } else if (stream_slot) |slot| slot.* = buf;
+            if (state.pending_skip_to != null) continue;
         }
-        var dest = buf[filled..];
-        if (filled == 0 and state.bytes_read == 0 and watchesBinary(config) and config.binary == .quit and dest.len > 64 * 1024) {
-            dest = dest[0 .. 64 * 1024];
-        }
-        if (scanRemaining(&state, config)) |left| {
-            if (left == 0) {
-                noteLimit(&state, .max_bytes);
-                break;
-            }
-            if (dest.len > left) dest = dest[0..left];
-        }
-        var raw_read_sink: u64 = 0;
-        const pulled = if (decompressed_stream) |ds| blk: {
-            const SliceCtx = struct {
-                data: []const u8,
-                pos: *usize,
-                fn read(ctx: *anyopaque, out: []u8) error{}!usize {
-                    const self: *@This() = @ptrCast(@alignCast(ctx));
-                    const avail = self.data.len - self.pos.*;
-                    const n = @min(avail, out.len);
-                    if (n > 0) @memcpy(out[0..n], self.data[self.pos.* .. self.pos.* + n]);
-                    self.pos.* += n;
-                    return n;
-                }
-            };
-            var sctx = SliceCtx{ .data = ds, .pos = &decompressed_pos };
-            break :blk decoder.pull(pool_alloc, SliceCtx.read, &sctx, bufferWindow(config), dest, &raw_read_sink) catch |err| {
-                if (err == error.OutOfMemory) return error.OutOfMemory;
-                if (err == error.DecodeLimit) return error.DecodeLimit;
-                unreachable;
-            };
-        } else decoder.pull(pool_alloc, struct {
-            fn read(ctx: *anyopaque, out: []u8) readRet(readFn) {
-                return readUpstream(S, readFn, ctx, out);
-            }
-        }.read, &upstream, bufferWindow(config), dest, &state.bytes_read) catch |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            if (err == error.DecodeLimit) return error.DecodeLimit;
-            state.soft_error = .read_failed;
-            logDetail(config, name, err);
-            state.need_close = true;
-            break;
-        };
-        const eof = pulled.eof;
-        if (pulled.n == 0 and !eof and filled == 0) continue;
         var chunk_at = filled;
-        if (pulled.n != 0) filled += pulled.n;
+        var eof = range_eof;
+        if (!range_eof) {
+            var dest = buf[filled..];
+            if (filled == 0 and state.bytes_read == 0 and watchesBinary(config) and config.binary == .quit and dest.len > 64 * 1024) {
+                dest = dest[0 .. 64 * 1024];
+            }
+            if (range_end) |re_end| {
+                if (!config.range_align_lines) {
+                    const cur_end = state.abs_base + @as(u64, filled);
+                    if (cur_end >= re_end) {
+                        dest = dest[0..0];
+                        range_eof = true;
+                    } else {
+                        const max_r = re_end - cur_end;
+                        if (@as(u64, dest.len) > max_r) dest = dest[0..@intCast(max_r)];
+                    }
+                }
+            }
+            if (!range_eof) {
+                if (scanRemaining(&state, config)) |left| {
+                    if (left == 0) {
+                        noteLimit(&state, .max_bytes);
+                        break;
+                    }
+                    if (dest.len > left) dest = dest[0..left];
+                }
+                var raw_read_sink: u64 = 0;
+                const pulled = if (decompressed_stream) |ds| blk: {
+                    const SliceCtx = struct {
+                        data: []const u8,
+                        pos: *usize,
+                        end: usize,
+                        fn read(ctx: *anyopaque, out: []u8) error{}!usize {
+                            const self: *@This() = @ptrCast(@alignCast(ctx));
+                            const avail = self.end -| self.pos.*;
+                            const n = @min(avail, out.len);
+                            if (n > 0) @memcpy(out[0..n], self.data[self.pos.* .. self.pos.* + n]);
+                            self.pos.* += n;
+                            return n;
+                        }
+                    };
+                    var sctx = SliceCtx{ .data = ds, .pos = &decompressed_pos, .end = decompressed_end };
+                    break :blk decoder.pull(pool_alloc, SliceCtx.read, &sctx, bufferWindow(config), dest, &raw_read_sink) catch |err| {
+                        if (err == error.OutOfMemory) return error.OutOfMemory;
+                        if (err == error.DecodeLimit) return error.DecodeLimit;
+                        unreachable;
+                    };
+                } else decoder.pull(pool_alloc, struct {
+                    fn read(ctx: *anyopaque, out: []u8) anyerror!usize {
+                        return readUpstream(S, readFn, ctx, out);
+                    }
+                }.read, &upstream, bufferWindow(config), dest, &state.bytes_read) catch |err| {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    if (err == error.DecodeLimit) return error.DecodeLimit;
+                    state.soft_error = .read_failed;
+                    logDetail(config, name, err);
+                    state.need_close = true;
+                    break;
+                };
+                eof = pulled.eof;
+                if (pulled.n == 0 and !eof and filled == 0) continue;
+                chunk_at = filled;
+                if (pulled.n != 0) filled += pulled.n;
+                if (range_end) |re_end| {
+                    if (state.abs_base + @as(u64, filled) >= re_end) {
+                        if (!config.range_align_lines) {
+                            filled = @intCast(re_end - state.abs_base);
+                            range_eof = true;
+                            eof = true;
+                        } else if (state.abs_base < re_end) {
+                            const rel_re: usize = @intCast(re_end - state.abs_base);
+                            if (buf[rel_re - 1] == sep) {
+                                filled = rel_re;
+                                range_eof = true;
+                                eof = true;
+                            } else if (memchr.find(width, buf[0..filled], rel_re, sep)) |nl_idx| {
+                                filled = nl_idx + 1;
+                                range_eof = true;
+                                eof = true;
+                            } else {
+                                extending_past_range_end = true;
+                            }
+                        } else if (memchr.find(width, buf[chunk_at..filled], 0, sep)) |rel_nl| {
+                            filled = chunk_at + rel_nl + 1;
+                            range_eof = true;
+                            eof = true;
+                        }
+                    }
+                }
+            } else {
+                eof = true;
+            }
+        }
+        if (filled == 0 and eof) {
+            state.scanned_all = !state.output_blocked and state.soft_error == null;
+            break;
+        }
 
         if (state.long_active or longTail(buf[0..filled], eof, config)) {
             const cont = try pumpLong(
@@ -888,9 +1580,11 @@ pub fn drive(
             );
             if (stream_slot) |slot| slot.* = buf;
             if (!cont) {
+                if (state.pending_skip_to != null and !state.paused) continue;
                 state.stopped = true;
                 break;
             }
+            if (state.pending_skip_to != null and !state.paused) continue;
             if (state.long_active) {
                 if (eof) break;
                 continue;
@@ -900,13 +1594,15 @@ pub fn drive(
 
         const exact_max = state_mod.exactMatcherMaxLen(matcher);
         const can_fuse_chunk = canFuse(matcher, config, &state);
-        const fuse_full_buf = can_fuse_chunk and exact_max != null and exact_max.? > 0 and filled > state.pos;
+        const fuse_full_buf = !is_ml and can_fuse_chunk and exact_max != null and exact_max.? > 0 and filled > state.pos;
         var search_end: usize = 0;
         var view_end: usize = 0;
         var skip_match = false;
         var fast_consumed: ?usize = null;
         var fast_next_pos: ?usize = null;
 
+        const no_more_reads = eof or state_mod.overBytes(&state, config) or state_mod.overDecompressed(&state, config);
+        const saved_pos_before_fuse = state.pos;
         if (fuse_full_buf) {
             var nul_rel: ?usize = null;
             const found = if (comptime @hasDecl(state_mod.MatcherType(@TypeOf(matcher)), "findWatched"))
@@ -988,7 +1684,7 @@ pub fn drive(
         } else {
             search_end = if (eof) filled else lastComplete(buf[0..filled], config);
             view_end = if (eof) filled else search_end;
-            const fuse = search_end > state.pos and can_fuse_chunk;
+            const fuse = search_end > state.pos and can_fuse_chunk and (!is_ml or no_more_reads or (filled >= ml_win and search_end > ml_win));
             if (fuse) {
                 var nul_rel: ?usize = null;
                 const found = if (comptime @hasDecl(state_mod.MatcherType(@TypeOf(matcher)), "findWatched")) matcher.findWatched(buf[0..search_end], state.pos, &nul_rel) else unreachable;
@@ -1000,8 +1696,15 @@ pub fn drive(
                             if (hit.start < state.pos + 4096) {
                                 state.prefer_prepass = true;
                             }
+                            if (state_mod.watchedMatchIsExact(matcher, config)) {
+                                state.setCachedMatch(buf[0..view_end], state.pos, hit);
+                            }
                             if (config.progress_interval == null or config.progress_interval.? == 0) {
-                                state.pos = lineStart(buf[0..view_end], hit.start, config);
+                                const safe_hit = if (!is_ml or state_mod.watchedMatchHasExactStart(matcher, config))
+                                    hit.start
+                                else
+                                    @max(state.pos, hit.start -| ml_win);
+                                state.pos = lineStart(buf[0..view_end], safe_hit, config);
                             }
                         }
                     } else {
@@ -1066,28 +1769,103 @@ pub fn drive(
             }
         }
 
-        const is_ml = isMultilineMatcher(matcher);
-        const ml_win = if (is_ml) multilineWindow(matcher, config) else 0;
-        if (is_ml and !eof and filled < ml_win and !config.passthru and !config.invert) {
-            if (matcher.find(buf[0..search_end], state.pos, config.match_mode) == null) {
-                continue;
+        var commit_end: usize = view_end;
+        var start_anchored_done = false;
+        if (is_ml and ml_win > 0 and !no_more_reads) {
+            const sa_eligible = isStartAnchoredMatcher(matcher) and state.abs_base == 0 and !config.invert and !config.passthru and filled >= ml_win;
+            var start_anchored_ready = false;
+            if (sa_eligible) {
+                if (matcher.find(buf[0..filled], 0, config.match_mode)) |sa_hit| {
+                    const need_end = line_matcher_mod.matchLineEnd(buf[0..filled], 0, sa_hit, config);
+                    if (need_end <= search_end or filled >= hold_limit) {
+                        start_anchored_ready = true;
+                        start_anchored_done = true;
+                    }
+                } else {
+                    if (state.after_left == 0) {
+                        state.bytes_searched = @max(state.bytes_searched, state_mod.searchedSpanAt(&state, config, state.abs_base + filled));
+                        state.stopped = true;
+                        state.need_close = true;
+                        break;
+                    }
+                    start_anchored_ready = true;
+                    start_anchored_done = true;
+                }
+            }
+            if (!start_anchored_ready) {
+                if (filled < ml_win and filled < hold_limit) {
+                    state.pos = saved_pos_before_fuse;
+                    continue;
+                }
+                if (search_end <= ml_win) {
+                    if (filled < hold_limit) {
+                        state.pos = saved_pos_before_fuse;
+                        continue;
+                    }
+                    commit_end = if (search_end > 0) lineEnd(buf[0..search_end], 0, config) else 0;
+                } else {
+                    var ce = lineStart(buf[0..search_end], search_end - ml_win, config);
+                    if (!config.null_data and !config.whole_line and !config.invert) {
+                        if (state_mod.effectiveMaxNewlines(matcher, config)) |max_nl| {
+                            if (max_nl <= 8) {
+                                var nl_pos = search_end;
+                                var rem_nl: u32 = max_nl + 2;
+                                while (rem_nl > 0 and nl_pos > 0) : (rem_nl -= 1) {
+                                    if (memchr.findLast(width, buf, 0, nl_pos, cfg_mod.recordSep(config))) |at| {
+                                        nl_pos = at;
+                                    } else {
+                                        nl_pos = 0;
+                                        break;
+                                    }
+                                }
+                                if (nl_pos > 0) {
+                                    ce = @max(ce, nl_pos + 1);
+                                }
+                            }
+                        }
+                        const pend = state_mod.effectiveEarliestPendingStart(matcher, buf[0..search_end], ce);
+                        if (pend > ce) {
+                            const pend_ce = lineStart(buf[0..search_end], pend, config);
+                            ce = @max(ce, pend_ce);
+                        }
+                    }
+                    if (ce == 0) {
+                        if (filled < hold_limit) {
+                            state.pos = saved_pos_before_fuse;
+                            continue;
+                        }
+                        ce = lineEnd(buf[0..search_end], 0, config);
+                    }
+                    commit_end = ce;
+                }
+                if (skip_match or state.pos > commit_end) {
+                    state.pos = commit_end;
+                }
             }
         }
 
-        if (!skip_match and (search_end > state.pos or eof)) {
-            if (!try matchBuffer(S, sink, matcher, buf[0..view_end], &state, config)) {
+        if (!skip_match and (commit_end > state.pos or eof)) {
+            const can_hold_zero = is_ml and !no_more_reads and filled < hold_limit;
+            if (!try line_matcher_mod.matchBufferWithLimit(S, sink, matcher, buf[0..view_end], commit_end, can_hold_zero, &state, config)) {
+                if (state.pending_skip_to != null and !state.paused) continue;
                 state.stopped = true;
                 if (eof and state.pos >= view_end and !state.output_blocked) state.scanned_all = true;
                 break;
             }
+            if (state.pending_skip_to != null and !state.paused) continue;
         } else if (skip_match) {
+            countLines(buf[0..filled], @min(state.pos, filled), &state, config);
             if (!maybeProgress(S, sink, &state, config)) {
                 state.stopped = true;
                 break;
             }
+            if (state.pending_skip_to != null and !state.paused) continue;
         }
 
-        if (is_ml and isStartAnchoredMatcher(matcher) and state.abs_base + filled >= ml_win) {
+        if (is_ml and isStartAnchoredMatcher(matcher) and !config.invert and !config.passthru and
+            (start_anchored_done or (state.abs_base > 0 and eff_start == 0)) and state.after_left == 0)
+        {
+            state.bytes_searched = @max(state.bytes_searched, state_mod.searchedSpanAt(&state, config, state.abs_base + filled));
             state.stopped = true;
             state.need_close = true;
             break;
@@ -1101,13 +1879,10 @@ pub fn drive(
 
         const consumed = if (fast_consumed) |fc|
             fc
-        else if (is_ml and search_end > ml_win)
-            @max(state.last_line_visited, lineEnd(buf[0..search_end], search_end - ml_win, config))
+        else if (is_ml)
+            state.pos
         else
             search_end;
-        if (is_ml and consumed < search_end) {
-            state.pos = consumed;
-        }
         rememberBefore(matcher, buf, &state, config, consumed);
         countLines(buf, consumed, &state, config);
         const remain = filled - consumed;
@@ -1120,6 +1895,7 @@ pub fn drive(
         state.last_line_counted = 0;
         state.remembered_until = 0;
         state.abs_base += consumed;
+        state.bytes_searched = @max(state.bytes_searched, state_mod.searchedSpanAt(&state, config, state.abs_base));
     }
 
     return finishSink(S, sink, &state, config);
@@ -1131,6 +1907,7 @@ pub const Upstream = struct {
     state: *State,
     config: SearchConfig,
     sink: *anyopaque,
+    raw_cursor: u64 = 0,
     spins: u8 = 0,
     spin_at: i128 = 0,
     have_spin: bool = false,
@@ -1143,7 +1920,18 @@ pub fn readRet(comptime readFn: anytype) type {
     return @typeInfo(@TypeOf(readFn)).@"fn".return_type.?;
 }
 
-pub fn readUpstream(comptime S: type, comptime readFn: anytype, ctx: *anyopaque, dest: []u8) readRet(readFn) {
+fn readRawOnce(comptime readFn: anytype, box: *Upstream, dest: []u8) anyerror!usize {
+    if (box.config.read_at) |rat| {
+        const n = try rat(box.config.read_at_ctx, box.raw_cursor, dest);
+        box.raw_cursor += n;
+        return n;
+    }
+    const n = try readFn(box.inner, dest);
+    box.raw_cursor += n;
+    return n;
+}
+
+pub fn readUpstream(comptime S: type, comptime readFn: anytype, ctx: *anyopaque, dest: []u8) anyerror!usize {
     const box: *Upstream = @ptrCast(@alignCast(ctx));
     if (box.prefix_pos < box.prefix_len) {
         const avail: usize = box.prefix_len - box.prefix_pos;
@@ -1152,10 +1940,10 @@ pub fn readUpstream(comptime S: type, comptime readFn: anytype, ctx: *anyopaque,
         box.prefix_pos += @intCast(n);
         return n;
     }
-    if (!box.config.live) return readFn(box.inner, dest);
+    if (!box.config.live) return readRawOnce(readFn, box, dest);
     const sink: *S = @ptrCast(@alignCast(box.sink));
     while (!box.state.stopped) {
-        const n = try readFn(box.inner, dest);
+        const n = try readRawOnce(readFn, box, dest);
         if (n != 0) {
             box.state.last_input_ns = readClock(box.config);
             box.state.idle_sent = false;
@@ -1176,11 +1964,29 @@ pub fn readUpstream(comptime S: type, comptime readFn: anytype, ctx: *anyopaque,
         const timeout: i128 = @intCast(box.config.idle_timeout_ns orelse 0);
         if (!box.state.idle_sent and now - box.state.last_input_ns >= timeout) {
             const at = box.state.abs_base + @as(u64, box.state.pos);
-            const keep = callOpt(S, "heartbeat", sink, .{ at, box.state.matches, box.state.matched_lines });
+            const action = state_mod.callSinkAction(S, "heartbeat", sink, .{ at, box.state.matches, box.state.matched_lines });
             box.state.idle_sent = true;
-            if (!keep) {
-                noteRejected(S, box.state, sink);
-                return 0;
+            switch (action) {
+                .cont => {},
+                .skip_to => |target| {
+                    if (target > at) {
+                        box.state.after_left = 0;
+                        box.state.ring.clear();
+                        box.state.pending_skip_to = target;
+                        return 0;
+                    }
+                },
+                .pause => {
+                    box.state.paused = true;
+                    box.state.resume_at = at;
+                    box.state.resume_line = box.state.line_number orelse 0;
+                    box.state.stopped = true;
+                    return 0;
+                },
+                .stop => {
+                    box.state.stopped = true;
+                    return 0;
+                },
             }
         }
         if (stopForBudget(box.state, box.config)) return 0;

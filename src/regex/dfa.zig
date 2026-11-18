@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const matcher = @import("../matcher.zig");
+const memchr = @import("../finder/memchr.zig");
 const inst_mod = @import("inst.zig");
 const Inst = inst_mod.Inst;
 const UnicodeRangeList = inst_mod.UnicodeRangeList;
@@ -59,6 +60,10 @@ pub fn BoundedDfa(comptime max_states_cap: u16) type {
         is_match: [max_states_cap]bool = @splat(false),
         /// Number of contiguous linear single-successor non-match states (`s -> s+1 -> ... -> s+L`) starting at `s`.
         chain_len: [max_states_cap]u8 = @splat(0),
+        /// Number of exit bytes (1 or 2) where `trans[s][b] != s` for self-loop states (`0` otherwise).
+        loop_exit_count: [max_states_cap]u8 = @splat(0),
+        /// Exit byte values for self-loop states when `loop_exit_count[s]` is 1 or 2.
+        loop_exit_bytes: [max_states_cap][2]u8 = undefined,
         /// Cold NFA closure sets used only during state construction, never touched on hot scan path.
         meta: [max_states_cap]StateMeta = undefined,
         num_states: u16 = 0,
@@ -136,6 +141,10 @@ pub fn BoundedDfa(comptime max_states_cap: u16) type {
             }
             self.stops_on_crlf = crlf_dead;
             self.chain_len = @splat(0);
+            self.loop_exit_count = @splat(0);
+            if (self.flushes == 0 and self.bailouts == 0 and self.num_states > 1) {
+                self.computeLoopExitsForRange(1, self.num_states);
+            }
             if (self.flushes == 0 and self.bailouts == 0 and self.num_states > 2) {
                 var s_idx: usize = self.num_states - 1;
                 while (s_idx >= 1) : (s_idx -= 1) {
@@ -160,6 +169,27 @@ pub fn BoundedDfa(comptime max_states_cap: u16) type {
                 }
             }
             return self.flushes == 0 and self.bailouts == 0;
+        }
+
+        fn computeLoopExitsForRange(self: *Self, from_state: u16, to_state: u16) void {
+            var s: u16 = from_state;
+            while (s < to_state) : (s += 1) {
+                var diff_count: u16 = 0;
+                var exits: [2]u8 = .{ 0, 0 };
+                for (self.trans[s], 0..) |t, b| {
+                    if (t != s) {
+                        if (diff_count < 2) exits[diff_count] = @intCast(b);
+                        diff_count += 1;
+                        if (diff_count > 2) break;
+                    }
+                }
+                if (diff_count == 1 or diff_count == 2) {
+                    self.loop_exit_count[s] = @intCast(diff_count);
+                    self.loop_exit_bytes[s] = exits;
+                } else {
+                    self.loop_exit_count[s] = 0;
+                }
+            }
         }
 
         /// Adds an additional root state for `suffix_pc` into an already determinized DFA
@@ -219,6 +249,7 @@ pub fn BoundedDfa(comptime max_states_cap: u16) type {
             }
             self.stops_on_crlf = crlf_dead;
             if (self.flushes == 0 and self.bailouts == 0 and self.num_states > root_id) {
+                self.computeLoopExitsForRange(root_id, self.num_states);
                 var s_idx: usize = self.num_states - 1;
                 while (s_idx >= root_id) : (s_idx -= 1) {
                     const s: u16 = @intCast(s_idx);
@@ -262,6 +293,33 @@ pub fn BoundedDfa(comptime max_states_cap: u16) type {
             var last_match: ?usize = if (self.is_match[curr_state]) prefix_offset else null;
             var idx: usize = 0;
             while (idx < rem.len) {
+                const lex = self.loop_exit_count[curr_state];
+                if (lex != 0) {
+                    const eb = self.loop_exit_bytes[curr_state];
+                    const next_pos = if (lex == 1)
+                        memchr.find(memchr.native_width, rem, idx, eb[0])
+                    else
+                        memchr.findEither(memchr.native_width, rem, idx, eb[0], eb[1]);
+                    if (next_pos) |at| {
+                        idx = at;
+                        if (self.is_match[curr_state]) {
+                            last_match = prefix_offset + idx;
+                        }
+                        curr_state = self.trans[curr_state][rem[idx]];
+                        idx += 1;
+                        if (curr_state == dead_state) break;
+                        if (self.is_match[curr_state]) {
+                            if (earliest) return prefix_offset + idx;
+                            last_match = prefix_offset + idx;
+                        }
+                        continue;
+                    } else {
+                        if (self.is_match[curr_state]) {
+                            last_match = prefix_offset + rem.len;
+                        }
+                        break;
+                    }
+                }
                 const clen: usize = self.chain_len[curr_state];
                 if (clen >= 2) {
                     if (idx + clen > rem.len) break;

@@ -43,6 +43,7 @@ pub const Node = struct {
     kind: Kind,
     bytes: []const u8 = &.{},
     children: []const *const Node = &.{},
+    mtime: ?i64 = null,
 };
 
 /// Handles are 1-based slot indices; 0 is reserved.
@@ -263,5 +264,14 @@ test "source.Memory lookup rejects .. path traversal" {
     try std.testing.expectError(error.NotFound, src.open(std.testing.io, "sub\\secret.txt"));
 }
 
+test "source.Node mtime defaults to null and preserves explicit timestamp" {
+    const f_default = Node{ .name = "default.txt", .kind = .file, .bytes = "a" };
+    const f_stamped = Node{ .name = "stamped.txt", .kind = .file, .bytes = "b", .mtime = 1_718_461_330 };
+    const root = Node{ .name = "", .kind = .directory, .children = &.{ &f_default, &f_stamped } };
 
+    const got_default = Memory.lookup(&root, "default.txt").?;
+    const got_stamped = Memory.lookup(&root, "stamped.txt").?;
+    try std.testing.expectEqual(@as(?i64, null), got_default.mtime);
+    try std.testing.expectEqual(@as(?i64, 1_718_461_330), got_stamped.mtime);
+}
 

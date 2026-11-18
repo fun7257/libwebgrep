@@ -170,7 +170,7 @@ const Worker = struct {
         cfg.scratch = &self.scratch;
         cfg.stop = &self.shared.stop;
         if (self.shared.emit == .json) cfg.line_numbers = true;
-        if (cfg.binary != .none) cfg.binary = .quit;
+        if (cfg.binary != .none and cfg.binary != .report) cfg.binary = .quit;
         return cfg;
     }
 };
@@ -293,7 +293,11 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, req: Run) !Stats {
         var group: std.Io.Group = .init;
         var index: u32 = 0;
         while (index < workers) : (index += 1) {
-            try group.concurrent(io, workerMain, .{ &shared, index });
+            group.concurrent(io, workerMain, .{ &shared, index }) catch |err| {
+                requestStop(&shared);
+                group.await(io) catch {};
+                return err;
+            };
         }
         try group.await(io);
     }
@@ -625,7 +629,8 @@ const Tally = struct {
         if (self.shared.on_event != null) {
             if (!self.shared.emitEvent(.{ .match = .{
                 .source_id = self.source_id,
-                .line_number = line.number orelse 1,
+                .line_number = line.number orelse 0,
+                .line_number_known = line.number != null,
                 .column = line.column,
                 .u16_column = line.u16_column,
                 .absolute_offset = line.offset,
@@ -645,6 +650,7 @@ const Tally = struct {
             requestStop(self.shared);
             return false;
         }
+        if (line.binary_status == .detected and self.shared.emit != .count) return false;
         if (self.stop_file) return false;
         return true;
     }

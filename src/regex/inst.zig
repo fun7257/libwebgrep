@@ -355,7 +355,11 @@ pub fn hasTopLevelAlt(pattern: []const u8) bool {
             continue;
         }
         switch (c) {
-            '[' => in_class = true,
+            '[' => {
+                in_class = true;
+                if (i + 1 < pattern.len and (pattern[i + 1] == '^' or pattern[i + 1] == '!')) i += 1;
+                if (i + 1 < pattern.len and pattern[i + 1] == ']') i += 1;
+            },
             '(' => depth += 1,
             ')' => if (depth > 0) {
                 depth -= 1;

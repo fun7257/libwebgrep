@@ -10,6 +10,7 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const decompress = @import("../codec/decompress.zig");
+const matcher_mod = @import("../matcher.zig");
 const memchr = @import("../finder/memchr.zig");
 const regex_mod = @import("../regex.zig");
 const sink_mod = @import("../sink.zig");
@@ -43,6 +44,7 @@ pub const BufMatch = struct {
     start: usize,
     end: usize,
     pattern_id: ?u32 = null,
+    single_match: bool = false,
 };
 
 pub const State = struct {
@@ -112,9 +114,40 @@ pub const State = struct {
     from_reader: bool = false,
     paused: bool = false,
     resume_line: u64 = 1,
+    pending_skip_to: ?u64 = null,
+    range_base_offset: u64 = 0,
+    is_range_search: bool = false,
     next_progress: u64 = 0,
     last_input_ns: i128 = 0,
     idle_sent: bool = false,
+    cached_match_abs_base: u64 = std.math.maxInt(u64),
+    cached_match_buf_ptr: usize = 0,
+    cached_match_buf_len: usize = 0,
+    cached_match_from: usize = 0,
+    cached_match: ?matcher_mod.Match = null,
+
+    pub inline fn getCachedMatch(self: *const State, buf: []const u8, pos: usize) ??matcher_mod.Match {
+        if (self.cached_match_abs_base == self.abs_base and
+            self.cached_match_buf_ptr == @intFromPtr(buf.ptr) and
+            self.cached_match_buf_len == buf.len and
+            pos >= self.cached_match_from)
+        {
+            if (self.cached_match) |m| {
+                if (pos <= m.start) return m;
+                return null;
+            }
+            return @as(?matcher_mod.Match, null);
+        }
+        return null;
+    }
+
+    pub inline fn setCachedMatch(self: *State, buf: []const u8, from: usize, m: ?matcher_mod.Match) void {
+        self.cached_match_abs_base = self.abs_base;
+        self.cached_match_buf_ptr = @intFromPtr(buf.ptr);
+        self.cached_match_buf_len = buf.len;
+        self.cached_match_from = from;
+        self.cached_match = m;
+    }
 
     pub fn exceeded(self: *const State, config: SearchConfig) bool {
         const limit = config.max_count orelse return false;
@@ -204,6 +237,41 @@ pub fn armClock(state: *State, config: SearchConfig) void {
     }
 }
 
+pub fn effectiveRangeStart(config: SearchConfig) u64 {
+    const base: u64 = if (config.byte_range) |br| br.start else (config.stream_offset orelse 0);
+    return @max(base, config.resume_from);
+}
+
+pub fn initLineNumber(state: *State, config: SearchConfig, eff_start: u64) void {
+    if (config.line_number_mode == .unknown) {
+        state.line_number = null;
+        state.resume_line = 0;
+        return;
+    }
+    if (config.initial_line_number) |n| {
+        state.line_number = n;
+        state.resume_line = n;
+        return;
+    }
+    if (!config.line_numbers and config.line_number_mode != .from_one) {
+        state.line_number = null;
+        state.resume_line = 0;
+        return;
+    }
+    if (config.line_number_mode == .from_one) {
+        state.line_number = 1;
+        state.resume_line = 1;
+        return;
+    }
+    if (eff_start > 0 and config.continuation == null) {
+        state.line_number = null;
+        state.resume_line = 0;
+    } else {
+        state.line_number = 1;
+        state.resume_line = 1;
+    }
+}
+
 pub fn restoreCounters(state: *State, config: SearchConfig) void {
     const saved = config.continuation orelse return;
     state.matched_lines = saved.matched_lines;
@@ -213,8 +281,9 @@ pub fn restoreCounters(state: *State, config: SearchConfig) void {
     state.output_bytes = saved.output_bytes;
     state.results_out = saved.results_out;
     state.limit_count = saved.limit_count;
-    if (config.line_numbers and (!state.from_reader or config.resume_from == 0)) {
-        state.line_number = saved.line_number;
+    if (config.line_number_mode != .unknown and (config.line_numbers or config.initial_line_number != null or config.line_number_mode == .from_one)) {
+        state.line_number = if (saved.line_number == 0) null else saved.line_number;
+        state.resume_line = saved.line_number;
     }
 }
 
@@ -226,11 +295,12 @@ pub fn liveIsClosed(config: SearchConfig) bool {
 
 
 pub fn noteRejected(comptime S: type, state: *State, sink: *S) void {
-    if (@hasDecl(S, "control") and sink.control() == .pause) state.paused = true;
+    if (isPause(S, sink)) state.paused = true;
     state.stopped = true;
 }
 
 pub fn isPause(comptime S: type, sink: *S) bool {
+    if (@hasDecl(S, "controlAction")) return sink.controlAction() == .pause;
     return @hasDecl(S, "control") and sink.control() == .pause;
 }
 
@@ -314,12 +384,61 @@ pub fn closeOnce(state: *State, config: SearchConfig) void {
 
 pub fn budgetView(haystack: []const u8, prepared_base: u64, state: *State, config: SearchConfig) []const u8 {
     var bytes = haystack;
+    const sep = recordSep(config);
     if (prepared_base > 0) {
-        state.abs_base = prepared_base;
-    } else if (config.resume_from > 0) {
-        const off: usize = if (config.resume_from >= haystack.len) haystack.len else @intCast(config.resume_from);
-        state.abs_base = off;
-        bytes = haystack[off..];
+        var start_idx: usize = 0;
+        var end_idx: usize = haystack.len;
+        if (config.byte_range) |br| {
+            state.is_range_search = true;
+            if (br.start > prepared_base) {
+                start_idx = @intCast(@min(br.start - prepared_base, @as(u64, haystack.len)));
+                if (config.range_align_lines and start_idx > 0 and start_idx < haystack.len and haystack[start_idx - 1] != sep) {
+                    start_idx = if (memchr.find(width, haystack, start_idx, sep)) |d| d + 1 else haystack.len;
+                }
+            }
+            if (br.end) |be| {
+                const raw_end: usize = if (be <= prepared_base) 0 else @intCast(@min(be - prepared_base, @as(u64, haystack.len)));
+                if (raw_end <= start_idx) {
+                    end_idx = start_idx;
+                } else if (config.range_align_lines and raw_end < haystack.len and haystack[raw_end - 1] != sep) {
+                    end_idx = if (memchr.find(width, haystack, raw_end, sep)) |d| d + 1 else haystack.len;
+                } else {
+                    end_idx = raw_end;
+                }
+            }
+        } else if (config.stream_offset != null) {
+            state.is_range_search = true;
+        }
+        state.abs_base = prepared_base + @as(u64, start_idx);
+        if (state.is_range_search) state.range_base_offset = state.abs_base;
+        bytes = haystack[start_idx..end_idx];
+    } else {
+        const eff_start = effectiveRangeStart(config);
+        var start_idx: usize = @intCast(@min(eff_start, @as(u64, haystack.len)));
+        if (config.range_align_lines and eff_start > 0 and start_idx > 0 and start_idx < haystack.len) {
+            if (haystack[start_idx - 1] != sep) {
+                start_idx = if (memchr.find(width, haystack, start_idx, sep)) |d| d + 1 else haystack.len;
+            }
+        }
+        var end_idx: usize = haystack.len;
+        if (config.byte_range) |br| {
+            state.is_range_search = true;
+            if (br.end) |be| {
+                const raw_end: usize = @intCast(@min(be, @as(u64, haystack.len)));
+                if (raw_end <= start_idx) {
+                    end_idx = start_idx;
+                } else if (config.range_align_lines and raw_end < haystack.len and haystack[raw_end - 1] != sep) {
+                    end_idx = if (memchr.find(width, haystack, raw_end, sep)) |d| d + 1 else haystack.len;
+                } else {
+                    end_idx = raw_end;
+                }
+            }
+        } else if (config.stream_offset != null) {
+            state.is_range_search = true;
+        }
+        state.abs_base = @intCast(start_idx);
+        if (state.is_range_search) state.range_base_offset = state.abs_base;
+        bytes = haystack[start_idx..end_idx];
     }
     if (scanCap(config)) |cap| {
         if (@as(u64, bytes.len) > cap) {
@@ -374,13 +493,20 @@ pub fn noteHitLimit(state: *State, config: SearchConfig, end_abs: u64) bool {
     return true;
 }
 
-pub fn grow(allocator: std.mem.Allocator, buf: []u8, config: SearchConfig) error{OutOfMemory}!?[]u8 {
-    const limit = lineHoldLimit(config);
+pub fn multilineHoldLimit(config: SearchConfig, ml_win: usize) usize {
+    return lineHoldLimit(config) +| ml_win +| cfg_mod.bufferWindow(config);
+}
+
+pub fn growWithLimit(allocator: std.mem.Allocator, buf: []u8, limit: usize) error{OutOfMemory}!?[]u8 {
     if (buf.len >= limit) return null;
     const doubled = if (buf.len > limit / 2) limit else buf.len * 2;
     const next = @min(limit, @max(doubled, buf.len + 1));
     if (next <= buf.len) return null;
     return try allocator.realloc(buf, next);
+}
+
+pub fn grow(allocator: std.mem.Allocator, buf: []u8, config: SearchConfig) error{OutOfMemory}!?[]u8 {
+    return growWithLimit(allocator, buf, lineHoldLimit(config));
 }
 
 pub fn MatcherType(comptime M: type) type {
@@ -396,6 +522,10 @@ pub fn isMultilineMatcher(matcher: anytype) bool {
     return false;
 }
 
+pub fn effectiveMultiline(matcher: anytype, config: SearchConfig) bool {
+    return isMultilineMatcher(matcher) or config.multiline;
+}
+
 pub fn isStartAnchoredMatcher(matcher: anytype) bool {
     const T = MatcherType(@TypeOf(matcher));
     if (@hasDecl(T, "isStartAnchored")) return matcher.isStartAnchored();
@@ -405,16 +535,58 @@ pub fn isStartAnchoredMatcher(matcher: anytype) bool {
 pub fn multilineWindow(matcher: anytype, config: SearchConfig) usize {
     const T = MatcherType(@TypeOf(matcher));
     const cap = if (config.max_line_len == 0) 1 else config.max_line_len;
+    if (config.max_multiline_window) |w| return @min(w, cap);
     if (@hasDecl(T, "multilineWindow")) return @min(matcher.multilineWindow(), cap);
-    return cap;
+    return @min(@as(usize, 64 * 1024), cap);
+}
+
+pub fn effectiveMultilineWindow(matcher: anytype, config: SearchConfig) usize {
+    if (!effectiveMultiline(matcher, config)) return 0;
+    const T = MatcherType(@TypeOf(matcher));
+    const m_win: usize = if (@hasDecl(T, "multilineWindow")) matcher.multilineWindow() else 0;
+    const base = config.max_multiline_window orelse (if (m_win > 0) m_win else 64 * 1024);
+    if (base == 0) return 0;
+    const cap = if (config.max_line_len == 0) 1 else config.max_line_len;
+    return @min(base, cap);
+}
+
+pub fn effectiveMaxNewlines(matcher: anytype, config: SearchConfig) ?u32 {
+    if (!effectiveMultiline(matcher, config)) return 0;
+    const T = MatcherType(@TypeOf(matcher));
+    if (@hasDecl(T, "maxNewlines")) return matcher.maxNewlines();
+    if (@hasField(T, "needle")) return @intCast(std.mem.count(u8, matcher.needle, "\n"));
+    return null;
+}
+
+pub fn effectiveEarliestPendingStart(matcher: anytype, chunk: []const u8, from: usize) usize {
+    const T = MatcherType(@TypeOf(matcher));
+    if (@hasDecl(T, "earliestPendingStart")) return matcher.earliestPendingStart(chunk, from);
+    return from;
+}
+
+pub fn watchedMatchIsExact(matcher: anytype, config: SearchConfig) bool {
+    if (config.whole_word or config.whole_line) return false;
+    if (config.match_mode == .earliest) return true;
+    const T = MatcherType(@TypeOf(matcher));
+    if (@hasDecl(T, "watchedIsExact")) return matcher.watchedIsExact();
+    if (T == regex_mod.Regex or @hasField(T, "patterns")) return false;
+    return @hasDecl(T, "findWatched");
+}
+
+pub fn watchedMatchHasExactStart(matcher: anytype, config: SearchConfig) bool {
+    if (config.whole_word or config.whole_line) return false;
+    if (watchedMatchIsExact(matcher, config)) return true;
+    const T = MatcherType(@TypeOf(matcher));
+    if (@hasDecl(T, "watchedHasExactStart")) return matcher.watchedHasExactStart();
+    return false;
 }
 
 pub fn canFuse(matcher: anytype, config: SearchConfig, state: *const State) bool {
     if (config.null_data) return false;
-    if (isMultilineMatcher(matcher)) return false;
     if (config.passthru or config.stop_on_nonmatch) return false;
     if (state.prefer_prepass or state.nul_offset != null) return false;
     if (config.binary == .none or config.invert or beforeCount(config) != 0 or afterCount(config) != 0) return false;
+    if (config.line_filter != null) return false;
     if (config.whole_word or config.whole_line or config.contains.len != 0 or config.excludes.len != 0 or config.contains_regexes.len != 0 or config.excludes_regexes.len != 0) return false;
     return @hasDecl(MatcherType(@TypeOf(matcher)), "findWatched");
 }
@@ -434,7 +606,12 @@ pub fn lastComplete(buf: []const u8, config: SearchConfig) usize {
 
 pub fn nextLineNumber(state: *const State, buf: []const u8, line: Range, config: SearchConfig) u64 {
     var n = state.line_number orelse 1;
-    if (line.end > line.start and line.end <= buf.len and buf[line.end - 1] == recordSep(config)) n += 1;
+    if (line.end > line.start) {
+        const end = @min(line.end, buf.len);
+        if (end > line.start) {
+            n += memchr.count(width, buf, line.start, end, recordSep(config));
+        }
+    }
     return n;
 }
 
@@ -445,12 +622,29 @@ pub fn maybeProgress(comptime S: type, sink: *S, state: *State, config: SearchCo
     if (state.next_progress == 0) state.next_progress = step;
     if (at < state.next_progress) return true;
     state.next_progress = at + step;
-    const keep = callOpt(S, "progress", sink, .{ at, state.matches, state.matched_lines });
-    if (!keep) {
-        noteRejected(S, state, sink);
-        return false;
+    const action = callSinkAction(S, "progress", sink, .{ at, state.matches, state.matched_lines });
+    switch (action) {
+        .cont => return true,
+        .skip_to => |target| {
+            if (target > at) {
+                state.after_left = 0;
+                state.ring.clear();
+                state.pending_skip_to = target;
+            }
+            return true;
+        },
+        .pause => {
+            state.paused = true;
+            state.resume_at = at;
+            state.resume_line = state.line_number orelse 0;
+            state.stopped = true;
+            return false;
+        },
+        .stop => {
+            state.stopped = true;
+            return false;
+        },
     }
-    return true;
 }
 
 
@@ -513,16 +707,34 @@ pub fn preceding(bytes: []const u8, count: usize) usize {
     }
 }
 
+pub inline fn searchedSpanAt(state: *const State, config: SearchConfig, abs_cursor: u64) u64 {
+    if (state.is_range_search) {
+        const base: u64 = if (config.continuation) |s| s.bytes_searched else 0;
+        return base + (abs_cursor -| state.range_base_offset);
+    }
+    return abs_cursor;
+}
+
 pub fn finishSink(comptime S: type, sink: *S, state: *State, config: SearchConfig) Result {
     const cursor = state.abs_base + @as(u64, state.pos);
-    if (cursor > state.bytes_searched) state.bytes_searched = cursor;
+    const span_searched = searchedSpanAt(state, config, cursor);
+    if (span_searched > state.bytes_searched) state.bytes_searched = span_searched;
     if (!state.from_reader) {
-        state.bytes_read = @max(state.bytes_read, state.bytes_searched);
+        const base_read: u64 = if (config.continuation) |s| s.bytes_read else 0;
+        const span_read: u64 = if (state.is_range_search) base_read + (cursor -| state.range_base_offset) else state.bytes_searched;
+        state.bytes_read = @max(state.bytes_read, span_read);
     } else if (config.continuation) |saved| {
         state.bytes_read = @max(state.bytes_read, saved.bytes_read);
     }
     const elapsed = elapsedOf(state, config);
-    if (state.paused and state.resume_at == null) state.resume_at = cursor;
+    if (state.paused) {
+        if (state.resume_at == null) {
+            state.resume_at = cursor;
+            state.resume_line = state.line_number orelse 0;
+        }
+    } else {
+        state.resume_line = state.line_number orelse 0;
+    }
     const r_at = state.resume_at orelse cursor;
     const has_decomp = if (state.decompress_map) |dm| (dm.anchors.items.len != 0 or dm.base_raw_offset != 0) else false;
     const raw_resume_at: u64 = if (!has_decomp)
@@ -627,9 +839,26 @@ pub fn resetStats(matcher: anytype) void {
     }
 }
 
+pub fn callSinkAction(comptime S: type, comptime name: []const u8, sink: *S, args: anytype) sink_mod.FlowAction {
+    if (!@hasDecl(S, name)) return .cont;
+    const ret = @call(.auto, @field(S, name), .{sink} ++ args);
+    return switch (@TypeOf(ret)) {
+        bool => if (ret)
+            .cont
+        else if (@hasDecl(S, "controlAction"))
+            sink.controlAction()
+        else if (@hasDecl(S, "control"))
+            sink_mod.FlowAction.fromFlow(sink.control())
+        else
+            .stop,
+        sink_mod.Flow => sink_mod.FlowAction.fromFlow(ret),
+        sink_mod.FlowAction => ret,
+        else => @compileError("Sink callback must return bool, Flow, or FlowAction"),
+    };
+}
+
 pub fn callOpt(comptime S: type, comptime name: []const u8, sink: *S, args: anytype) bool {
-    if (!@hasDecl(S, name)) return true;
-    return @call(.auto, @field(S, name), .{sink} ++ args);
+    return callSinkAction(S, name, sink, args) == .cont;
 }
 
 

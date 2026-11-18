@@ -1,6 +1,6 @@
 # libwebgrep Benchmarks (v0.5.0)
 
-This document records the reproducible `ReleaseFast` microbenchmarks ([`bench/micro.zig`](bench/micro.zig)) across `x86_64` (AMD Ryzen 7 7735U AVX2) and `aarch64` (Apple M2 NEON), the microarchitectural cache-hierarchy throughput curves, the `v0.3.0`–`v0.5.0` engine specialization evaluations, and the **reproducible 17-scenario Warm Cache (`mincore=100%`) & Cold Disk (`fsync` + `POSIX_FADV_DONTNEED` + `mincore=0`) end-to-end comparative experiment against `ripgrep 15.2.0`** ([`bench/wg_cli.zig`](bench/wg_cli.zig) & [`bench/bench_driver.c`](bench/bench_driver.c)).
+This document records the reproducible `ReleaseFast` microbenchmarks ([`bench/micro.zig`](bench/micro.zig)) across `x86_64` (AMD Ryzen 7 7735U AVX2) and `aarch64` (Apple M2 NEON), the microarchitectural cache-hierarchy throughput curves, the `v0.3.0`–`v0.5.0` engine specialization evaluations, and the **reproducible 22-scenario Warm Cache (`mincore=100%`) & Cold Disk (`fsync` + `POSIX_FADV_DONTNEED` + `mincore=0`) end-to-end comparative experiment against `ripgrep 15.2.0`** ([`bench/wg_cli.zig`](bench/wg_cli.zig) & [`bench/bench_driver.c`](bench/bench_driver.c)), including single-line and cross-line (`-U` / `--multiline` & `--multiline-dotall`) workloads.
 
 Run the in-process microbenchmark suite with:
 
@@ -26,8 +26,8 @@ zig build bench-cli -Doptimize=ReleaseFast -Dteddy=avx2
    - **`Scratch` Worker Buffer Pool**: Reduces heap allocations across `20,000 × 4 KiB` context-enabled streaming searches from `40,000` allocations (`81.25 GiB`) to **2 warmup allocations (`0` steady-state allocations)**, boosting throughput by **`44.7x` (`12,284 QPS → 549,368 QPS`, `1.82 µs/req`)**.
    - **`RegexSet` Single-Pass Multi-Regex**: Evaluates 256 prefixed regular expressions simultaneously at **`35.13 GB/s`** (**`266x` faster** than looping 256 individual `Regex.isMatch` calls at `0.132 GB/s`).
    - **Zero-Cost Polymorphism & C ABI ([`include/webgrep.h`](include/webgrep.h))**: Runtime-dispatched `AnyMatcher` + `AnyEventSink` incurs **`< 0.02%`** overhead vs. static generics, and the zero-`libc` C ABI (`webgrep_search_slice`) incurs **`< 0.4%`** FFI overhead.
-3. **17 / 17 Non-Inferiority & Surpass over `ripgrep 15.2.0` (Warm Cache & Cold Disk)**:
-   - Evaluated via [`bench/wg_cli.zig`](bench/wg_cli.zig) and [`bench/bench_driver.c`](bench/bench_driver.c) on the 2.488 GB `zg-corpus` using an interleaved ABBA C11 benchmark driver (`sched_setaffinity` to physical Core 2, `mincore(2)` residency verification with hard fail on residual cold pages, and median-sample `wait4` resource accounting), `libwebgrep` (`wg_best = min(wg --no-mmap, wg --mmap)`) achieves **`wg_best <= rg_best` on 17/17 scenarios in Warm Cache** — **15 scenarios clearly surpass `rg_best` (`1.01x–2.88x`, with 14 at `1.02x–2.88x`) and 2 scenarios (`S01` at `75.43 ms vs 75.46 ms`, `S15` at `104.20 ms vs 104.72 ms`) tie `rg_best` (`1.00x`, within ~1% CV), with zero scenarios lagging** — and **surpasses `rg_best` on all 17/17 scenarios in Cold Disk (`1.08x–2.02x`)** with **100% output, exit-code, and match-count parity**.
+3. **22 / 22 Non-Inferiority & Surpass over `ripgrep 15.2.0` (Warm Cache & Cold Disk, Including Cross-Line `-U`)**:
+   - Evaluated via [`bench/wg_cli.zig`](bench/wg_cli.zig) and [`bench/bench_driver.c`](bench/bench_driver.c) on the 2.488 GB `zg-corpus` using an interleaved ABBA C11 benchmark driver (`sched_setaffinity` to physical Core 2, `mincore(2)` residency verification with hard fail on residual cold pages, and median-sample `wait4` resource accounting), `libwebgrep` (`wg_best = min(wg --no-mmap, wg --mmap)`) achieves **`wg_best <= rg_best` on 22/22 scenarios in Warm Cache** — **20 scenarios clearly surpass `rg_best` (`1.01x–2.88x`, including all 5 cross-line `-U` scenarios `S16`–`S19` at `1.03x–1.17x` overall and `2.80x–4.56x` in `--no-mmap` streaming mode) and 2 scenarios (`S01` at `75.43 ms vs 75.46 ms`, `S15` at `104.20 ms vs 104.72 ms`) tie `rg_best` (`1.00x`, within ~1% CV), with zero scenarios lagging** — and **surpasses `rg_best` on all 22/22 scenarios in Cold Disk (`1.06x–2.02x`, with `S16`–`S19` winning by `1.06x–1.35x`)** with **100% output, exit-code, byte-hash, and match-count parity**.
 
 ---
 
@@ -43,7 +43,7 @@ zig build bench-cli -Doptimize=ReleaseFast -Dteddy=avx2
 
 ---
 
-## 3. In-Process 35-Scenario Microbenchmark Suite ([`bench/micro.zig`](bench/micro.zig))
+## 3. In-Process 36-Scenario Microbenchmark Suite ([`bench/micro.zig`](bench/micro.zig))
 
 Each scenario executes 1 unmeasured warmup iteration followed by at least 300 ms and at least 2 measured iterations, guarded by a compiler memory barrier and a 1-bit input flip per iteration:
 
@@ -62,6 +62,7 @@ Each scenario executes 1 unmeasured warmup iteration followed by at least 300 ms
 | `finder_ignore` | `64 MiB` | **20.982** | 1.39% | **24.881** | Branchless `(block \| 0x20)` 32B AVX2 case folding (`63.8 GB/s` in L2) |
 | `multi_teddy` | `64 MiB` | **20.398** | 0.12% | **24.131** | AVX2 `vpshufb` / NEON `vtbl` nibble-mask `Teddy` (`67.2 GB/s` in L2) |
 | `multi_ac` | `64 MiB` | **17.706** | 0.10% | **24.273** | Dense `AhoCorasick` DFA + 64B high-nibble SIMD skip |
+| `regex_multiline` | `16 MiB` | **45.779** | 1.12% | — | Cross-line `-U` regex (`ERROR \[http\][^\n]*\n[^\n]*WARN \[cache\]`) with SIMD DFA self-loop skip |
 | `regex_utf8_class` | `16 MiB` | **39.941** | 14.59% | — | UTF-8 character class alternation with SIMD prefilter |
 | `finder_unicode_case` | `16 MiB` | **35.770** | 17.44% | — | ASCII fast-path skips UTF-8 case folding on pure ASCII chunks |
 | `regex_captures` | `16 MiB` | **33.687** | 14.23% | — | SIMD prefilter + bounded capture group extraction (`$1..$3`) |
@@ -101,20 +102,21 @@ Measured on a single pinned physical core (Ryzen 7 7735U AVX2) across working se
 
 ---
 
-## 5. Reproducible 17-Scenario Comparative Experiment vs. `ripgrep 15.2.0`
+## 5. Reproducible 22-Scenario Comparative Experiment vs. `ripgrep 15.2.0`
 
 ### 5.1 Experimental Methodology ([`bench/wg_cli.zig`](bench/wg_cli.zig) & [`bench/bench_driver.c`](bench/bench_driver.c))
 
 To eliminate ordering bias, page-cache leakage, and I/O mode asymmetry, `libwebgrep` is benchmarked via the in-tree CLI wrapper ([`bench/wg_cli.zig`](bench/wg_cli.zig)) and native C11 driver ([`bench/bench_driver.c`](bench/bench_driver.c)), built via `zig build bench-cli -Doptimize=ReleaseFast -Dteddy=avx2`:
 
 1. **Symmetric 4-Contender Subprocess Accounting**: All 4 distinct I/O configurations (`wg --no-mmap`, `wg --mmap`, `rg --no-mmap`, `rg --mmap`) are launched via `fork() + execve()` and measured with `clock_gettime(CLOCK_MONOTONIC_RAW)` + `wait4()`. Each round records a coupled `TimedSample { wall_ms, user_ms, sys_ms, minflt, majflt }` and sorts by `wall_ms` so that all reported resource metrics come from the exact median wall-clock sample.
-2. **ABBA Interleaved Ordering & Physical Core Pinning**: Single-threaded scenarios (`S01`–`S14`) are pinned to physical Core 2 (`sched_setaffinity`, avoiding Core 0 IRQ noise); 8-thread directory search (`S15`) is pinned to all 8 physical cores (`0,2,4,6,8,10,12,14`). Even rounds execute in forward order (`0 → 3`) and odd rounds execute in reverse order (`3 → 0`) across **7 Warm Cache rounds** and **5 Cold Disk rounds**.
+2. **ABBA Interleaved Ordering & Physical Core Pinning**: Single-threaded scenarios (`S01`–`S14`, `S16`–`S18`) are pinned to physical Core 2 (`sched_setaffinity`, avoiding Core 0 IRQ noise); 8-thread directory searches (`S15`, `S19`) are pinned to all 8 physical cores (`0,2,4,6,8,10,12,14`). Even rounds execute in forward order (`0 → 3`) and odd rounds execute in reverse order (`3 → 0`) across **7 Warm Cache rounds** and **5 Cold Disk rounds**.
 3. **`mincore(2)` Hardware Page-Cache Residency Proofs**:
    - **Warm Cache**: Pre-warmed via `populate_page_cache()` and verified via `mincore(2)` prior to timing (`mincore == 100.0%` resident).
    - **Cold Disk**: Before **every individual subprocess invocation**, the harness calls `fsync(fd)` + `posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED)` on the target file(s) and verifies via `mincore(2)` that **`max_resident_pages == 0`** (hard-aborting with exit code `2` if any page remains resident).
-4. **Apples-to-Apples Binary & Dense Regex Coverage**:
+4. **Apples-to-Apples Binary, Dense Regex & Cross-Line (`-U`) Coverage**:
    - **`S12_words_regex` & `S12b_words_regex_dense`**: Tests both the rare prefix-literal regex (`zealtionou\s+[a-z]+\s+the`, 40 hits) and the high-frequency interior-literal regex (`[a-z]+tion\s+[a-z]+\s+the`, 27,035 hits across millions of `"tion"` occurrences).
    - **`S13_random_bin_quit` & `S13b_random_bin_text`**: Tests both directory-mode implicit binary quit (`-g random.bin`, where both `wg` and `rg` stop on the first NUL byte) and explicit full-file binary scan (`-a/--text` on 537 MB `random.bin`, where both `wg` and `rg` scan all 537 MB).
+   - **`S16`–`S19` Cross-Line Multiline (`-U` & `--multiline-dotall`)**: Covers 2-line log spans with `12,459` hits (`S16_log_multiline_regex`), full subline `-n -U` output with exact `2,765,863`-byte FNV-1a hash verification (`S16b_log_multiline_lines`), bounded dotall `.{1,160}` (`S17_log_multiline_dotall`), cross-line word spans (`S18_words_multiline_cross`), and 8-thread `2.488 GB` directory-wide multiline search (`S19_dir_multiline_T8`).
 
 ---
 
@@ -126,15 +128,15 @@ All hardware- and OS-specific optimizations inside `libwebgrep` are guarded at `
 | :--- | :--- | :--- |
 | [`src/finder/packed_pair.zig`](src/finder/packed_pair.zig) | `builtin.cpu.arch.endian() == .little` & `width == 16 / 32` | Removed the 48-byte scalar prefix loop before the 128B 4-window SIMD loop; extracts lane hits via `@bitCast` hardware integer bitmask + `@ctz` bit-clearing (`6.81 GB/s` on 514 MB `log.txt`). |
 | [`src/finder/teddy.zig`](src/finder/teddy.zig) & [`src/finder/multi.zig`](src/finder/multi.zig) | `build_options.teddy` (`avx2` / `ssse3` / `neon` / `off`) | Per-pattern rarest 3-byte window selection (`pickWindowOffset` + `pat_offsets`), 3rd-byte `vpshufb`/`tbl` SIMD secondary filter (`evalRefine`), and `preferTeddyOverPairs` adaptive routing. |
-| [`src/regex/dfa.zig`](src/regex/dfa.zig), [`src/regex/vm.zig`](src/regex/vm.zig) & [`src/regex/prefilter.zig`](src/regex/prefilter.zig) | Compile-time DFA state capacity & determinization guards | Ahead-of-time determinized prefix DFA (`dfa_is_exact` in `.earliest` mode) + **interior required-literal suffix DFA (`dfa_suffix_state` & `determinizeSuffix`)** rejecting non-matching suffixes in 1–5 bytes before `windowLimit`/`lineStartAt`; single-pass fused `pf.findWatched` in `Regex.findWatched`. |
-| [`src/search/pipeline.zig`](src/search/pipeline.zig) & [`src/search/line_matcher.zig`](src/search/line_matcher.zig) | `@hasDecl(S, "matched")` & `exactMatcherMaxLen` comptime checks | Count-only `needLineStart` elision skips backward `memchr.findLast` when no `matched` callback is present; direct `sinkMatched` in `searchPrepared` eliminates duplicate per-line `matcher.find` on `mmap`; 64 KiB initial binary-quit probe on cold streams. |
+| [`src/regex/compiler.zig`](src/regex/compiler.zig), [`src/regex/dfa.zig`](src/regex/dfa.zig), [`src/regex/vm.zig`](src/regex/vm.zig) & [`src/regex/prefilter.zig`](src/regex/prefilter.zig) | Compile-time DFA state capacity & determinization guards | Ahead-of-time determinized prefix DFA (`dfa_is_exact`) + interior required-literal suffix DFA (`dfa_suffix_state`); single-instruction byte-exact `.class` loop collapse for `[^...]*`/`[^...]+` and multiline `.*`/`.+`; **SIMD `memchr.find`/`findEither` self-loop fast-forward** in `BoundedDfa.matchPrefixDeterminized` (`loop_exit_count <= 2`); Bellman-Ford `maxNewlines()` & `earliestPendingStart()` reducing `--no-mmap` cross-line chunk holdback from `64 KiB` to `~250 B`; single-pass fused `pf.findWatched` in `Regex.findWatched` (including multiline). |
+| [`src/search/pipeline.zig`](src/search/pipeline.zig), [`src/search/line_matcher.zig`](src/search/line_matcher.zig) & [`src/search/state.zig`](src/search/state.zig) | `@hasDecl(S, "matched")` & `exactMatcherMaxLen` comptime checks | Count-only `needLineStart` elision skips backward `memchr.findLast` when no `matched` callback is present; fused single-pass NUL detection (`canFuse`) enabled for multiline (`-U`); O(1) match caching (`getCachedMatch`/`setCachedMatch`), bounded bridging-match probe (`bridgingProbeLimit`), and `single_match` fast-path in `gatherSpans` eliminating redundant NFA/DFA re-scans on multiline sublines. |
 | [`src/search/config.zig`](src/search/config.zig) & [`src/io/platform.zig`](src/io/platform.zig) | `switch (comptime builtin.cpu.arch)` (`.x86_64, .aarch64`) & `switch (comptime builtin.os.tag)` (`.linux`) | `SearchConfig.optimalBufferSize(threads)` sizes per-worker streaming buffers (`1 MiB` for 1T, `256 KiB` for multi-thread L2 residency); issues `POSIX_FADV_SEQUENTIAL` and `MADV_SEQUENTIAL \| MADV_HUGEPAGE` on Linux. |
 
 ---
 
 ### 5.3 Warm Cache Results (`mincore = 100.0%`, 7 Interleaved ABBA Rounds, Median)
 
-All 17 scenarios verified **100% accuracy parity** (identical exit codes, match counts, and `27,670,092`-byte FNV-1a checksum `c03c2d5e2da6acee` on `S03`) prior to timing. Across the 17 Warm Cache scenarios, `wg_best <= rg_best` on all 17/17 (`0` lagging): 15 scenarios surpass `rg_best` (`1.01x–2.88x`) and 2 scenarios (`S01` at `75.43 ms vs 75.46 ms`, `S15` at `104.20 ms vs 104.72 ms`) tie `rg_best` (`1.00x`, within ~1% CV):
+All 22 scenarios verified **100% accuracy parity** (identical exit codes, match counts, `27,670,092`-byte FNV-1a checksum `c03c2d5e2da6acee` on `S03`, and `2,765,863`-byte FNV-1a checksum `0e7b44106947ae47` on `S16b`) prior to timing. Across the 22 Warm Cache scenarios, `wg_best <= rg_best` on all 22/22 (`0` lagging): **20 scenarios surpass `rg_best` (`1.01x–2.88x`, including all 5 cross-line `-U` scenarios `S16`–`S19`)** and 2 scenarios (`S01` at `75.43 ms vs 75.46 ms`, `S15` at `104.20 ms vs 104.72 ms`) tie `rg_best` (`1.00x`, within ~1% CV):
 
 | Scenario | Corpus & Query | `wg --no-mmap` (ms) | `wg --mmap` (ms) | `rg --no-mmap` (ms) | `rg --mmap` (ms) | `wg_best` vs `rg_best` | Same-Mode (`no-mmap` / `mmap`) |
 | :--- | :--- | ---: | ---: | ---: | ---: | :---: | :---: |
@@ -155,6 +157,11 @@ All 17 scenarios verified **100% accuracy parity** (identical exit codes, match 
 | **`S13b_random_bin_text`** | `random.bin` (537 MB) `-a -c -F` full binary scan | **53.57** | 64.22 | **62.49** | 68.27 | **1.17x WIN** | **1.17x** / **1.06x** |
 | **`S14_dir_all_T1`** | `zg-corpus/` (2.49 GB, 9 files) `-c -j 1 -F` | **265.14** | 285.94 | 293.04 | **286.85** | **1.08x WIN** | **1.11x** / **1.00x** |
 | **`S15_dir_all_T8`** | `zg-corpus/` (2.49 GB, 9 files) `-c -j 8 -F` | **104.20** | 140.43 | **104.72** | 139.89 | **1.00x TIE** | **1.00x** / **1.00x** |
+| **`S16_log_multiline_regex`** | `log.txt` (514 MB) `-U -c 'ERROR \[http\]...\n...WARN \[cache\]'` | 97.62 | **96.80** | 284.10 | **111.24** | **1.15x WIN** | **2.91x** / **1.15x** |
+| **`S16b_log_multiline_lines`** | `log.txt` (514 MB) `-U -n 'ERROR \[http\]...\n...WARN \[cache\]'` (2.77 MB) | 103.65 | **103.42** | 289.97 | **120.51** | **1.17x WIN** | **2.80x** / **1.17x** |
+| **`S17_log_multiline_dotall`** | `log.txt` (514 MB) `-U --multiline-dotall -c 'req=04203afdc6de.{1,160}DEBUG \[db\]'` | **71.06** | 71.52 | 244.37 | **72.98** | **1.03x WIN** | **3.44x** / **1.02x** |
+| **`S18_words_multiline_cross`** | `words.txt` (540 MB) `-U -c 'zealtionou[^\n]+\n[a-z]+'` | **61.85** | 65.31 | 232.58 | **66.68** | **1.08x WIN** | **3.76x** / **1.02x** |
+| **`S19_dir_multiline_T8`** | `zg-corpus/` (2.49 GB, 9 files) `-U -c -j 8` | 111.88 | **107.41** | 509.78 | **110.28** | **1.03x WIN** | **4.56x** / **1.03x** |
 
 ---
 
@@ -179,3 +186,8 @@ All 17 scenarios verified **100% accuracy parity** (identical exit codes, match 
 | **`S13b_random_bin_text`** | 536.9 MB | 265.06 | **202.70** | 394.92 | **369.24** | **1.82x WIN** | **1.49x** / **1.82x** |
 | **`S14_dir_all_T1`** | 2,487.6 MB | 1018.30 | **721.25** | 1451.80 | **1398.97** | **1.94x WIN** | **1.43x** / **1.94x** |
 | **`S15_dir_all_T8`** | 2,487.6 MB | **889.84** | 946.46 | 1102.98 | **963.16** | **1.08x WIN** | **1.24x** / **1.02x** |
+| **`S16_log_multiline_regex`** | 514.0 MB | **305.97** | 381.54 | 543.43 | **389.38** | **1.27x WIN** | **1.78x** / **1.02x** |
+| **`S16b_log_multiline_lines`** | 514.0 MB | **312.09** | 384.30 | 551.29 | **392.85** | **1.26x WIN** | **1.77x** / **1.02x** |
+| **`S17_log_multiline_dotall`** | 514.0 MB | **276.75** | 372.49 | 509.94 | **374.41** | **1.35x WIN** | **1.84x** / **1.01x** |
+| **`S18_words_multiline_cross`** | 540.0 MB | **274.41** | 355.00 | 503.04 | **356.23** | **1.30x WIN** | **1.83x** / **1.00x** |
+| **`S19_dir_multiline_T8`** | 2,487.6 MB | **886.54** | 902.60 | 1452.56 | **938.89** | **1.06x WIN** | **1.64x** / **1.04x** |

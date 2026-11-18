@@ -35,11 +35,18 @@ const binaryStatus = cfg_mod.binaryStatus;
 const liveIsClosed = state_mod.liveIsClosed;
 const searchSourceSlice = searcher.searchSourceSlice;
 
-pub fn eventFlow(inner: anytype, ev: Event) Flow {
-    const Ret = @typeInfo(@TypeOf(@field(@TypeOf(inner.*), "event"))).@"fn".return_type.?;
+pub fn eventAction(inner: anytype, ev: Event) sink_mod.FlowAction {
+    const Base = @TypeOf(inner.*);
+    if (Base == sink_mod.AnyEventSink) return inner.eventAction(ev);
+    const Ret = @typeInfo(@TypeOf(@field(Base, "event"))).@"fn".return_type.?;
     if (Ret == bool) return if (inner.event(ev)) .cont else .stop;
-    if (Ret == Flow) return inner.event(ev);
-    @compileError("event must return bool or Flow");
+    if (Ret == Flow) return sink_mod.FlowAction.fromFlow(inner.event(ev));
+    if (Ret == sink_mod.FlowAction) return inner.event(ev);
+    @compileError("event must return bool, Flow, or FlowAction");
+}
+
+pub fn eventFlow(inner: anytype, ev: Event) Flow {
+    return eventAction(inner, ev).toFlow();
 }
 
 pub fn EventBridge(comptime S: type) type {
@@ -47,18 +54,22 @@ pub fn EventBridge(comptime S: type) type {
         inner: *S,
         source_id: []const u8,
         config: SearchConfig,
-        last_flow: Flow = .cont,
+        last_action: sink_mod.FlowAction = .cont,
 
         const Bridge = @This();
 
         pub fn control(self: *Bridge) Flow {
-            return self.last_flow;
+            return self.last_action.toFlow();
+        }
+
+        pub fn controlAction(self: *Bridge) sink_mod.FlowAction {
+            return self.last_action;
         }
 
         fn deliver(self: *Bridge, ev: Event) bool {
-            const flow = eventFlow(self.inner, ev);
-            self.last_flow = flow;
-            return flow == .cont;
+            const action = eventAction(self.inner, ev);
+            self.last_action = action;
+            return action == .cont;
         }
 
         pub fn begin(self: *Bridge, _: []const u8) bool {
@@ -146,6 +157,7 @@ pub const PullEvent = struct {
     kind: enum { begin, match, context, context_break, progress, heartbeat, end, summary },
     source_id: []u8,
     line_number: u64 = 0,
+    line_number_known: bool = true,
     column: ?u64 = null,
     u16_column: ?u64 = null,
     absolute_offset: u64 = 0,
@@ -333,6 +345,9 @@ pub const StreamDecompressor = struct {
     decompress_map: ?*decompress_mod.OffsetMap = null,
     eof_reached: bool = false,
     corrupt_on_init: bool = false,
+    raw_cursor: u64 = 0,
+    read_at: ?*const fn (?*anyopaque, u64, []u8) anyerror!usize = null,
+    read_at_ctx: ?*anyopaque = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -343,18 +358,40 @@ pub const StreamDecompressor = struct {
         max_compression_ratio: ?u64,
         decompress_map: ?*decompress_mod.OffsetMap,
     ) !*StreamDecompressor {
+        return initWithConfig(allocator, upstream, mode, initial_decompressed, max_decompressed_bytes, max_compression_ratio, decompress_map, .{});
+    }
+
+    pub fn initWithConfig(
+        allocator: std.mem.Allocator,
+        upstream: *std.Io.Reader,
+        mode: cfg_mod.Compression,
+        initial_decompressed: u64,
+        max_decompressed_bytes: ?u64,
+        max_compression_ratio: ?u64,
+        decompress_map: ?*decompress_mod.OffsetMap,
+        config: SearchConfig,
+    ) !*StreamDecompressor {
         var sniff_buf: [6]u8 = undefined;
         var sniff_len: usize = 0;
         var sniff_eof = false;
         var init_corrupt = false;
+        const eff_start = state_mod.effectiveRangeStart(config);
+        const mid_seek = eff_start > 0 and (config.read_at != null or config.seek_input != null or (config.stream_offset orelse 0) > 0);
 
-        if (mode == .auto) {
+        if (mode == .auto and !mid_seek) {
             while (sniff_len < 6 and !sniff_eof) {
-                const rn = upstream.readSliceShort(sniff_buf[sniff_len..]) catch |err| {
-                    if (err == error.OutOfMemory) return error.OutOfMemory;
-                    init_corrupt = true;
-                    break;
-                };
+                const rn = if (config.read_at) |rat|
+                    rat(config.read_at_ctx, sniff_len, sniff_buf[sniff_len..]) catch |err| blk: {
+                        if (err == error.OutOfMemory) return error.OutOfMemory;
+                        init_corrupt = true;
+                        break :blk 0;
+                    }
+                else
+                    upstream.readSliceShort(sniff_buf[sniff_len..]) catch |err| blk: {
+                        if (err == error.OutOfMemory) return error.OutOfMemory;
+                        init_corrupt = true;
+                        break :blk 0;
+                    };
                 sniff_len += rn;
                 if (rn == 0) sniff_eof = true;
                 const detected = decompress_mod.sniff(sniff_buf[0..sniff_len], sniff_eof);
@@ -367,7 +404,7 @@ pub const StreamDecompressor = struct {
             .gzip => .gzip,
             .zstd => .zstd,
             .xz => .xz,
-            .auto => switch (decompress_mod.sniff(sniff_buf[0..sniff_len], true)) {
+            .auto => if (mid_seek) .raw else switch (decompress_mod.sniff(sniff_buf[0..sniff_len], true)) {
                 .gzip => .gzip,
                 .zstd => .zstd,
                 .xz => .xz,
@@ -380,13 +417,16 @@ pub const StreamDecompressor = struct {
         self.* = StreamDecompressor{
             .kind = kind,
             .allocator = allocator,
-            .prefixed = PrefixedReader.init(upstream, sniff_buf[0..sniff_len]),
+            .prefixed = PrefixedReader.init(upstream, if (config.read_at != null and kind == .raw) &.{} else sniff_buf[0..sniff_len]),
             .decompressed_bytes = initial_decompressed,
             .max_decompressed_bytes = max_decompressed_bytes,
             .max_compression_ratio = max_compression_ratio orelse decompress_mod.default_max_compression_ratio,
             .decompress_map = decompress_map,
-            .raw_consumed = sniff_len,
+            .raw_consumed = if (config.read_at != null and kind == .raw) 0 else sniff_len,
             .corrupt_on_init = init_corrupt,
+            .raw_cursor = config.stream_offset orelse 0,
+            .read_at = config.read_at,
+            .read_at_ctx = config.read_at_ctx,
         };
         if (kind != .raw) {
             self.prefixed.reader.buffer = &self.prefixed.read_buf;
@@ -435,11 +475,21 @@ pub const StreamDecompressor = struct {
         var n: usize = 0;
         switch (self.kind) {
             .raw => {
-                n = self.prefixed.reader.readSliceShort(slice_dest) catch |err| {
-                    if (err == error.OutOfMemory) return error.OutOfMemory;
-                    return error.CorruptStream;
-                };
-                self.raw_consumed = self.prefixed.totalRead();
+                if (self.read_at) |rat| {
+                    n = rat(self.read_at_ctx, self.raw_cursor, slice_dest) catch |err| {
+                        if (err == error.OutOfMemory) return error.OutOfMemory;
+                        return error.CorruptStream;
+                    };
+                    self.raw_cursor += n;
+                    self.raw_consumed += n;
+                } else {
+                    n = self.prefixed.reader.readSliceShort(slice_dest) catch |err| {
+                        if (err == error.OutOfMemory) return error.OutOfMemory;
+                        return error.CorruptStream;
+                    };
+                    self.raw_cursor += n;
+                    self.raw_consumed = self.prefixed.totalRead();
+                }
             },
             .gzip => {
                 n = self.flate_dec.?.reader.readSliceShort(slice_dest) catch |err| {
@@ -590,6 +640,9 @@ pub fn ReaderPull(comptime M: type) type {
         phase: Phase = .init,
         search_ended: bool = false,
         scanned_all: bool = false,
+        range_eof: bool = false,
+        extending_past_range_end: bool = false,
+        eff_start: u64 = 0,
 
         const Self = @This();
 
@@ -616,8 +669,8 @@ pub fn ReaderPull(comptime M: type) type {
             else
                 allocator;
 
-            const initial = if (state_mod.isMultilineMatcher(matcher))
-                @max(cfg_mod.bufferWindow(config), state_mod.multilineWindow(matcher, config))
+            const initial = if (state_mod.effectiveMultiline(matcher, config))
+                @max(cfg_mod.bufferWindow(config), state_mod.effectiveMultilineWindow(matcher, config))
             else
                 cfg_mod.bufferWindow(config);
             const cap0 = @max(initial, 1);
@@ -728,7 +781,7 @@ pub fn ReaderPull(comptime M: type) type {
             }
 
             const max_dec = config.max_decompressed_bytes orelse config.max_source_bytes;
-            const decompressor = StreamDecompressor.init(
+            const decompressor = StreamDecompressor.initWithConfig(
                 allocator,
                 reader,
                 config.compression,
@@ -736,6 +789,7 @@ pub fn ReaderPull(comptime M: type) type {
                 max_dec,
                 config.max_compression_ratio,
                 &decompress_map,
+                config,
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
             };
@@ -771,11 +825,260 @@ pub fn ReaderPull(comptime M: type) type {
             return self;
         }
 
+        fn resetDecoderMidStream(self: *Self) void {
+            const saved_in = self.decoder.in;
+            const saved_raw = self.decoder.raw_buf;
+            const saved_max_in = self.decoder.max_in;
+            const saved_map = self.decoder.offset_map;
+            if (encoding_mod.resolveHint(self.config.encoding, self.config.charset) == .auto) {
+                self.decoder = encoding_mod.Decoder.init(.none);
+            } else {
+                self.decoder = encoding_mod.Decoder.initWithHint(self.config.encoding, self.config.charset);
+            }
+            self.decoder.in = saved_in;
+            self.decoder.raw_buf = saved_raw;
+            self.decoder.max_in = saved_max_in;
+            self.decoder.offset_map = saved_map;
+        }
+
+        fn positionInitialRange(self: *Self) cfg_mod.ReadError!bool {
+            const eff_start = self.eff_start;
+            const range_end: ?u64 = if (self.config.byte_range) |br| br.end else null;
+            const sep = cfg_mod.recordSep(self.config);
+            const align_start = self.config.range_align_lines and self.config.continuation == null;
+            const ReadCtx = struct {
+                fn readFn(ctx: *anyopaque, out: []u8) !usize {
+                    const d: *StreamDecompressor = @ptrCast(@alignCast(ctx));
+                    return d.read(out);
+                }
+            };
+
+            if (eff_start > 0 and self.decompressor.kind == .raw) {
+                if (self.config.read_at != null or self.config.seek_input != null) {
+                    self.resetDecoderMidStream();
+                    self.decompressor.prefixed.prefix_pos = self.decompressor.prefixed.prefix_len;
+                    const check_prev = align_start and eff_start > 0;
+                    const seek_target = if (check_prev) eff_start - 1 else eff_start;
+                    if (self.config.read_at == null) {
+                        if (self.config.seek_input) |seek_fn| {
+                            seek_fn(self.config.seek_ctx, seek_target) catch {
+                                self.state.soft_error = .read_failed;
+                                return false;
+                            };
+                        }
+                    }
+                    self.decompressor.raw_cursor = seek_target;
+                    self.state.abs_base = eff_start;
+                    if (check_prev) {
+                        var prev_b: [1]u8 = undefined;
+                        const prev_n = self.decompressor.read(prev_b[0..1]) catch |err| switch (err) {
+                            error.OutOfMemory => return error.OutOfMemory,
+                            else => {
+                                self.state.soft_error = .read_failed;
+                                return false;
+                            },
+                        };
+                        if (prev_n == 0) {
+                            self.range_eof = true;
+                        } else if (prev_b[0] != sep) {
+                            while (!state_mod.stopForBudget(&self.state, self.config)) {
+                                var max_align = self.buf.len;
+                                if (range_end) |re_end| {
+                                    if (self.state.abs_base >= re_end) {
+                                        self.range_eof = true;
+                                        break;
+                                    }
+                                    const rem_r = re_end - self.state.abs_base;
+                                    if (@as(u64, max_align) > rem_r) max_align = @intCast(rem_r);
+                                }
+                                if (state_mod.scanRemaining(&self.state, self.config)) |left| {
+                                    if (left == 0) {
+                                        state_mod.noteLimit(&self.state, .max_bytes);
+                                        return false;
+                                    }
+                                    if (max_align > left) max_align = left;
+                                }
+                                const rn = self.decompressor.read(self.buf[0..max_align]) catch |err| switch (err) {
+                                    error.OutOfMemory => return error.OutOfMemory,
+                                    else => {
+                                        self.state.soft_error = .read_failed;
+                                        return false;
+                                    },
+                                };
+                                self.state.bytes_read += rn;
+                                if (rn == 0) {
+                                    self.range_eof = true;
+                                    break;
+                                }
+                                if (memchr.find(cfg_mod.width, self.buf[0..rn], 0, sep)) |nl_rel| {
+                                    const drop = nl_rel + 1;
+                                    self.state.abs_base += drop;
+                                    const rem = rn - drop;
+                                    if (rem > 0) std.mem.copyForwards(u8, self.buf[0..rem], self.buf[drop..rn]);
+                                    self.filled = rem;
+                                    break;
+                                }
+                                self.state.abs_base += rn;
+                            }
+                            if (self.state.limit_hit != .none) return false;
+                        }
+                    }
+                    if (self.state.is_range_search) self.state.range_base_offset = self.state.abs_base;
+                    return true;
+                } else if (self.decompressor.raw_cursor == eff_start) {
+                    self.resetDecoderMidStream();
+                    self.state.abs_base = eff_start;
+                    if (align_start) {
+                        while (!state_mod.stopForBudget(&self.state, self.config)) {
+                            var max_align = self.buf.len;
+                            if (range_end) |re_end| {
+                                if (self.state.abs_base >= re_end) {
+                                    self.range_eof = true;
+                                    break;
+                                }
+                                const rem_r = re_end - self.state.abs_base;
+                                if (@as(u64, max_align) > rem_r) max_align = @intCast(rem_r);
+                            }
+                            if (state_mod.scanRemaining(&self.state, self.config)) |left| {
+                                if (left == 0) {
+                                    state_mod.noteLimit(&self.state, .max_bytes);
+                                    return false;
+                                }
+                                if (max_align > left) max_align = left;
+                            }
+                            const rn = self.decompressor.read(self.buf[0..max_align]) catch |err| switch (err) {
+                                error.OutOfMemory => return error.OutOfMemory,
+                                else => {
+                                    self.state.soft_error = .read_failed;
+                                    return false;
+                                },
+                            };
+                            self.state.bytes_read += rn;
+                            if (rn == 0) {
+                                self.range_eof = true;
+                                break;
+                            }
+                            if (memchr.find(cfg_mod.width, self.buf[0..rn], 0, sep)) |nl_rel| {
+                                const drop = nl_rel + 1;
+                                self.state.abs_base += drop;
+                                const rem = rn - drop;
+                                if (rem > 0) std.mem.copyForwards(u8, self.buf[0..rem], self.buf[drop..rn]);
+                                self.filled = rem;
+                                break;
+                            }
+                            self.state.abs_base += rn;
+                        }
+                        if (self.state.limit_hit != .none) return false;
+                    }
+                    if (self.state.is_range_search) self.state.range_base_offset = self.state.abs_base;
+                    return true;
+                }
+            }
+
+            if (eff_start > 0) {
+                var cur_decoded: u64 = if (self.decompressor.kind == .raw) self.decompressor.raw_cursor else 0;
+                var prev_b: u8 = sep;
+                while (cur_decoded < eff_start and !state_mod.stopForBudget(&self.state, self.config)) {
+                    var sk_read: u64 = 0;
+                    const p_sk = self.decoder.pull(self.pool_alloc, ReadCtx.readFn, self.decompressor, cfg_mod.bufferWindow(self.config), self.buf, &sk_read) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.DecodeLimit => return error.DecodeLimit,
+                        error.DecompressLimit => {
+                            self.state.decompressed_bytes = self.decompressor.decompressed_bytes;
+                            state_mod.noteLimit(&self.state, .decompressed_bytes);
+                            return false;
+                        },
+                        error.CorruptStream => {
+                            self.state.decompressed_bytes = self.decompressor.decompressed_bytes;
+                            self.state.soft_error = .read_failed;
+                            return false;
+                        },
+                    };
+                    self.state.decompressed_bytes = self.decompressor.decompressed_bytes;
+                    if (!self.state.is_range_search) {
+                        if (self.decompressor.kind == .raw) self.state.bytes_read += sk_read else self.state.bytes_read = self.decompressor.raw_consumed;
+                    }
+                    if (cur_decoded + p_sk.n >= eff_start) {
+                        const cut: usize = @intCast(eff_start - cur_decoded);
+                        if (cut > 0) prev_b = self.buf[cut - 1];
+                        const rem = p_sk.n - cut;
+                        if (rem > 0) std.mem.copyForwards(u8, self.buf[0..rem], self.buf[cut..p_sk.n]);
+                        self.filled = rem;
+                        if (self.state.is_range_search) self.state.bytes_read += rem;
+                        cur_decoded = eff_start;
+                        if (p_sk.eof and self.filled == 0) self.range_eof = true;
+                        break;
+                    }
+                    if (p_sk.n > 0) prev_b = self.buf[p_sk.n - 1];
+                    cur_decoded += p_sk.n;
+                    if (p_sk.eof) {
+                        self.range_eof = true;
+                        break;
+                    }
+                }
+                if (self.state.limit_hit != .none) return false;
+                self.state.abs_base = cur_decoded;
+                if (!self.range_eof and align_start and prev_b != sep) {
+                    while (true) {
+                        const check_len: usize = if (range_end) |re_end|
+                            @intCast(@min(@as(u64, self.filled), re_end -| self.state.abs_base))
+                        else
+                            self.filled;
+                        if (memchr.find(cfg_mod.width, self.buf[0..check_len], 0, sep)) |nl_rel| {
+                            const drop = nl_rel + 1;
+                            const rem = self.filled - drop;
+                            if (rem > 0) std.mem.copyForwards(u8, self.buf[0..rem], self.buf[drop..self.filled]);
+                            self.filled = rem;
+                            self.state.abs_base += drop;
+                            break;
+                        }
+                        if (range_end) |re_end| {
+                            if (self.state.abs_base + @as(u64, check_len) >= re_end) {
+                                self.filled = 0;
+                                self.state.abs_base = re_end;
+                                self.range_eof = true;
+                                break;
+                            }
+                        }
+                        self.state.abs_base += self.filled;
+                        self.filled = 0;
+                        if (state_mod.stopForBudget(&self.state, self.config)) return false;
+                        var al_read: u64 = 0;
+                        const p_al = self.decoder.pull(self.pool_alloc, ReadCtx.readFn, self.decompressor, cfg_mod.bufferWindow(self.config), self.buf, &al_read) catch |err| switch (err) {
+                            error.OutOfMemory => return error.OutOfMemory,
+                            error.DecodeLimit => return error.DecodeLimit,
+                            error.DecompressLimit => {
+                                self.state.decompressed_bytes = self.decompressor.decompressed_bytes;
+                                state_mod.noteLimit(&self.state, .decompressed_bytes);
+                                return false;
+                            },
+                            error.CorruptStream => {
+                                self.state.decompressed_bytes = self.decompressor.decompressed_bytes;
+                                self.state.soft_error = .read_failed;
+                                return false;
+                            },
+                        };
+                        self.state.bytes_read += al_read;
+                        self.filled = p_al.n;
+                        if (p_al.eof and self.filled == 0) {
+                            self.range_eof = true;
+                            break;
+                        }
+                    }
+                }
+                if (self.state.is_range_search) self.state.range_base_offset = self.state.abs_base;
+            }
+            return true;
+        }
+
         pub fn next(self: *Self) !?PullEvent {
             self.state.offset_map = &self.offset_map;
             self.state.decompress_map = &self.decompress_map;
             self.decoder.offset_map = &self.offset_map;
             self.decompressor.decompress_map = &self.decompress_map;
+            if (comptime state_mod.MatcherType(M) == regex_mod.Regex and @typeInfo(M) != .pointer) {
+                self.state.capture_regex = &self.matcher;
+            }
 
             if (self.index < self.items.items.len) {
                 const ev = self.items.items[self.index];
@@ -784,7 +1087,12 @@ pub fn ReaderPull(comptime M: type) type {
             }
 
             if (self.phase == .init) {
-                if (self.config.line_numbers) self.state.line_number = 1;
+                self.eff_start = state_mod.effectiveRangeStart(self.config);
+                if (self.config.byte_range != null or self.config.stream_offset != null) {
+                    self.state.is_range_search = true;
+                    self.state.range_base_offset = self.eff_start;
+                }
+                state_mod.initLineNumber(&self.state, self.config, self.eff_start);
                 state_mod.restoreCounters(&self.state, self.config);
 
                 var bridge = PullBridge(M){ .pull = self };
@@ -792,7 +1100,18 @@ pub fn ReaderPull(comptime M: type) type {
                     _ = bridge.deliver(.{ .begin = .{ .source_id = self.source_id } });
                 }
                 if (state_mod.rejectEmptyResults(&self.state, self.config) or state_mod.stopForBudget(&self.state, self.config)) {
+                    self.state.abs_base = self.eff_start;
+                    if (self.state.limit_hit == .max_results) self.state.resume_at = self.eff_start;
                     self.state.stopped = true;
+                    self.finishSearch();
+                    self.phase = .done;
+                } else if (!try self.positionInitialRange()) {
+                    self.state.stopped = true;
+                    self.finishSearch();
+                    self.phase = .done;
+                } else if (self.config.byte_range != null and self.config.byte_range.?.end != null and self.state.abs_base >= self.config.byte_range.?.end.?) {
+                    self.filled = 0;
+                    self.scanned_all = !self.state.output_blocked and self.state.soft_error == null;
                     self.finishSearch();
                     self.phase = .done;
                 } else {
@@ -849,8 +1168,43 @@ pub fn ReaderPull(comptime M: type) type {
 
             var bridge = PullBridge(M){ .pull = self };
 
-            if (self.filled == self.buf.len) {
-                if (try state_mod.grow(self.stream_alloc, self.buf, self.config)) |grown| {
+            const is_ml = state_mod.effectiveMultiline(self.matcher, self.config);
+            const ml_win = if (is_ml) state_mod.effectiveMultilineWindow(self.matcher, self.config) else 0;
+            const hold_limit = if (is_ml and ml_win > 0) state_mod.multilineHoldLimit(self.config, ml_win) else cfg_mod.lineHoldLimit(self.config);
+            const range_end: ?u64 = if (self.config.byte_range) |br| br.end else null;
+            const sep = cfg_mod.recordSep(self.config);
+
+            if (range_end) |re_end| {
+                if (!self.extending_past_range_end and self.state.abs_base >= re_end) {
+                    self.scanned_all = !self.state.output_blocked and self.state.soft_error == null;
+                    self.finishSearch();
+                    self.phase = .done;
+                    return false;
+                }
+                if (self.filled > 0 and self.state.abs_base + @as(u64, self.filled) >= re_end) {
+                    if (!self.config.range_align_lines) {
+                        self.filled = @intCast(re_end - self.state.abs_base);
+                        self.range_eof = true;
+                    } else if (self.state.abs_base < re_end) {
+                        const rel_re: usize = @intCast(re_end - self.state.abs_base);
+                        if (self.buf[rel_re - 1] == sep) {
+                            self.filled = rel_re;
+                            self.range_eof = true;
+                        } else if (memchr.find(cfg_mod.width, self.buf[0..self.filled], rel_re, sep)) |nl_idx| {
+                            self.filled = nl_idx + 1;
+                            self.range_eof = true;
+                        } else {
+                            self.extending_past_range_end = true;
+                        }
+                    } else if (memchr.find(cfg_mod.width, self.buf[0..self.filled], 0, sep)) |nl_idx| {
+                        self.filled = nl_idx + 1;
+                        self.range_eof = true;
+                    }
+                }
+            }
+
+            if (!self.range_eof and self.filled == self.buf.len) {
+                if (try state_mod.growWithLimit(self.stream_alloc, self.buf, hold_limit)) |grown| {
                     self.buf = grown;
                     if (self.stream_slot) |slot| slot.* = self.buf;
                 } else if (!try long_line_mod.makeRoom(PullBridge(M), self.pool_alloc, &bridge, self.matcher, &self.buf, &self.filled, &self.hold, &self.seen, &self.state, self.config)) {
@@ -861,66 +1215,117 @@ pub fn ReaderPull(comptime M: type) type {
                 } else if (self.stream_slot) |slot| slot.* = self.buf;
             }
 
-            var dest = self.buf[self.filled..];
-            if (state_mod.scanRemaining(&self.state, self.config)) |left| {
-                if (left == 0) {
-                    state_mod.noteLimit(&self.state, .max_bytes);
-                    self.state.stopped = true;
-                    self.finishSearch();
-                    self.phase = .done;
-                    return false;
-                }
-                if (dest.len > left) dest = dest[0..left];
-            }
-
-            const ReadCtx = struct {
-                dec: *StreamDecompressor,
-                fn readFn(ctx: *anyopaque, out: []u8) !usize {
-                    const d: *StreamDecompressor = @ptrCast(@alignCast(ctx));
-                    return d.read(out);
-                }
-            };
-
-            var raw_read_sink: u64 = 0;
-            const pulled = self.decoder.pull(
-                self.pool_alloc,
-                ReadCtx.readFn,
-                self.decompressor,
-                cfg_mod.bufferWindow(self.config),
-                dest,
-                &raw_read_sink,
-            ) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.DecodeLimit => return error.DecodeLimit,
-                error.DecompressLimit => {
-                    self.state.decompressed_bytes = self.decompressor.decompressed_bytes;
-                    state_mod.noteLimit(&self.state, .decompressed_bytes);
-                    self.state.stopped = true;
-                    self.finishSearch();
-                    self.phase = .done;
-                    return false;
-                },
-                error.CorruptStream => {
-                    self.state.decompressed_bytes = self.decompressor.decompressed_bytes;
-                    self.state.soft_error = .read_failed;
-                    self.state.stopped = true;
-                    self.finishSearch();
-                    self.phase = .done;
-                    return false;
-                },
-            };
-
-            self.state.decompressed_bytes = self.decompressor.decompressed_bytes;
-            if (self.decompressor.kind == .raw) {
-                self.state.bytes_read += raw_read_sink;
-            } else {
-                self.state.bytes_read = self.decompressor.raw_consumed;
-            }
-            const eof = pulled.eof;
-            if (pulled.n == 0 and !eof and self.filled == 0) return true;
-
             var chunk_at = self.filled;
-            if (pulled.n != 0) self.filled += pulled.n;
+            var eof = self.range_eof;
+            if (!self.range_eof) {
+                var dest = self.buf[self.filled..];
+                if (range_end) |re_end| {
+                    if (!self.config.range_align_lines) {
+                        const cur_end = self.state.abs_base + @as(u64, self.filled);
+                        if (cur_end >= re_end) {
+                            dest = dest[0..0];
+                            self.range_eof = true;
+                        } else {
+                            const max_r = re_end - cur_end;
+                            if (@as(u64, dest.len) > max_r) dest = dest[0..@intCast(max_r)];
+                        }
+                    }
+                }
+                if (!self.range_eof) {
+                    if (state_mod.scanRemaining(&self.state, self.config)) |left| {
+                        if (left == 0) {
+                            state_mod.noteLimit(&self.state, .max_bytes);
+                            self.state.stopped = true;
+                            self.finishSearch();
+                            self.phase = .done;
+                            return false;
+                        }
+                        if (dest.len > left) dest = dest[0..left];
+                    }
+
+                    const ReadCtx = struct {
+                        fn readFn(ctx: *anyopaque, out: []u8) !usize {
+                            const d: *StreamDecompressor = @ptrCast(@alignCast(ctx));
+                            return d.read(out);
+                        }
+                    };
+
+                    var raw_read_sink: u64 = 0;
+                    const pulled = self.decoder.pull(
+                        self.pool_alloc,
+                        ReadCtx.readFn,
+                        self.decompressor,
+                        cfg_mod.bufferWindow(self.config),
+                        dest,
+                        &raw_read_sink,
+                    ) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.DecodeLimit => return error.DecodeLimit,
+                        error.DecompressLimit => {
+                            self.state.decompressed_bytes = self.decompressor.decompressed_bytes;
+                            state_mod.noteLimit(&self.state, .decompressed_bytes);
+                            self.state.stopped = true;
+                            self.finishSearch();
+                            self.phase = .done;
+                            return false;
+                        },
+                        error.CorruptStream => {
+                            self.state.decompressed_bytes = self.decompressor.decompressed_bytes;
+                            self.state.soft_error = .read_failed;
+                            self.state.stopped = true;
+                            self.finishSearch();
+                            self.phase = .done;
+                            return false;
+                        },
+                    };
+
+                    self.state.decompressed_bytes = self.decompressor.decompressed_bytes;
+                    if (self.decompressor.kind == .raw) {
+                        self.state.bytes_read += raw_read_sink;
+                    } else {
+                        self.state.bytes_read = self.decompressor.raw_consumed;
+                    }
+                    eof = pulled.eof;
+                    if (pulled.n == 0 and !eof and self.filled == 0) return true;
+
+                    chunk_at = self.filled;
+                    if (pulled.n != 0) self.filled += pulled.n;
+                    if (range_end) |re_end| {
+                        if (self.state.abs_base + @as(u64, self.filled) >= re_end) {
+                            if (!self.config.range_align_lines) {
+                                self.filled = @intCast(re_end - self.state.abs_base);
+                                self.range_eof = true;
+                                eof = true;
+                            } else if (self.state.abs_base < re_end) {
+                                const rel_re: usize = @intCast(re_end - self.state.abs_base);
+                                if (self.buf[rel_re - 1] == sep) {
+                                    self.filled = rel_re;
+                                    self.range_eof = true;
+                                    eof = true;
+                                } else if (memchr.find(cfg_mod.width, self.buf[0..self.filled], rel_re, sep)) |nl_idx| {
+                                    self.filled = nl_idx + 1;
+                                    self.range_eof = true;
+                                    eof = true;
+                                } else {
+                                    self.extending_past_range_end = true;
+                                }
+                            } else if (memchr.find(cfg_mod.width, self.buf[chunk_at..self.filled], 0, sep)) |rel_nl| {
+                                self.filled = chunk_at + rel_nl + 1;
+                                self.range_eof = true;
+                                eof = true;
+                            }
+                        }
+                    }
+                } else {
+                    eof = true;
+                }
+            }
+            if (self.filled == 0 and eof) {
+                self.scanned_all = !self.state.output_blocked and self.state.soft_error == null;
+                self.finishSearch();
+                self.phase = .done;
+                return false;
+            }
 
             if (self.state.long_active or long_line_mod.longTail(self.buf[0..self.filled], eof, self.config)) {
                 const cont = try long_line_mod.pumpLong(
@@ -957,8 +1362,11 @@ pub fn ReaderPull(comptime M: type) type {
 
             const search_end = if (eof) self.filled else state_mod.lastComplete(self.buf[0..self.filled], self.config);
             const view_end = if (eof) self.filled else search_end;
+            const no_more_reads = eof or state_mod.overBytes(&self.state, self.config) or state_mod.overDecompressed(&self.state, self.config);
+            const saved_pos_before_fuse = self.state.pos;
 
-            const fuse = search_end > self.state.pos and state_mod.canFuse(self.matcher, self.config, &self.state);
+            const fuse = search_end > self.state.pos and state_mod.canFuse(self.matcher, self.config, &self.state) and
+                (!is_ml or no_more_reads or (self.filled >= ml_win and search_end > ml_win));
             var skip_match = false;
             if (fuse) {
                 var nul_rel: ?usize = null;
@@ -974,8 +1382,15 @@ pub fn ReaderPull(comptime M: type) type {
                             if (hit.start < self.state.pos + 4096) {
                                 self.state.prefer_prepass = true;
                             }
+                            if (state_mod.watchedMatchIsExact(self.matcher, self.config)) {
+                                self.state.setCachedMatch(self.buf[0..view_end], self.state.pos, hit);
+                            }
                             if (self.config.progress_interval == null or self.config.progress_interval.? == 0) {
-                                self.state.pos = state_mod.lineStart(self.buf[0..view_end], hit.start, self.config);
+                                const safe_hit = if (!is_ml or state_mod.watchedMatchHasExactStart(self.matcher, self.config))
+                                    hit.start
+                                else
+                                    @max(self.state.pos, hit.start -| ml_win);
+                                self.state.pos = state_mod.lineStart(self.buf[0..view_end], safe_hit, self.config);
                             }
                         }
                     } else {
@@ -1046,16 +1461,85 @@ pub fn ReaderPull(comptime M: type) type {
                 }
             }
 
-            const is_ml = state_mod.isMultilineMatcher(self.matcher);
-            const ml_win = if (is_ml) state_mod.multilineWindow(self.matcher, self.config) else 0;
-            if (is_ml and !eof and self.filled < ml_win and !self.config.passthru and !self.config.invert) {
-                if (self.matcher.find(self.buf[0..search_end], self.state.pos, self.config.match_mode) == null) {
-                    return true;
+            var commit_end: usize = view_end;
+            var start_anchored_done = false;
+            if (is_ml and ml_win > 0 and !no_more_reads) {
+                const sa_eligible = state_mod.isStartAnchoredMatcher(self.matcher) and self.state.abs_base == 0 and !self.config.invert and !self.config.passthru and self.filled >= ml_win;
+                var start_anchored_ready = false;
+                if (sa_eligible) {
+                    if (self.matcher.find(self.buf[0..self.filled], 0, self.config.match_mode)) |sa_hit| {
+                        const need_end = line_matcher_mod.matchLineEnd(self.buf[0..self.filled], 0, sa_hit, self.config);
+                        if (need_end <= search_end or self.filled >= hold_limit) {
+                            start_anchored_ready = true;
+                            start_anchored_done = true;
+                        }
+                    } else {
+                        if (self.state.after_left == 0) {
+                            self.state.bytes_searched = @max(self.state.bytes_searched, state_mod.searchedSpanAt(&self.state, self.config, self.state.abs_base + self.filled));
+                            self.state.stopped = true;
+                            self.finishSearch();
+                            self.phase = .done;
+                            return false;
+                        }
+                        start_anchored_ready = true;
+                        start_anchored_done = true;
+                    }
+                }
+                if (!start_anchored_ready) {
+                    if (self.filled < ml_win and self.filled < hold_limit) {
+                        self.state.pos = saved_pos_before_fuse;
+                        return true;
+                    }
+                    if (search_end <= ml_win) {
+                        if (self.filled < hold_limit) {
+                            self.state.pos = saved_pos_before_fuse;
+                            return true;
+                        }
+                        commit_end = if (search_end > 0) state_mod.lineEnd(self.buf[0..search_end], 0, self.config) else 0;
+                    } else {
+                        var ce = state_mod.lineStart(self.buf[0..search_end], search_end - ml_win, self.config);
+                        if (!self.config.null_data and !self.config.whole_line and !self.config.invert) {
+                            if (state_mod.effectiveMaxNewlines(self.matcher, self.config)) |max_nl| {
+                                if (max_nl <= 8) {
+                                    var nl_pos = search_end;
+                                    var rem_nl: u32 = max_nl + 2;
+                                    while (rem_nl > 0 and nl_pos > 0) : (rem_nl -= 1) {
+                                        if (memchr.findLast(cfg_mod.width, self.buf, 0, nl_pos, cfg_mod.recordSep(self.config))) |at| {
+                                            nl_pos = at;
+                                        } else {
+                                            nl_pos = 0;
+                                            break;
+                                        }
+                                    }
+                                    if (nl_pos > 0) {
+                                        ce = @max(ce, nl_pos + 1);
+                                    }
+                                }
+                            }
+                            const pend = state_mod.effectiveEarliestPendingStart(self.matcher, self.buf[0..search_end], ce);
+                            if (pend > ce) {
+                                const pend_ce = state_mod.lineStart(self.buf[0..search_end], pend, self.config);
+                                ce = @max(ce, pend_ce);
+                            }
+                        }
+                        if (ce == 0) {
+                            if (self.filled < hold_limit) {
+                                self.state.pos = saved_pos_before_fuse;
+                                return true;
+                            }
+                            ce = state_mod.lineEnd(self.buf[0..search_end], 0, self.config);
+                        }
+                        commit_end = ce;
+                    }
+                    if (skip_match or self.state.pos > commit_end) {
+                        self.state.pos = commit_end;
+                    }
                 }
             }
 
-            if (!skip_match and (search_end > self.state.pos or eof)) {
-                if (!try line_matcher_mod.matchBuffer(PullBridge(M), &bridge, self.matcher, self.buf[0..view_end], &self.state, self.config)) {
+            if (!skip_match and (commit_end > self.state.pos or eof)) {
+                const can_hold_zero = is_ml and !no_more_reads and self.filled < hold_limit;
+                if (!try line_matcher_mod.matchBufferWithLimit(PullBridge(M), &bridge, self.matcher, self.buf[0..view_end], commit_end, can_hold_zero, &self.state, self.config)) {
                     self.state.stopped = true;
                     if (eof and self.state.pos >= view_end and !self.state.output_blocked) self.scanned_all = true;
                     self.finishSearch();
@@ -1063,6 +1547,7 @@ pub fn ReaderPull(comptime M: type) type {
                     return false;
                 }
             } else if (skip_match) {
+                state_mod.countLines(self.buf[0..self.filled], @min(self.state.pos, self.filled), &self.state, self.config);
                 if (!state_mod.maybeProgress(PullBridge(M), &bridge, &self.state, self.config)) {
                     self.state.stopped = true;
                     self.finishSearch();
@@ -1071,7 +1556,10 @@ pub fn ReaderPull(comptime M: type) type {
                 }
             }
 
-            if (is_ml and state_mod.isStartAnchoredMatcher(self.matcher) and self.state.abs_base + self.filled >= ml_win) {
+            if (is_ml and state_mod.isStartAnchoredMatcher(self.matcher) and !self.config.invert and !self.config.passthru and
+                (start_anchored_done or (self.state.abs_base > 0 and self.eff_start == 0)) and self.state.after_left == 0)
+            {
+                self.state.bytes_searched = @max(self.state.bytes_searched, state_mod.searchedSpanAt(&self.state, self.config, self.state.abs_base + self.filled));
                 self.state.stopped = true;
                 self.finishSearch();
                 self.phase = .done;
@@ -1085,13 +1573,10 @@ pub fn ReaderPull(comptime M: type) type {
                 return false;
             }
 
-            const consumed = if (is_ml and search_end > ml_win)
-                @max(self.state.last_line_visited, state_mod.lineEnd(self.buf[0..search_end], search_end - ml_win, self.config))
+            const consumed = if (is_ml)
+                self.state.pos
             else
                 search_end;
-            if (is_ml and consumed < search_end) {
-                self.state.pos = consumed;
-            }
             ring_mod.rememberBefore(self.matcher, self.buf, &self.state, self.config, consumed);
             state_mod.countLines(self.buf, consumed, &self.state, self.config);
             const remain = self.filled - consumed;
@@ -1104,6 +1589,7 @@ pub fn ReaderPull(comptime M: type) type {
             self.state.last_line_counted = 0;
             self.state.remembered_until = 0;
             self.state.abs_base += consumed;
+            self.state.bytes_searched = @max(self.state.bytes_searched, state_mod.searchedSpanAt(&self.state, self.config, self.state.abs_base));
 
             return true;
         }
@@ -1113,7 +1599,8 @@ pub fn ReaderPull(comptime M: type) type {
             self.search_ended = true;
 
             const cursor = self.state.abs_base + @as(u64, self.state.pos);
-            if (cursor > self.state.bytes_searched) self.state.bytes_searched = cursor;
+            const span_searched = state_mod.searchedSpanAt(&self.state, self.config, cursor);
+            if (span_searched > self.state.bytes_searched) self.state.bytes_searched = span_searched;
             state_mod.closeOnce(&self.state, self.config);
 
             var outcome: Outcome = if (self.state.stopped) .stopped else .complete;
@@ -1141,7 +1628,9 @@ pub fn ReaderPull(comptime M: type) type {
             var bridge = PullBridge(M){ .pull = self };
             _ = bridge.deliver(end_ev);
 
-            if (self.scanned_all and self.state.soft_error == null and !self.state.paused) {
+            if (self.scanned_all and self.state.soft_error == null and !self.state.paused and
+                !(self.config.live and !liveIsClosed(self.config)))
+            {
                 const res = Result{
                     .matches = self.state.matches,
                     .matched_lines = self.state.matched_lines,
@@ -1275,6 +1764,7 @@ pub fn copyPull(allocator: std.mem.Allocator, ev: Event) !PullEvent {
                 .kind = if (ev == .match) .match else .context,
                 .source_id = id,
                 .line_number = line.line_number,
+                .line_number_known = line.line_number_known,
                 .column = line.column,
                 .u16_column = line.u16_column,
                 .absolute_offset = line.absolute_offset,
@@ -1301,6 +1791,7 @@ pub fn lineEvent(source_id: []const u8, line: Line) sink_mod.LineEvent {
     return .{
         .source_id = source_id,
         .line_number = line.number orelse 0,
+        .line_number_known = line.number != null,
         .column = line.column,
         .u16_column = u16_column,
         .absolute_offset = line.offset,

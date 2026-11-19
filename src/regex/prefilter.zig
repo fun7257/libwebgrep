@@ -80,7 +80,7 @@ pub fn extractLiterals(self: anytype, pattern: []const u8, options: inst_mod.Reg
                     var j = i + 2;
                     var only_flags = false;
                     var has_neg_or_scoped = false;
-                    while (j < pattern.len and (pattern[j] == 'i' or pattern[j] == 'm' or pattern[j] == 's' or pattern[j] == 'U' or pattern[j] == 'x' or pattern[j] == '-')) : (j += 1) {
+                    while (j < pattern.len and (pattern[j] == 'i' or pattern[j] == 'm' or pattern[j] == 's' or pattern[j] == 'U' or pattern[j] == 'u' or pattern[j] == 'x' or pattern[j] == '-')) : (j += 1) {
                         only_flags = true;
                         if (pattern[j] == 'x') return;
                         if (pattern[j] == '-') has_neg_or_scoped = true;

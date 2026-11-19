@@ -519,3 +519,61 @@ test "v0.7.0: hex/unicode escapes, \\Q..\\E, \\a/\\f/\\v/\\Z, POSIX classes, (?x
         try std.testing.expectEqualStrings("aaaab", "aaaab"[ms.start..ms.end]);
     }
 }
+
+test "regex v0.8: unicode_classes option and (?u)/(?-u) inline flags for \\d \\w \\s" {
+    const alloc = std.testing.allocator;
+
+    // 1. ASCII default vs unicode_classes = true for \d (Arabic-Indic ٠١٢ & Fullwidth ０１２)
+    {
+        var re_ascii = try Regex.init(alloc, "\\d+", .{});
+        defer re_ascii.deinit();
+        try std.testing.expect(re_ascii.find("٠١٢", 0, .leftmost_first) == null);
+
+        var re_uni = try Regex.init(alloc, "\\d+", .{ .unicode_classes = true });
+        defer re_uni.deinit();
+        const hay = "val=٠١٢/０１２!";
+        const m1 = re_uni.find(hay, 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("٠١٢", hay[m1.start..m1.end]);
+        const m2 = re_uni.find(hay, m1.end, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("０１２", hay[m2.start..m2.end]);
+    }
+
+    // 2. Unicode \w and \W (Han, Cyrillic, Latin accents, underscore, punctuation exclusion)
+    {
+        var re_w = try Regex.init(alloc, "(?u)\\w+", .{});
+        defer re_w.deinit();
+        const hay = "。中文_café123，Привет!";
+        const m1 = re_w.find(hay, 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("中文_café123", hay[m1.start..m1.end]);
+        const m2 = re_w.find(hay, m1.end, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("Привет", hay[m2.start..m2.end]);
+
+        var re_W = try Regex.init(alloc, "(?u)\\W+", .{});
+        defer re_W.deinit();
+        const mw = re_W.find("中文，Привет", 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("，", "中文，Привет"[mw.start..mw.end]);
+    }
+
+    // 3. Unicode \s and \S (NBSP U+00A0 and Ideographic Space U+3000)
+    {
+        var re_s = try Regex.init(alloc, "(?u)\\s+", .{});
+        defer re_s.deinit();
+        const hay = "a\u{00A0}\u{3000}b";
+        const ms = re_s.find(hay, 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("\u{00A0}\u{3000}", hay[ms.start..ms.end]);
+    }
+
+    // 4. Inside character classes [...] and scoped (?u:...) / (?-u:...)
+    {
+        var re_cls = try Regex.init(alloc, "(?u)[\\d\\s]+", .{});
+        defer re_cls.deinit();
+        const hay = "x٠\u{3000}９y";
+        const mc = re_cls.find(hay, 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("٠\u{3000}９", hay[mc.start..mc.end]);
+
+        var re_toggle = try Regex.init(alloc, "(?u:\\w+)-(?-u:\\d+)", .{ .unicode_classes = true });
+        defer re_toggle.deinit();
+        try std.testing.expect(re_toggle.find("中文-42", 0, .leftmost_first) != null);
+        try std.testing.expect(re_toggle.find("中文-٠١", 0, .leftmost_first) == null);
+    }
+}

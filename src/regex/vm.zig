@@ -205,6 +205,7 @@ pub const Regex = struct {
             .pattern = pattern,
             .ignore_case = ignore_case,
             .unicode_case = options.unicode_case,
+            .unicode_classes = options.unicode_classes,
             .multiline = options.multiline,
             .dot_all = options.dot_all,
             .max_inst = inst_cap,

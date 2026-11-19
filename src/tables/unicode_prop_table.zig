@@ -1171,6 +1171,8 @@ fn lookupNormalized(norm: []const u8, prefix_kind: anytype) ?PropertySpec {
         if (std.mem.eql(u8, norm, "any") or std.mem.eql(u8, norm, "assigned")) return .{ .ranges = &prop_Any };
         if (std.mem.eql(u8, norm, "emoji") or std.mem.eql(u8, norm, "emojipresentation") or std.mem.eql(u8, norm, "extendedpictographic"))
             return .{ .ranges = &prop_Emoji };
+        if (std.mem.eql(u8, norm, "whitespace") or std.mem.eql(u8, norm, "wspace") or std.mem.eql(u8, norm, "space"))
+            return .{ .ranges = &prop_Whitespace };
     }
 
     if (prefix_kind == .any or prefix_kind == .sc) {
@@ -1200,6 +1202,20 @@ fn lookupNormalized(norm: []const u8, prefix_kind: anytype) ?PropertySpec {
 
     return null;
 }
+
+/// Unicode White_Space property (25 codepoints in 11 sorted ranges).
+pub const prop_Whitespace = [_]CodepointRange{
+    .{ .start = 0x0009, .end = 0x000D },
+    .{ .start = 0x0020, .end = 0x0020 },
+    .{ .start = 0x0085, .end = 0x0085 },
+    .{ .start = 0x00A0, .end = 0x00A0 },
+    .{ .start = 0x1680, .end = 0x1680 },
+    .{ .start = 0x2000, .end = 0x200A },
+    .{ .start = 0x2028, .end = 0x2029 },
+    .{ .start = 0x202F, .end = 0x202F },
+    .{ .start = 0x205F, .end = 0x205F },
+    .{ .start = 0x3000, .end = 0x3000 },
+};
 
 /// UAX #29 / UTS #18 Unicode Word character classification (`Alphabetic | M | N | Pc | Join_Control`).
 pub fn isWordCodepoint(cp: u21) bool {

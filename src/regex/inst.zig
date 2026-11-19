@@ -184,6 +184,8 @@ pub const RegexOptions = struct {
     case: CaseMode = .sensitive,
     /// Enable Unicode simple case folding for multi-byte UTF-8 codepoints when case-insensitive or smart-case is active.
     unicode_case: bool = true,
+    /// When true, `\d`/`\D`, `\w`/`\W`, and `\s`/`\S` match full Unicode classes (`\p{Nd}`, UAX #29 word, `White_Space`) instead of ASCII-only. Can also be toggled inline via `(?u)` / `(?-u)`.
+    unicode_classes: bool = false,
     /// Allow matches to span multiple lines (including `\n`), with `^` and `$` matching line boundaries.
     multiline: bool = false,
     /// Allow `.` to match `\n` (requires `multiline = true` to cross lines).

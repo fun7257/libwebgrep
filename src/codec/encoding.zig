@@ -11,6 +11,7 @@ const std = @import("std");
 const unicode = std.unicode;
 const decompress = @import("decompress.zig");
 const gbk_table = @import("../tables/gbk_table.zig");
+const legacy_tables = @import("../tables/legacy_encodings.zig");
 const memchr = @import("../finder/memchr.zig");
 
 pub const Encoding = enum {
@@ -28,6 +29,26 @@ pub const Encoding = enum {
     gbk,
     /// Transcode from ISO-8859-1 / Latin-1 to UTF-8.
     latin1,
+    /// Transcode from exact Windows-1252 / CP1252 (with 0x80..0x9F punctuation/Euro) to UTF-8.
+    windows1252,
+    /// Transcode from full GB18030 (2-byte + 4-byte BMP & supplementary) to UTF-8.
+    gb18030,
+    /// Transcode from Shift_JIS / CP932 to UTF-8.
+    shift_jis,
+    /// Transcode from EUC-JP (JIS X 0208 + halfwidth katakana) to UTF-8.
+    euc_jp,
+    /// Transcode from Big5 / CP950 to UTF-8.
+    big5,
+    /// Transcode from EUC-KR / CP949 to UTF-8.
+    euc_kr,
+    /// Transcode from Windows-1251 / CP1251 (Cyrillic) to UTF-8.
+    windows1251,
+    /// Transcode from UTF-32LE to UTF-8.
+    utf32le,
+    /// Transcode from UTF-32BE to UTF-8.
+    utf32be,
+    /// Heuristic auto-detection when no BOM or explicit `charset` hint is present.
+    detect,
 };
 
 pub const Sniff = enum {
@@ -38,9 +59,33 @@ pub const Sniff = enum {
     utf16be,
     gbk,
     latin1,
+    windows1252,
+    gb18030,
+    shift_jis,
+    euc_jp,
+    big5,
+    euc_kr,
+    windows1251,
+    utf32le,
+    utf32be,
 };
 
-const coded_mode = enum { utf8, utf16le, utf16be, gbk, latin1 };
+const coded_mode = enum {
+    utf8,
+    utf16le,
+    utf16be,
+    gbk,
+    latin1,
+    windows1252,
+    gb18030,
+    shift_jis,
+    euc_jp,
+    big5,
+    euc_kr,
+    windows1251,
+    utf32le,
+    utf32be,
+};
 
 const Step = struct {
     n: usize,
@@ -59,18 +104,24 @@ pub const Pull = struct {
 
 /// Inspects only the beginning of the stream. When `eof` is true, an incomplete BOM prefix is treated as raw bytes.
 pub fn sniff(bytes: []const u8, eof: bool) Sniff {
+    if (bytes.len >= 4 and bytes[0] == 0xff and bytes[1] == 0xfe and bytes[2] == 0x00 and bytes[3] == 0x00) return .utf32le;
+    if (bytes.len >= 4 and bytes[0] == 0x00 and bytes[1] == 0x00 and bytes[2] == 0xfe and bytes[3] == 0xff) return .utf32be;
     if (bytes.len >= 3 and std.mem.eql(u8, bytes[0..3], "\xef\xbb\xbf")) return .utf8;
-    if (bytes.len >= 2 and bytes[0] == 0xff and bytes[1] == 0xfe) return .utf16le;
+    if (bytes.len >= 2 and bytes[0] == 0xff and bytes[1] == 0xfe) {
+        if (!eof and (bytes.len == 2 or (bytes.len == 3 and bytes[2] == 0x00))) return .need_more;
+        return .utf16le;
+    }
     if (bytes.len >= 2 and bytes[0] == 0xfe and bytes[1] == 0xff) return .utf16be;
-    if (eof or bytes.len >= 3) return .raw;
+    if (eof or bytes.len >= 4) return .raw;
     if (bytes.len == 0) return .need_more;
     if (bytes.len == 1) {
         return switch (bytes[0]) {
-            0xef, 0xff, 0xfe => .need_more,
+            0xef, 0xff, 0xfe, 0x00 => .need_more,
             else => .raw,
         };
     }
     if (bytes[0] == 0xef and bytes[1] == 0xbb) return .need_more;
+    if (bytes[0] == 0x00 and bytes[1] == 0x00 and (bytes.len == 2 or bytes[2] == 0xfe)) return .need_more;
     return .raw;
 }
 
@@ -89,22 +140,137 @@ pub fn fromCharset(label_or_header: []const u8) ?Encoding {
     if (std.ascii.eqlIgnoreCase(token, "utf-8") or std.ascii.eqlIgnoreCase(token, "utf8")) return .utf8;
     if (std.ascii.eqlIgnoreCase(token, "utf-16le") or std.ascii.eqlIgnoreCase(token, "utf16le") or std.ascii.eqlIgnoreCase(token, "utf-16")) return .utf16le;
     if (std.ascii.eqlIgnoreCase(token, "utf-16be") or std.ascii.eqlIgnoreCase(token, "utf16be")) return .utf16be;
+    if (std.ascii.eqlIgnoreCase(token, "utf-32le") or std.ascii.eqlIgnoreCase(token, "utf32le") or std.ascii.eqlIgnoreCase(token, "utf-32") or std.ascii.eqlIgnoreCase(token, "utf32")) return .utf32le;
+    if (std.ascii.eqlIgnoreCase(token, "utf-32be") or std.ascii.eqlIgnoreCase(token, "utf32be")) return .utf32be;
+    if (std.ascii.eqlIgnoreCase(token, "gb18030")) return .gb18030;
     if (std.ascii.eqlIgnoreCase(token, "gbk") or
         std.ascii.eqlIgnoreCase(token, "gb2312") or
         std.ascii.eqlIgnoreCase(token, "gb_2312") or
-        std.ascii.eqlIgnoreCase(token, "gb18030") or
         std.ascii.eqlIgnoreCase(token, "cp936") or
         std.ascii.eqlIgnoreCase(token, "ms936") or
         std.ascii.eqlIgnoreCase(token, "windows-936") or
         std.ascii.eqlIgnoreCase(token, "chinese") or
         std.ascii.eqlIgnoreCase(token, "csgb2312")) return .gbk;
+    if (std.ascii.eqlIgnoreCase(token, "windows-1252") or
+        std.ascii.eqlIgnoreCase(token, "cp1252") or
+        std.ascii.eqlIgnoreCase(token, "x-cp1252")) return .windows1252;
     if (std.ascii.eqlIgnoreCase(token, "iso-8859-1") or
         std.ascii.eqlIgnoreCase(token, "iso8859-1") or
         std.ascii.eqlIgnoreCase(token, "latin1") or
-        std.ascii.eqlIgnoreCase(token, "latin-1") or
-        std.ascii.eqlIgnoreCase(token, "windows-1252") or
-        std.ascii.eqlIgnoreCase(token, "cp1252")) return .latin1;
+        std.ascii.eqlIgnoreCase(token, "latin-1")) return .latin1;
+    if (std.ascii.eqlIgnoreCase(token, "shift_jis") or
+        std.ascii.eqlIgnoreCase(token, "shift-jis") or
+        std.ascii.eqlIgnoreCase(token, "sjis") or
+        std.ascii.eqlIgnoreCase(token, "cp932") or
+        std.ascii.eqlIgnoreCase(token, "ms932") or
+        std.ascii.eqlIgnoreCase(token, "windows-31j")) return .shift_jis;
+    if (std.ascii.eqlIgnoreCase(token, "euc-jp") or std.ascii.eqlIgnoreCase(token, "eucjp")) return .euc_jp;
+    if (std.ascii.eqlIgnoreCase(token, "big5") or std.ascii.eqlIgnoreCase(token, "big5-hkscs") or std.ascii.eqlIgnoreCase(token, "cp950")) return .big5;
+    if (std.ascii.eqlIgnoreCase(token, "euc-kr") or std.ascii.eqlIgnoreCase(token, "euckr") or std.ascii.eqlIgnoreCase(token, "cp949") or std.ascii.eqlIgnoreCase(token, "ks_c_5601-1987")) return .euc_kr;
+    if (std.ascii.eqlIgnoreCase(token, "windows-1251") or std.ascii.eqlIgnoreCase(token, "cp1251") or std.ascii.eqlIgnoreCase(token, "x-cp1251")) return .windows1251;
     return null;
+}
+
+/// Heuristic character encoding detector for BOM-less, hint-less text samples (inspects up to 8 KiB).
+pub fn detectEncoding(sample: []const u8) Encoding {
+    if (sample.len == 0) return .utf8;
+    switch (sniff(sample, true)) {
+        .utf8 => return .utf8,
+        .utf32le => return .utf32le,
+        .utf32be => return .utf32be,
+        .utf16le => return .utf16le,
+        .utf16be => return .utf16be,
+        else => {},
+    }
+
+    const head = sample[0..@min(sample.len, 8192)];
+
+    // Check UTF-32LE / UTF-32BE null-byte cadence
+    if (head.len >= 8 and (head.len % 4) == 0) {
+        var le32_hits: usize = 0;
+        var be32_hits: usize = 0;
+        var i: usize = 0;
+        while (i + 4 <= head.len) : (i += 4) {
+            if (head[i] > 0 and head[i] < 0x80 and head[i + 1] == 0 and head[i + 2] == 0 and head[i + 3] == 0) le32_hits += 1;
+            if (head[i] == 0 and head[i + 1] == 0 and head[i + 2] == 0 and head[i + 3] > 0 and head[i + 3] < 0x80) be32_hits += 1;
+        }
+        const units = head.len / 4;
+        if (le32_hits * 2 >= units and le32_hits >= 2) return .utf32le;
+        if (be32_hits * 2 >= units and be32_hits >= 2) return .utf32be;
+    }
+
+    // Check UTF-16LE / UTF-16BE null-byte cadence
+    if (head.len >= 4 and (head.len % 2) == 0) {
+        var le16_hits: usize = 0;
+        var be16_hits: usize = 0;
+        var i: usize = 0;
+        while (i + 2 <= head.len) : (i += 2) {
+            if (head[i] > 0 and head[i] < 0x80 and head[i + 1] == 0) le16_hits += 1;
+            if (head[i] == 0 and head[i + 1] > 0 and head[i + 1] < 0x80) be16_hits += 1;
+        }
+        const units = head.len / 2;
+        if (le16_hits * 2 >= units and le16_hits >= 2) return .utf16le;
+        if (be16_hits * 2 >= units and be16_hits >= 2) return .utf16be;
+    }
+
+    if (isAsciiSlice(head) or validUtf8(head)) return .utf8;
+
+    // Score multi-byte legacy CJK encodings
+    const candidates = [_]struct { enc: Encoding, mode: coded_mode }{
+        .{ .enc = .gb18030, .mode = .gb18030 },
+        .{ .enc = .shift_jis, .mode = .shift_jis },
+        .{ .enc = .euc_jp, .mode = .euc_jp },
+        .{ .enc = .big5, .mode = .big5 },
+        .{ .enc = .euc_kr, .mode = .euc_kr },
+    };
+    var best_enc: ?Encoding = null;
+    var best_score: i64 = 0;
+    for (candidates) |cand| {
+        var i: usize = 0;
+        var valid_mb: i64 = 0;
+        var bad: i64 = 0;
+        var script_bonus: i64 = 0;
+        while (i < head.len) {
+            const st = decodeMode(cand.mode, head[i..], true) orelse break;
+            if (st.cp == unicode.replacement_character) {
+                bad += 1;
+            } else if (st.n >= 2) {
+                valid_mb += 1;
+                if (cand.enc == .shift_jis or cand.enc == .euc_jp) {
+                    if ((st.cp >= 0x3040 and st.cp <= 0x30FF) or (st.cp >= 0xFF61 and st.cp <= 0xFF9F)) script_bonus += 4;
+                } else if (cand.enc == .euc_kr) {
+                    if (st.cp >= 0xAC00 and st.cp <= 0xD7A3) script_bonus += 4;
+                } else if (cand.enc == .gb18030 and st.n == 4) {
+                    script_bonus += 6;
+                }
+            }
+            i += st.n;
+        }
+        if (valid_mb >= 1 and bad == 0) {
+            const score = valid_mb * 4 + script_bonus;
+            if (score > best_score) {
+                best_score = score;
+                best_enc = cand.enc;
+            }
+        }
+    }
+    if (best_enc) |enc| return enc;
+
+    // Single-byte high-bit heuristic: Windows-1251 (Cyrillic 0xC0..0xFF) vs Windows-1252
+    var high_total: usize = 0;
+    var cyr_lower: usize = 0;
+    var mid_80_bf: usize = 0;
+    for (head) |b| {
+        if (b >= 0x80) {
+            high_total += 1;
+            if (b >= 0xE0) cyr_lower += 1;
+            if (b >= 0x80 and b <= 0xBF) mid_80_bf += 1;
+        }
+    }
+    if (high_total >= 4 and cyr_lower * 2 >= high_total and mid_80_bf * 5 <= high_total) {
+        return .windows1251;
+    }
+    return .windows1252;
 }
 
 fn asciiIndexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
@@ -188,16 +354,49 @@ pub fn utf16Span(bytes: []const u8, start: usize, end: usize) Utf16Span {
     return .{ .start = u16_start, .end = u16_end };
 }
 
-/// Byte length after transcoding into searchable bytes. Returns `input.len` unchanged for raw bytes.
-pub fn decodedSize(kind: Sniff, input: []const u8) usize {
-    const mode: coded_mode = switch (kind) {
+pub fn sniffToCodedMode(kind: Sniff) ?coded_mode {
+    return switch (kind) {
         .utf8 => .utf8,
         .utf16le => .utf16le,
         .utf16be => .utf16be,
         .gbk => .gbk,
         .latin1 => .latin1,
-        else => return input.len,
+        .windows1252 => .windows1252,
+        .gb18030 => .gb18030,
+        .shift_jis => .shift_jis,
+        .euc_jp => .euc_jp,
+        .big5 => .big5,
+        .euc_kr => .euc_kr,
+        .windows1251 => .windows1251,
+        .utf32le => .utf32le,
+        .utf32be => .utf32be,
+        .raw, .need_more => null,
     };
+}
+
+pub fn encodingToSniff(enc: Encoding) Sniff {
+    return switch (enc) {
+        .auto, .none, .detect => .raw,
+        .utf8 => .utf8,
+        .utf16le => .utf16le,
+        .utf16be => .utf16be,
+        .gbk => .gbk,
+        .latin1 => .latin1,
+        .windows1252 => .windows1252,
+        .gb18030 => .gb18030,
+        .shift_jis => .shift_jis,
+        .euc_jp => .euc_jp,
+        .big5 => .big5,
+        .euc_kr => .euc_kr,
+        .windows1251 => .windows1251,
+        .utf32le => .utf32le,
+        .utf32be => .utf32be,
+    };
+}
+
+/// Byte length after transcoding into searchable bytes. Returns `input.len` unchanged for raw bytes.
+pub fn decodedSize(kind: Sniff, input: []const u8) usize {
+    const mode = sniffToCodedMode(kind) orelse return input.len;
     return convertedLen(mode, input);
 }
 
@@ -212,14 +411,7 @@ pub fn convertAllocWithMap(
     raw_base: u64,
     offset_map: ?*decompress.OffsetMap,
 ) error{OutOfMemory}![]u8 {
-    const mode: coded_mode = switch (kind) {
-        .utf8 => .utf8,
-        .utf16le => .utf16le,
-        .utf16be => .utf16be,
-        .gbk => .gbk,
-        .latin1 => .latin1,
-        else => return allocator.dupe(u8, input),
-    };
+    const mode = sniffToCodedMode(kind) orelse return allocator.dupe(u8, input);
     const len = convertedLen(mode, input);
     const buf = try allocator.alloc(u8, len);
     errdefer allocator.free(buf);
@@ -237,23 +429,16 @@ pub fn convertScratchWithMap(
     raw_base: u64,
     offset_map: ?*decompress.OffsetMap,
 ) error{OutOfMemory}![]u8 {
-    const mode: coded_mode = switch (kind) {
-        .utf8 => .utf8,
-        .utf16le => .utf16le,
-        .utf16be => .utf16be,
-        .gbk => .gbk,
-        .latin1 => .latin1,
-        else => {
-            if (decode_buf.len < input.len) {
-                if (decode_buf.len == 0) {
-                    decode_buf.* = try buf_alloc.alloc(u8, input.len);
-                } else {
-                    decode_buf.* = try buf_alloc.realloc(decode_buf.*, input.len);
-                }
+    const mode = sniffToCodedMode(kind) orelse {
+        if (decode_buf.len < input.len) {
+            if (decode_buf.len == 0) {
+                decode_buf.* = try buf_alloc.alloc(u8, input.len);
+            } else {
+                decode_buf.* = try buf_alloc.realloc(decode_buf.*, input.len);
             }
-            if (input.len > 0) @memcpy(decode_buf.*[0..input.len], input);
-            return decode_buf.*[0..input.len];
-        },
+        }
+        if (input.len > 0) @memcpy(decode_buf.*[0..input.len], input);
+        return decode_buf.*[0..input.len];
     };
     const len = convertedLen(mode, input);
     if (decode_buf.len < len) {
@@ -287,7 +472,25 @@ pub const Decoder = struct {
     out_produced: u64 = 0,
     offset_map: ?*decompress.OffsetMap = null,
 
-    const Mode = enum { undecided, raw, utf8, utf16le, utf16be, gbk, latin1 };
+    const Mode = enum {
+        undecided,
+        raw,
+        detect,
+        utf8,
+        utf16le,
+        utf16be,
+        gbk,
+        latin1,
+        windows1252,
+        gb18030,
+        shift_jis,
+        euc_jp,
+        big5,
+        euc_kr,
+        windows1251,
+        utf32le,
+        utf32be,
+    };
 
     pub fn init(encoding: Encoding) Decoder {
         return initWithHint(encoding, null);
@@ -298,11 +501,21 @@ pub const Decoder = struct {
         return switch (resolved) {
             .none => .{ .mode = .raw, .fallback_mode = .raw },
             .auto => .{ .mode = .undecided, .fallback_mode = .raw },
+            .detect => .{ .mode = .undecided, .fallback_mode = .detect },
             .utf8 => .{ .mode = .undecided, .fallback_mode = .utf8 },
             .utf16le => .{ .mode = .undecided, .fallback_mode = .utf16le },
             .utf16be => .{ .mode = .undecided, .fallback_mode = .utf16be },
             .gbk => .{ .mode = .undecided, .fallback_mode = .gbk },
             .latin1 => .{ .mode = .undecided, .fallback_mode = .latin1 },
+            .windows1252 => .{ .mode = .undecided, .fallback_mode = .windows1252 },
+            .gb18030 => .{ .mode = .undecided, .fallback_mode = .gb18030 },
+            .shift_jis => .{ .mode = .undecided, .fallback_mode = .shift_jis },
+            .euc_jp => .{ .mode = .undecided, .fallback_mode = .euc_jp },
+            .big5 => .{ .mode = .undecided, .fallback_mode = .big5 },
+            .euc_kr => .{ .mode = .undecided, .fallback_mode = .euc_kr },
+            .windows1251 => .{ .mode = .undecided, .fallback_mode = .windows1251 },
+            .utf32le => .{ .mode = .undecided, .fallback_mode = .utf32le },
+            .utf32be => .{ .mode = .undecided, .fallback_mode = .utf32be },
         };
     }
 
@@ -358,6 +571,27 @@ pub const Decoder = struct {
         dest: []u8,
         bytes_read: *u64,
     ) PullError(readFn)!Pull {
+        if (self.fallback_mode == .detect) {
+            var tmp: [1024]u8 = undefined;
+            const pending_len = self.in_len - self.in_i;
+            const remain = if (pending_len < tmp.len) tmp.len - pending_len else 0;
+            if (remain > 0 and !self.saw_eof) {
+                const want = @min(remain, @max(raw_cap, 1));
+                const n = try readFn(read_ctx, tmp[0..want]);
+                bytes_read.* += n;
+                if (n == 0) {
+                    self.saw_eof = true;
+                } else {
+                    try self.appendIn(allocator, tmp[0..n]);
+                }
+            }
+            const cur_len = self.in_len - self.in_i;
+            if (!self.saw_eof and cur_len < tmp.len) {
+                return .{ .n = 0, .eof = false };
+            }
+            return self.decide(allocator, dest, self.saw_eof);
+        }
+
         if (self.in_i < self.in_len) {
             var tmp: [4]u8 = undefined;
             const want = @min(tmp.len, @max(raw_cap, 1));
@@ -390,7 +624,7 @@ pub const Decoder = struct {
                 self.mode = .raw;
                 return .{ .n = n, .eof = false };
             },
-            .utf8, .utf16le, .utf16be, .gbk, .latin1 => {
+            else => {
                 const copy = try allocator.dupe(u8, dest[0..n]);
                 defer allocator.free(copy);
                 return self.acceptBom(allocator, kind, copy, dest, false);
@@ -413,13 +647,33 @@ pub const Decoder = struct {
                 self.mode = .raw;
                 return self.emitPending(dest, eof);
             },
-            .utf8, .utf16le, .utf16be, .gbk, .latin1 => {
+            else => {
                 const copy = try allocator.dupe(u8, pending);
                 defer allocator.free(copy);
                 self.in_i = self.in_len;
                 return self.acceptBom(allocator, kind, copy, dest, eof);
             },
         }
+    }
+
+    fn encodingToMode(enc: Encoding) Mode {
+        return switch (enc) {
+            .none, .auto, .detect => .raw,
+            .utf8 => .utf8,
+            .utf16le => .utf16le,
+            .utf16be => .utf16be,
+            .gbk => .gbk,
+            .latin1 => .latin1,
+            .windows1252 => .windows1252,
+            .gb18030 => .gb18030,
+            .shift_jis => .shift_jis,
+            .euc_jp => .euc_jp,
+            .big5 => .big5,
+            .euc_kr => .euc_kr,
+            .windows1251 => .windows1251,
+            .utf32le => .utf32le,
+            .utf32be => .utf32be,
+        };
     }
 
     fn acceptFallback(
@@ -429,7 +683,7 @@ pub const Decoder = struct {
         dest: []u8,
         eof: bool,
     ) !Pull {
-        self.mode = self.fallback_mode;
+        self.mode = if (self.fallback_mode == .detect) encodingToMode(detectEncoding(raw)) else self.fallback_mode;
         self.in_i = 0;
         self.in_len = 0;
         if (raw.len != 0) try self.appendIn(allocator, raw);
@@ -444,22 +698,29 @@ pub const Decoder = struct {
         dest: []u8,
         eof: bool,
     ) !Pull {
-        const mode: coded_mode = switch (kind) {
-            .utf8 => .utf8,
-            .utf16le => .utf16le,
-            .utf16be => .utf16be,
-            .gbk => .gbk,
-            .latin1 => .latin1,
-            else => .utf8,
-        };
+        const mode = sniffToCodedMode(kind) orelse .utf8;
         self.mode = switch (mode) {
             .utf8 => .utf8,
             .utf16le => .utf16le,
             .utf16be => .utf16be,
             .gbk => .gbk,
             .latin1 => .latin1,
+            .windows1252 => .windows1252,
+            .gb18030 => .gb18030,
+            .shift_jis => .shift_jis,
+            .euc_jp => .euc_jp,
+            .big5 => .big5,
+            .euc_kr => .euc_kr,
+            .windows1251 => .windows1251,
+            .utf32le => .utf32le,
+            .utf32be => .utf32be,
         };
-        const bom: usize = if (mode == .utf8) 3 else if (mode == .utf16le or mode == .utf16be) 2 else 0;
+        const bom: usize = switch (mode) {
+            .utf8 => 3,
+            .utf16le, .utf16be => 2,
+            .utf32le, .utf32be => 4,
+            else => 0,
+        };
         self.raw_consumed = bom;
         if (self.offset_map) |m| m.base_raw_offset = bom;
         const payload = if (raw.len >= bom) raw[bom..] else raw[raw.len..];
@@ -595,6 +856,15 @@ pub const Decoder = struct {
             .utf16be => .utf16be,
             .gbk => .gbk,
             .latin1 => .latin1,
+            .windows1252 => .windows1252,
+            .gb18030 => .gb18030,
+            .shift_jis => .shift_jis,
+            .euc_jp => .euc_jp,
+            .big5 => .big5,
+            .euc_kr => .euc_kr,
+            .windows1251 => .windows1251,
+            .utf32le => .utf32le,
+            .utf32be => .utf32be,
             else => .utf8,
         };
     }
@@ -725,12 +995,153 @@ fn decodeMode(mode: coded_mode, bytes: []const u8, eof: bool) ?Step {
         .utf16be => decodeUtf16(bytes, .big, eof),
         .gbk => decodeGbk(bytes, eof),
         .latin1 => decodeLatin1(bytes),
+        .windows1252 => decodeWindows1252(bytes),
+        .gb18030 => decodeGb18030(bytes, eof),
+        .shift_jis => decodeShiftJis(bytes, eof),
+        .euc_jp => decodeEucJp(bytes, eof),
+        .big5 => decodeBig5(bytes, eof),
+        .euc_kr => decodeEucKr(bytes, eof),
+        .windows1251 => decodeWindows1251(bytes),
+        .utf32le => decodeUtf32(bytes, .little, eof),
+        .utf32be => decodeUtf32(bytes, .big, eof),
     };
 }
 
 fn decodeLatin1(bytes: []const u8) ?Step {
     if (bytes.len == 0) return null;
     return .{ .n = 1, .cp = bytes[0] };
+}
+
+fn decodeWindows1252(bytes: []const u8) ?Step {
+    if (bytes.len == 0) return null;
+    const b = bytes[0];
+    if (b >= 0x80 and b <= 0x9F) {
+        return .{ .n = 1, .cp = legacy_tables.windows1252_80_9f[b - 0x80] };
+    }
+    return .{ .n = 1, .cp = b };
+}
+
+fn decodeWindows1251(bytes: []const u8) ?Step {
+    if (bytes.len == 0) return null;
+    const b = bytes[0];
+    if (b < 0x80) return .{ .n = 1, .cp = b };
+    return .{ .n = 1, .cp = legacy_tables.windows1251_high[b - 0x80] };
+}
+
+fn decodeGb18030(bytes: []const u8, eof: bool) ?Step {
+    if (bytes.len == 0) return null;
+    const b0 = bytes[0];
+    if (b0 < 0x80) return .{ .n = 1, .cp = b0 };
+    if (b0 == 0x80) return .{ .n = 1, .cp = 0x20AC };
+    if (b0 == 0xFF) return .{ .n = 1, .cp = unicode.replacement_character };
+    if (bytes.len < 2) {
+        if (!eof) return null;
+        return .{ .n = 1, .cp = unicode.replacement_character };
+    }
+    const b1 = bytes[1];
+    if (b1 >= 0x30 and b1 <= 0x39) {
+        if (bytes.len < 4) {
+            if (!eof) return null;
+            return .{ .n = 1, .cp = unicode.replacement_character };
+        }
+        const b2 = bytes[2];
+        const b3 = bytes[3];
+        if (legacy_tables.lookupGb18030FourByte(b0, b1, b2, b3)) |cp| {
+            return .{ .n = 4, .cp = cp };
+        }
+        return .{ .n = 1, .cp = unicode.replacement_character };
+    }
+    if (legacy_tables.lookupGb18030TwoByteExtra(b0, b1)) |cp| {
+        return .{ .n = 2, .cp = cp };
+    }
+    return decodeGbk(bytes, eof);
+}
+
+fn decodeShiftJis(bytes: []const u8, eof: bool) ?Step {
+    if (bytes.len == 0) return null;
+    const b0 = bytes[0];
+    if (b0 < 0x80) return .{ .n = 1, .cp = b0 };
+    if (b0 >= 0xA1 and b0 <= 0xDF) return .{ .n = 1, .cp = 0xFF61 + @as(u21, b0 - 0xA1) };
+    if ((b0 >= 0x81 and b0 <= 0x9F) or (b0 >= 0xE0 and b0 <= 0xFC)) {
+        if (bytes.len < 2) {
+            if (!eof) return null;
+            return .{ .n = 1, .cp = unicode.replacement_character };
+        }
+        if (legacy_tables.lookupShiftJis(b0, bytes[1])) |cp| {
+            return .{ .n = 2, .cp = cp };
+        }
+    }
+    return .{ .n = 1, .cp = unicode.replacement_character };
+}
+
+fn decodeEucJp(bytes: []const u8, eof: bool) ?Step {
+    if (bytes.len == 0) return null;
+    const b0 = bytes[0];
+    if (b0 < 0x80) return .{ .n = 1, .cp = b0 };
+    if (b0 == 0x8E) {
+        if (bytes.len < 2) {
+            if (!eof) return null;
+            return .{ .n = 1, .cp = unicode.replacement_character };
+        }
+        const b1 = bytes[1];
+        if (b1 >= 0xA1 and b1 <= 0xDF) return .{ .n = 2, .cp = 0xFF61 + @as(u21, b1 - 0xA1) };
+        return .{ .n = 1, .cp = unicode.replacement_character };
+    }
+    if (b0 >= 0xA1 and b0 <= 0xFE) {
+        if (bytes.len < 2) {
+            if (!eof) return null;
+            return .{ .n = 1, .cp = unicode.replacement_character };
+        }
+        if (legacy_tables.lookupEucJp(b0, bytes[1])) |cp| {
+            return .{ .n = 2, .cp = cp };
+        }
+    }
+    return .{ .n = 1, .cp = unicode.replacement_character };
+}
+
+fn decodeBig5(bytes: []const u8, eof: bool) ?Step {
+    if (bytes.len == 0) return null;
+    const b0 = bytes[0];
+    if (b0 < 0x80) return .{ .n = 1, .cp = b0 };
+    if (b0 >= 0x81 and b0 <= 0xFE) {
+        if (bytes.len < 2) {
+            if (!eof) return null;
+            return .{ .n = 1, .cp = unicode.replacement_character };
+        }
+        if (legacy_tables.lookupBig5(b0, bytes[1])) |cp| {
+            return .{ .n = 2, .cp = cp };
+        }
+    }
+    return .{ .n = 1, .cp = unicode.replacement_character };
+}
+
+fn decodeEucKr(bytes: []const u8, eof: bool) ?Step {
+    if (bytes.len == 0) return null;
+    const b0 = bytes[0];
+    if (b0 < 0x80) return .{ .n = 1, .cp = b0 };
+    if (b0 >= 0x81 and b0 <= 0xFE) {
+        if (bytes.len < 2) {
+            if (!eof) return null;
+            return .{ .n = 1, .cp = unicode.replacement_character };
+        }
+        if (legacy_tables.lookupEucKr(b0, bytes[1])) |cp| {
+            return .{ .n = 2, .cp = cp };
+        }
+    }
+    return .{ .n = 1, .cp = unicode.replacement_character };
+}
+
+fn decodeUtf32(bytes: []const u8, endian: std.builtin.Endian, eof: bool) ?Step {
+    if (bytes.len == 0) return null;
+    if (bytes.len < 4) {
+        if (!eof) return null;
+        return .{ .n = bytes.len, .cp = unicode.replacement_character };
+    }
+    const raw = std.mem.readInt(u32, bytes[0..4], endian);
+    if (raw > 0x10FFFF or (raw >= 0xD800 and raw <= 0xDFFF)) {
+        return .{ .n = 4, .cp = unicode.replacement_character };
+    }
+    return .{ .n = 4, .cp = @intCast(raw) };
 }
 
 fn decodeGbk(bytes: []const u8, eof: bool) ?Step {
@@ -956,4 +1367,106 @@ test "GBK / CP936 full table decodes Level-1, Level-2, GBK/3, GBK/4, Euro 0x80, 
     const lossy_gbk = try convertAlloc(testing.allocator, .gbk, &invalid_gbk);
     defer testing.allocator.free(lossy_gbk);
     try testing.expectEqualStrings("\u{FFFD}\x7FA\u{FFFD}", lossy_gbk);
+}
+
+test "v0.8 encodings: Windows-1252, GB18030, Shift_JIS, EUC-JP, Big5, EUC-KR, Windows-1251, UTF-32" {
+    // Windows-1252 (0x80..0x9F differ from ISO-8859-1)
+    const cp1252_bytes = [_]u8{ 0x80, 0x31, 0x30, 0x30, 0x20, 0x97, 0x20, 0x93, 0x68, 0x69, 0x94 };
+    const cp1252_out = try convertAlloc(testing.allocator, .windows1252, &cp1252_bytes);
+    defer testing.allocator.free(cp1252_out);
+    try testing.expectEqualStrings("€100 — “hi”", cp1252_out);
+
+    // GB18030: 2-byte + 4-byte BMP (U+0080) + 4-byte supplementary (U+1F600 😀)
+    const gb18030_bytes = [_]u8{ 0xC4, 0xE3, 0xBA, 0xC3, 0xA2, 0xE3, 0x81, 0x30, 0x81, 0x30, 0x94, 0x39, 0xFC, 0x36 };
+    const gb18030_out = try convertAlloc(testing.allocator, .gb18030, &gb18030_bytes);
+    defer testing.allocator.free(gb18030_out);
+    try testing.expectEqualStrings("你好€\u{0080}😀", gb18030_out);
+
+    // Shift_JIS (CP932) including half-width katakana
+    const sjis_bytes = [_]u8{ 0x82, 0xB1, 0x82, 0xF1, 0x82, 0xC9, 0x82, 0xBF, 0x82, 0xCD, 0xB1, 0xB2, 0xB3 };
+    const sjis_out = try convertAlloc(testing.allocator, .shift_jis, &sjis_bytes);
+    defer testing.allocator.free(sjis_out);
+    try testing.expectEqualStrings("こんにちはｱｲｳ", sjis_out);
+
+    // EUC-JP
+    const eucjp_bytes = [_]u8{ 0xA4, 0xB3, 0xA4, 0xF3, 0xA4, 0xCB, 0xA4, 0xC1, 0xA4, 0xCF, 0xC0, 0xA4, 0xB3, 0xA6 };
+    const eucjp_out = try convertAlloc(testing.allocator, .euc_jp, &eucjp_bytes);
+    defer testing.allocator.free(eucjp_out);
+    try testing.expectEqualStrings("こんにちは世界", eucjp_out);
+
+    // Big5
+    const big5_bytes = [_]u8{ 0xC1, 0x63, 0xC5, 0xE9, 0xA4, 0xA4, 0xA4, 0xE5, 0xB4, 0xFA, 0xB8, 0xD5 };
+    const big5_out = try convertAlloc(testing.allocator, .big5, &big5_bytes);
+    defer testing.allocator.free(big5_out);
+    try testing.expectEqualStrings("繁體中文測試", big5_out);
+
+    // EUC-KR / CP949
+    const euckr_bytes = [_]u8{ 0xBE, 0xC8, 0xB3, 0xE7, 0xC7, 0xCF, 0xBC, 0xBC, 0xBF, 0xE4 };
+    const euckr_out = try convertAlloc(testing.allocator, .euc_kr, &euckr_bytes);
+    defer testing.allocator.free(euckr_out);
+    try testing.expectEqualStrings("안녕하세요", euckr_out);
+
+    // Windows-1251 (Cyrillic)
+    const cp1251_bytes = [_]u8{ 0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2, 0x20, 0xEC, 0xE8, 0xF0 };
+    const cp1251_out = try convertAlloc(testing.allocator, .windows1251, &cp1251_bytes);
+    defer testing.allocator.free(cp1251_out);
+    try testing.expectEqualStrings("Привет мир", cp1251_out);
+
+    // UTF-32LE with BOM (FF FE 00 00) + 'A' + 😀 (U+1F600)
+    const utf32le_bytes = [_]u8{
+        0xFF, 0xFE, 0x00, 0x00,
+        'A',  0x00, 0x00, 0x00,
+        0x00, 0xF6, 0x01, 0x00,
+    };
+    const le_sniff = sniff(&utf32le_bytes, true);
+    try testing.expectEqual(Sniff.utf32le, le_sniff);
+    const utf32le_out = try convertAlloc(testing.allocator, .utf32le, utf32le_bytes[4..]);
+    defer testing.allocator.free(utf32le_out);
+    try testing.expectEqualStrings("A😀", utf32le_out);
+
+    // UTF-32BE with BOM (00 00 FE FF) + 'A' + 😀 (U+1F600)
+    const utf32be_bytes = [_]u8{
+        0x00, 0x00, 0xFE, 0xFF,
+        0x00, 0x00, 0x00, 'A',
+        0x00, 0x01, 0xF6, 0x00,
+    };
+    const be_sniff = sniff(&utf32be_bytes, true);
+    try testing.expectEqual(Sniff.utf32be, be_sniff);
+    const utf32be_out = try convertAlloc(testing.allocator, .utf32be, utf32be_bytes[4..]);
+    defer testing.allocator.free(utf32be_out);
+    try testing.expectEqualStrings("A😀", utf32be_out);
+
+    // fromCharset aliases
+    try testing.expectEqual(Encoding.windows1252, fromCharset("windows-1252").?);
+    try testing.expectEqual(Encoding.windows1252, fromCharset("cp1252").?);
+    try testing.expectEqual(Encoding.gb18030, fromCharset("gb18030").?);
+    try testing.expectEqual(Encoding.shift_jis, fromCharset("shift_jis").?);
+    try testing.expectEqual(Encoding.shift_jis, fromCharset("cp932").?);
+    try testing.expectEqual(Encoding.euc_jp, fromCharset("euc-jp").?);
+    try testing.expectEqual(Encoding.big5, fromCharset("big5").?);
+    try testing.expectEqual(Encoding.euc_kr, fromCharset("euc-kr").?);
+    try testing.expectEqual(Encoding.windows1251, fromCharset("windows-1251").?);
+    try testing.expectEqual(Encoding.utf32le, fromCharset("utf-32le").?);
+    try testing.expectEqual(Encoding.utf32be, fromCharset("utf-32be").?);
+
+    // Heuristic detectEncoding + streaming Decoder.init(.detect)
+    try testing.expectEqual(Encoding.utf8, detectEncoding("hello 世界\n"));
+    try testing.expectEqual(Encoding.utf32le, detectEncoding(&utf32le_bytes));
+    try testing.expectEqual(Encoding.utf32be, detectEncoding(&utf32be_bytes));
+    try testing.expectEqual(Encoding.windows1252, detectEncoding(&cp1252_bytes));
+    try testing.expectEqual(Encoding.gb18030, detectEncoding(&gb18030_bytes));
+    try testing.expectEqual(Encoding.shift_jis, detectEncoding(&sjis_bytes));
+
+    var det_src = Chunk{ .rest = &sjis_bytes, .cap = 3 };
+    var det_dec = Decoder.init(.detect);
+    defer det_dec.deinit(testing.allocator);
+    var out_buf: [64]u8 = undefined;
+    var filled: usize = 0;
+    var read_bytes: u64 = 0;
+    while (true) {
+        const pulled = try det_dec.pull(testing.allocator, Chunk.read, &det_src, 3, out_buf[filled..], &read_bytes);
+        filled += pulled.n;
+        if (pulled.eof) break;
+    }
+    try testing.expectEqualStrings("こんにちはｱｲｳ", out_buf[0..filled]);
 }

@@ -204,14 +204,19 @@ pub fn materialize(haystack: []const u8, config: SearchConfig) SliceError!Prepar
                     if (was_decompressed) try stashDecompressedInScratch(&prep, config);
                     return prep;
                 },
+                .detect => blk: {
+                    const det = encoding.detectEncoding(current);
+                    if (det == .utf8 and encoding.validUtf8(current)) {
+                        if (was_decompressed) try stashDecompressedInScratch(&prep, config);
+                        return prep;
+                    }
+                    break :blk encoding.encodingToSniff(det);
+                },
                 .utf8 => if (encoding.validUtf8(current)) {
                     if (was_decompressed) try stashDecompressedInScratch(&prep, config);
                     return prep;
                 } else .utf8,
-                .utf16le => .utf16le,
-                .utf16be => .utf16be,
-                .gbk => .gbk,
-                .latin1 => .latin1,
+                else => encoding.encodingToSniff(resolved),
             };
             const src_slice = if (resume_raw) |rr| current[rr..] else current;
             const init_raw: u64 = if (resume_raw) |rr| @intCast(rr) else 0;
@@ -295,7 +300,32 @@ pub fn materialize(haystack: []const u8, config: SearchConfig) SliceError!Prepar
             if (resume_raw != null and resume_raw.? >= 2) prep.base_searchable_offset = config.resume_from;
             return prep;
         },
-        .gbk, .latin1 => unreachable,
+        .utf32le, .utf32be => |kind| {
+            const payload = current[4..];
+            const src_slice = if (resume_raw) |rr| (if (rr > 4) current[rr..] else payload) else payload;
+            const init_raw: u64 = if (resume_raw) |rr| @intCast(@max(rr, 4)) else 4;
+            if (encoding.decodedSize(kind, src_slice) > cap) return error.DecodeLimit;
+            const alloc = effectiveAllocator(config) orelse return error.OutOfMemory;
+            prep.alloc = alloc;
+            prep.transformed = true;
+            prep.offset_map.base_raw_offset = 4;
+            if (config.scratch_pool) |sp| {
+                const decoded = try encoding.convertScratchWithMap(sp.allocator, &sp.decode_buf, alloc, kind, src_slice, init_raw, &prep.offset_map);
+                if (prep.owned.len != 0) {
+                    alloc.free(prep.owned);
+                    prep.owned = &.{};
+                }
+                prep.bytes = decoded;
+            } else {
+                const owned = try encoding.convertAllocWithMap(alloc, kind, src_slice, init_raw, &prep.offset_map);
+                if (prep.owned.len != 0) alloc.free(prep.owned);
+                prep.owned = owned;
+                prep.bytes = owned;
+            }
+            if (resume_raw != null and resume_raw.? >= 4) prep.base_searchable_offset = config.resume_from;
+            return prep;
+        },
+        else => unreachable,
     }
 }
 

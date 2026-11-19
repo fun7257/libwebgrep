@@ -1082,9 +1082,9 @@ All multi-tenant budgets are configured via `SearchConfig` and enforced determin
 | `stop_on_nonmatch` | `bool` | `false` | `false` | Stops and closes upstream on first non-matching line after a match |
 | `binary` | `BinaryPolicy` | `.quit` | `.quit` | Binary handling (`quit`, `report`, `none`) |
 | `null_data` | `bool` | `false` | `false` | Uses NUL (`0x00`) as record delimiter instead of LF |
-| `encoding` | `Encoding` | `.auto` | `.auto` | BOM sniffing or explicit encoding (`utf8`, `utf16le/be`, `gbk`, `latin1`) |
+| `encoding` | `Encoding` | `.auto` | `.auto` | BOM sniffing, heuristic `.detect`, or explicit encoding (`utf8`, `utf16le/be`, `utf32le/be`, `gbk`, `gb18030`, `shift_jis`, `euc_jp`, `big5`, `euc_kr`, `latin1`, `windows1252`, `windows1251`, `none`) |
 | `charset` | `?[]const u8` | `null` | `null` | WHATWG or HTTP `Content-Type` charset hint |
-| `compression` | `Compression` | `.none` | `.none` | In-process streaming decompression (`none`, `auto`, `gzip`, `zstd`, `xz`) |
+| `compression` | `Compression` | `.none` | `.none` | In-process streaming decompression (`none`, `auto`, `gzip`, `zlib`, `deflate`, `zstd`, `xz`, `lz4`, `bzip2`, `brotli`) |
 | `max_compression_ratio` | `?u64` | `null` | Default `100` (caller-configurable) | Maximum decompression expansion ratio (`decompressed / raw`) |
 | `decompressed_bytes` | `u64` | `0` | `0` | Prior decompressed bytes charged to this request |
 | `max_decompressed_bytes` | `?u64` | `null` | Default `64 MiB` when compressed | Maximum decompressed bytes (`LimitHit.decompressed_bytes`) |

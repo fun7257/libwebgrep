@@ -95,7 +95,7 @@ pub fn deinit(self: *Regex) void
 pub fn find(self: *Regex, haystack: []const u8, start: usize, mode: MatchMode) ?Match
 ```
 
-- **语法支持**：字符类 `[a-z0-9_]` / `[^...]`、14 个 POSIX 字符类（`[:alnum:]`..`[:xdigit:]` 及否定形式 `[:^...:]`）、预定义类 `\d` `\D` `\w` `\W` `\s` `\S`、转义序列 `\xHH` `\x{...}` `\uHHHH` `\u{...}` `\a` `\f` `\v` `\Q...\E`、通配符 `.`、行/流锚点 `^` `$` `\A` `\z` `\Z`、贪婪与非贪婪量词 `*` `+` `?` `{m}` `{m,}` `{m,n}`、交替 `a|b`、分组 `(?:...)` / 32 个捕获组 `(...)` / 命名捕获组 `(?P<name>...)` / `(?<name>...)` 及内联标志 `(?i)` `(?m)` `(?s)` `(?U)` `(?x)`。
+- **语法支持**：字符类 `[a-z0-9_]` / `[^...]`、14 个 POSIX 字符类（`[:alnum:]`..`[:xdigit:]` 及否定形式 `[:^...:]`）、预定义类 `\d` `\D` `\w` `\W` `\s` `\S`（支持 `RegexOptions.unicode_classes` 或内联 `(?u)`/`(?-u)` 启用 Unicode 语义）、转义序列 `\xHH` `\x{...}` `\uHHHH` `\u{...}` `\a` `\f` `\v` `\Q...\E`、通配符 `.`、行/流锚点 `^` `$` `\A` `\z` `\Z`、贪婪与非贪婪量词 `*` `+` `?` `{m}` `{m,}` `{m,n}`、交替 `a|b`、分组 `(?:...)` / 32 个捕获组 `(...)` / 命名捕获组 `(?P<name>...)` / `(?<name>...)` 及内联标志 `(?i)` `(?m)` `(?s)` `(?U)` `(?u)` `(?x)`。
 - **绝对防 ReDoS**：采用锁步 Thompson NFA / PikeVM 执行，每个输入字节上每条指令最多激活 1 次，最坏时间复杂度严格为 $O(n)$；默认编译指令数上限 `8192`（可通过 `max_inst` 按需上调或下调），超限返回 `error.RegexTooLarge`。
 - **SIMD 字面量双预过滤**：自动从 AST 提取必需的前缀与尾随字面量（`RequiredLiteral`）并挂载 `Finder` 做 42.9 GB/s SIMD 预过滤。
 - **有界窗口跨行（`RegexOptions.multiline`）**：跨行跨度严格限制在 `max_multiline_window`（默认 `64 KiB`，支持调用方按需配置）内，窗口耗尽仍未闭合匹配时立即判定失配。
@@ -139,9 +139,9 @@ pub fn find(self: *Regex, haystack: []const u8, start: usize, mode: MatchMode) ?
 | `stop_on_nonmatch` | `bool` | `false` | `false` | 有序流提前停止：出现匹配后遇到第一条不匹配行立即停止并关闭上游 |
 | `binary` | `BinaryPolicy` | `.quit` | `.quit` | 二进制处理策略：`.quit`（默认跳过）、`.report`（探测但不交出行）、`.none`（按文本） |
 | `null_data` | `bool` | `false` | `false` | 用 NUL (`0x00`) 代替 `\n` 分隔记录 |
-| `encoding` | `Encoding` | `.auto` | `.auto` | 编码处理：`.auto`（嗅探 BOM 或用 `charset`）、`.utf8`、`.utf16le/be`、`.gbk`、`.latin1`、`.none` |
-| `charset` | `?[]const u8` | `null` | `null` | WHATWG 标签或 HTTP `Content-Type` 字符集提示（如 `"gbk"`） |
-| `compression` | `Compression` | `.none` | `.none` | 进程内流式解压：`.none`、`.auto`（魔数识别）、`.gzip`、`.zstd`、`.xz` |
+| `encoding` | `Encoding` | `.auto` | `.auto` | 编码处理：`.auto`（嗅探 BOM 或用 `charset`）、`.detect`（启发式自动识别）、`.utf8`、`.utf16le/be`、`.utf32le/be`、`.gbk`、`.gb18030`、`.shift_jis`、`.euc_jp`、`.big5`、`.euc_kr`、`.latin1`、`.windows1252`、`.windows1251`、`.none` |
+| `charset` | `?[]const u8` | `null` | `null` | WHATWG 标签或 HTTP `Content-Type` 字符集提示（如 `"gb18030"`、`"shift_jis"`、`"windows-1252"`） |
+| `compression` | `Compression` | `.none` | `.none` | 进程内流式解压：`.none`、`.auto`（魔数识别）、`.gzip`、`.zlib`、`.deflate`、`.zstd`、`.xz`、`.lz4`、`.bzip2`、`.brotli` |
 | `max_compression_ratio` | `?u64` | `null` | 默认 `100`（调用方可配置） | 最大允许解压膨胀比（拦截压缩炸弹） |
 | `max_decompressed_bytes` | `?u64` | `null` | 开启解压时默认 `64 MiB` | 最大解压产出字节上限（超限记为 `LimitHit.decompressed_bytes`） |
 | `decode_allocator` | `?Allocator` | `null` | `null` | 切片入口在需要转码/解压/生成替换预览时使用的分配器 |

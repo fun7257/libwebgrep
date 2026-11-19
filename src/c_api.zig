@@ -1,6 +1,6 @@
 //! [Module] c_api.zig
 //! [Layer] Layer 6 — C ABI & Cross-Language FFI Exports (`F4`)
-//! [Role] Exports 17 C ABI functions (`callconv(.c)`) matching `include/webgrep.h` for embedding
+//! [Role] Exports 20 C ABI functions (`callconv(.c)`) matching `include/webgrep.h` for embedding
 //!        `libwebgrep` in C, C++, Rust, Go, Python, and Node.js.
 //! [Invariants]
 //!   1. Zero mutable global state; compiled `webgrep_matcher_t` handles are immutable during search
@@ -637,11 +637,11 @@ fn populateCSummary(out_summary: ?*webgrep_summary_t, res: sink_mod.Result, stop
 }
 
 // ============================================================================
-// Exported C ABI Functions (17 Functions)
+// Exported C ABI Functions (20 Functions)
 // ============================================================================
 
 pub export fn webgrep_version() callconv(.c) [*:0]const u8 {
-    return "0.5.0";
+    return "0.6.0";
 }
 
 pub export fn webgrep_find_options_default() callconv(.c) webgrep_find_options_t {
@@ -1247,7 +1247,7 @@ pub export fn webgrep_search_reverse_slice(
 
 test "c_api: version and options default" {
     const ver = std.mem.span(webgrep_version());
-    try std.testing.expectEqualStrings("0.5.0", ver);
+    try std.testing.expectEqualStrings("0.6.0", ver);
 
     const fopts = webgrep_find_options_default();
     try std.testing.expectEqual(@as(c_int, 0), fopts.case_mode);

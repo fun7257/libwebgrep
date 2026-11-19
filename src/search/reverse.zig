@@ -10,6 +10,8 @@
 //!      so callers can paginate further backward with `byte_range = .{ .start = start, .end = res.resume_at }`.
 
 const std = @import("std");
+const decompress = @import("../codec/decompress.zig");
+const encoding = @import("../codec/encoding.zig");
 const matcher_mod = @import("../matcher.zig");
 const memchr = @import("../finder/memchr.zig");
 const probe_mod = @import("../probe.zig");
@@ -20,6 +22,7 @@ const state_mod = @import("state.zig");
 const ring_mod = @import("context_ring.zig");
 const format_mod = @import("format.zig");
 const line_matcher_mod = @import("line_matcher.zig");
+const pipeline_mod = @import("pipeline.zig");
 const pull_mod = @import("pull.zig");
 
 pub const RandomAccess = probe_mod.RandomAccess;
@@ -242,6 +245,333 @@ fn emitReverseMatched(
     return .cont;
 }
 
+const AbsRange = struct {
+    start: u64,
+    end: u64,
+};
+
+const LineSource = union(enum) {
+    slice: []const u8,
+    random_access: RandomAccess,
+};
+
+fn emitReverseContextLine(
+    comptime S: type,
+    sink: *S,
+    line_bytes: []const u8,
+    line_abs: u64,
+    line_num: ?u64,
+    state: *State,
+    config: SearchConfig,
+) SliceError!ReverseAction {
+    if (comptime !@hasDecl(S, "context")) return .cont;
+    const line = Range{ .start = 0, .end = line_bytes.len };
+    const preview = ring_mod.previewLine(line_bytes, line, null, config);
+    const withheld = config.binary == .report and state.nul_offset != null;
+    const bytes = if (withheld) line_bytes[0..0] else line_bytes[preview.start..preview.end];
+    if (!try state_mod.guardLine(state, config, bytes.len)) return .stopped;
+    state.abs_base = line_abs;
+    state.line_number = line_num;
+    const action = format_mod.sinkLineAction(
+        S,
+        "context",
+        sink,
+        state,
+        bytes,
+        if (withheld) bytes else line_bytes,
+        if (withheld) 0 else preview.start,
+        if (withheld) 0 else line.end,
+        config.match_mode,
+        null,
+        &.{},
+        line_abs,
+        line_num,
+        preview.truncated and !withheld,
+        preview.line_len,
+        if (withheld) 0 else preview.window_start,
+        null,
+    );
+    state_mod.releaseQueue(state);
+    state.has_sunk = true;
+    switch (action) {
+        .cont => return .cont,
+        .skip_to => |target| {
+            if (target < line_abs) return .{ .jump_back = target };
+            return .cont;
+        },
+        .pause => {
+            state.paused = true;
+            state.resume_at = line_abs;
+            state.resume_line = if (line_num) |ln| ln -| 1 else 0;
+            state.stopped = true;
+            return .stopped;
+        },
+        .stop => {
+            state.stopped = true;
+            return .stopped;
+        },
+    }
+}
+
+const ReverseContext = struct {
+    before_n: u32 = 0,
+    after_n: u32 = 0,
+    min_off: u64 = 0,
+    max_off: u64 = 0,
+    sep: u8 = '\n',
+    last_emitted_start: ?u64 = null,
+    pending_before: u32 = 0,
+    pending_before_end: u64 = 0,
+    pending_before_ln: ?u64 = null,
+    alloc: ?std.mem.Allocator = null,
+    io_buf: []u8 = &.{},
+    after_heap: []AbsRange = &.{},
+    bytes_read: *u64,
+
+    fn active(self: *const ReverseContext) bool {
+        return self.before_n > 0 or self.after_n > 0;
+    }
+
+    fn deinit(self: *ReverseContext) void {
+        if (self.alloc) |a| {
+            if (self.io_buf.len != 0) a.free(self.io_buf);
+            if (self.after_heap.len != 0) a.free(self.after_heap);
+        }
+        self.io_buf = &.{};
+        self.after_heap = &.{};
+    }
+
+    fn ensureIoBuf(self: *ReverseContext, want: usize) SliceError![]u8 {
+        if (self.io_buf.len >= want) return self.io_buf;
+        const a = self.alloc orelse return error.OutOfMemory;
+        const cap = @max(want, @max(self.io_buf.len * 2, 4096));
+        if (self.io_buf.len == 0) {
+            self.io_buf = try a.alloc(u8, cap);
+        } else {
+            self.io_buf = try a.realloc(self.io_buf, cap);
+        }
+        return self.io_buf;
+    }
+
+    fn readRange(self: *ReverseContext, src: LineSource, start: u64, end: u64) SliceError!?[]const u8 {
+        if (end <= start) return &.{};
+        switch (src) {
+            .slice => |s| {
+                const s_i: usize = @intCast(@min(start, @as(u64, s.len)));
+                const e_i: usize = @intCast(@min(end, @as(u64, s.len)));
+                return s[s_i..e_i];
+            },
+            .random_access => |ra| {
+                const len: usize = @intCast(end - start);
+                const buf = try self.ensureIoBuf(len);
+                const got = ra.readAtFull(start, buf[0..len]) catch return null;
+                self.bytes_read.* += got;
+                return buf[0..got];
+            },
+        }
+    }
+
+    fn nextLineAfter(self: *ReverseContext, src: LineSource, off: u64, upper: u64) SliceError!?AbsRange {
+        if (off >= upper) return null;
+        switch (src) {
+            .slice => |s| {
+                const s_i: usize = @intCast(@min(off, @as(u64, s.len)));
+                const u_i: usize = @intCast(@min(upper, @as(u64, s.len)));
+                if (s_i >= u_i) return null;
+                const end_i = if (memchr.find(width, s[0..u_i], s_i, self.sep)) |nl| nl + 1 else u_i;
+                return .{ .start = s_i, .end = end_i };
+            },
+            .random_access => |ra| {
+                var cur = off;
+                var tmp: [4096]u8 = undefined;
+                while (cur < upper) {
+                    const want: usize = @intCast(@min(@as(u64, tmp.len), upper - cur));
+                    const got = ra.readAtFull(cur, tmp[0..want]) catch return null;
+                    self.bytes_read.* += got;
+                    if (got == 0) break;
+                    if (memchr.find(width, tmp[0..got], 0, self.sep)) |nl| {
+                        return .{ .start = off, .end = cur + nl + 1 };
+                    }
+                    cur += got;
+                }
+                if (cur > off) return .{ .start = off, .end = cur };
+                return null;
+            },
+        }
+    }
+
+    fn prevLineBefore(self: *ReverseContext, src: LineSource, end_off: u64, lower: u64) SliceError!?AbsRange {
+        if (end_off <= lower) return null;
+        switch (src) {
+            .slice => |s| {
+                const e_i: usize = @intCast(@min(end_off, @as(u64, s.len)));
+                const l_i: usize = @intCast(@min(lower, @as(u64, s.len)));
+                if (e_i <= l_i) return null;
+                const scan_hi = if (s[e_i - 1] == self.sep) e_i - 1 else e_i;
+                const start_i = if (scan_hi > l_i)
+                    (if (memchr.findLast(width, s, l_i, scan_hi, self.sep)) |nl| nl + 1 else l_i)
+                else
+                    l_i;
+                return .{ .start = start_i, .end = e_i };
+            },
+            .random_access => |ra| {
+                var scan_end = end_off;
+                var last_b: [1]u8 = undefined;
+                const got1 = ra.readAtFull(end_off - 1, &last_b) catch return null;
+                self.bytes_read.* += got1;
+                if (got1 == 0) return null;
+                if (last_b[0] == self.sep) scan_end = end_off - 1;
+
+                var tmp: [4096]u8 = undefined;
+                var cur = scan_end;
+                while (cur > lower) {
+                    const want: usize = @intCast(@min(@as(u64, tmp.len), cur - lower));
+                    const lo = cur - want;
+                    const got = ra.readAtFull(lo, tmp[0..want]) catch return null;
+                    self.bytes_read.* += got;
+                    if (got == 0) break;
+                    if (memchr.findLast(width, tmp[0..got], 0, got, self.sep)) |nl| {
+                        return .{ .start = lo + nl + 1, .end = end_off };
+                    }
+                    cur = lo;
+                }
+                return .{ .start = lower, .end = end_off };
+            },
+        }
+    }
+
+    fn flushPendingBefore(
+        self: *ReverseContext,
+        comptime S: type,
+        sink: *S,
+        state: *State,
+        config: SearchConfig,
+        src: LineSource,
+        stop_at: u64,
+    ) SliceError!ReverseAction {
+        if (self.pending_before == 0) return .cont;
+        const lower = @max(self.min_off, stop_at);
+        while (self.pending_before > 0 and self.pending_before_end > lower and !state.stopped) {
+            const r = (try self.prevLineBefore(src, self.pending_before_end, lower)) orelse {
+                self.pending_before = 0;
+                break;
+            };
+            const bytes = (try self.readRange(src, r.start, r.end)) orelse {
+                state.soft_error = .read_failed;
+                state.stopped = true;
+                return .stopped;
+            };
+            const ln: ?u64 = if (self.pending_before_ln) |pln| (if (pln > 1) pln - 1 else 1) else null;
+            const act = try emitReverseContextLine(S, sink, bytes, r.start, ln, state, config);
+            self.last_emitted_start = r.start;
+            self.pending_before_end = r.start;
+            self.pending_before_ln = ln;
+            self.pending_before -= 1;
+            switch (act) {
+                .cont => {},
+                .stopped => return .stopped,
+                .jump_back => |t| {
+                    self.pending_before = 0;
+                    return .{ .jump_back = t };
+                },
+            }
+        }
+        if (self.pending_before_end <= lower) self.pending_before = 0;
+        return .cont;
+    }
+
+    fn beforeMatch(
+        self: *ReverseContext,
+        comptime S: type,
+        sink: *S,
+        state: *State,
+        config: SearchConfig,
+        src: LineSource,
+        match_start: u64,
+        match_end: u64,
+        match_ln: ?u64,
+    ) SliceError!ReverseAction {
+        if (!self.active()) return .cont;
+        const f_act = try self.flushPendingBefore(S, sink, state, config, src, match_end);
+        if (f_act != .cont) return f_act;
+
+        var inline_after: [64]AbsRange = undefined;
+        var after_buf: []AbsRange = &inline_after;
+        if (self.after_n > inline_after.len) {
+            if (self.after_heap.len < self.after_n) {
+                const a = self.alloc orelse return error.OutOfMemory;
+                if (self.after_heap.len == 0) {
+                    self.after_heap = try a.alloc(AbsRange, self.after_n);
+                } else {
+                    self.after_heap = try a.realloc(self.after_heap, self.after_n);
+                }
+            }
+            after_buf = self.after_heap;
+        }
+
+        const upper = if (self.last_emitted_start) |les| @min(self.max_off, les) else self.max_off;
+        var after_len: usize = 0;
+        var cur = match_end;
+        while (after_len < self.after_n and cur < upper) {
+            const r = (try self.nextLineAfter(src, cur, upper)) orelse break;
+            after_buf[after_len] = r;
+            after_len += 1;
+            cur = r.end;
+        }
+
+        const top_end = if (after_len > 0) after_buf[after_len - 1].end else match_end;
+        if (self.last_emitted_start) |les| {
+            if (top_end < les) {
+                switch (state_mod.callSinkAction(S, "contextBreak", sink, .{})) {
+                    .cont => {},
+                    .skip_to => |t| {
+                        if (t < match_start) return .{ .jump_back = t };
+                    },
+                    .pause => {
+                        state.paused = true;
+                        state.resume_at = match_start;
+                        state.resume_line = if (match_ln) |ln| ln -| 1 else 0;
+                        state.stopped = true;
+                        return .stopped;
+                    },
+                    .stop => {
+                        state.stopped = true;
+                        return .stopped;
+                    },
+                }
+            }
+        }
+
+        var i = after_len;
+        while (i > 0 and !state.stopped) {
+            i -= 1;
+            const r = after_buf[i];
+            const bytes = (try self.readRange(src, r.start, r.end)) orelse {
+                state.soft_error = .read_failed;
+                state.stopped = true;
+                return .stopped;
+            };
+            const ln: ?u64 = if (match_ln) |mln| mln + @as(u64, i) + 1 else null;
+            const act = try emitReverseContextLine(S, sink, bytes, r.start, ln, state, config);
+            self.last_emitted_start = r.start;
+            switch (act) {
+                .cont => {},
+                .stopped => return .stopped,
+                .jump_back => |t| return .{ .jump_back = t },
+            }
+        }
+        return .cont;
+    }
+
+    fn afterMatch(self: *ReverseContext, match_start: u64, match_ln: ?u64) void {
+        if (!self.active()) return;
+        self.last_emitted_start = match_start;
+        self.pending_before = self.before_n;
+        self.pending_before_end = match_start;
+        self.pending_before_ln = match_ln;
+    }
+};
+
 /// Processes a single window `chunk` (`[overlap_lo .. cursor_end)`) where `rel_commit = commit_lo - overlap_lo`.
 /// May lower `commit_lo_io.*` if a cross-line match straddles `commit_lo`.
 fn processReverseWindow(
@@ -256,6 +586,8 @@ fn processReverseWindow(
     config: SearchConfig,
     alloc: ?std.mem.Allocator,
     heap_cands: *[]RevCandidate,
+    rev_ctx: *ReverseContext,
+    line_src: LineSource,
 ) SliceError!ReverseAction {
     var rel_commit: usize = @intCast(commit_lo_io.* - overlap_lo);
     if (rel_commit >= chunk.len) return .cont;
@@ -405,11 +737,33 @@ fn processReverseWindow(
         }
 
         state.limit_count += 1;
+        if (rev_ctx.active()) {
+            const match_start_abs = overlap_lo + @as(u64, cand.start);
+            const match_end_abs = overlap_lo + @as(u64, cand.end);
+            const ctx_act = try rev_ctx.beforeMatch(S, sink, state, config, line_src, match_start_abs, match_end_abs, line_num);
+            switch (ctx_act) {
+                .cont => {},
+                .stopped => return .stopped,
+                .jump_back => |target| {
+                    while (idx > 0) {
+                        const prev_cand = cands[idx - 1];
+                        if (overlap_lo + @as(u64, prev_cand.end) <= target) break;
+                        idx -= 1;
+                    }
+                    if (target < commit_lo_io.*) {
+                        return .{ .jump_back = target };
+                    }
+                    continue;
+                },
+            }
+        }
         const act = try emitReverseMatched(S, sink, matcher, chunk, overlap_lo, cand, line_num, state, config);
+        rev_ctx.afterMatch(overlap_lo + @as(u64, cand.start), line_num);
         switch (act) {
             .cont => {},
             .stopped => return .stopped,
             .jump_back => |target| {
+                rev_ctx.pending_before = 0;
                 while (idx > 0) {
                     const prev_cand = cands[idx - 1];
                     if (overlap_lo + @as(u64, prev_cand.end) <= target) break;
@@ -503,21 +857,38 @@ pub fn searchReverseSlice(
     var heap_cands: []RevCandidate = &.{};
     defer if (heap_cands.len != 0) if (pool_alloc) |alloc| alloc.free(heap_cands);
 
+    var prep = try pipeline_mod.materialize(haystack, config);
+    defer prep.deinit();
+    state.decompressed_bytes = prep.decompressed_bytes;
+    if (prep.offset_map.active) state.offset_map = &prep.offset_map;
+    if (prep.decompress_map.active) state.decompress_map = &prep.decompress_map;
+
+    if (prep.decompress_limit_hit or prep.corrupt_stream) {
+        if (prep.decompress_limit_hit) {
+            state_mod.noteLimit(&state, .decompressed_bytes);
+        } else {
+            state.soft_error = .read_failed;
+        }
+        _ = state_mod.callOpt(S, "begin", sink, .{name});
+        return finalizeReverse(S, sink, &state, config, 0, haystack.len, false);
+    }
+
+    const data = prep.bytes;
     const sep = cfg_mod.recordSep(config);
-    var start_idx: usize = if (config.byte_range) |br| @intCast(@min(br.start, @as(u64, haystack.len))) else 0;
+    var start_idx: usize = if (config.byte_range) |br| @intCast(@min(br.start, @as(u64, data.len))) else 0;
     var end_idx: usize = if (config.byte_range) |br|
-        (if (br.end) |be| @intCast(@min(be, @as(u64, haystack.len))) else haystack.len)
+        (if (br.end) |be| @intCast(@min(be, @as(u64, data.len))) else data.len)
     else
-        haystack.len;
+        data.len;
 
     if (config.range_align_lines) {
-        if (start_idx > 0 and start_idx < haystack.len and haystack[start_idx - 1] != sep) {
-            start_idx = if (memchr.find(width, haystack, start_idx, sep)) |d| d + 1 else haystack.len;
+        if (start_idx > 0 and start_idx < data.len and data[start_idx - 1] != sep) {
+            start_idx = if (memchr.find(width, data, start_idx, sep)) |d| d + 1 else data.len;
         }
         if (end_idx <= start_idx) {
             end_idx = start_idx;
-        } else if (end_idx < haystack.len and haystack[end_idx - 1] != sep) {
-            end_idx = if (memchr.find(width, haystack, end_idx, sep)) |d| d + 1 else haystack.len;
+        } else if (end_idx < data.len and data[end_idx - 1] != sep) {
+            end_idx = if (memchr.find(width, data, end_idx, sep)) |d| d + 1 else data.len;
         }
     } else if (end_idx < start_idx) {
         end_idx = start_idx;
@@ -533,7 +904,7 @@ pub fn searchReverseSlice(
     state_mod.restoreCounters(&state, config);
     var cur_last_ln: ?u64 = switch (config.line_number_mode) {
         .unknown => null,
-        .from_one => if (config.initial_line_number) |n| n else if (end_idx > start_idx) linesInSlice(haystack[start_idx..end_idx], sep) else 1,
+        .from_one => if (config.initial_line_number) |n| n else if (end_idx > start_idx) linesInSlice(data[start_idx..end_idx], sep) else 1,
         .auto => config.initial_line_number,
     };
 
@@ -544,7 +915,7 @@ pub fn searchReverseSlice(
             if (target < @as(u64, cursor_end)) {
                 const clamped: usize = @intCast(@max(@as(u64, start_idx), target));
                 if (cur_last_ln) |lln| {
-                    cur_last_ln = adjustLastLineForJump(haystack, start_idx, clamped, cursor_end, lln, sep);
+                    cur_last_ln = adjustLastLineForJump(data, start_idx, clamped, cursor_end, lln, sep);
                 }
                 cursor_end = clamped;
             }
@@ -570,6 +941,19 @@ pub fn searchReverseSlice(
         return finalizeReverse(S, sink, &state, config, 0, 0, false);
     }
 
+    var dummy_ctx_reads: u64 = 0;
+    var rev_ctx = ReverseContext{
+        .before_n = cfg_mod.beforeCount(config),
+        .after_n = cfg_mod.afterCount(config),
+        .min_off = @intCast(start_idx),
+        .max_off = @intCast(end_idx),
+        .sep = sep,
+        .alloc = pool_alloc,
+        .bytes_read = &dummy_ctx_reads,
+    };
+    defer rev_ctx.deinit();
+    const line_src = LineSource{ .slice = data };
+
     const is_ml = state_mod.effectiveMultiline(matcher, config);
     const ml_win = if (is_ml) state_mod.effectiveMultilineWindow(matcher, config) else 0;
     const step_sz = @max(cfg_mod.bufferWindow(config), if (is_ml) @max(ml_win *| 2, 64) else 64);
@@ -577,16 +961,16 @@ pub fn searchReverseSlice(
     var bytes_scanned: u64 = 0;
     while (cursor_end > start_idx and !state.stopped) {
         var commit_lo_idx: usize = if (cursor_end - start_idx <= step_sz) start_idx else cursor_end - step_sz;
-        if (commit_lo_idx > start_idx and haystack[commit_lo_idx - 1] != sep) {
-            if (memchr.find(width, haystack[0..cursor_end], commit_lo_idx, sep)) |nl_at| {
+        if (commit_lo_idx > start_idx and data[commit_lo_idx - 1] != sep) {
+            if (memchr.find(width, data[0..cursor_end], commit_lo_idx, sep)) |nl_at| {
                 if (nl_at + 1 < cursor_end) {
                     commit_lo_idx = nl_at + 1;
-                } else if (memchr.findLast(width, haystack, start_idx, commit_lo_idx, sep)) |prev_nl| {
+                } else if (memchr.findLast(width, data, start_idx, commit_lo_idx, sep)) |prev_nl| {
                     commit_lo_idx = prev_nl + 1;
                 } else {
                     commit_lo_idx = start_idx;
                 }
-            } else if (memchr.findLast(width, haystack, start_idx, commit_lo_idx, sep)) |prev_nl| {
+            } else if (memchr.findLast(width, data, start_idx, commit_lo_idx, sep)) |prev_nl| {
                 commit_lo_idx = prev_nl + 1;
             } else {
                 commit_lo_idx = start_idx;
@@ -595,15 +979,15 @@ pub fn searchReverseSlice(
 
         const overlap_lo_idx: usize = if (is_ml and ml_win > 0 and commit_lo_idx > start_idx) blk: {
             const raw_ov = if (commit_lo_idx - start_idx <= ml_win) start_idx else commit_lo_idx - ml_win;
-            if (raw_ov > start_idx and haystack[raw_ov - 1] != sep) {
-                if (memchr.findLast(width, haystack, start_idx, raw_ov, sep)) |pnl| break :blk pnl + 1;
+            if (raw_ov > start_idx and data[raw_ov - 1] != sep) {
+                if (memchr.findLast(width, data, start_idx, raw_ov, sep)) |pnl| break :blk pnl + 1;
                 break :blk start_idx;
             }
             break :blk raw_ov;
         } else commit_lo_idx;
 
         var commit_lo_u64: u64 = @intCast(commit_lo_idx);
-        const chunk = haystack[overlap_lo_idx..cursor_end];
+        const chunk = data[overlap_lo_idx..cursor_end];
         const act = try processReverseWindow(
             S,
             sink,
@@ -616,6 +1000,8 @@ pub fn searchReverseSlice(
             config,
             pool_alloc,
             &heap_cands,
+            &rev_ctx,
+            line_src,
         );
         const actual_commit: usize = @intCast(commit_lo_u64);
         bytes_scanned += @intCast(cursor_end - actual_commit);
@@ -625,19 +1011,25 @@ pub fn searchReverseSlice(
             },
             .stopped => break,
             .jump_back => |target| {
+                rev_ctx.pending_before = 0;
                 const clamped: usize = @intCast(@max(@as(u64, start_idx), target));
                 const next_end = @min(clamped, actual_commit);
                 if (cur_last_ln) |lln| {
-                    cur_last_ln = adjustLastLineForJump(haystack, start_idx, next_end, cursor_end, lln, sep);
+                    cur_last_ln = adjustLastLineForJump(data, start_idx, next_end, cursor_end, lln, sep);
                 }
                 cursor_end = next_end;
             },
         }
     }
 
+    if (!state.stopped and rev_ctx.pending_before > 0) {
+        _ = try rev_ctx.flushPendingBefore(S, sink, &state, config, line_src, @intCast(start_idx));
+    }
+
     const reached_start = (cursor_end <= start_idx) and !state.stopped;
     if (reached_start and state.hit_byte_cap) state_mod.noteLimit(&state, .max_bytes);
-    return finalizeReverse(S, sink, &state, config, bytes_scanned, bytes_scanned, reached_start and !state.hit_byte_cap);
+    const reported_read: u64 = if (prep.transformed) @intCast(haystack.len) else bytes_scanned;
+    return finalizeReverse(S, sink, &state, config, bytes_scanned, reported_read, reached_start and !state.hit_byte_cap);
 }
 
 /// Service entry point: reverse tail search over an in-memory byte slice.
@@ -694,6 +1086,54 @@ pub fn searchReverseAt(
         config.scratch_pool.?.allocator
     else
         allocator;
+
+    // Check if decompression or explicit non-UTF-8 encoding transcoding requires materialized input.
+    // Default (`compression == .none` and `encoding == .auto` with no charset) stays strictly on
+    // the O(tail) RandomAccess path without probing offset 0.
+    const resolved_enc = encoding.resolveHint(config.encoding, config.charset);
+    var needs_materialize = (config.compression != .none and config.compression != .auto) or
+        (resolved_enc != .none and resolved_enc != .auto);
+    if (!needs_materialize and config.compression == .auto) {
+        var hdr: [6]u8 = undefined;
+        const hn = source.readAtFull(0, &hdr) catch 0;
+        const hslice = hdr[0..hn];
+        const c_det = decompress.sniff(hslice, hn < hdr.len);
+        if (c_det != .raw and c_det != .need_more) needs_materialize = true;
+    }
+    if (needs_materialize) {
+        const cap_u64: u64 = @min(
+            cfg_mod.scanCap(config) orelse std.math.maxInt(u64),
+            @as(u64, cfg_mod.decodeCap(config)),
+        );
+        var raw_list: std.ArrayList(u8) = .empty;
+        defer raw_list.deinit(pool_alloc);
+        var off: u64 = 0;
+        var chunk_buf: [16384]u8 = undefined;
+        var read_err = false;
+        while (off < cap_u64) {
+            const want: usize = @intCast(@min(@as(u64, chunk_buf.len), cap_u64 - off));
+            const n = source.readAtFull(off, chunk_buf[0..want]) catch |err| {
+                state_mod.logDetail(config, name, err);
+                read_err = true;
+                break;
+            };
+            if (n == 0) break;
+            try raw_list.appendSlice(pool_alloc, chunk_buf[0..n]);
+            off += n;
+            if (n < want) break;
+        }
+        if (read_err) {
+            var err_state = State{};
+            err_state.label = name;
+            err_state.from_reader = true;
+            err_state.soft_error = .read_failed;
+            _ = state_mod.callOpt(S, "begin", sink, .{name});
+            return finalizeReverse(S, sink, &err_state, config, 0, off, false);
+        }
+        var slice_cfg = config;
+        if (slice_cfg.allocator == null) slice_cfg.allocator = pool_alloc;
+        return try searchReverseSlice(S, sink, raw_list.items, name, matcher, slice_cfg);
+    }
 
     var state = State{};
     bindCaptureRegex(&state, matcher);
@@ -915,6 +1355,18 @@ pub fn searchReverseAt(
         return finalizeReverse(S, sink, &state, config, 0, total_bytes_read, false);
     }
 
+    var rev_ctx = ReverseContext{
+        .before_n = cfg_mod.beforeCount(config),
+        .after_n = cfg_mod.afterCount(config),
+        .min_off = start_off,
+        .max_off = end_off,
+        .sep = sep,
+        .alloc = pool_alloc,
+        .bytes_read = &total_bytes_read,
+    };
+    defer rev_ctx.deinit();
+    const line_src = LineSource{ .random_access = source };
+
     var bytes_scanned: u64 = 0;
     var cur_step_sz: u64 = @intCast(step_sz);
     while (cursor_end > start_off and !state.stopped) {
@@ -1025,6 +1477,8 @@ pub fn searchReverseAt(
             config,
             pool_alloc,
             &heap_cands,
+            &rev_ctx,
+            line_src,
         );
         bytes_scanned += cursor_end -| commit_lo_u64;
         switch (act) {
@@ -1033,6 +1487,7 @@ pub fn searchReverseAt(
             },
             .stopped => break,
             .jump_back => |target| {
+                rev_ctx.pending_before = 0;
                 const clamped = @max(start_off, target);
                 if (clamped < commit_lo_u64) {
                     cur_last_ln = null;
@@ -1042,6 +1497,10 @@ pub fn searchReverseAt(
                 }
             },
         }
+    }
+
+    if (!state.stopped and rev_ctx.pending_before > 0) {
+        _ = try rev_ctx.flushPendingBefore(S, sink, &state, config, line_src, start_off);
     }
 
     const reached_start = (cursor_end <= start_off) and !state.stopped and state.soft_error == null;
@@ -1068,4 +1527,138 @@ pub fn searchSourceReverseAt(
     const result = try searchReverseAt(pull_mod.EventBridge(S), allocator, &bridge, source, "", matcher, cfg);
     pull_mod.emitSummary(S, sink, source_id, cfg, result);
     return result;
+}
+
+test "reverse search v0.8: -B/-A/-C context lines, deduplication, and contextBreak (slice & RandomAccess)" {
+    const gpa = std.testing.allocator;
+    const lz4_mod = @import("../codec/lz4.zig");
+
+    const text =
+        "L1 plain\n" ++
+        "L2 hit-one\n" ++
+        "L3 mid\n" ++
+        "L4 plain\n" ++
+        "L5 plain\n" ++
+        "L6 before\n" ++
+        "L7 hit-two\n" ++
+        "L8 hit-three\n" ++
+        "L9 after\n";
+
+    const RecKind = enum { matched, context, brk };
+    const Rec = struct {
+        kind: RecKind,
+        text: []u8 = &.{},
+        num: ?u64 = null,
+    };
+    const Collect = struct {
+        alloc: std.mem.Allocator,
+        items: std.ArrayList(Rec) = .empty,
+
+        pub fn matched(self: *@This(), line: sink_mod.Line) bool {
+            self.items.append(self.alloc, .{
+                .kind = .matched,
+                .text = self.alloc.dupe(u8, line.bytes) catch unreachable,
+                .num = line.number,
+            }) catch unreachable;
+            return true;
+        }
+        pub fn context(self: *@This(), line: sink_mod.Line) bool {
+            self.items.append(self.alloc, .{
+                .kind = .context,
+                .text = self.alloc.dupe(u8, line.bytes) catch unreachable,
+                .num = line.number,
+            }) catch unreachable;
+            return true;
+        }
+        pub fn contextBreak(self: *@This()) bool {
+            self.items.append(self.alloc, .{ .kind = .brk }) catch unreachable;
+            return true;
+        }
+        fn deinit(self: *@This()) void {
+            for (self.items.items) |it| {
+                if (it.text.len != 0) self.alloc.free(it.text);
+            }
+            self.items.deinit(self.alloc);
+        }
+    };
+
+    var m = try regex_mod.Regex.init(gpa, "hit", .{});
+    defer m.deinit();
+
+    // Slice with context = 1 (before=1, after=1)
+    var s1 = Collect{ .alloc = gpa };
+    defer s1.deinit();
+    const res1 = try searchReverseSlice(Collect, &s1, text, "log", &m, .{
+        .allocator = gpa,
+        .context = 1,
+        .line_number_mode = .from_one,
+    });
+    try std.testing.expectEqual(@as(u64, 3), res1.matched_lines);
+    // Expected newest-first order:
+    // L9 (ctx), L8 (match), L7 (match), L6 (ctx), [break], L3 (ctx), L2 (match), L1 (ctx)
+    try std.testing.expectEqual(@as(usize, 8), s1.items.items.len);
+    try std.testing.expectEqual(RecKind.context, s1.items.items[0].kind);
+    try std.testing.expectEqualStrings("L9 after", s1.items.items[0].text);
+    try std.testing.expectEqual(RecKind.matched, s1.items.items[1].kind);
+    try std.testing.expectEqualStrings("L8 hit-three", s1.items.items[1].text);
+    try std.testing.expectEqual(RecKind.matched, s1.items.items[2].kind);
+    try std.testing.expectEqualStrings("L7 hit-two", s1.items.items[2].text);
+    try std.testing.expectEqual(RecKind.context, s1.items.items[3].kind);
+    try std.testing.expectEqualStrings("L6 before", s1.items.items[3].text);
+    try std.testing.expectEqual(RecKind.brk, s1.items.items[4].kind);
+    try std.testing.expectEqual(RecKind.context, s1.items.items[5].kind);
+    try std.testing.expectEqualStrings("L3 mid", s1.items.items[5].text);
+    try std.testing.expectEqual(RecKind.matched, s1.items.items[6].kind);
+    try std.testing.expectEqualStrings("L2 hit-one", s1.items.items[6].text);
+    try std.testing.expectEqual(RecKind.context, s1.items.items[7].kind);
+    try std.testing.expectEqualStrings("L1 plain", s1.items.items[7].text);
+
+    // RandomAccess with identical context = 1
+    var s2 = Collect{ .alloc = gpa };
+    defer s2.deinit();
+    const text_slice: []const u8 = text;
+    const ra = RandomAccess.fromSlice(&text_slice);
+    const res2 = try searchReverseAt(Collect, gpa, &s2, ra, "log", &m, .{
+        .context = 1,
+        .line_number_mode = .from_one,
+    });
+    try std.testing.expectEqual(@as(u64, 3), res2.matched_lines);
+    try std.testing.expectEqual(s1.items.items.len, s2.items.items.len);
+    for (s1.items.items, s2.items.items) |a, b| {
+        try std.testing.expectEqual(a.kind, b.kind);
+        try std.testing.expectEqualStrings(a.text, b.text);
+        try std.testing.expectEqual(a.num, b.num);
+    }
+
+    // Reverse search over UTF-16LE with BOM (both slice and RandomAccess)
+    const utf16le = [_]u8{
+        0xFF, 0xFE,
+        'h',  0,    'i', 0, 't', 0, '1', 0, '\n', 0,
+        'o',  0,    'k', 0, '\n', 0,
+        'h',  0,    'i', 0, 't', 0, '2', 0, '\n', 0,
+    };
+    var s3 = Collect{ .alloc = gpa };
+    defer s3.deinit();
+    const res3 = try searchReverseSlice(Collect, &s3, &utf16le, "u16", &m, .{
+        .allocator = gpa,
+        .encoding = .auto,
+    });
+    try std.testing.expectEqual(@as(u64, 2), res3.matched_lines);
+    try std.testing.expectEqualStrings("hit2", s3.items.items[0].text);
+    try std.testing.expectEqualStrings("hit1", s3.items.items[1].text);
+
+    // Reverse search over LZ4 compressed data via RandomAccess (.auto decompression)
+    const compressed = try lz4_mod.compressLz4StoredAlloc(gpa, text);
+    defer gpa.free(compressed);
+    var s4 = Collect{ .alloc = gpa };
+    defer s4.deinit();
+    const comp_slice: []const u8 = compressed;
+    const ra_lz4 = RandomAccess.fromSlice(&comp_slice);
+    const res4 = try searchReverseAt(Collect, gpa, &s4, ra_lz4, "log.lz4", &m, .{
+        .compression = .auto,
+    });
+    try std.testing.expectEqual(@as(u64, 3), res4.matched_lines);
+    try std.testing.expectEqualStrings("L8 hit-three", s4.items.items[0].text);
+    try std.testing.expectEqualStrings("L7 hit-two", s4.items.items[1].text);
+    try std.testing.expectEqualStrings("L2 hit-one", s4.items.items[2].text);
 }

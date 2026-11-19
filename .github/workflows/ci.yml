@@ -58,10 +58,16 @@ jobs:
         run: |
           zig build check -Dlinux-getdents=true -Dmmap-windows=true -Dteddy=${{ matrix.teddy_simd }}
 
-      - name: Compile check (x86_64 SSSE3)
+      - name: Compile check (x86_64 SSSE3, runtime & baseline off)
         if: matrix.arch == 'x86_64'
         run: |
           zig build check -Dteddy=ssse3
+          zig build check -Dtarget=x86_64-linux-musl -Dteddy=off
+          zig build check -Dtarget=x86_64-linux-musl -Dteddy=runtime
+
+      - name: Compile check (Windows x86_64 cross-target)
+        if: matrix.arch == 'x86_64'
+        run: zig build check -Dtarget=x86_64-windows-gnu
 
       - name: Compile check (macOS x86_64 cross-target)
         if: runner.os == 'macOS'
@@ -70,6 +76,10 @@ jobs:
 
       - name: Run unit, C ABI, and documentation tests (SIMD=${{ matrix.teddy_simd }})
         run: zig build test -Dteddy=${{ matrix.teddy_simd }}
+
+      - name: Run unit, C ABI, and documentation tests (SIMD=runtime)
+        if: matrix.arch == 'x86_64'
+        run: zig build test -Dteddy=runtime
 
       - name: Run unit, C ABI, and documentation tests (SIMD=off)
         run: zig build test -Dteddy=off

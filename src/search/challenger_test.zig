@@ -319,7 +319,7 @@ test "vector 4.3: source.Memory handle exhaustion (64 max handles) and reuse" {
     var mem = source_mod.Memory{ .root = &root };
     const src = mem.source();
 
-    var handles: [64]usize = undefined;
+    var handles: [source_mod.Memory.max_slots]usize = undefined;
     for (&handles) |*h| {
         h.* = try src.open(testing.io, "f.txt");
     }

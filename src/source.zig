@@ -47,14 +47,28 @@ pub const Node = struct {
 };
 
 /// Handles are 1-based slot indices; 0 is reserved.
+/// Thread-safe across concurrent workers via a lightweight atomic spinlock.
 pub const Memory = struct {
+    pub const max_slots: usize = 128;
+
     pub const Slot = struct {
         node: *const Node,
         offset: usize = 0,
     };
 
     root: *const Node,
-    slots: [64]?Slot = @splat(null),
+    slots: [max_slots]?Slot = @splat(null),
+    lock_word: std.atomic.Value(u32) = .init(0),
+
+    fn lock(self: *Memory) void {
+        while (self.lock_word.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn unlock(self: *Memory) void {
+        self.lock_word.store(0, .release);
+    }
 
     pub fn source(self: *Memory) Source {
         return .{ .ctx = self, .vtable = &vtable };
@@ -113,6 +127,8 @@ fn memOpen(ctx: *anyopaque, io: std.Io, path: []const u8) OpenError!usize {
     _ = io;
     const self: *Memory = @ptrCast(@alignCast(ctx));
     const node = lookupNode(self.root, path) orelse return error.NotFound;
+    self.lock();
+    defer self.unlock();
     const handle = try self.openSlot();
     self.slots[handle - 1] = .{ .node = node, .offset = 0 };
     return handle;
@@ -121,19 +137,26 @@ fn memOpen(ctx: *anyopaque, io: std.Io, path: []const u8) OpenError!usize {
 fn memRead(ctx: *anyopaque, io: std.Io, handle: usize, dest: []u8) ReadError!usize {
     _ = io;
     const self: *Memory = @ptrCast(@alignCast(ctx));
-    const slot = self.slotPtr(handle) catch return error.InvalidHandle;
-    if (slot.node.kind != .file) return error.NotFile;
-    if (slot.offset >= slot.node.bytes.len) return 0;
-    const rem = slot.node.bytes[slot.offset..];
-    const n = @min(dest.len, rem.len);
-    @memcpy(dest[0..n], rem[0..n]);
-    slot.offset += n;
+    const rem: []const u8, const n: usize = blk: {
+        self.lock();
+        defer self.unlock();
+        const slot = self.slotPtr(handle) catch return error.InvalidHandle;
+        if (slot.node.kind != .file) return error.NotFile;
+        if (slot.offset >= slot.node.bytes.len) return 0;
+        const avail = slot.node.bytes[slot.offset..];
+        const copy_n = @min(dest.len, avail.len);
+        slot.offset += copy_n;
+        break :blk .{ avail, copy_n };
+    };
+    if (n > 0) @memcpy(dest[0..n], rem[0..n]);
     return n;
 }
 
 fn memList(ctx: *anyopaque, io: std.Io, handle: usize, out: []Entry) ListError!usize {
     _ = io;
     const self: *Memory = @ptrCast(@alignCast(ctx));
+    self.lock();
+    defer self.unlock();
     const slot = self.slotPtr(handle) catch return error.InvalidHandle;
     if (slot.node.kind != .directory) return error.NotDir;
     if (slot.offset >= slot.node.children.len) return 0;
@@ -150,6 +173,8 @@ fn memClose(ctx: *anyopaque, io: std.Io, handle: usize) void {
     _ = io;
     const self: *Memory = @ptrCast(@alignCast(ctx));
     if (handle == 0 or handle > self.slots.len) return;
+    self.lock();
+    defer self.unlock();
     self.slots[handle - 1] = null;
 }
 
@@ -236,7 +261,7 @@ test "source.Memory slot reuse after close" {
     var memory = Memory{ .root = &dir };
     const src = memory.source();
 
-    var handles: [64]usize = undefined;
+    var handles: [Memory.max_slots]usize = undefined;
     for (&handles) |*h| {
         h.* = try src.open(std.testing.io, "a.txt");
     }

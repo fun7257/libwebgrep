@@ -47,4 +47,5 @@ pub const scheduler = @import("scheduler.zig");
 pub const archive = @import("codec/archive.zig");
 pub const tree = @import("search/tree.zig");
 pub const searchArchiveSlice = tree.searchArchiveSlice;
+pub const searchTarStream = tree.searchTarStream;
 

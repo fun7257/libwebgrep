@@ -1,8 +1,8 @@
 /**
  * @file c_api_test.c
- * @brief Comprehensive C ABI and FFI verification suite for libwebgrep v0.6.0.
+ * @brief Comprehensive C ABI and FFI verification suite for libwebgrep v0.7.0.
  *
- * Exercises all 20 exported C ABI functions, adversarial streaming reader callbacks,
+ * Exercises all 52 exported C ABI functions, adversarial streaming reader callbacks,
  * corrupt and path-traversal archives, NULL/boundary pointer checks, 1,000 allocation/free
  * cycles, and 8-thread concurrent shared-matcher stress tests.
  */
@@ -172,6 +172,104 @@ static void write_tar_header(uint8_t block[512], const char *name, size_t size, 
     block[155] = ' ';
 }
 
+static int slice_read_at_cb(uint64_t offset, uint8_t *buf, size_t cap, size_t *out_n, void *userdata) {
+    const mem_reader_ctx_t *r = (const mem_reader_ctx_t *)userdata;
+    if (!r || !out_n) return -1;
+    if (offset >= (uint64_t)r->len || cap == 0) {
+        *out_n = 0;
+        return 0;
+    }
+    size_t off = (size_t)offset;
+    size_t avail = r->len - off;
+    size_t n = avail < cap ? avail : cap;
+    memcpy(buf, r->data + off, n);
+    *out_n = n;
+    return 0;
+}
+
+static uint32_t c_crc32(const uint8_t *data, size_t len) {
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; ++i) {
+        crc ^= (uint32_t)data[i];
+        for (int b = 0; b < 8; ++b) {
+            uint32_t mask = (uint32_t)-(int32_t)(crc & 1u);
+            crc = (crc >> 1) ^ (0xEDB88320u & mask);
+        }
+    }
+    return ~crc;
+}
+
+static void put_u16_le(uint8_t *p, uint16_t v) {
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)((v >> 8) & 0xFFu);
+}
+
+static void put_u32_le(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)((v >> 8) & 0xFFu);
+    p[2] = (uint8_t)((v >> 16) & 0xFFu);
+    p[3] = (uint8_t)((v >> 24) & 0xFFu);
+}
+
+static size_t build_stored_gzip(uint8_t *out, size_t cap, const uint8_t *payload, size_t plen) {
+    size_t need = 23 + plen;
+    assert(cap >= need && plen <= 65535);
+    memset(out, 0, need);
+    out[0] = 0x1F;
+    out[1] = 0x8B;
+    out[2] = 8;
+    out[9] = 255;
+    out[10] = 0x01; /* BFINAL=1, BTYPE=00 (stored) */
+    uint16_t len16 = (uint16_t)plen;
+    uint16_t nlen16 = (uint16_t)(~len16);
+    put_u16_le(out + 11, len16);
+    put_u16_le(out + 13, nlen16);
+    memcpy(out + 15, payload, plen);
+    put_u32_le(out + 15 + plen, c_crc32(payload, plen));
+    put_u32_le(out + 19 + plen, (uint32_t)plen);
+    return need;
+}
+
+static size_t build_stored_zip_single(uint8_t *out, size_t cap, const char *name, const uint8_t *payload, size_t plen) {
+    size_t nlen = strlen(name);
+    size_t lfh_size = 30 + nlen + plen;
+    size_t cdh_size = 46 + nlen;
+    size_t total = lfh_size + cdh_size + 22;
+    assert(cap >= total);
+    memset(out, 0, total);
+    uint32_t crc = c_crc32(payload, plen);
+
+    /* Local file header */
+    out[0] = 'P'; out[1] = 'K'; out[2] = 3; out[3] = 4;
+    put_u16_le(out + 4, 20);
+    put_u32_le(out + 14, crc);
+    put_u32_le(out + 18, (uint32_t)plen);
+    put_u32_le(out + 22, (uint32_t)plen);
+    put_u16_le(out + 26, (uint16_t)nlen);
+    memcpy(out + 30, name, nlen);
+    memcpy(out + 30 + nlen, payload, plen);
+
+    /* Central directory header */
+    uint8_t *cd = out + lfh_size;
+    cd[0] = 'P'; cd[1] = 'K'; cd[2] = 1; cd[3] = 2;
+    put_u16_le(cd + 4, 20);
+    put_u16_le(cd + 6, 20);
+    put_u32_le(cd + 16, crc);
+    put_u32_le(cd + 20, (uint32_t)plen);
+    put_u32_le(cd + 24, (uint32_t)plen);
+    put_u16_le(cd + 28, (uint16_t)nlen);
+    memcpy(cd + 46, name, nlen);
+
+    /* End of central directory */
+    uint8_t *eocd = cd + cdh_size;
+    eocd[0] = 'P'; eocd[1] = 'K'; eocd[2] = 5; eocd[3] = 6;
+    put_u16_le(eocd + 8, 1);
+    put_u16_le(eocd + 10, 1);
+    put_u32_le(eocd + 12, (uint32_t)cdh_size);
+    put_u32_le(eocd + 16, (uint32_t)lfh_size);
+    return total;
+}
+
 /* ============================================================================
  * Multithreaded Worker Context
  * ========================================================================= */
@@ -249,7 +347,7 @@ int main(void) {
     /* 1. webgrep_version() */
     const char *ver = webgrep_version();
     assert(ver != NULL);
-    assert(strcmp(ver, "0.6.0") == 0);
+    assert(strcmp(ver, "0.7.0") == 0);
     printf("[1/16] webgrep_version(): PASS (version=\"%s\")\n", ver);
 
     /* 2. *_default() option & config functions */
@@ -821,7 +919,262 @@ int main(void) {
 
         webgrep_matcher_free(hit_m);
     }
-    printf("[18/18] Range, line_number_mode, line_filter, reverse tail, probe, & archive entry_filter: PASS\n");
-    printf("=== ALL 18 C ABI TEST SECTIONS PASSED ===\n");
+    printf("[18/24] Range, line_number_mode, line_filter, reverse tail, probe, & archive entry_filter: PASS\n");
+
+    /* 19. Extended webgrep_config_t fields & atomic cancel token */
+    {
+        webgrep_cancel_t *cancel = webgrep_cancel_new();
+        assert(cancel != NULL);
+
+        webgrep_matcher_t *m = NULL;
+        assert(webgrep_matcher_compile_literal((const uint8_t *)"LOG", 3, NULL, &m) == WEBGREP_OK);
+
+        const char *doc = "LOG keep Alpha\nLOG skip Beta\nLOG keep Gamma\n";
+        webgrep_pattern_t c_pats[1] = { { (const uint8_t *)"alpha", 5 } };
+        webgrep_pattern_t x_pats[1] = { { (const uint8_t *)"beta", 4 } };
+
+        webgrep_config_t ecfg = webgrep_config_default();
+        ecfg.contains_ptr = c_pats;
+        ecfg.contains_len = 1;
+        ecfg.excludes_ptr = x_pats;
+        ecfg.excludes_len = 1;
+        ecfg.filter_case_insensitive = 1;
+        ecfg.charset_ptr = "UTF-8";
+        ecfg.charset_len = 5;
+        ecfg.cancel = cancel;
+
+        line_capture_ctx_t lctx;
+        webgrep_summary_t sum;
+
+        webgrep_cancel_trigger(cancel);
+        memset(&lctx, 0, sizeof(lctx));
+        memset(&sum, 0, sizeof(sum));
+        assert(webgrep_search_slice(m, (const uint8_t *)doc, strlen(doc), &ecfg, on_line_capture, &lctx, &sum) == WEBGREP_OK);
+        assert(lctx.matched_lines == 0);
+
+        webgrep_cancel_reset(cancel);
+        memset(&lctx, 0, sizeof(lctx));
+        memset(&sum, 0, sizeof(sum));
+        assert(webgrep_search_slice(m, (const uint8_t *)doc, strlen(doc), &ecfg, on_line_capture, &lctx, &sum) == WEBGREP_OK);
+        assert(lctx.matched_lines == 1 && sum.matched_lines == 1);
+
+        webgrep_config_t rcfg = webgrep_config_default();
+        rcfg.resume_from = 15; /* Start at second line */
+        memset(&lctx, 0, sizeof(lctx));
+        assert(webgrep_search_slice(m, (const uint8_t *)doc, strlen(doc), &rcfg, on_line_capture, &lctx, &sum) == WEBGREP_OK);
+        assert(lctx.matched_lines == 2);
+
+        webgrep_matcher_free(m);
+        webgrep_cancel_free(cancel);
+        webgrep_cancel_free(NULL);
+    }
+    printf("[19/24] Extended config (contains/excludes/charset/cancel/resume_from): PASS\n");
+
+    /* 20. Regex captures, named groups, & ${name} replacement */
+    {
+        const char *pat = "(?P<user>[a-z]+)@(?<host>[a-z]+\\.[a-z]+)";
+        webgrep_matcher_t *re = NULL;
+        webgrep_compile_diag_t diag;
+        assert(webgrep_matcher_compile_regex((const uint8_t *)pat, strlen(pat), NULL, &diag, &re) == WEBGREP_OK);
+
+        assert(webgrep_matcher_group_index(re, "user", 4) == 1);
+        assert(webgrep_matcher_group_index(re, "host", 4) == 2);
+        assert(webgrep_matcher_group_index(re, "unknown", 7) == 0);
+
+        webgrep_scratch_t *scratch = webgrep_scratch_new();
+        assert(scratch != NULL);
+
+        const char *line = "user=alice@example.org!";
+        webgrep_captures_t caps;
+        assert(webgrep_find_captures(re, (const uint8_t *)line, strlen(line), 0, 1, scratch, &caps) == 1);
+        assert(caps.group_count == 2);
+        assert(caps.full.matched == 1 && caps.full.end - caps.full.start == 17);
+        assert(caps.groups[0].matched == 1 && memcmp(line + caps.groups[0].start, "alice", 5) == 0);
+        assert(caps.groups[1].matched == 1 && memcmp(line + caps.groups[1].start, "example.org", 11) == 0);
+
+        webgrep_config_t cfg = webgrep_config_default();
+        const char *tmpl = "id:${user}->${host}";
+        cfg.replacement_ptr = (const uint8_t *)tmpl;
+        cfg.replacement_len = strlen(tmpl);
+        /* Verify ${name} expanded properly in replaced_ptr */
+        webgrep_pull_t *pull = NULL;
+        assert(webgrep_pull_open_slice(re, (const uint8_t *)line, strlen(line), &cfg, &pull) == WEBGREP_OK);
+        webgrep_line_event_t ev;
+        webgrep_summary_t sum;
+        assert(webgrep_pull_next(pull, &ev, &sum) == 1);
+        assert(ev.replaced_ptr != NULL && ev.replaced_len == strlen("user=id:alice->example.org!"));
+        assert(bytes_contains(ev.replaced_ptr, ev.replaced_len, "id:alice->example.org", 21));
+        assert(webgrep_pull_next(pull, &ev, &sum) == 0);
+        webgrep_pull_free(pull);
+
+        webgrep_scratch_free(scratch);
+        webgrep_matcher_free(re);
+    }
+    printf("[20/24] Regex captures, named group lookup, & ${name} replacement: PASS\n");
+
+    /* 21. Positional RandomAccess: search_range, search_reverse_at, & probe_line_at */
+    {
+        webgrep_matcher_t *m = NULL;
+        assert(webgrep_matcher_compile_literal((const uint8_t *)"HIT", 3, NULL, &m) == WEBGREP_OK);
+
+        const char *doc = "line1 HIT\nline2 HIT\nline3 no\nline4 HIT\n";
+        mem_reader_ctx_t ra = { .data = (const uint8_t *)doc, .len = strlen(doc), .pos = 0, .chunk_size = 0 };
+        line_capture_ctx_t lctx;
+        webgrep_summary_t sum;
+
+        memset(&lctx, 0, sizeof(lctx));
+        assert(webgrep_search_range(m, slice_read_at_cb, &ra, (uint64_t)ra.len, 1, 10, 20, 1, NULL, on_line_capture, &lctx, &sum) == WEBGREP_OK);
+        assert(lctx.matched_lines == 1 && sum.matched_lines == 1);
+
+        webgrep_config_t rev_cfg = webgrep_config_default();
+        rev_cfg.initial_line_number = 4;
+        memset(&lctx, 0, sizeof(lctx));
+        assert(webgrep_search_reverse_at(m, slice_read_at_cb, &ra, (uint64_t)ra.len, 1, &rev_cfg, on_line_capture, &lctx, &sum) == WEBGREP_OK);
+        assert(lctx.matched_lines == 3 && lctx.first_line_no == 4 && lctx.last_line_no == 1);
+
+        uint8_t pbuf[64];
+        webgrep_line_probe_t probe;
+        assert(webgrep_probe_line_at(slice_read_at_cb, &ra, (uint64_t)ra.len, 1, 12, pbuf, sizeof(pbuf), NULL, &probe) == 1);
+        assert(probe.bytes_len == 9 && memcmp(probe.bytes_ptr, "line2 HIT", 9) == 0);
+
+        webgrep_matcher_free(m);
+    }
+    printf("[21/24] RandomAccess search_range, search_reverse_at, & probe_line_at: PASS\n");
+
+    /* 22. Pull-mode iterators (slice + streaming reader) */
+    {
+        webgrep_matcher_t *m = NULL;
+        assert(webgrep_matcher_compile_literal((const uint8_t *)"EVT", 3, NULL, &m) == WEBGREP_OK);
+
+        const char *stream_doc = "skip\nEVT alpha\nEVT beta\nskip\n";
+        webgrep_pull_t *pull = NULL;
+        webgrep_line_event_t ev;
+        webgrep_summary_t sum;
+
+        assert(webgrep_pull_open_slice(m, (const uint8_t *)stream_doc, strlen(stream_doc), NULL, &pull) == WEBGREP_OK);
+        assert(webgrep_pull_next(pull, &ev, &sum) == 1 && ev.line_number == 2);
+        assert(webgrep_pull_next(pull, &ev, &sum) == 1 && ev.line_number == 3);
+        assert(webgrep_pull_next(pull, &ev, &sum) == 0 && sum.matched_lines == 2);
+        webgrep_pull_free(pull);
+
+        mem_reader_ctx_t mr = { .data = (const uint8_t *)stream_doc, .len = strlen(stream_doc), .pos = 0, .chunk_size = 5 };
+        assert(webgrep_pull_open_reader(m, mem_read_cb, &mr, NULL, &pull) == WEBGREP_OK);
+        size_t seen = 0;
+        while (webgrep_pull_next(pull, &ev, &sum) == 1) seen++;
+        assert(seen == 2 && sum.matched_lines == 2);
+        webgrep_pull_free(pull);
+        webgrep_pull_free(NULL);
+
+        webgrep_matcher_free(m);
+    }
+    printf("[22/24] Pull-mode iterators (slice & streaming reader): PASS\n");
+
+    /* 23. Streaming archive reader (TAR & ZIP) */
+    {
+        webgrep_matcher_t *m = NULL;
+        assert(webgrep_matcher_compile_literal((const uint8_t *)"STREAM_HIT", 10, NULL, &m) == WEBGREP_OK);
+
+        uint8_t tar_buf[2560];
+        memset(tar_buf, 0, sizeof(tar_buf));
+        const char *t1 = "hello\nSTREAM_HIT tar\n";
+        write_tar_header(tar_buf, "logs/app.log", strlen(t1), '0', NULL);
+        memcpy(tar_buf + 512, t1, strlen(t1));
+        mem_reader_ctx_t tr = { .data = tar_buf, .len = sizeof(tar_buf), .pos = 0, .chunk_size = 64 };
+        webgrep_tree_summary_t tsum;
+        line_capture_ctx_t lctx = { 0 };
+        assert(webgrep_search_archive_reader(m, mem_read_cb, &tr, NULL, on_line_capture, &lctx, &tsum) == WEBGREP_OK);
+        assert(tsum.files_searched == 1 && tsum.matched_files == 1 && lctx.matched_lines == 1);
+
+        uint8_t zip_buf[512];
+        const char *zpayload = "none\nSTREAM_HIT zip\n";
+        size_t zlen = build_stored_zip_single(zip_buf, sizeof(zip_buf), "in/z.txt", (const uint8_t *)zpayload, strlen(zpayload));
+        mem_reader_ctx_t zr = { .data = zip_buf, .len = zlen, .pos = 0, .chunk_size = 13 };
+        memset(&tsum, 0, sizeof(tsum));
+        memset(&lctx, 0, sizeof(lctx));
+        assert(webgrep_search_archive_reader(m, mem_read_cb, &zr, NULL, on_line_capture, &lctx, &tsum) == WEBGREP_OK);
+        assert(tsum.files_searched == 1 && tsum.matched_files == 1 && lctx.matched_lines == 1);
+
+        webgrep_matcher_free(m);
+    }
+    printf("[23/24] Streaming archive reader (TAR & ZIP): PASS\n");
+
+    /* 24. N-gram Bloom Filter, Indexed Gzip, & Seekable Zstd boundary checks */
+    {
+        webgrep_bloom_config_t bcfg = webgrep_bloom_config_default();
+        webgrep_bloom_t *b1 = NULL;
+        webgrep_bloom_t *b2 = NULL;
+        assert(webgrep_bloom_new(&bcfg, &b1) == WEBGREP_OK);
+        assert(webgrep_bloom_new(&bcfg, &b2) == WEBGREP_OK);
+
+        const char *sample = "node-07 timeout connecting to backend";
+        assert(webgrep_bloom_add(b1, (const uint8_t *)sample, strlen(sample)) == WEBGREP_OK);
+        assert(webgrep_bloom_merge(b2, b1) == WEBGREP_OK);
+
+        webgrep_matcher_t *m_hit = NULL;
+        webgrep_matcher_t *m_miss = NULL;
+        assert(webgrep_matcher_compile_literal((const uint8_t *)"timeout", 7, NULL, &m_hit) == WEBGREP_OK);
+        assert(webgrep_matcher_compile_literal((const uint8_t *)"zzq99x", 6, NULL, &m_miss) == WEBGREP_OK);
+        assert(webgrep_bloom_may_contain(b2, m_hit) == 1);
+        assert(webgrep_bloom_may_contain(b2, m_miss) == 0);
+
+        size_t need = 0;
+        assert(webgrep_bloom_serialize(b2, NULL, 0, &need) == WEBGREP_OK && need > 0);
+        uint8_t small_buf[4];
+        assert(webgrep_bloom_serialize(b2, small_buf, sizeof(small_buf), &need) == WEBGREP_ERR_TOO_LARGE);
+        uint8_t *ser = (uint8_t *)malloc(need);
+        assert(ser != NULL);
+        assert(webgrep_bloom_serialize(b2, ser, need, &need) == WEBGREP_OK);
+        webgrep_bloom_t *b3 = NULL;
+        assert(webgrep_bloom_deserialize(ser, need, &b3) == WEBGREP_OK);
+        assert(webgrep_bloom_may_contain(b3, m_hit) == 1);
+
+        free(ser);
+        webgrep_matcher_free(m_hit);
+        webgrep_matcher_free(m_miss);
+        webgrep_bloom_free(b1);
+        webgrep_bloom_free(b2);
+        webgrep_bloom_free(b3);
+        webgrep_bloom_free(NULL);
+
+        /* Indexed Gzip end-to-end */
+        const char *gz_text = "alpha_beta_gamma_0123456789_indexed_gzip";
+        size_t gz_plen = strlen(gz_text);
+        uint8_t gz_buf[128];
+        size_t gz_len = build_stored_gzip(gz_buf, sizeof(gz_buf), (const uint8_t *)gz_text, gz_plen);
+
+        mem_reader_ctx_t gzr = { .data = gz_buf, .len = gz_len, .pos = 0, .chunk_size = 9 };
+        webgrep_gzip_index_t *gidx = NULL;
+        assert(webgrep_gzip_index_build(mem_read_cb, &gzr, 16, &gidx) == WEBGREP_OK);
+        assert(webgrep_gzip_index_uncompressed_size(gidx) == (uint64_t)gz_plen);
+
+        size_t gneed = 0;
+        assert(webgrep_gzip_index_serialize(gidx, NULL, 0, &gneed) == WEBGREP_OK && gneed > 0);
+        uint8_t *gser = (uint8_t *)malloc(gneed);
+        assert(gser != NULL);
+        assert(webgrep_gzip_index_serialize(gidx, gser, gneed, &gneed) == WEBGREP_OK);
+        webgrep_gzip_index_t *gidx2 = NULL;
+        assert(webgrep_gzip_index_deserialize(gser, gneed, &gidx2) == WEBGREP_OK);
+
+        uint8_t out_slice[12];
+        size_t got = 0;
+        mem_reader_ctx_t gzra = { .data = gz_buf, .len = gz_len, .pos = 0, .chunk_size = 0 };
+        assert(webgrep_gzip_index_read_at(gidx2, slice_read_at_cb, &gzra, (uint64_t)gz_len, 1, 17, out_slice, sizeof(out_slice), &got) == WEBGREP_OK);
+        assert(got == 12 && memcmp(out_slice, gz_text + 17, 12) == 0);
+
+        free(gser);
+        webgrep_gzip_index_free(gidx);
+        webgrep_gzip_index_free(gidx2);
+        webgrep_gzip_index_free(NULL);
+
+        /* Seekable Zstd boundary checks */
+        webgrep_zstd_seek_table_t *ztbl = NULL;
+        const uint8_t bad_zst[8] = { 0 };
+        mem_reader_ctx_t zra = { .data = bad_zst, .len = sizeof(bad_zst), .pos = 0, .chunk_size = 0 };
+        assert(webgrep_zstd_seek_table_parse(slice_read_at_cb, &zra, 4, &ztbl) == WEBGREP_ERR_CORRUPT_ARCHIVE);
+        assert(webgrep_zstd_seek_table_uncompressed_size(NULL) == 0);
+        webgrep_zstd_seek_table_free(NULL);
+    }
+    printf("[24/24] N-gram Bloom Filter, Indexed Gzip, & Seekable Zstd checks: PASS\n");
+    printf("=== ALL 24 C ABI TEST SECTIONS PASSED ===\n");
     return 0;
 }

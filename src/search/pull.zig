@@ -307,7 +307,7 @@ pub const PrefixedReader = struct {
     }
 
     fn streamFn(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
-        const self: *PrefixedReader = @fieldParentPtr("reader", r);
+        const self: *PrefixedReader = @alignCast(@fieldParentPtr("reader", r));
         if (self.prefix_pos < self.prefix_len) {
             const avail = self.prefix[self.prefix_pos..self.prefix_len];
             const max_len = limit.minInt(avail.len);

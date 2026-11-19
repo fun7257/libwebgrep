@@ -1,6 +1,6 @@
 /**
  * @file webgrep.h
- * @brief C ABI and Cross-Language FFI Header for libwebgrep v0.6.0.
+ * @brief C ABI and Cross-Language FFI Header for libwebgrep v0.7.0.
  *
  * Thread-safe, zero-global-state SIMD literal, multi-pattern, and linear-time
  * regular expression search engine with in-memory archive and streaming reader support.
@@ -17,14 +17,26 @@
 extern "C" {
 #endif
 
+#ifndef WEBGREP_API
+#  if defined(_WIN32) && defined(WEBGREP_SHARED)
+#    ifdef WEBGREP_BUILD_SHARED
+#      define WEBGREP_API __declspec(dllexport)
+#    else
+#      define WEBGREP_API __declspec(dllimport)
+#    endif
+#  else
+#    define WEBGREP_API
+#  endif
+#endif
+
 /* ============================================================================
  * Version Information
  * ========================================================================= */
 
 #define WEBGREP_VERSION_MAJOR 0
-#define WEBGREP_VERSION_MINOR 6
+#define WEBGREP_VERSION_MINOR 7
 #define WEBGREP_VERSION_PATCH 0
-#define WEBGREP_VERSION_STRING "0.6.0"
+#define WEBGREP_VERSION_STRING "0.7.0"
 
 /* ============================================================================
  * Status & Error Codes
@@ -144,6 +156,21 @@ typedef struct webgrep_matcher_s webgrep_matcher_t;
 
 /** Opaque per-thread reusable scratch buffer pool (`Scratch`). Not shared concurrently across threads. */
 typedef struct webgrep_scratch_s webgrep_scratch_t;
+
+/** Opaque atomic cancellation token (`CancelToken`). Thread-safe to trigger from another thread. */
+typedef struct webgrep_cancel_s webgrep_cancel_t;
+
+/** Opaque pull-mode line event iterator handle. Not shared concurrently across threads. */
+typedef struct webgrep_pull_s webgrep_pull_t;
+
+/** Opaque N-gram Bloom filter handle for zero-false-negative pre-screening. */
+typedef struct webgrep_bloom_s webgrep_bloom_t;
+
+/** Opaque parsed Zstd Seek Table handle for random-access decompression. */
+typedef struct webgrep_zstd_seek_table_s webgrep_zstd_seek_table_t;
+
+/** Opaque indexed Gzip checkpoint table handle for random-access decompression. */
+typedef struct webgrep_gzip_index_s webgrep_gzip_index_t;
 
 /* ============================================================================
  * Option, Pattern, Match, Event, & Summary Structures
@@ -315,14 +342,49 @@ typedef struct webgrep_config_s {
     uint64_t               max_output_bytes;
     uint8_t                has_byte_range;
     uint8_t                has_byte_range_end;
-    uint8_t                range_align_lines;
-    int32_t                line_number_mode;
-    uint64_t               byte_range_start;
-    uint64_t               byte_range_end;
-    uint64_t               initial_line_number;
-    webgrep_line_filter_cb line_filter;
-    void                  *line_filter_ctx;
+    uint8_t                  range_align_lines;
+    int32_t                  line_number_mode;
+    uint64_t                 byte_range_start;
+    uint64_t                 byte_range_end;
+    uint64_t                 initial_line_number;
+    webgrep_line_filter_cb   line_filter;
+    void                    *line_filter_ctx;
+    const char              *charset_ptr;
+    size_t                   charset_len;
+    const webgrep_pattern_t *contains_ptr;
+    size_t                   contains_len;
+    const webgrep_pattern_t *excludes_ptr;
+    size_t                   excludes_len;
+    uint8_t                  filter_case_insensitive;
+    uint8_t                  filter_smart_case;
+    const webgrep_cancel_t  *cancel;
+    uint64_t                 resume_from;
+    uint64_t                 progress_interval;
 } webgrep_config_t;
+
+#define WEBGREP_MAX_CAPTURE_GROUPS 32
+
+/** Single capture group byte range inside a searched slice. */
+typedef struct webgrep_capture_group_s {
+    size_t  start;
+    size_t  end;
+    uint8_t matched;
+} webgrep_capture_group_t;
+
+/** Full regex capture match (`$0` plus `$1`..`$32`). */
+typedef struct webgrep_captures_s {
+    webgrep_capture_group_t full;
+    webgrep_capture_group_t groups[WEBGREP_MAX_CAPTURE_GROUPS];
+    size_t                  group_count;
+} webgrep_captures_t;
+
+/** Configuration for constructing an N-gram Bloom filter. */
+typedef struct webgrep_bloom_config_s {
+    uint32_t bit_count;
+    uint8_t  num_hashes;
+    uint8_t  ngram_len;
+    uint8_t  ascii_lower;
+} webgrep_bloom_config_t;
 
 /** Summary populated by `webgrep_search_slice`, `webgrep_search_reader`, and `webgrep_search_reverse_slice`. */
 typedef struct webgrep_summary_s {
@@ -392,27 +454,36 @@ typedef int (*webgrep_line_cb)(const webgrep_line_event_t *ev, void *userdata);
  */
 typedef int (*webgrep_read_cb)(uint8_t *buf, size_t cap, size_t *out_n, void *userdata);
 
+/**
+ * Random-access positional read callback invoked by `webgrep_search_range`,
+ * `webgrep_search_reverse_at`, `webgrep_probe_line_at`, `webgrep_zstd_seek_table_*`,
+ * and `webgrep_gzip_index_read_at`.
+ * Reads up to `cap` bytes starting at `offset` into `buf` and writes bytes read into `*out_n`.
+ * Return 0 on success (`*out_n = 0` at EOF), or any non-zero value on error.
+ */
+typedef int (*webgrep_read_at_cb)(uint64_t offset, uint8_t *buf, size_t cap, size_t *out_n, void *userdata);
+
 /* ============================================================================
- * Exported C ABI Functions (20 Functions)
+ * Exported C ABI Functions (52 Functions)
  * ========================================================================= */
 
-/** 1. Returns the null-terminated semantic version string ("0.6.0"). */
-const char *webgrep_version(void);
+/** 1. Returns the null-terminated semantic version string ("0.7.0"). */
+WEBGREP_API const char *webgrep_version(void);
 
 /** 2. Returns default literal/multi find options by value. */
-webgrep_find_options_t webgrep_find_options_default(void);
+WEBGREP_API webgrep_find_options_t webgrep_find_options_default(void);
 
 /** 3. Returns default regex compilation options by value. */
-webgrep_regex_options_t webgrep_regex_options_default(void);
+WEBGREP_API webgrep_regex_options_t webgrep_regex_options_default(void);
 
 /** 4. Returns default search configuration by value. */
-webgrep_config_t webgrep_config_default(void);
+WEBGREP_API webgrep_config_t webgrep_config_default(void);
 
 /** 5. Returns default tree/archive search configuration by value. */
-webgrep_tree_config_t webgrep_tree_config_default(void);
+WEBGREP_API webgrep_tree_config_t webgrep_tree_config_default(void);
 
 /** 6. Compiles a single-literal SIMD `Finder` matcher. Returns 0 (`WEBGREP_OK`) on success. */
-int webgrep_matcher_compile_literal(
+WEBGREP_API int webgrep_matcher_compile_literal(
     const uint8_t                *pattern_ptr,
     size_t                        pattern_len,
     const webgrep_find_options_t *opts,
@@ -420,7 +491,7 @@ int webgrep_matcher_compile_literal(
 );
 
 /** 7. Compiles a multi-literal SIMD `Multi` matcher. Returns 0 (`WEBGREP_OK`) on success. */
-int webgrep_matcher_compile_multi(
+WEBGREP_API int webgrep_matcher_compile_multi(
     const webgrep_pattern_t      *patterns_ptr,
     size_t                        patterns_len,
     const webgrep_find_options_t *opts,
@@ -428,7 +499,7 @@ int webgrep_matcher_compile_multi(
 );
 
 /** 8. Compiles a linear-time `Regex` matcher with optional diagnostic output on failure. */
-int webgrep_matcher_compile_regex(
+WEBGREP_API int webgrep_matcher_compile_regex(
     const uint8_t                 *pattern_ptr,
     size_t                         pattern_len,
     const webgrep_regex_options_t *opts,
@@ -437,7 +508,7 @@ int webgrep_matcher_compile_regex(
 );
 
 /** 9. Compiles a multi-pattern `RegexSet` matcher with optional diagnostic output on failure. */
-int webgrep_matcher_compile_regex_set(
+WEBGREP_API int webgrep_matcher_compile_regex_set(
     const webgrep_pattern_t       *patterns_ptr,
     size_t                         patterns_len,
     const webgrep_regex_options_t *opts,
@@ -446,19 +517,19 @@ int webgrep_matcher_compile_regex_set(
 );
 
 /** 10. Frees a compiled matcher handle. Safe to call with NULL. */
-void webgrep_matcher_free(webgrep_matcher_t *matcher);
+WEBGREP_API void webgrep_matcher_free(webgrep_matcher_t *matcher);
 
 /** 11. Allocates a reusable per-thread scratch buffer pool (`webgrep_scratch_t`). Returns NULL on OOM. */
-webgrep_scratch_t *webgrep_scratch_new(void);
+WEBGREP_API webgrep_scratch_t *webgrep_scratch_new(void);
 
 /** 12. Frees a reusable scratch buffer pool. Safe to call with NULL. */
-void webgrep_scratch_free(webgrep_scratch_t *scratch);
+WEBGREP_API void webgrep_scratch_free(webgrep_scratch_t *scratch);
 
 /**
  * 13. Finds the first match in `haystack_ptr[start_offset..haystack_len]` using `matcher`.
  * Returns 1 if a match was found (populating `*out_match`), 0 if no match, or < 0 on invalid arguments.
  */
-int webgrep_find(
+WEBGREP_API int webgrep_find(
     const webgrep_matcher_t *matcher,
     const uint8_t           *haystack_ptr,
     size_t                   haystack_len,
@@ -471,7 +542,7 @@ int webgrep_find(
  * writing matching 0-based pattern IDs into `out_ids_ptr` (up to `out_ids_cap`) and storing the count in `*out_count`.
  * Returns 0 (`WEBGREP_OK`) on success, or < 0 on invalid arguments or non-RegexSet matcher.
  */
-int webgrep_regex_set_matches(
+WEBGREP_API int webgrep_regex_set_matches(
     const webgrep_matcher_t *matcher,
     const uint8_t           *haystack_ptr,
     size_t                   haystack_len,
@@ -481,7 +552,7 @@ int webgrep_regex_set_matches(
 );
 
 /** 15. Searches an in-memory byte slice, invoking `on_line` for each matched or context line. */
-int webgrep_search_slice(
+WEBGREP_API int webgrep_search_slice(
     const webgrep_matcher_t *matcher,
     const uint8_t           *data_ptr,
     size_t                   data_len,
@@ -492,7 +563,7 @@ int webgrep_search_slice(
 );
 
 /** 16. Searches a streaming reader driven by `read_cb`, invoking `on_line` for each matched or context line. */
-int webgrep_search_reader(
+WEBGREP_API int webgrep_search_reader(
     const webgrep_matcher_t *matcher,
     webgrep_read_cb          read_cb,
     void                    *read_userdata,
@@ -503,7 +574,7 @@ int webgrep_search_reader(
 );
 
 /** 17. Unpacks and searches an in-memory archive (`.tar`, `.tar.gz`, `.tar.zst`, `.tar.xz`, `.zip`) without touching disk. */
-int webgrep_search_archive_slice(
+WEBGREP_API int webgrep_search_archive_slice(
     const webgrep_matcher_t     *matcher,
     const uint8_t               *archive_ptr,
     size_t                       archive_len,
@@ -514,7 +585,7 @@ int webgrep_search_archive_slice(
 );
 
 /** 18. Returns default byte-offset line probe options by value. */
-webgrep_probe_options_t webgrep_probe_options_default(void);
+WEBGREP_API webgrep_probe_options_t webgrep_probe_options_default(void);
 
 /**
  * 19. Zero-allocation byte-offset line probe over `data_ptr[0..data_len]`.
@@ -523,7 +594,7 @@ webgrep_probe_options_t webgrep_probe_options_default(void);
  * Returns 1 if `offset < data_len` (populating `*out_probe`), 0 if empty or `offset >= data_len`,
  * or < 0 (`WEBGREP_ERR_INVALID_ARG`) on invalid arguments.
  */
-int webgrep_probe_line_slice(
+WEBGREP_API int webgrep_probe_line_slice(
     const uint8_t                 *data_ptr,
     size_t                         data_len,
     uint64_t                       offset,
@@ -535,7 +606,7 @@ int webgrep_probe_line_slice(
  * 20. Searches an in-memory byte slice backward from the end (or `cfg->byte_range`),
  * invoking `on_line` for each matching line in newest-first (reverse) order.
  */
-int webgrep_search_reverse_slice(
+WEBGREP_API int webgrep_search_reverse_slice(
     const webgrep_matcher_t *matcher,
     const uint8_t           *data_ptr,
     size_t                   data_len,
@@ -543,6 +614,264 @@ int webgrep_search_reverse_slice(
     webgrep_line_cb          on_line,
     void                    *userdata,
     webgrep_summary_t       *out_summary
+);
+
+/** 21. Allocates a thread-safe atomic cancellation token. Returns NULL on OOM. */
+WEBGREP_API webgrep_cancel_t *webgrep_cancel_new(void);
+
+/** 22. Signals cancellation on `cancel`. Thread-safe. No-op if NULL. */
+WEBGREP_API void webgrep_cancel_trigger(webgrep_cancel_t *cancel);
+
+/** 23. Resets `cancel` back to non-cancelled state. Thread-safe. No-op if NULL. */
+WEBGREP_API void webgrep_cancel_reset(webgrep_cancel_t *cancel);
+
+/** 24. Frees a cancellation token. Safe to call with NULL. */
+WEBGREP_API void webgrep_cancel_free(webgrep_cancel_t *cancel);
+
+/**
+ * 25. Finds the next regex match with submatch capture groups `$0`..`$32`.
+ * `match_mode`: 0 = earliest, 1 = leftmost_first. `scratch` may be NULL.
+ * Returns 1 on match, 0 if no match, or < 0 on invalid arguments or non-Regex matcher.
+ */
+WEBGREP_API int webgrep_find_captures(
+    const webgrep_matcher_t *matcher,
+    const uint8_t           *haystack_ptr,
+    size_t                   haystack_len,
+    size_t                   start_offset,
+    int                      match_mode,
+    webgrep_scratch_t       *scratch,
+    webgrep_captures_t      *out_captures
+);
+
+/**
+ * 26. Resolves a named capture group `(?P<name>...)` / `(?<name>...)` to its 1-based capture index (1..32).
+ * Returns 1..32 if found, 0 if not found, or < 0 on invalid arguments or non-Regex matcher.
+ */
+WEBGREP_API int webgrep_matcher_group_index(
+    const webgrep_matcher_t *matcher,
+    const char              *name_ptr,
+    size_t                   name_len
+);
+
+/**
+ * 27. Searches byte range `[range_start, range_end)` over a random-access `read_at_cb` source.
+ */
+WEBGREP_API int webgrep_search_range(
+    const webgrep_matcher_t *matcher,
+    webgrep_read_at_cb       read_at_cb,
+    void                    *read_userdata,
+    uint64_t                 total_size,
+    uint8_t                  has_total_size,
+    uint64_t                 range_start,
+    uint64_t                 range_end,
+    uint8_t                  has_range_end,
+    const webgrep_config_t  *cfg,
+    webgrep_line_cb          on_line,
+    void                    *line_userdata,
+    webgrep_summary_t       *out_summary
+);
+
+/**
+ * 28. Searches backward in newest-first order over a random-access `read_at_cb` source.
+ */
+WEBGREP_API int webgrep_search_reverse_at(
+    const webgrep_matcher_t *matcher,
+    webgrep_read_at_cb       read_at_cb,
+    void                    *read_userdata,
+    uint64_t                 total_size,
+    uint8_t                  has_total_size,
+    const webgrep_config_t  *cfg,
+    webgrep_line_cb          on_line,
+    void                    *line_userdata,
+    webgrep_summary_t       *out_summary
+);
+
+/**
+ * 29. Zero-allocation byte-offset line probe over a random-access `read_at_cb` source into `buf_ptr[0..buf_cap]`.
+ * Borrowed `out_probe->bytes_ptr` points into `buf_ptr`. Returns 1 on hit, 0 if EOF/empty, or < 0 on error.
+ */
+WEBGREP_API int webgrep_probe_line_at(
+    webgrep_read_at_cb             read_at_cb,
+    void                          *read_userdata,
+    uint64_t                       total_size,
+    uint8_t                        has_total_size,
+    uint64_t                       offset,
+    uint8_t                       *buf_ptr,
+    size_t                         buf_cap,
+    const webgrep_probe_options_t *opts,
+    webgrep_line_probe_t          *out_probe
+);
+
+/** 30. Opens a pull-mode event iterator over an in-memory slice. Caller must keep `data_ptr` alive until freed. */
+WEBGREP_API int webgrep_pull_open_slice(
+    const webgrep_matcher_t *matcher,
+    const uint8_t           *data_ptr,
+    size_t                   data_len,
+    const webgrep_config_t  *cfg,
+    webgrep_pull_t         **out_pull
+);
+
+/** 31. Opens a pull-mode streaming event iterator driven by `read_cb`. */
+WEBGREP_API int webgrep_pull_open_reader(
+    const webgrep_matcher_t *matcher,
+    webgrep_read_cb          read_cb,
+    void                    *read_userdata,
+    const webgrep_config_t  *cfg,
+    webgrep_pull_t         **out_pull
+);
+
+/**
+ * 32. Advances the pull iterator to the next matched/context line.
+ * Returns 1 and fills `*out_event` (borrowed pointers valid until the next `webgrep_pull_next` or `webgrep_pull_free`),
+ * 0 at end-of-stream (filling `*out_summary` if non-NULL), or < 0 on error.
+ */
+WEBGREP_API int webgrep_pull_next(
+    webgrep_pull_t       *pull,
+    webgrep_line_event_t *out_event,
+    webgrep_summary_t    *out_summary
+);
+
+/** 33. Frees a pull iterator handle. Safe to call with NULL. */
+WEBGREP_API void webgrep_pull_free(webgrep_pull_t *pull);
+
+/**
+ * 34. Searches a streaming archive reader (`.tar`, `.tar.gz`, `.tar.zst`, `.tar.xz`, `.zip`).
+ * Streams TAR archives in constant memory without buffering the full archive.
+ */
+WEBGREP_API int webgrep_search_archive_reader(
+    const webgrep_matcher_t     *matcher,
+    webgrep_read_cb              read_cb,
+    void                        *read_userdata,
+    const webgrep_tree_config_t *tree_cfg,
+    webgrep_line_cb              on_line,
+    void                        *line_userdata,
+    webgrep_tree_summary_t      *out_summary
+);
+
+/** 35. Returns default N-gram Bloom filter configuration by value. */
+WEBGREP_API webgrep_bloom_config_t webgrep_bloom_config_default(void);
+
+/** 36. Creates an N-gram Bloom filter handle. */
+WEBGREP_API int webgrep_bloom_new(
+    const webgrep_bloom_config_t *cfg,
+    webgrep_bloom_t             **out_bloom
+);
+
+/** 37. Frees an N-gram Bloom filter handle. Safe to call with NULL. */
+WEBGREP_API void webgrep_bloom_free(webgrep_bloom_t *bloom);
+
+/** 38. Indexes `data_ptr[0..data_len]` N-grams into `bloom`. */
+WEBGREP_API int webgrep_bloom_add(
+    webgrep_bloom_t *bloom,
+    const uint8_t   *data_ptr,
+    size_t           data_len
+);
+
+/** 39. Unions bits from `src` into `dst` (both must share identical configuration). */
+WEBGREP_API int webgrep_bloom_merge(
+    webgrep_bloom_t       *dst,
+    const webgrep_bloom_t *src
+);
+
+/**
+ * 40. Zero-false-negative pre-screen check: returns 1 if `matcher` may match, 0 if definitely absent,
+ * or < 0 on invalid arguments.
+ */
+WEBGREP_API int webgrep_bloom_may_contain(
+    const webgrep_bloom_t   *bloom,
+    const webgrep_matcher_t *matcher
+);
+
+/**
+ * 41. Serializes `bloom` into `out_buf[0..out_cap]`.
+ * Pass `out_buf = NULL` to query the required byte length in `*out_len` (`WEBGREP_OK`).
+ * Returns `WEBGREP_ERR_TOO_LARGE` (while writing `*out_len`) if `out_cap` is smaller than required.
+ */
+WEBGREP_API int webgrep_bloom_serialize(
+    const webgrep_bloom_t *bloom,
+    uint8_t               *out_buf,
+    size_t                 out_cap,
+    size_t                *out_len
+);
+
+/** 42. Deserializes an N-gram Bloom filter from `data_ptr[0..data_len]`. */
+WEBGREP_API int webgrep_bloom_deserialize(
+    const uint8_t    *data_ptr,
+    size_t            data_len,
+    webgrep_bloom_t **out_bloom
+);
+
+/** 43. Parses a Zstd Seek Table footer from a random-access `read_at_cb` source. */
+WEBGREP_API int webgrep_zstd_seek_table_parse(
+    webgrep_read_at_cb           read_at_cb,
+    void                        *read_userdata,
+    uint64_t                     total_size,
+    webgrep_zstd_seek_table_t **out_table
+);
+
+/** 44. Frees a parsed Zstd Seek Table handle. Safe to call with NULL. */
+WEBGREP_API void webgrep_zstd_seek_table_free(webgrep_zstd_seek_table_t *table);
+
+/** 45. Returns the total uncompressed byte size covered by `table` (or 0 if NULL). */
+WEBGREP_API uint64_t webgrep_zstd_seek_table_uncompressed_size(const webgrep_zstd_seek_table_t *table);
+
+/** 46. Random-access reads uncompressed bytes at `uncomp_offset` using `table` and `read_at_cb`. */
+WEBGREP_API int webgrep_zstd_seek_table_read_at(
+    const webgrep_zstd_seek_table_t *table,
+    webgrep_read_at_cb               read_at_cb,
+    void                            *read_userdata,
+    uint64_t                         total_size,
+    uint64_t                         uncomp_offset,
+    uint8_t                         *out_buf,
+    size_t                           out_cap,
+    uint64_t                         max_ratio,
+    size_t                          *out_n
+);
+
+/** 47. Builds an indexed Gzip checkpoint table by streaming `read_cb`. */
+WEBGREP_API int webgrep_gzip_index_build(
+    webgrep_read_cb        read_cb,
+    void                  *read_userdata,
+    uint64_t               checkpoint_interval,
+    webgrep_gzip_index_t **out_index
+);
+
+/** 48. Frees a Gzip index handle. Safe to call with NULL. */
+WEBGREP_API void webgrep_gzip_index_free(webgrep_gzip_index_t *index);
+
+/** 49. Returns the total uncompressed byte size indexed by `index` (or 0 if NULL). */
+WEBGREP_API uint64_t webgrep_gzip_index_uncompressed_size(const webgrep_gzip_index_t *index);
+
+/**
+ * 50. Serializes `index` into `out_buf[0..out_cap]`.
+ * Pass `out_buf = NULL` to query the required byte length in `*out_len` (`WEBGREP_OK`).
+ * Returns `WEBGREP_ERR_TOO_LARGE` (while writing `*out_len`) if `out_cap` is smaller than required.
+ */
+WEBGREP_API int webgrep_gzip_index_serialize(
+    const webgrep_gzip_index_t *index,
+    uint8_t                    *out_buf,
+    size_t                      out_cap,
+    size_t                     *out_len
+);
+
+/** 51. Deserializes an indexed Gzip table from `data_ptr[0..data_len]`. */
+WEBGREP_API int webgrep_gzip_index_deserialize(
+    const uint8_t         *data_ptr,
+    size_t                 data_len,
+    webgrep_gzip_index_t **out_index
+);
+
+/** 52. Random-access reads uncompressed bytes at `uncomp_offset` using `index` and `read_at_cb`. */
+WEBGREP_API int webgrep_gzip_index_read_at(
+    const webgrep_gzip_index_t *index,
+    webgrep_read_at_cb          read_at_cb,
+    void                       *read_userdata,
+    uint64_t                    total_size,
+    uint8_t                     has_total_size,
+    uint64_t                    uncomp_offset,
+    uint8_t                    *out_buf,
+    size_t                      out_cap,
+    size_t                     *out_n
 );
 
 #ifdef __cplusplus

@@ -10,17 +10,25 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const ascii = @import("ascii.zig");
+const build_options = @import("build_options");
 const byteset = @import("byteset.zig");
+const cpuid = @import("../io/cpuid.zig");
 const frequency = @import("frequency.zig");
 const matcher = @import("../matcher.zig");
 const memchr = @import("memchr.zig");
 
-const has_nibble_isa = builtin.cpu.arch == .aarch64 or builtin.cpu.arch == .x86_64;
-const nibble_isa = switch (builtin.cpu.arch) {
+const static_nibble_isa = switch (builtin.cpu.arch) {
+    .aarch64 => std.Target.aarch64.featureSetHas(builtin.cpu.features, .neon),
+    .x86_64 => std.Target.x86.featureSetHas(builtin.cpu.features, .ssse3),
+    else => false,
+};
+const runtime_nibble_isa = !static_nibble_isa and builtin.cpu.arch == .x86_64 and build_options.teddy == .runtime;
+const has_nibble_isa = static_nibble_isa or runtime_nibble_isa;
+const nibble_isa = if (has_nibble_isa) switch (builtin.cpu.arch) {
     .aarch64 => @import("teddy_neon.zig"),
     .x86_64 => @import("teddy_ssse3.zig"),
     else => struct {},
-};
+} else struct {};
 
 const sentinel: u32 = 0;
 
@@ -71,6 +79,7 @@ pub const Ac = struct {
     max_off: u32,
     min_len: u32,
     use_anchor: bool,
+    use_nibble_skip: bool = false,
     start_lo: [16]u8,
     start_hi: [16]u8,
     allocator: std.mem.Allocator,
@@ -122,51 +131,24 @@ pub const Ac = struct {
 
         const lo_v: @Vector(16, u8) = self.start_lo;
         const hi_v: @Vector(16, u8) = self.start_hi;
-        const zero: @Vector(16, u8) = @splat(0);
         var state: u32 = 0;
         var i = start;
         var nul_checked = start;
 
         outer: while (i < haystack.len) {
             if (comptime has_nibble_isa) {
-                const stride = 64;
-                while (state == 0 and best == null and i + stride <= haystack.len) {
-                    var accs: [4]@Vector(16, u8) = undefined;
-                    var nul_hit: @Vector(16, bool) = @splat(false);
-                    inline for (0..4) |w| {
-                        const b: @Vector(16, u8) = haystack[i + w * 16 ..][0..16].*;
-                        const lo_idx = b & @as(@Vector(16, u8), @splat(0x0f));
-                        const hi_idx = b >> @as(@Vector(16, u8), @splat(@as(u8, 4)));
-                        accs[w] = nibble_isa.lookup(lo_v, lo_idx) & nibble_isa.lookup(hi_v, hi_idx);
-                        if (watch_nul) nul_hit = nul_hit | (b == zero);
-                    }
-                    const combined = (accs[0] | accs[1]) | (accs[2] | accs[3]);
-                    const check_v = if (watch_nul) combined | @as(@Vector(16, u8), @intFromBool(nul_hit)) else combined;
-                    if (@reduce(.Or, check_v) == 0) {
-                        i += stride;
-                        if (watch_nul) nul_checked = i;
-                        continue;
-                    }
-                    if (watch_nul and @reduce(.Or, combined) == 0) {
-                        if (memchr.find(16, haystack[0 .. i + stride], nul_checked, 0)) |nul_at| {
-                            nul_out.* = nul_at;
-                            return null;
-                        }
-                    }
-                    inline for (0..4) |w| {
-                        if (@reduce(.Or, accs[w]) != 0) {
-                            if (watch_nul and @reduce(.Or, nul_hit)) {
-                                if (memchr.find(16, haystack[0 .. i + w * 16], nul_checked, 0)) |nul_at| {
-                                    nul_out.* = nul_at;
-                                    return null;
-                                }
-                            }
-                            i += w * 16;
-                            if (watch_nul and i > nul_checked) nul_checked = i;
-                            break;
-                        }
-                    }
-                    break;
+                if (self.use_nibble_skip and state == 0 and best == null and i + 64 <= haystack.len) {
+                    const skip_res = nibbleSkip64(
+                        lo_v,
+                        hi_v,
+                        haystack,
+                        i,
+                        watch_nul,
+                        &nul_checked,
+                        nul_out,
+                    );
+                    if (skip_res.nul_hit) return null;
+                    i = skip_res.pos;
                 }
             }
 
@@ -207,6 +189,64 @@ pub const Ac = struct {
             }
         }
         return .{ .start = chosen.start, .end = chosen.end, .pattern_id = chosen.id };
+    }
+
+    const NibbleSkipResult = struct {
+        pos: usize,
+        nul_hit: bool = false,
+    };
+
+    noinline fn nibbleSkip64(
+        lo_v: @Vector(16, u8),
+        hi_v: @Vector(16, u8),
+        haystack: []const u8,
+        start_i: usize,
+        comptime watch_nul: bool,
+        nul_checked: *usize,
+        nul_out: *?usize,
+    ) NibbleSkipResult {
+        const zero: @Vector(16, u8) = @splat(0);
+        const stride = 64;
+        var i = start_i;
+        while (i + stride <= haystack.len) {
+            var accs: [4]@Vector(16, u8) = undefined;
+            var nul_hit: @Vector(16, bool) = @splat(false);
+            inline for (0..4) |w| {
+                const b: @Vector(16, u8) = haystack[i + w * 16 ..][0..16].*;
+                const lo_idx = b & @as(@Vector(16, u8), @splat(0x0f));
+                const hi_idx = b >> @as(@Vector(16, u8), @splat(@as(u8, 4)));
+                accs[w] = nibble_isa.lookup(lo_v, lo_idx) & nibble_isa.lookup(hi_v, hi_idx);
+                if (watch_nul) nul_hit = nul_hit | (b == zero);
+            }
+            const combined = (accs[0] | accs[1]) | (accs[2] | accs[3]);
+            const check_v = if (watch_nul) combined | @as(@Vector(16, u8), @intFromBool(nul_hit)) else combined;
+            if (@reduce(.Or, check_v) == 0) {
+                i += stride;
+                if (watch_nul) nul_checked.* = i;
+                continue;
+            }
+            if (watch_nul and @reduce(.Or, combined) == 0) {
+                if (memchr.find(16, haystack[0 .. i + stride], nul_checked.*, 0)) |nul_at| {
+                    nul_out.* = nul_at;
+                    return .{ .pos = i, .nul_hit = true };
+                }
+            }
+            inline for (0..4) |w| {
+                if (@reduce(.Or, accs[w]) != 0) {
+                    if (watch_nul and @reduce(.Or, nul_hit)) {
+                        if (memchr.find(16, haystack[0 .. i + w * 16], nul_checked.*, 0)) |nul_at| {
+                            nul_out.* = nul_at;
+                            return .{ .pos = i, .nul_hit = true };
+                        }
+                    }
+                    i += w * 16;
+                    if (watch_nul and i > nul_checked.*) nul_checked.* = i;
+                    break;
+                }
+            }
+            return .{ .pos = i };
+        }
+        return .{ .pos = i };
     }
 
     noinline fn findAnchored(
@@ -457,6 +497,12 @@ pub fn build(
     errdefer allocator.free(owned_outs);
     const anchor = try buildAnchor(allocator, patterns, ignore_case);
     deinitNodes(allocator, &nodes);
+    const use_nibble_skip = if (comptime static_nibble_isa)
+        true
+    else if (comptime runtime_nibble_isa)
+        cpuid.detectX86().ssse3
+    else
+        false;
     return .{
         .dense = dense,
         .class_of = class_of,
@@ -473,6 +519,7 @@ pub fn build(
         .max_off = anchor.max_off,
         .min_len = anchor.min_len,
         .use_anchor = anchor.use,
+        .use_nibble_skip = use_nibble_skip,
         .start_lo = start_lo,
         .start_hi = start_hi,
         .allocator = allocator,

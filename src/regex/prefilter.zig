@@ -17,6 +17,7 @@ const popLastUtf8Codepoint = inst_mod.popLastUtf8Codepoint;
 const utf8SeqLenAt = inst_mod.utf8SeqLenAt;
 
 pub fn extractLiterals(self: anytype, pattern: []const u8, options: inst_mod.RegexOptions) !void {
+    if (self.saw_extended) return;
     // Analyze required literal runs on the main spine: top-level contiguous literals outside `(a|b)`, `*`, `?`, or `{0,...}`
     var first_lit = std.ArrayList(u8).empty;
     defer first_lit.deinit(self.allocator);
@@ -38,13 +39,50 @@ pub fn extractLiterals(self: anytype, pattern: []const u8, options: inst_mod.Reg
         const c = pattern[i];
         switch (c) {
             '(' => {
-                // Check for standalone inline flag group `(?i)`, `(?m)`, `(?s)`, `(?-i)` at the start of the pattern
+                // Check for standalone inline flag group `(?i)`, `(?m)`, `(?s)`, `(?U)`, `(?-i)` or named group `(?P<name>...)` / `(?<name>...)`
                 if (i + 2 < pattern.len and pattern[i + 1] == '?') {
+                    if (i + 3 < pattern.len and pattern[i + 2] == 'P' and pattern[i + 3] == '<') {
+                        if (curr_lit.items.len > best_lit.items.len) {
+                            best_lit.clearRetainingCapacity();
+                            try best_lit.appendSlice(self.allocator, curr_lit.items);
+                            best_offset = curr_offset;
+                        }
+                        curr_lit.clearRetainingCapacity();
+                        depth += 1;
+                        prefix_active = false;
+                        exact_only = false;
+                        fixed_offset = null;
+                        if (std.mem.indexOfScalarPos(u8, pattern, i + 4, '>')) |gt| {
+                            i = gt + 1;
+                        } else {
+                            return;
+                        }
+                        continue;
+                    }
+                    if (pattern[i + 2] == '<') {
+                        if (curr_lit.items.len > best_lit.items.len) {
+                            best_lit.clearRetainingCapacity();
+                            try best_lit.appendSlice(self.allocator, curr_lit.items);
+                            best_offset = curr_offset;
+                        }
+                        curr_lit.clearRetainingCapacity();
+                        depth += 1;
+                        prefix_active = false;
+                        exact_only = false;
+                        fixed_offset = null;
+                        if (std.mem.indexOfScalarPos(u8, pattern, i + 3, '>')) |gt| {
+                            i = gt + 1;
+                        } else {
+                            return;
+                        }
+                        continue;
+                    }
                     var j = i + 2;
                     var only_flags = false;
                     var has_neg_or_scoped = false;
-                    while (j < pattern.len and (pattern[j] == 'i' or pattern[j] == 'm' or pattern[j] == 's' or pattern[j] == '-')) : (j += 1) {
+                    while (j < pattern.len and (pattern[j] == 'i' or pattern[j] == 'm' or pattern[j] == 's' or pattern[j] == 'U' or pattern[j] == 'x' or pattern[j] == '-')) : (j += 1) {
                         only_flags = true;
+                        if (pattern[j] == 'x') return;
                         if (pattern[j] == '-') has_neg_or_scoped = true;
                     }
                     if (j < pattern.len and pattern[j] == ')' and only_flags and !has_neg_or_scoped and i == 0) {
@@ -141,9 +179,37 @@ pub fn extractLiterals(self: anytype, pattern: []const u8, options: inst_mod.Reg
                 }
                 if (i < pattern.len and pattern[i] == ']') i += 1;
                 while (i < pattern.len and pattern[i] != ']') {
+                    if (pattern[i] == '[' and i + 1 < pattern.len and pattern[i + 1] == ':') {
+                        if (std.mem.indexOfPos(u8, pattern, i + 2, ":]")) |end_posix| {
+                            if (pattern[i + 2] == '^') class_fixed_one = false;
+                            i = end_posix + 2;
+                            continue;
+                        }
+                    }
                     if (pattern[i] >= 0x80) class_fixed_one = false;
                     if (pattern[i] == '\\' and i + 1 < pattern.len) {
                         const esc = pattern[i + 1];
+                        if (esc == 'Q') {
+                            class_fixed_one = false;
+                            i += 2;
+                            if (std.mem.indexOfPos(u8, pattern, i, "\\E")) |e_pos| {
+                                i = e_pos + 2;
+                            } else {
+                                i = pattern.len;
+                            }
+                            continue;
+                        }
+                        if (esc == 'x' or esc == 'u') {
+                            class_fixed_one = false;
+                            i += 2;
+                            if (i < pattern.len and pattern[i] == '{') {
+                                while (i < pattern.len and pattern[i] != '}') i += 1;
+                                if (i < pattern.len) i += 1;
+                            } else {
+                                i = @min(pattern.len, i + (if (esc == 'x') @as(usize, 2) else @as(usize, 4)));
+                            }
+                            continue;
+                        }
                         if (esc == 'D' or esc == 'W' or esc == 'S' or esc == 'p' or esc == 'P' or esc >= 0x80) {
                             class_fixed_one = false;
                         }
@@ -162,6 +228,43 @@ pub fn extractLiterals(self: anytype, pattern: []const u8, options: inst_mod.Reg
             '\\' => {
                 if (i + 1 >= pattern.len) break;
                 const next_c = pattern[i + 1];
+                if (next_c == 'Q') {
+                    if (curr_lit.items.len > best_lit.items.len) {
+                        best_lit.clearRetainingCapacity();
+                        try best_lit.appendSlice(self.allocator, curr_lit.items);
+                        best_offset = curr_offset;
+                    }
+                    curr_lit.clearRetainingCapacity();
+                    prefix_active = false;
+                    exact_only = false;
+                    fixed_offset = null;
+                    i += 2;
+                    if (std.mem.indexOfPos(u8, pattern, i, "\\E")) |e_pos| {
+                        i = e_pos + 2;
+                    } else {
+                        i = pattern.len;
+                    }
+                    continue;
+                }
+                if (next_c == 'x' or next_c == 'u') {
+                    if (curr_lit.items.len > best_lit.items.len) {
+                        best_lit.clearRetainingCapacity();
+                        try best_lit.appendSlice(self.allocator, curr_lit.items);
+                        best_offset = curr_offset;
+                    }
+                    curr_lit.clearRetainingCapacity();
+                    prefix_active = false;
+                    exact_only = false;
+                    fixed_offset = null;
+                    i += 2;
+                    if (i < pattern.len and pattern[i] == '{') {
+                        while (i < pattern.len and pattern[i] != '}') i += 1;
+                        if (i < pattern.len) i += 1;
+                    } else {
+                        i = @min(pattern.len, i + (if (next_c == 'x') @as(usize, 2) else @as(usize, 4)));
+                    }
+                    continue;
+                }
                 if (next_c == 'p' or next_c == 'P') {
                     if (curr_lit.items.len > best_lit.items.len) {
                         best_lit.clearRetainingCapacity();
@@ -182,10 +285,13 @@ pub fn extractLiterals(self: anytype, pattern: []const u8, options: inst_mod.Reg
                     continue;
                 }
                 const decoded: ?u8 = switch (next_c) {
+                    'a' => 0x07,
+                    'f' => 0x0C,
+                    'v' => 0x0B,
                     'n' => if (self.multiline) '\n' else null,
                     'r' => '\r',
                     't' => '\t',
-                    'A', 'z', 'd', 'D', 'w', 'W', 's', 'S', 'b', 'B', '0' => null,
+                    'A', 'z', 'Z', 'd', 'D', 'w', 'W', 's', 'S', 'b', 'B', '0' => null,
                     else => next_c,
                 };
                 if (decoded) |lit_b| {
@@ -298,13 +404,14 @@ pub fn extractRequiredPrefix(allocator: std.mem.Allocator, pattern: []const u8, 
     defer prefix.deinit(allocator);
 
     var i: usize = 0;
-    // Allow leading `(?i)` / `(?m)` / `(?s)` standalone flag group
+    // Allow leading `(?i)` / `(?m)` / `(?s)` / `(?U)` standalone flag group (bail out on `(?x)`)
     if (pattern.len >= 4 and pattern[0] == '(' and pattern[1] == '?') {
         var j: usize = 2;
         var only_flags = false;
         var has_neg = false;
-        while (j < pattern.len and (pattern[j] == 'i' or pattern[j] == 'm' or pattern[j] == 's' or pattern[j] == '-')) : (j += 1) {
+        while (j < pattern.len and (pattern[j] == 'i' or pattern[j] == 'm' or pattern[j] == 's' or pattern[j] == 'U' or pattern[j] == 'x' or pattern[j] == '-')) : (j += 1) {
             only_flags = true;
+            if (pattern[j] == 'x') return null;
             if (pattern[j] == '-') has_neg = true;
         }
         if (j < pattern.len and pattern[j] == ')' and only_flags and !has_neg) {
@@ -338,13 +445,17 @@ pub fn extractRequiredPrefix(allocator: std.mem.Allocator, pattern: []const u8, 
             '\\' => {
                 if (i + 1 >= pattern.len) break;
                 const next_c = pattern[i + 1];
-                if (next_c == 'p' or next_c == 'P' or next_c == 'A' or next_c == 'z' or
+                if (next_c == 'p' or next_c == 'P' or next_c == 'A' or next_c == 'z' or next_c == 'Z' or
+                    next_c == 'x' or next_c == 'u' or next_c == 'Q' or
                     next_c == 'd' or next_c == 'D' or next_c == 'w' or next_c == 'W' or
                     next_c == 's' or next_c == 'S' or next_c == 'b' or next_c == 'B' or next_c == '0')
                 {
                     break;
                 }
                 const lit_b: u8 = switch (next_c) {
+                    'a' => 0x07,
+                    'f' => 0x0C,
+                    'v' => 0x0B,
                     'n' => if (!multiline) break else '\n',
                     'r' => '\r',
                     't' => '\t',
@@ -366,6 +477,7 @@ pub fn extractRequiredPrefix(allocator: std.mem.Allocator, pattern: []const u8, 
 }
 
 pub fn tryExtractAltLiterals(self: anytype, pattern: []const u8, find_opts: matcher.FindOptions) !void {
+    if (self.saw_extended) return;
     var inner = pattern;
     if (inner.len >= 3 and inner[0] == '(' and inner[inner.len - 1] == ')') {
         // Check whether the opening '(' at index 0 matches the closing ')' at inner.len - 1
@@ -376,10 +488,22 @@ pub fn tryExtractAltLiterals(self: anytype, pattern: []const u8, find_opts: matc
         while (j < inner.len) : (j += 1) {
             const ch = inner[j];
             if (ch == '\\' and j + 1 < inner.len) {
+                if (inner[j + 1] == 'Q') {
+                    j += 2;
+                    while (j + 1 < inner.len and !(inner[j] == '\\' and inner[j + 1] == 'E')) : (j += 1) {}
+                    if (j + 1 < inner.len) j += 1;
+                    continue;
+                }
                 j += 1;
                 continue;
             }
             if (in_class) {
+                if (ch == '[' and j + 1 < inner.len and inner[j + 1] == ':') {
+                    if (std.mem.indexOfPos(u8, inner, j + 2, ":]")) |end_posix| {
+                        j = end_posix + 1;
+                        continue;
+                    }
+                }
                 if (ch == ']') in_class = false;
                 continue;
             }
@@ -400,6 +524,14 @@ pub fn tryExtractAltLiterals(self: anytype, pattern: []const u8, find_opts: matc
         if (wraps_entire and depth == 0) {
             if (std.mem.startsWith(u8, inner, "(?:")) {
                 inner = inner[3 .. inner.len - 1];
+            } else if (std.mem.startsWith(u8, inner, "(?P<")) {
+                if (std.mem.indexOfScalarPos(u8, inner, 4, '>')) |gt| {
+                    inner = inner[gt + 1 .. inner.len - 1];
+                }
+            } else if (std.mem.startsWith(u8, inner, "(?<")) {
+                if (std.mem.indexOfScalarPos(u8, inner, 3, '>')) |gt| {
+                    inner = inner[gt + 1 .. inner.len - 1];
+                }
             } else if (inner[1] != '?') {
                 inner = inner[1 .. inner.len - 1];
             }
@@ -415,10 +547,22 @@ pub fn tryExtractAltLiterals(self: anytype, pattern: []const u8, find_opts: matc
     while (i < inner.len) : (i += 1) {
         const ch = inner[i];
         if (ch == '\\' and i + 1 < inner.len) {
+            if (inner[i + 1] == 'Q') {
+                i += 2;
+                while (i + 1 < inner.len and !(inner[i] == '\\' and inner[i + 1] == 'E')) : (i += 1) {}
+                if (i + 1 < inner.len) i += 1;
+                continue;
+            }
             i += 1;
             continue;
         }
         if (in_class) {
+            if (ch == '[' and i + 1 < inner.len and inner[i + 1] == ':') {
+                if (std.mem.indexOfPos(u8, inner, i + 2, ":]")) |end_posix| {
+                    i = end_posix + 1;
+                    continue;
+                }
+            }
             if (ch == ']') in_class = false;
             continue;
         }
@@ -477,7 +621,8 @@ pub fn tryExtractAltLiterals(self: anytype, pattern: []const u8, find_opts: matc
                         break;
                     }
                     const next_c = br[k + 1];
-                    if (next_c == 'p' or next_c == 'P' or next_c == 'A' or next_c == 'z' or
+                    if (next_c == 'p' or next_c == 'P' or next_c == 'A' or next_c == 'z' or next_c == 'Z' or
+                        next_c == 'x' or next_c == 'u' or next_c == 'Q' or
                         next_c == 'd' or next_c == 'D' or next_c == 'w' or next_c == 'W' or
                         next_c == 's' or next_c == 'S' or next_c == 'b' or next_c == 'B' or next_c == '0')
                     {
@@ -485,6 +630,9 @@ pub fn tryExtractAltLiterals(self: anytype, pattern: []const u8, find_opts: matc
                         break;
                     }
                     const lit_b: u8 = switch (next_c) {
+                        'a' => 0x07,
+                        'f' => 0x0C,
+                        'v' => 0x0B,
                         'n' => if (!self.multiline) {
                             br_exact = false;
                             break;

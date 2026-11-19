@@ -40,7 +40,8 @@ pub const Compiler = struct {
     multiline: bool,
     dot_all: bool,
     capture_count: u8 = 0,
-    capture_positions: [9]usize = @splat(std.math.maxInt(usize)),
+    capture_positions: [inst_mod.max_capture_groups]usize = @splat(std.math.maxInt(usize)),
+    capture_names: [inst_mod.max_capture_groups][]const u8 = @splat(""),
     max_inst: usize,
     max_repeat: usize = inst_mod.default_max_repeat,
     max_recursion_depth: usize = inst_mod.default_max_recursion_depth,
@@ -51,6 +52,11 @@ pub const Compiler = struct {
     saw_scoped_m: bool = false,
     saw_ignore_case: bool = false,
     explicit_neg_m: bool = false,
+    extended: bool = false,
+    ungreedy: bool = false,
+    saw_extended: bool = false,
+    saw_ungreedy: bool = false,
+    saw_literal_nl_pos: ?usize = null,
     diag: ?*CompileDiagnostic = null,
     pattern_index: ?usize = null,
     match_inst: Inst = .match,
@@ -72,11 +78,39 @@ pub const Compiler = struct {
         return err;
     }
 
+    fn recordLiteralNewline(self: *Compiler, pos: usize) void {
+        if (!self.multiline and self.saw_literal_nl_pos == null) {
+            self.saw_literal_nl_pos = pos;
+        }
+    }
+
+    fn skipExtended(self: *Compiler) void {
+        if (!self.extended) return;
+        while (self.pos < self.pattern.len) {
+            const b = self.pattern[self.pos];
+            if (b == ' ' or b == '\t' or b == '\n' or b == '\r' or b == 0x0B or b == 0x0C) {
+                self.pos += 1;
+                continue;
+            }
+            if (b == '#') {
+                self.pos += 1;
+                while (self.pos < self.pattern.len and self.pattern[self.pos] != '\n') {
+                    self.pos += 1;
+                }
+                if (self.pos < self.pattern.len and self.pattern[self.pos] == '\n') {
+                    self.pos += 1;
+                }
+                continue;
+            }
+            break;
+        }
+    }
+
     fn groupForPos(self: *Compiler, paren_pos: usize) u8 {
         for (self.capture_positions[0..self.capture_count], 0..) |p, idx| {
             if (p == paren_pos) return @intCast(idx + 1);
         }
-        if (self.capture_count < 9) {
+        if (self.capture_count < inst_mod.max_capture_groups) {
             self.capture_positions[self.capture_count] = paren_pos;
             self.capture_count += 1;
             return self.capture_count;
@@ -196,6 +230,7 @@ pub const Compiler = struct {
             return self.fail(error.RegexSyntax, .invalid_utf8, bad_pos, "pattern contains invalid UTF-8 byte sequence");
         }
         const body = try self.parseAlt();
+        self.skipExtended();
         if (self.pos != self.pattern.len) {
             if (self.pattern[self.pos] == ')') {
                 return self.fail(error.RegexSyntax, .unmatched_close_paren, self.pos, "unmatched closing parenthesis ')'");
@@ -356,6 +391,7 @@ pub const Compiler = struct {
 
     fn parseAlt(self: *Compiler) Error!Frag {
         var left = try self.parseConcat();
+        self.skipExtended();
         while (self.pos < self.pattern.len and self.pattern[self.pos] == '|') {
             self.has_alt = true;
             self.pos += 1;
@@ -365,13 +401,16 @@ pub const Compiler = struct {
             self.patch(left.end, join_jmp);
             self.patch(right.end, join_jmp);
             left = .{ .start = split_pc, .end = join_jmp };
+            self.skipExtended();
         }
         return left;
     }
 
     fn parseConcat(self: *Compiler) Error!Frag {
         var first: ?Frag = null;
-        while (self.pos < self.pattern.len) {
+        while (true) {
+            self.skipExtended();
+            if (self.pos >= self.pattern.len) break;
             const c = self.pattern[self.pos];
             if (c == ')' or c == '|') break;
             const rep = try self.parseRepeat();
@@ -388,12 +427,15 @@ pub const Compiler = struct {
     }
 
     fn parseRepeat(self: *Compiler) Error!Frag {
+        self.skipExtended();
         const atom_start_pos = self.pos;
         var atom = try self.parseAtom();
         const atom_end_pos = self.pos;
 
         var had_quantifier = false;
-        while (self.pos < self.pattern.len) {
+        while (true) {
+            self.skipExtended();
+            if (self.pos >= self.pattern.len) break;
             const c = self.pattern[self.pos];
             switch (c) {
                 '*', '+', '?' => {
@@ -402,12 +444,14 @@ pub const Compiler = struct {
                     }
                     had_quantifier = true;
                     self.pos += 1;
+                    self.skipExtended();
                     var lazy = false;
                     if (self.pos < self.pattern.len and self.pattern[self.pos] == '?') {
                         lazy = true;
-                        self.has_lazy = true;
                         self.pos += 1;
                     }
+                    if (self.ungreedy) lazy = !lazy;
+                    if (lazy) self.has_lazy = true;
                     atom = try self.applyQuantifier(atom, c, lazy);
                 },
                 '{' => {
@@ -416,12 +460,14 @@ pub const Compiler = struct {
                     }
                     had_quantifier = true;
                     const bounds = try self.parseBraces();
+                    self.skipExtended();
                     var lazy = false;
                     if (self.pos < self.pattern.len and self.pattern[self.pos] == '?') {
                         lazy = true;
-                        self.has_lazy = true;
                         self.pos += 1;
                     }
+                    if (self.ungreedy) lazy = !lazy;
+                    if (lazy) self.has_lazy = true;
                     atom = try self.applyBoundedRepeat(atom, atom_start_pos, atom_end_pos, bounds.min, bounds.max, lazy);
                 },
                 else => break,
@@ -600,10 +646,72 @@ pub const Compiler = struct {
                 self.pos += 1;
                 if (self.pos < self.pattern.len and self.pattern[self.pos] == '?') {
                     self.pos += 1;
+                    const is_py_named = (self.pos + 1 < self.pattern.len and self.pattern[self.pos] == 'P' and self.pattern[self.pos + 1] == '<');
+                    const is_pl_named = (!is_py_named and self.pos < self.pattern.len and self.pattern[self.pos] == '<');
+                    if (is_py_named or is_pl_named) {
+                        self.pos += if (is_py_named) @as(usize, 2) else @as(usize, 1);
+                        const name_start = self.pos;
+                        const close_gt = std.mem.indexOfScalarPos(u8, self.pattern, name_start, '>') orelse {
+                            return self.fail(error.RegexSyntax, .invalid_group_name, paren_pos, "unclosed named capture group name");
+                        };
+                        const name = self.pattern[name_start..close_gt];
+                        if (name.len == 0 or !((name[0] >= 'a' and name[0] <= 'z') or (name[0] >= 'A' and name[0] <= 'Z') or name[0] == '_')) {
+                            return self.fail(error.RegexSyntax, .invalid_group_name, paren_pos, "invalid capture group name");
+                        }
+                        for (name[1..]) |ch| {
+                            if (!((ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '_')) {
+                                return self.fail(error.RegexSyntax, .invalid_group_name, paren_pos, "invalid character in capture group name");
+                            }
+                        }
+                        for (self.capture_names[0..self.capture_count], 0..) |existing, idx| {
+                            if (existing.len > 0 and self.capture_positions[idx] != paren_pos and std.mem.eql(u8, existing, name)) {
+                                return self.fail(error.RegexSyntax, .duplicate_group_name, paren_pos, "duplicate capture group name");
+                            }
+                        }
+                        self.pos = close_gt + 1;
+                        if (self.multiline) self.saw_scoped_m = true;
+                        const group_id = self.groupForPos(paren_pos);
+                        if (group_id >= 1 and group_id <= inst_mod.max_capture_groups) {
+                            self.capture_names[group_id - 1] = name;
+                        }
+                        const saved_i = self.ignore_case;
+                        const saved_m = self.multiline;
+                        const saved_neg_m = self.explicit_neg_m;
+                        const saved_s = self.dot_all;
+                        const saved_x = self.extended;
+                        const saved_u = self.ungreedy;
+                        self.depth += 1;
+                        const inner = blk: {
+                            errdefer self.depth -= 1;
+                            break :blk try self.parseAlt();
+                        };
+                        self.depth -= 1;
+                        self.ignore_case = saved_i;
+                        self.multiline = saved_m;
+                        self.explicit_neg_m = saved_neg_m;
+                        self.dot_all = saved_s;
+                        self.extended = saved_x;
+                        self.ungreedy = saved_u;
+                        if (self.pos >= self.pattern.len or self.pattern[self.pos] != ')') {
+                            return self.fail(error.RegexSyntax, .unclosed_group, paren_pos, "unclosed named capture group '('");
+                        }
+                        self.pos += 1;
+                        if (group_id >= 1 and group_id <= inst_mod.max_capture_groups) {
+                            const slot_start: u8 = (group_id - 1) * 2;
+                            const slot_end: u8 = slot_start + 1;
+                            const save_end = try self.emit(.{ .save = .{ .slot = slot_end, .out = 0 } });
+                            self.patch(inner.end, save_end);
+                            const save_start = try self.emit(.{ .save = .{ .slot = slot_start, .out = inner.start } });
+                            return .{ .start = save_start, .end = save_end };
+                        }
+                        return inner;
+                    }
                     var new_i = self.ignore_case;
                     var new_m = self.multiline;
                     var new_neg_m = self.explicit_neg_m;
                     var new_s = self.dot_all;
+                    var new_x = self.extended;
+                    var new_u = self.ungreedy;
                     var neg = false;
                     var saw_flag = false;
                     while (self.pos < self.pattern.len) {
@@ -629,6 +737,16 @@ pub const Compiler = struct {
                                 saw_flag = true;
                                 self.pos += 1;
                             },
+                            'x' => {
+                                new_x = !neg;
+                                saw_flag = true;
+                                self.pos += 1;
+                            },
+                            'U' => {
+                                new_u = !neg;
+                                saw_flag = true;
+                                self.pos += 1;
+                            },
                             else => break,
                         }
                     }
@@ -638,8 +756,12 @@ pub const Compiler = struct {
                         self.multiline = new_m;
                         self.explicit_neg_m = new_neg_m;
                         self.dot_all = new_s;
+                        self.extended = new_x;
+                        self.ungreedy = new_u;
                         if (new_i) self.saw_ignore_case = true;
                         if (new_m) self.saw_scoped_m = true;
+                        if (new_x) self.saw_extended = true;
+                        if (new_u) self.saw_ungreedy = true;
                         const nop = try self.emit(.{ .jmp = 0 });
                         return .{ .start = nop, .end = nop };
                     }
@@ -649,12 +771,18 @@ pub const Compiler = struct {
                         const saved_m = self.multiline;
                         const saved_neg_m = self.explicit_neg_m;
                         const saved_s = self.dot_all;
+                        const saved_x = self.extended;
+                        const saved_u = self.ungreedy;
                         self.ignore_case = new_i;
                         self.multiline = new_m;
                         self.explicit_neg_m = new_neg_m;
                         self.dot_all = new_s;
+                        self.extended = new_x;
+                        self.ungreedy = new_u;
                         if (new_i) self.saw_ignore_case = true;
                         if (new_m) self.saw_scoped_m = true;
+                        if (new_x) self.saw_extended = true;
+                        if (new_u) self.saw_ungreedy = true;
                         self.depth += 1;
                         defer {
                             self.depth -= 1;
@@ -662,6 +790,8 @@ pub const Compiler = struct {
                             self.multiline = saved_m;
                             self.explicit_neg_m = saved_neg_m;
                             self.dot_all = saved_s;
+                            self.extended = saved_x;
+                            self.ungreedy = saved_u;
                         }
                         const inner = try self.parseAlt();
                         if (self.pos >= self.pattern.len or self.pattern[self.pos] != ')') {
@@ -681,6 +811,8 @@ pub const Compiler = struct {
                 const saved_m = self.multiline;
                 const saved_neg_m = self.explicit_neg_m;
                 const saved_s = self.dot_all;
+                const saved_x = self.extended;
+                const saved_u = self.ungreedy;
                 self.depth += 1;
                 const inner = blk: {
                     errdefer self.depth -= 1;
@@ -691,11 +823,13 @@ pub const Compiler = struct {
                 self.multiline = saved_m;
                 self.explicit_neg_m = saved_neg_m;
                 self.dot_all = saved_s;
+                self.extended = saved_x;
+                self.ungreedy = saved_u;
                 if (self.pos >= self.pattern.len or self.pattern[self.pos] != ')') {
                     return self.fail(error.RegexSyntax, .unclosed_group, paren_pos, "unclosed group parenthesis '('");
                 }
                 self.pos += 1;
-                if (group_id >= 1 and group_id <= 9) {
+                if (group_id >= 1 and group_id <= inst_mod.max_capture_groups) {
                     const slot_start: u8 = (group_id - 1) * 2;
                     const slot_end: u8 = slot_start + 1;
                     const save_end = try self.emit(.{ .save = .{ .slot = slot_end, .out = 0 } });
@@ -745,6 +879,7 @@ pub const Compiler = struct {
             },
             else => {
                 if (self.multiline) self.saw_scoped_m = true;
+                if (c == '\n') self.recordLiteralNewline(self.pos);
                 if (c >= 0x80) {
                     const seq_len = utf8SeqLenAt(self.pattern, self.pos, self.pattern.len);
                     if (seq_len > 1) {
@@ -810,6 +945,50 @@ pub const Compiler = struct {
         return .{ .ranges = ranges, .negated = is_neg };
     }
 
+    fn parseHexScalar(self: *Compiler, kind: u8, slash_pos: usize) Error!u21 {
+        if (self.pos < self.pattern.len and self.pattern[self.pos] == '{') {
+            self.pos += 1; // skip '{'
+            const hex_start = self.pos;
+            var val: u32 = 0;
+            var digits: usize = 0;
+            while (self.pos < self.pattern.len and self.pattern[self.pos] != '}') : (self.pos += 1) {
+                const d = std.fmt.charToDigit(self.pattern[self.pos], 16) catch {
+                    return self.fail(error.RegexSyntax, .invalid_escape, slash_pos, "invalid hex digit in escape sequence");
+                };
+                digits += 1;
+                if (digits > 6) {
+                    return self.fail(error.RegexSyntax, .invalid_escape, slash_pos, "hex escape exceeds 6 digits");
+                }
+                val = (val << 4) | d;
+            }
+            if (self.pos >= self.pattern.len or self.pattern[self.pos] != '}' or self.pos == hex_start) {
+                return self.fail(error.RegexSyntax, .invalid_escape, slash_pos, "invalid or unclosed braced hex escape");
+            }
+            self.pos += 1; // skip '}'
+            if (val > 0x10FFFF or (val >= 0xD800 and val <= 0xDFFF)) {
+                return self.fail(error.RegexSyntax, .invalid_escape, slash_pos, "hex escape is not a valid Unicode scalar value");
+            }
+            return @intCast(val);
+        }
+
+        const expected: usize = if (kind == 'x') 2 else 4;
+        if (self.pos + expected > self.pattern.len) {
+            return self.fail(error.RegexSyntax, .invalid_escape, slash_pos, "incomplete hex escape sequence");
+        }
+        var val: u32 = 0;
+        for (self.pattern[self.pos .. self.pos + expected]) |ch| {
+            const d = std.fmt.charToDigit(ch, 16) catch {
+                return self.fail(error.RegexSyntax, .invalid_escape, slash_pos, "invalid hex digit in escape sequence");
+            };
+            val = (val << 4) | d;
+        }
+        self.pos += expected;
+        if (val >= 0xD800 and val <= 0xDFFF) {
+            return self.fail(error.RegexSyntax, .invalid_escape, slash_pos, "hex escape is a surrogate code point");
+        }
+        return @intCast(val);
+    }
+
     fn parseEscape(self: *Compiler) Error!Frag {
         const slash_pos = self.pos;
         self.pos += 1; // skip '\'
@@ -841,6 +1020,10 @@ pub const Compiler = struct {
                 const pc = try self.emit(.{ .assert = .{ .kind = .end_input, .out = 0 } });
                 return .{ .start = pc, .end = pc };
             },
+            'Z' => {
+                const pc = try self.emit(.{ .assert = .{ .kind = .end_input_before_nl, .out = 0 } });
+                return .{ .start = pc, .end = pc };
+            },
             'b' => {
                 const pc = try self.emit(.{ .assert = .{ .kind = .word_boundary, .out = 0 } });
                 return .{ .start = pc, .end = pc };
@@ -848,6 +1031,64 @@ pub const Compiler = struct {
             'B' => {
                 const pc = try self.emit(.{ .assert = .{ .kind = .not_word_boundary, .out = 0 } });
                 return .{ .start = pc, .end = pc };
+            },
+            'Q' => {
+                if (self.multiline) self.saw_scoped_m = true;
+                const lit_start = self.pos;
+                var end_pos = self.pattern.len;
+                if (std.mem.indexOfPos(u8, self.pattern, lit_start, "\\E")) |e_pos| {
+                    end_pos = e_pos;
+                    self.pos = e_pos + 2;
+                } else {
+                    self.pos = self.pattern.len;
+                }
+                const verbatim = self.pattern[lit_start..end_pos];
+                if (verbatim.len == 0) {
+                    const nop = try self.emit(.{ .jmp = 0 });
+                    return .{ .start = nop, .end = nop };
+                }
+                var idx: usize = 0;
+                var combined: ?Frag = null;
+                while (idx < verbatim.len) {
+                    const ch = verbatim[idx];
+                    if (ch == '\n') self.recordLiteralNewline(lit_start + idx);
+                    const seq_len: usize = if (ch >= 0x80) utf8SeqLenAt(verbatim, idx, verbatim.len) else 1;
+                    const raw = verbatim[idx .. idx + seq_len];
+                    const piece: Frag = if (seq_len > 1) blk: {
+                        const cp = std.unicode.utf8Decode(raw) catch unreachable;
+                        break :blk try self.emitCodepoint(cp, raw);
+                    } else if (self.ignore_case and self.unicode_case and (ch == 'k' or ch == 'K' or ch == 's' or ch == 'S')) blk: {
+                        break :blk try self.emitCodepoint(ch, raw);
+                    } else blk: {
+                        const pc = try self.emit(.{ .byte = .{ .b = ch, .ignore_case = self.ignore_case, .out = 0 } });
+                        break :blk Frag{ .start = pc, .end = pc };
+                    };
+                    if (combined) |prev| {
+                        self.patch(prev.end, piece.start);
+                        combined = .{ .start = prev.start, .end = piece.end };
+                    } else {
+                        combined = piece;
+                    }
+                    idx += seq_len;
+                }
+                return combined.?;
+            },
+            'x', 'u' => {
+                if (self.multiline) self.saw_scoped_m = true;
+                const cp = try self.parseHexScalar(c, slash_pos);
+                var enc: [4]u8 = undefined;
+                const ulen = std.unicode.utf8Encode(cp, &enc) catch {
+                    return self.fail(error.RegexSyntax, .invalid_escape, slash_pos, "invalid Unicode scalar in escape sequence");
+                };
+                if (cp < 0x80) {
+                    const b: u8 = @intCast(cp);
+                    if (self.ignore_case and self.unicode_case and (b == 'k' or b == 'K' or b == 's' or b == 'S')) {
+                        return self.emitCodepoint(cp, enc[0..1]);
+                    }
+                    const pc = try self.emit(.{ .byte = .{ .b = b, .ignore_case = self.ignore_case, .out = 0 } });
+                    return .{ .start = pc, .end = pc };
+                }
+                return self.emitCodepoint(cp, enc[0..ulen]);
             },
             'd', 'D', 'w', 'W', 's', 'S' => {
                 var set = ByteSet{};
@@ -874,6 +1115,9 @@ pub const Compiler = struct {
             },
             else => {
                 const b: u8 = switch (c) {
+                    'a' => 0x07,
+                    'f' => 0x0C,
+                    'v' => 0x0B,
                     'n' => '\n',
                     'r' => '\r',
                     't' => '\t',
@@ -1009,6 +1253,68 @@ pub const Compiler = struct {
             }
             first = false;
 
+            // Check for POSIX class [:name:] / [:^name:] inside [...]
+            if (c == '[' and self.pos + 1 < self.pattern.len and self.pattern[self.pos + 1] == ':') {
+                const posix_pos = self.pos;
+                const close_idx = std.mem.indexOfPos(u8, self.pattern, self.pos + 2, ":]") orelse {
+                    return self.fail(error.RegexSyntax, .invalid_posix_class, posix_pos, "unclosed POSIX character class '[:'");
+                };
+                var raw_name = self.pattern[self.pos + 2 .. close_idx];
+                var pneg = false;
+                if (raw_name.len > 0 and raw_name[0] == '^') {
+                    pneg = true;
+                    raw_name = raw_name[1..];
+                }
+                if (!addPosixClass(&set, raw_name, pneg, self.ignore_case)) {
+                    return self.fail(error.RegexSyntax, .invalid_posix_class, posix_pos, "unknown POSIX character class");
+                }
+                has_byte_set = true;
+                if (pneg) {
+                    try unicode_list.append(self.allocator, .{ .start = 0x80, .end = 0x10FFFF });
+                    has_unicode_ranges = true;
+                }
+                self.pos = close_idx + 2;
+                if (self.pos + 1 < self.pattern.len and self.pattern[self.pos] == '-' and self.pattern[self.pos + 1] != ']') {
+                    return self.fail(error.RegexSyntax, .invalid_char_range, self.pos, "POSIX class cannot be range bound");
+                }
+                continue;
+            }
+
+            // Check for \Q...\E inside [...]
+            if (c == '\\' and self.pos + 1 < self.pattern.len and self.pattern[self.pos + 1] == 'Q') {
+                const lit_start = self.pos + 2;
+                var end_pos = self.pattern.len;
+                if (std.mem.indexOfPos(u8, self.pattern, lit_start, "\\E")) |e_pos| {
+                    end_pos = e_pos;
+                    self.pos = e_pos + 2;
+                } else {
+                    self.pos = self.pattern.len;
+                }
+                const verbatim = self.pattern[lit_start..end_pos];
+                var idx: usize = 0;
+                while (idx < verbatim.len) {
+                    const ch = verbatim[idx];
+                    if (ch == '\n') self.recordLiteralNewline(lit_start + idx);
+                    const seq_len: usize = if (ch >= 0x80) utf8SeqLenAt(verbatim, idx, verbatim.len) else 1;
+                    if (seq_len > 1) {
+                        const lo_cp = std.unicode.utf8Decode(verbatim[idx .. idx + seq_len]) catch unreachable;
+                        has_unicode_ranges = true;
+                        try unicode_list.append(self.allocator, .{ .start = lo_cp, .end = lo_cp });
+                        if (self.ignore_case and self.unicode_case) {
+                            try self.appendFoldVariants(&set, &has_byte_set, &unicode_list, lo_cp);
+                        }
+                    } else {
+                        set.setWithCase(ch, self.ignore_case);
+                        has_byte_set = true;
+                    }
+                    idx += seq_len;
+                }
+                if (self.pos + 1 < self.pattern.len and self.pattern[self.pos] == '-' and self.pattern[self.pos + 1] != ']') {
+                    return self.fail(error.RegexSyntax, .invalid_char_range, self.pos, "\\Q...\\E cannot be range bound");
+                }
+                continue;
+            }
+
             // Check for \p{...} or \P{...} inside [...]
             if (c == '\\' and self.pos + 1 < self.pattern.len and (self.pattern[self.pos + 1] == 'p' or self.pattern[self.pos + 1] == 'P')) {
                 const prop_pos = self.pos;
@@ -1027,122 +1333,206 @@ pub const Compiler = struct {
                 continue;
             }
 
-            if (c >= 0x80) {
-                const seq_len = utf8SeqLenAt(self.pattern, self.pos, self.pattern.len);
-                if (seq_len > 1) {
-                    const lo_raw = self.pattern[self.pos .. self.pos + seq_len];
-                    const lo_cp = std.unicode.utf8Decode(lo_raw) catch unreachable;
-                    self.pos += seq_len;
-                    has_unicode_ranges = true;
+            const item_pos = self.pos;
+            const lo_atom = try self.parseClassAtom(&set);
+            switch (lo_atom) {
+                .shorthand => {
+                    has_byte_set = true;
+                    if (self.pos + 1 < self.pattern.len and self.pattern[self.pos] == '-' and self.pattern[self.pos + 1] != ']') {
+                        return self.fail(error.RegexSyntax, .invalid_char_range, item_pos, "shorthand class cannot be range bound");
+                    }
+                },
+                .cp => |lo_cp| {
                     if (self.pos + 1 < self.pattern.len and self.pattern[self.pos] == '-' and self.pattern[self.pos + 1] != ']') {
                         const dash_pos = self.pos;
                         self.pos += 1; // skip '-'
-                        if (self.pos < self.pattern.len and self.pattern[self.pos] == '\\') {
-                            return self.fail(error.RegexSyntax, .invalid_char_range, dash_pos, "invalid character class range");
+                        if (self.pos + 1 < self.pattern.len and self.pattern[self.pos] == '[' and self.pattern[self.pos + 1] == ':') {
+                            return self.fail(error.RegexSyntax, .invalid_char_range, dash_pos, "POSIX class cannot be range bound");
                         }
-                        const hi_len = utf8SeqLenAt(self.pattern, self.pos, self.pattern.len);
-                        if (hi_len <= 1) {
-                            return self.fail(error.RegexSyntax, .invalid_char_range, dash_pos, "invalid UTF-8 upper bound in character range");
+                        if (self.pos + 1 < self.pattern.len and self.pattern[self.pos] == '\\' and self.pattern[self.pos + 1] == 'Q') {
+                            return self.fail(error.RegexSyntax, .invalid_char_range, dash_pos, "\\Q...\\E cannot be range bound");
                         }
-                        const hi_raw = self.pattern[self.pos .. self.pos + hi_len];
-                        const hi_cp = std.unicode.utf8Decode(hi_raw) catch {
-                            return self.fail(error.RegexSyntax, .invalid_char_range, dash_pos, "invalid UTF-8 in character range");
+                        const hi_atom = try self.parseClassAtom(&set);
+                        const hi_cp: u21 = switch (hi_atom) {
+                            .shorthand => return self.fail(error.RegexSyntax, .invalid_char_range, dash_pos, "invalid shorthand in character class range"),
+                            .cp => |v| v,
                         };
-                        self.pos += hi_len;
                         if (hi_cp < lo_cp) {
                             return self.fail(error.RegexSyntax, .invalid_char_range, dash_pos, "character range start is greater than end");
                         }
-                        try unicode_list.append(self.allocator, .{ .start = lo_cp, .end = hi_cp });
-                        if (self.ignore_case and self.unicode_case and (hi_cp - lo_cp <= 256)) {
-                            var cp: u21 = lo_cp;
-                            while (cp <= hi_cp) : (cp += 1) {
-                                var eq: [4]u21 = undefined;
-                                const n_eq = unicode_fold.foldEquivalents(cp, &eq);
-                                for (eq[0..n_eq]) |alt_cp| {
-                                    try unicode_list.append(self.allocator, .{ .start = alt_cp, .end = alt_cp });
+                        if (hi_cp < 0x80) {
+                            set.setRange(@intCast(lo_cp), @intCast(hi_cp), self.ignore_case);
+                            has_byte_set = true;
+                        } else {
+                            has_unicode_ranges = true;
+                            if (lo_cp < 0x80) {
+                                set.setRange(@intCast(lo_cp), 0x7F, self.ignore_case);
+                                has_byte_set = true;
+                                try unicode_list.append(self.allocator, .{ .start = 0x80, .end = hi_cp });
+                            } else {
+                                try unicode_list.append(self.allocator, .{ .start = lo_cp, .end = hi_cp });
+                                if (self.ignore_case and self.unicode_case and (hi_cp - lo_cp <= 256)) {
+                                    var cp: u21 = lo_cp;
+                                    while (cp <= hi_cp) : (cp += 1) {
+                                        try self.appendFoldVariants(&set, &has_byte_set, &unicode_list, cp);
+                                    }
                                 }
                             }
                         }
+                    } else if (lo_cp < 0x80) {
+                        set.setWithCase(@intCast(lo_cp), self.ignore_case);
+                        has_byte_set = true;
                     } else {
+                        has_unicode_ranges = true;
                         try unicode_list.append(self.allocator, .{ .start = lo_cp, .end = lo_cp });
                         if (self.ignore_case and self.unicode_case) {
-                            var eq: [4]u21 = undefined;
-                            const n_eq = unicode_fold.foldEquivalents(lo_cp, &eq);
-                            for (eq[0..n_eq]) |alt_cp| {
-                                try unicode_list.append(self.allocator, .{ .start = alt_cp, .end = alt_cp });
-                            }
+                            try self.appendFoldVariants(&set, &has_byte_set, &unicode_list, lo_cp);
                         }
                     }
-                    continue;
-                }
-            }
-
-            const item_pos = self.pos;
-            const lo = try self.parseClassChar(&set);
-            has_byte_set = true;
-            if (lo) |start_ch| {
-                if (self.pos + 1 < self.pattern.len and self.pattern[self.pos] == '-' and self.pattern[self.pos + 1] != ']') {
-                    const dash_pos = self.pos;
-                    self.pos += 1; // skip '-'
-                    // Check if upper bound is a multi-byte UTF-8 codepoint (e.g. [\x00-\u{10FFFF}])
-                    if (self.pos < self.pattern.len and self.pattern[self.pos] >= 0x80) {
-                        const hi_len = utf8SeqLenAt(self.pattern, self.pos, self.pattern.len);
-                        if (hi_len > 1) {
-                            const hi_cp = std.unicode.utf8Decode(self.pattern[self.pos .. self.pos + hi_len]) catch {
-                                return self.fail(error.RegexSyntax, .invalid_char_range, dash_pos, "invalid UTF-8 in character range");
-                            };
-                            self.pos += hi_len;
-                            has_unicode_ranges = true;
-                            try unicode_list.append(self.allocator, .{ .start = start_ch, .end = hi_cp });
-                            continue;
-                        }
-                    }
-                    const hi = (try self.parseClassChar(&set)) orelse {
-                        return self.fail(error.RegexSyntax, .invalid_char_range, dash_pos, "invalid shorthand in character class range");
-                    };
-                    if (hi < start_ch) {
-                        return self.fail(error.RegexSyntax, .invalid_char_range, dash_pos, "character range start is greater than end");
-                    }
-                    set.setRange(start_ch, hi, self.ignore_case);
-                } else {
-                    set.setWithCase(start_ch, self.ignore_case);
-                }
-            } else {
-                // Shorthand (\d, \w, \s) cannot be the start of a range like [\d-z]
-                if (self.pos + 1 < self.pattern.len and self.pattern[self.pos] == '-' and self.pattern[self.pos + 1] != ']') {
-                    return self.fail(error.RegexSyntax, .invalid_char_range, item_pos, "shorthand class cannot be range bound");
-                }
+                },
             }
         }
         return self.fail(error.RegexSyntax, .unclosed_char_class, class_start_pos, "unclosed character class '['");
     }
 
-    fn parseClassChar(self: *Compiler, set: *ByteSet) Error!?u8 {
+    fn appendFoldVariants(
+        self: *Compiler,
+        set: *ByteSet,
+        has_byte_set: *bool,
+        unicode_list: *std.ArrayList(CodepointRange),
+        cp: u21,
+    ) !void {
+        var eq: [4]u21 = undefined;
+        const n_eq = unicode_fold.foldEquivalents(cp, &eq);
+        for (eq[0..n_eq]) |alt_cp| {
+            if (alt_cp < 0x80) {
+                set.setWithCase(@intCast(alt_cp), true);
+                has_byte_set.* = true;
+            } else {
+                try unicode_list.append(self.allocator, .{ .start = alt_cp, .end = alt_cp });
+            }
+        }
+    }
+
+    fn addPosixClass(set: *ByteSet, name: []const u8, negated: bool, ignore_case: bool) bool {
+        var tmp = ByteSet{};
+        if (std.mem.eql(u8, name, "alnum")) {
+            tmp.setRange('0', '9', false);
+            tmp.setRange('A', 'Z', false);
+            tmp.setRange('a', 'z', false);
+        } else if (std.mem.eql(u8, name, "alpha")) {
+            tmp.setRange('A', 'Z', false);
+            tmp.setRange('a', 'z', false);
+        } else if (std.mem.eql(u8, name, "ascii")) {
+            tmp.setRange(0x00, 0x7F, false);
+        } else if (std.mem.eql(u8, name, "blank")) {
+            tmp.set(' ');
+            tmp.set('\t');
+        } else if (std.mem.eql(u8, name, "cntrl")) {
+            tmp.setRange(0x00, 0x1F, false);
+            tmp.set(0x7F);
+        } else if (std.mem.eql(u8, name, "digit")) {
+            tmp.setRange('0', '9', false);
+        } else if (std.mem.eql(u8, name, "graph")) {
+            tmp.setRange(0x21, 0x7E, false);
+        } else if (std.mem.eql(u8, name, "lower")) {
+            tmp.setRange('a', 'z', ignore_case);
+        } else if (std.mem.eql(u8, name, "print")) {
+            tmp.setRange(0x20, 0x7E, false);
+        } else if (std.mem.eql(u8, name, "punct")) {
+            tmp.setRange('!', '/', false);
+            tmp.setRange(':', '@', false);
+            tmp.setRange('[', '`', false);
+            tmp.setRange('{', '~', false);
+        } else if (std.mem.eql(u8, name, "space")) {
+            tmp.set(' ');
+            tmp.set('\t');
+            tmp.set('\n');
+            tmp.set('\r');
+            tmp.set(0x0B);
+            tmp.set(0x0C);
+        } else if (std.mem.eql(u8, name, "upper")) {
+            tmp.setRange('A', 'Z', ignore_case);
+        } else if (std.mem.eql(u8, name, "word")) {
+            tmp.setRange('0', '9', false);
+            tmp.setRange('A', 'Z', false);
+            tmp.setRange('a', 'z', false);
+            tmp.set('_');
+        } else if (std.mem.eql(u8, name, "xdigit")) {
+            tmp.setRange('0', '9', false);
+            tmp.setRange('A', 'F', false);
+            tmp.setRange('a', 'f', false);
+        } else {
+            return false;
+        }
+        if (negated) tmp.invert();
+        for (0..4) |i| set.bits[i] |= tmp.bits[i];
+        return true;
+    }
+
+    const ClassAtom = union(enum) {
+        cp: u21,
+        shorthand,
+    };
+
+    fn parseClassAtom(self: *Compiler, set: *ByteSet) Error!ClassAtom {
         if (self.pos >= self.pattern.len) {
             return self.fail(error.RegexSyntax, .unclosed_char_class, self.pos, "unclosed character class '['");
         }
+        const item_pos = self.pos;
         const c = self.pattern[self.pos];
-        const slash_pos = self.pos;
+        if (c >= 0x80) {
+            const seq_len = utf8SeqLenAt(self.pattern, self.pos, self.pattern.len);
+            if (seq_len > 1) {
+                const raw = self.pattern[self.pos .. self.pos + seq_len];
+                const cp = std.unicode.utf8Decode(raw) catch {
+                    return self.fail(error.RegexSyntax, .invalid_utf8, item_pos, "invalid UTF-8 in character class");
+                };
+                self.pos += seq_len;
+                return .{ .cp = cp };
+            }
+        }
         self.pos += 1;
-        if (c != '\\') return c;
+        if (c != '\\') {
+            if (c == '\n') self.recordLiteralNewline(item_pos);
+            return .{ .cp = c };
+        }
         if (self.pos >= self.pattern.len) {
-            return self.fail(error.RegexSyntax, .trailing_backslash, slash_pos, "trailing backslash in character class");
+            return self.fail(error.RegexSyntax, .trailing_backslash, item_pos, "trailing backslash in character class");
         }
         const esc = self.pattern[self.pos];
+        if (esc >= 0x80) {
+            const seq_len = utf8SeqLenAt(self.pattern, self.pos, self.pattern.len);
+            if (seq_len > 1) {
+                const raw = self.pattern[self.pos .. self.pos + seq_len];
+                const cp = std.unicode.utf8Decode(raw) catch {
+                    return self.fail(error.RegexSyntax, .invalid_utf8, self.pos, "invalid UTF-8 in character class");
+                };
+                self.pos += seq_len;
+                return .{ .cp = cp };
+            }
+        }
         self.pos += 1;
         switch (esc) {
             'd', 'D', 'w', 'W', 's', 'S' => {
                 addShorthand(set, esc);
-                return null;
+                return .shorthand;
             },
             'p', 'P' => {
-                return self.fail(error.RegexSyntax, .invalid_char_range, slash_pos, "cannot use Unicode property as character range bound");
+                return self.fail(error.RegexSyntax, .invalid_char_range, item_pos, "cannot use Unicode property as character range bound");
             },
-            'n' => return '\n',
-            'r' => return '\r',
-            't' => return '\t',
-            '0' => return 0,
-            else => return esc,
+            'x', 'u' => {
+                const cp = try self.parseHexScalar(esc, item_pos);
+                return .{ .cp = cp };
+            },
+            'a' => return .{ .cp = 0x07 },
+            'f' => return .{ .cp = 0x0C },
+            'v' => return .{ .cp = 0x0B },
+            'n' => return .{ .cp = '\n' },
+            'r' => return .{ .cp = '\r' },
+            't' => return .{ .cp = '\t' },
+            '0' => return .{ .cp = 0 },
+            else => return .{ .cp = esc },
         }
     }
 };

@@ -336,7 +336,7 @@ fn freezeTree(
     return node;
 }
 
-fn extractTarMtime(header_buf: *const [512]u8) ?i64 {
+pub fn extractTarMtime(header_buf: *const [512]u8) ?i64 {
     const raw = header_buf[136..148];
     if ((raw[0] & 0x80) != 0) {
         const val = std.mem.readInt(i64, raw[4..12], .big);

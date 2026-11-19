@@ -27,10 +27,15 @@ pub const UnicodeRangeList = struct {
     owned: bool = false,
 };
 
-/// Submatch capture spans for a regex match. `groups[0]` corresponds to `$1`, up to `groups[8]` for `$9`.
+/// Maximum numbered or named submatch capture groups supported per regex.
+pub const max_capture_groups: usize = 32;
+/// Maximum submatch capture boundary slots (`start` and `end` per group).
+pub const max_capture_slots: usize = max_capture_groups * 2;
+
+/// Submatch capture spans for a regex match. `groups[0]` corresponds to `$1`, up to `groups[31]` for `$32`.
 pub const Captures = struct {
     match: Match,
-    groups: [9]?Match = @splat(null),
+    groups: [max_capture_groups]?Match = @splat(null),
 
     pub fn fullMatch(self: Captures) Match {
         return self.match;
@@ -38,12 +43,18 @@ pub const Captures = struct {
 
     pub fn group(self: Captures, index: usize) ?Match {
         if (index == 0) return self.match;
-        if (index > 9) return null;
+        if (index > max_capture_groups) return null;
         return self.groups[index - 1];
     }
 
     pub fn span(self: Captures, index: usize) ?Match {
         return self.group(index);
+    }
+
+    /// Returns the captured span for named group `name` using `re.groupIndexByName(name)`.
+    pub fn byName(self: Captures, re: anytype, name: []const u8) ?Match {
+        const idx = re.groupIndexByName(name) orelse return null;
+        return self.group(idx);
     }
 
     pub fn slice(self: Captures, haystack: []const u8, index: usize) ?[]const u8 {
@@ -94,6 +105,9 @@ pub const DiagnosticCode = enum {
     unknown_unicode_property,
     unclosed_unicode_property,
     invalid_inline_flags,
+    invalid_group_name,
+    duplicate_group_name,
+    invalid_posix_class,
     trailing_backslash,
     invalid_utf8,
     recursion_depth_exceeded,
@@ -265,7 +279,7 @@ pub const Inst = union(enum) {
     jmp: u32,
     /// Zero-width assertion anchor.
     assert: struct { kind: AssertKind, out: u32 },
-    /// Zero-width submatch boundary slot (`0..17` for groups `1..9`).
+    /// Zero-width submatch boundary slot (`0..63` for groups `1..32`).
     save: struct { slot: u8, out: u32 },
     /// Accepting match state for single `Regex`.
     match,
@@ -278,6 +292,7 @@ pub const AssertKind = enum {
     end_line,
     start_input,
     end_input,
+    end_input_before_nl,
     word_boundary,
     not_word_boundary,
 };
@@ -343,14 +358,34 @@ pub inline fn invokeAllow(allow_arg: anytype, haystack: []const u8, start: usize
 pub fn hasTopLevelAlt(pattern: []const u8) bool {
     var depth: usize = 0;
     var in_class = false;
+    var extended = false;
     var i: usize = 0;
     while (i < pattern.len) : (i += 1) {
         const c = pattern[i];
+        if (!in_class and extended) {
+            if (c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 0x0B or c == 0x0C) continue;
+            if (c == '#') {
+                while (i + 1 < pattern.len and pattern[i + 1] != '\n') : (i += 1) {}
+                continue;
+            }
+        }
         if (c == '\\') {
+            if (i + 1 < pattern.len and pattern[i + 1] == 'Q') {
+                i += 2;
+                while (i + 1 < pattern.len and !(pattern[i] == '\\' and pattern[i + 1] == 'E')) : (i += 1) {}
+                if (i + 1 < pattern.len) i += 1;
+                continue;
+            }
             i += 1;
             continue;
         }
         if (in_class) {
+            if (c == '[' and i + 1 < pattern.len and pattern[i + 1] == ':') {
+                if (std.mem.indexOfPos(u8, pattern, i + 2, ":]")) |end_posix| {
+                    i = end_posix + 1;
+                    continue;
+                }
+            }
             if (c == ']') in_class = false;
             continue;
         }
@@ -360,7 +395,22 @@ pub fn hasTopLevelAlt(pattern: []const u8) bool {
                 if (i + 1 < pattern.len and (pattern[i + 1] == '^' or pattern[i + 1] == '!')) i += 1;
                 if (i + 1 < pattern.len and pattern[i + 1] == ']') i += 1;
             },
-            '(' => depth += 1,
+            '(' => {
+                if (depth == 0 and i + 2 < pattern.len and pattern[i + 1] == '?') {
+                    var j = i + 2;
+                    var neg = false;
+                    var next_ext = extended;
+                    var only_flags = false;
+                    while (j < pattern.len and (pattern[j] == 'i' or pattern[j] == 'm' or pattern[j] == 's' or pattern[j] == 'x' or pattern[j] == 'U' or pattern[j] == '-')) : (j += 1) {
+                        only_flags = true;
+                        if (pattern[j] == '-') neg = true else if (pattern[j] == 'x') next_ext = !neg;
+                    }
+                    if (only_flags and j < pattern.len and pattern[j] == ')') {
+                        extended = next_ext;
+                    }
+                }
+                depth += 1;
+            },
             ')' => if (depth > 0) {
                 depth -= 1;
             },
@@ -390,6 +440,7 @@ pub fn checkAssert(kind: AssertKind, haystack: []const u8, pos: usize) bool {
         .end_line => pos == haystack.len or haystack[pos] == '\n' or (pos + 1 < haystack.len and haystack[pos] == '\r' and haystack[pos + 1] == '\n'),
         .start_input => pos == 0,
         .end_input => pos == haystack.len,
+        .end_input_before_nl => pos == haystack.len or (pos + 1 == haystack.len and haystack[pos] == '\n'),
         .word_boundary => blk: {
             const left = unicode_fold.isWordBefore(haystack, pos);
             const right = unicode_fold.isWordAt(haystack, pos);
@@ -405,8 +456,45 @@ pub fn checkAssert(kind: AssertKind, haystack: []const u8, pos: usize) bool {
 
 pub fn hasLiteralUpper(pattern: []const u8, unicode_case: bool) bool {
     var i: usize = 0;
+    var in_class = false;
+    var extended = false;
     while (i < pattern.len) {
+        if (!in_class and extended) {
+            const w = pattern[i];
+            if (w == ' ' or w == '\t' or w == '\n' or w == '\r' or w == 0x0B or w == 0x0C) {
+                i += 1;
+                continue;
+            }
+            if (w == '#') {
+                while (i < pattern.len and pattern[i] != '\n') : (i += 1) {}
+                continue;
+            }
+        }
         if (pattern[i] == '\\') {
+            if (i + 1 < pattern.len and pattern[i + 1] == 'Q') {
+                i += 2;
+                while (i < pattern.len) {
+                    if (pattern[i] == '\\' and i + 1 < pattern.len and pattern[i + 1] == 'E') {
+                        i += 2;
+                        break;
+                    }
+                    if (pattern[i] >= 'A' and pattern[i] <= 'Z') return true;
+                    if (unicode_case and pattern[i] >= 0x80) {
+                        const qlen = utf8SeqLenAt(pattern, i, pattern.len);
+                        if (qlen > 1) {
+                            const cp = std.unicode.utf8Decode(pattern[i .. i + qlen]) catch {
+                                i += 1;
+                                continue;
+                            };
+                            if (unicode_fold.isUpperCodepoint(cp)) return true;
+                            i += qlen;
+                            continue;
+                        }
+                    }
+                    i += 1;
+                }
+                continue;
+            }
             if (i + 1 < pattern.len and (pattern[i + 1] == 'p' or pattern[i + 1] == 'P')) {
                 i += 2;
                 if (i < pattern.len and pattern[i] == '{') {
@@ -417,13 +505,64 @@ pub fn hasLiteralUpper(pattern: []const u8, unicode_case: bool) bool {
                 }
                 continue;
             }
+            if (i + 1 < pattern.len and (pattern[i + 1] == 'x' or pattern[i + 1] == 'u')) {
+                i += 2;
+                if (i < pattern.len and pattern[i] == '{') {
+                    while (i < pattern.len and pattern[i] != '}') : (i += 1) {}
+                    if (i < pattern.len) i += 1;
+                } else {
+                    const count: usize = if (pattern[i - 1] == 'x') 2 else 4;
+                    var k: usize = 0;
+                    while (k < count and i < pattern.len and std.ascii.isHex(pattern[i])) : (k += 1) i += 1;
+                }
+                continue;
+            }
             i += 2;
             continue;
         }
-        if (pattern[i] == '(' and i + 1 < pattern.len and pattern[i + 1] == '?') {
+        if (in_class) {
+            if (pattern[i] == '[' and i + 1 < pattern.len and pattern[i + 1] == ':') {
+                if (std.mem.indexOfPos(u8, pattern, i + 2, ":]")) |end_posix| {
+                    i = end_posix + 2;
+                    continue;
+                }
+            }
+            if (pattern[i] == ']') {
+                in_class = false;
+                i += 1;
+                continue;
+            }
+        } else if (pattern[i] == '[') {
+            in_class = true;
+            i += 1;
+            if (i < pattern.len and (pattern[i] == '^' or pattern[i] == '!')) i += 1;
+            if (i < pattern.len and pattern[i] == ']') i += 1;
+            continue;
+        }
+        if (!in_class and pattern[i] == '(' and i + 1 < pattern.len and pattern[i + 1] == '?') {
+            if (i + 2 < pattern.len and pattern[i + 2] == 'P' and i + 3 < pattern.len and pattern[i + 3] == '<') {
+                if (std.mem.indexOfScalarPos(u8, pattern, i + 4, '>')) |gt| {
+                    i = gt + 1;
+                    continue;
+                }
+            } else if (i + 2 < pattern.len and pattern[i + 2] == '<') {
+                if (std.mem.indexOfScalarPos(u8, pattern, i + 3, '>')) |gt| {
+                    i = gt + 1;
+                    continue;
+                }
+            }
             i += 2;
-            while (i < pattern.len and (pattern[i] == 'i' or pattern[i] == 'm' or pattern[i] == 's' or pattern[i] == '-')) : (i += 1) {}
-            if (i < pattern.len and (pattern[i] == ':' or pattern[i] == ')')) i += 1;
+            var neg = false;
+            var next_ext = extended;
+            while (i < pattern.len and (pattern[i] == 'i' or pattern[i] == 'm' or pattern[i] == 's' or pattern[i] == 'x' or pattern[i] == 'U' or pattern[i] == '-')) : (i += 1) {
+                if (pattern[i] == '-') neg = true else if (pattern[i] == 'x') next_ext = !neg;
+            }
+            if (i < pattern.len and pattern[i] == ')') {
+                extended = next_ext;
+                i += 1;
+            } else if (i < pattern.len and pattern[i] == ':') {
+                i += 1;
+            }
             continue;
         }
         if (pattern[i] >= 'A' and pattern[i] <= 'Z') return true;

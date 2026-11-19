@@ -1,4 +1,4 @@
-# libwebgrep Benchmarks (v0.6.0)
+# libwebgrep Benchmarks (v0.7.0)
 
 This document records the reproducible `ReleaseFast` microbenchmarks ([`bench/micro.zig`](bench/micro.zig)) across `x86_64` (AMD Ryzen 7 7735U AVX2) and `aarch64` (Apple M2 NEON), the microarchitectural cache-hierarchy throughput curves, the `v0.3.0`–`v0.6.0` engine specialization evaluations, and the **reproducible 22-scenario Warm Cache (`mincore=100%`) & Cold Disk (`fsync` + `POSIX_FADV_DONTNEED` + `mincore=0`) end-to-end comparative experiment against `ripgrep 15.2.0`** ([`bench/wg_cli.zig`](bench/wg_cli.zig) & [`bench/bench_driver.c`](bench/bench_driver.c)), including single-line and cross-line (`-U` / `--multiline` & `--multiline-dotall`) workloads.
 

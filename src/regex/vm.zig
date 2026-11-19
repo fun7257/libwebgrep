@@ -124,7 +124,7 @@ pub const Regex = struct {
     dot_all: bool,
     num_captures: u8 = 0,
     group_count: u8 = 0,
-    group_names: [9][]const u8 = @splat(""),
+    group_names: [inst_mod.max_capture_groups][]const u8 = @splat(""),
     anchored_start: bool = false,
     max_multiline_window: usize,
     max_dfa_states: u16 = 256,
@@ -146,13 +146,14 @@ pub const Regex = struct {
     precomputed_dfa: ?*HeapDfa = null,
     has_lazy: bool = false,
     has_alt: bool = false,
+    saw_extended: bool = false,
     dfa_is_exact: bool = false,
     dfa_prefix_state: u16 = dfa_mod.start_state,
     dfa_prefix_len: usize = 0,
     dfa_suffix_state: u16 = 0,
     max_newlines: ?u32 = null,
     /// Counts NFA state transition steps for unit tests asserting linear time complexity.
-    steps: u64 = 0,
+    steps: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, pattern: []const u8, options: RegexOptions) Error!Regex {
         return initDiagnostic(allocator, pattern, options, null);
@@ -216,7 +217,7 @@ pub const Regex = struct {
         const root_frag = try compiler.compile();
         const effective_ml = compiler.multiline or compiler.saw_scoped_m;
         if (!effective_ml) {
-            if (std.mem.indexOfScalar(u8, pattern, '\n')) |nl_pos| {
+            if (compiler.saw_literal_nl_pos) |nl_pos| {
                 populateDiagnostic(diag, pattern, error.PatternHasNewline, .pattern_has_newline, nl_pos, "pattern contains literal newline in single-line mode", null);
                 return error.PatternHasNewline;
             }
@@ -253,9 +254,16 @@ pub const Regex = struct {
             .max_dfa_states = options.max_dfa_states,
             .has_lazy = compiler.has_lazy,
             .has_alt = compiler.has_alt,
+            .saw_extended = compiler.saw_extended,
             .max_newlines = computeMaxNewlines(insts, unicode_ranges, root_frag.start, effective_ml),
         };
         errdefer self.deinit();
+
+        for (compiler.capture_names[0..compiler.capture_count], 0..) |name, idx| {
+            if (name.len > 0) {
+                self.group_names[idx] = try allocator.dupe(u8, name);
+            }
+        }
 
         try prefilter_mod.extractLiterals(&self, pattern, options);
         if (self.req_literal_bytes.len > 1 and (!self.ignore_case or !self.unicode_case)) {
@@ -321,6 +329,9 @@ pub const Regex = struct {
     }
 
     pub fn deinit(self: *Regex) void {
+        for (self.group_names[0..self.group_count]) |name| {
+            if (name.len != 0) self.allocator.free(name);
+        }
         if (self.precomputed_dfa) |d| self.allocator.destroy(d);
         if (self.req_literal_bytes.len != 0) self.allocator.free(self.req_literal_bytes);
         if (self.tail_literal_bytes.len != 0) self.allocator.free(self.tail_literal_bytes);
@@ -348,7 +359,9 @@ pub const Regex = struct {
     }
 
     pub fn resetStats(self: *const Regex) void {
-        @atomicStore(u64, @constCast(&self.steps), 0, .monotonic);
+        if (comptime builtin.is_test) {
+            @atomicStore(usize, @constCast(&self.steps), 0, .monotonic);
+        }
         if (self.prefilter) |*pf| @constCast(pf).resetStats();
         if (self.tail_finder) |*tf| @constCast(tf).resetStats();
     }
@@ -410,7 +423,7 @@ pub const Regex = struct {
 
     /// Thread-safe, lock-free search over `haystack`. Accepts `*const Regex` (and `*Regex` via auto-coercion).
     pub fn find(self: *const Regex, haystack: []const u8, start: usize, mode: MatchMode) ?Match {
-        const steps: ?*u64 = if (comptime builtin.is_test) @constCast(&self.steps) else null;
+        const steps: ?*usize = if (comptime builtin.is_test) @constCast(&self.steps) else null;
         return self.findInternal(haystack, start, mode, steps, null);
     }
 
@@ -428,7 +441,7 @@ pub const Regex = struct {
         scratch: *RegexScratch,
     ) ?Match {
         _ = scratch.ensureDfa() catch {};
-        const steps: ?*u64 = if (comptime builtin.is_test) @constCast(&self.steps) else null;
+        const steps: ?*usize = if (comptime builtin.is_test) @constCast(&self.steps) else null;
         return self.findInternal(haystack, start, mode, steps, scratch);
     }
 
@@ -442,13 +455,13 @@ pub const Regex = struct {
         return self.findWithScratch(haystack, 0, .earliest, scratch) != null;
     }
 
-    /// Finds the next match along with submatch capture groups `$1`..`$9`.
+    /// Finds the next match along with submatch capture groups `$1`..`$32`.
     pub fn findCaptures(self: *const Regex, haystack: []const u8, start: usize, mode: MatchMode) ?Captures {
         const m = self.findInternal(haystack, start, mode, null, null) orelse return null;
         return self.extractCaptures(haystack, m);
     }
 
-    /// Finds the next match along with submatch capture groups `$1`..`$9`, reusing `scratch`.
+    /// Finds the next match along with submatch capture groups `$1`..`$32`, reusing `scratch`.
     pub fn findCapturesWithScratch(
         self: *const Regex,
         haystack: []const u8,
@@ -465,7 +478,7 @@ pub const Regex = struct {
         haystack: []const u8,
         start: usize,
         mode: MatchMode,
-        steps: ?*u64,
+        steps: ?*usize,
         scratch: ?*RegexScratch,
     ) ?Match {
         if (start > haystack.len) return null;
@@ -691,7 +704,7 @@ pub const Regex = struct {
         start: usize,
         limit: usize,
         mode: MatchMode,
-        steps: ?*u64,
+        steps: ?*usize,
         scratch: ?*RegexScratch,
     ) ?Match {
         if (self.insts.len == 0 or start > limit) return null;
@@ -712,7 +725,7 @@ pub const Regex = struct {
         start: usize,
         limit: usize,
         mode: MatchMode,
-        steps: ?*u64,
+        steps: ?*usize,
         scratch: ?*RegexScratch,
     ) ?Match {
         if (!dfa.ensureInitialized(self.insts, self.start_pc, self.multiline, self.max_dfa_states)) {
@@ -728,10 +741,10 @@ pub const Regex = struct {
         var active_since: usize = start;
         var pos: usize = start;
         var restarts: usize = 0;
-        var local_steps: u64 = 0;
+        var local_steps: usize = 0;
         defer if (comptime builtin.is_test) {
             if (steps) |s| {
-                if (local_steps > 0) _ = @atomicRmw(u64, s, .Add, local_steps, .monotonic);
+                if (local_steps > 0) _ = @atomicRmw(usize, s, .Add, local_steps, .monotonic);
             }
         };
 
@@ -1080,7 +1093,7 @@ pub const Regex = struct {
         mode: MatchMode,
         allow_arg: anytype,
     ) ?Match {
-        const steps: ?*u64 = if (comptime builtin.is_test) @constCast(&self.steps) else null;
+        const steps: ?*usize = if (comptime builtin.is_test) @constCast(&self.steps) else null;
         return self.findAllowedInternal(haystack, start, mode, allow_arg, steps);
     }
 
@@ -1100,7 +1113,7 @@ pub const Regex = struct {
         start: usize,
         mode: MatchMode,
         allow_arg: anytype,
-        steps: ?*u64,
+        steps: ?*usize,
     ) ?Match {
         var pos = start;
         while (pos <= haystack.len) {
@@ -1137,7 +1150,7 @@ pub const Regex = struct {
         limit: usize,
         mode: MatchMode,
         allow_arg: anytype,
-        steps: ?*u64,
+        steps: ?*usize,
         scratch: ?*RegexScratch,
     ) ?Match {
         var window_clipped = false;
@@ -1195,7 +1208,7 @@ pub const Regex = struct {
         from_start: usize,
         max_start: usize,
         limit: usize,
-        steps: ?*u64,
+        steps: ?*usize,
         scratch: ?*RegexScratch,
     ) ?usize {
         const n_inst = self.insts.len;
@@ -1237,13 +1250,13 @@ pub const Regex = struct {
         @memset(gen_table, 0);
         var gen: u32 = 1;
         var curr_len: usize = 0;
-        var local_steps: u64 = 0;
+        var local_steps: usize = 0;
         defer if (comptime builtin.is_test) {
             if (steps) |s| {
-                if (local_steps > 0) _ = @atomicRmw(u64, s, .Add, local_steps, .monotonic);
+                if (local_steps > 0) _ = @atomicRmw(usize, s, .Add, local_steps, .monotonic);
             }
         };
-        const local_steps_ptr: ?*u64 = if (comptime builtin.is_test) &local_steps else null;
+        const local_steps_ptr: ?*usize = if (comptime builtin.is_test) &local_steps else null;
 
         var pos = from_start;
         while (true) {
@@ -1408,7 +1421,7 @@ pub const Regex = struct {
         limit: usize,
         mode: MatchMode,
         allow_arg: anytype,
-        steps: ?*u64,
+        steps: ?*usize,
         scratch: ?*RegexScratch,
         window_clipped: *bool,
     ) ?Match {
@@ -1453,13 +1466,13 @@ pub const Regex = struct {
 
         var curr_len: usize = 0;
         var best: ?Match = null;
-        var local_steps: u64 = 0;
+        var local_steps: usize = 0;
         defer if (comptime builtin.is_test) {
             if (steps) |s| {
-                if (local_steps > 0) _ = @atomicRmw(u64, s, .Add, local_steps, .monotonic);
+                if (local_steps > 0) _ = @atomicRmw(usize, s, .Add, local_steps, .monotonic);
             }
         };
-        const local_steps_ptr: ?*u64 = if (comptime builtin.is_test) &local_steps else null;
+        const local_steps_ptr: ?*usize = if (comptime builtin.is_test) &local_steps else null;
 
         var pos = start_lo;
         while (true) {
@@ -1667,7 +1680,7 @@ pub const Regex = struct {
         start: usize,
         haystack: []const u8,
         pos: usize,
-        steps: ?*u64,
+        steps: ?*usize,
     ) void {
         if (gen_table[pc] == gen) return;
         gen_table[pc] = gen;
@@ -1700,7 +1713,7 @@ pub const Regex = struct {
 
     const CapThread = struct {
         pc: u32,
-        slots: [18]?usize = @splat(null),
+        slots: [inst_mod.max_capture_slots]?usize = @splat(null),
     };
 
     pub fn extractCaptures(self: *const Regex, haystack: []const u8, m: Match) Captures {
@@ -1709,8 +1722,8 @@ pub const Regex = struct {
         const n_inst = self.insts.len;
         if (n_inst == 0) return res;
 
-        var stack_curr: [64]CapThread = undefined;
-        var stack_next: [64]CapThread = undefined;
+        var stack_curr: [16]CapThread = undefined;
+        var stack_next: [16]CapThread = undefined;
         var stack_gen: [256]u32 = undefined;
 
         var heap_curr: []CapThread = &.{};
@@ -1720,11 +1733,11 @@ pub const Regex = struct {
         var heap_gen: []u32 = &.{};
         defer if (heap_gen.len != 0) self.allocator.free(heap_gen);
 
-        var curr: []CapThread = if (n_inst <= 64) stack_curr[0..n_inst] else blk: {
+        var curr: []CapThread = if (n_inst <= 16) stack_curr[0..n_inst] else blk: {
             heap_curr = self.allocator.alloc(CapThread, n_inst) catch return res;
             break :blk heap_curr;
         };
-        var next: []CapThread = if (n_inst <= 64) stack_next[0..n_inst] else blk: {
+        var next: []CapThread = if (n_inst <= 16) stack_next[0..n_inst] else blk: {
             heap_next = self.allocator.alloc(CapThread, n_inst) catch return res;
             break :blk heap_next;
         };
@@ -1755,7 +1768,7 @@ pub const Regex = struct {
                 switch (inst) {
                     .match, .match_id => {
                         if (pos == m.end) {
-                            for (0..9) |g| {
+                            for (0..inst_mod.max_capture_groups) |g| {
                                 if (th.slots[g * 2]) |s| {
                                     if (th.slots[g * 2 + 1]) |e| {
                                         if (s <= e) res.groups[g] = .{ .start = s, .end = e };
@@ -1861,7 +1874,7 @@ pub const Regex = struct {
         gen_table: []u32,
         gen: u32,
         pc: u32,
-        slots: [18]?usize,
+        slots: [inst_mod.max_capture_slots]?usize,
         haystack: []const u8,
         pos: usize,
     ) void {
@@ -1883,7 +1896,7 @@ pub const Regex = struct {
             },
             .save => |sv| {
                 var next_slots = slots;
-                if (sv.slot < 18) next_slots[sv.slot] = pos;
+                if (sv.slot < inst_mod.max_capture_slots) next_slots[sv.slot] = pos;
                 self.addCapThread(list, list_len, gen_table, gen, sv.out, next_slots, haystack, pos);
             },
             else => {

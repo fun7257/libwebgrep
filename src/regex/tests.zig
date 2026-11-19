@@ -278,3 +278,244 @@ test "M2 F13: CompileDiagnostic line, column, offset, and reuse reset" {
     try std.testing.expectEqual(DiagnosticCode.none, diag.code);
     try std.testing.expectEqual(@as(?inst_mod.Error, null), diag.err);
 }
+
+test "v0.7.0: named capture groups, up to 32 captures, diagnostics, and smart-case" {
+    const alloc = std.testing.allocator;
+
+    // 1. (?P<name>...) and (?<name>...)
+    {
+        var re = try Regex.init(alloc, "(?P<user>[a-z]+):(?<id>[0-9]+):([a-z]+)", .{});
+        defer re.deinit();
+        try std.testing.expectEqual(@as(?usize, 1), re.groupIndexByName("user"));
+        try std.testing.expectEqual(@as(?usize, 2), re.groupIndexByName("id"));
+        try std.testing.expectEqual(@as(?usize, null), re.groupIndexByName("missing"));
+        try std.testing.expectEqual(@as(u8, 3), re.group_count);
+
+        const hay = "  alice:1024:admin  ";
+        const caps = re.findCaptures(hay, 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        const u_span = caps.byName(&re, "user") orelse return error.TestUnexpectedResult;
+        const id_span = caps.byName(&re, "id") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("alice", hay[u_span.start..u_span.end]);
+        try std.testing.expectEqualStrings("1024", hay[id_span.start..id_span.end]);
+        try std.testing.expectEqualStrings("admin", caps.slice(hay, 3).?);
+    }
+
+    // 2. Named group inside {m,n} bounded repeat does not trigger duplicate_group_name
+    {
+        var re = try Regex.init(alloc, "(?P<pair>[a-z][0-9]){2,3}", .{});
+        defer re.deinit();
+        try std.testing.expectEqual(@as(?usize, 1), re.groupIndexByName("pair"));
+        const hay = "a1b2c3";
+        const caps = re.findCaptures(hay, 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        const span = caps.byName(&re, "pair") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("c3", hay[span.start..span.end]);
+    }
+
+    // 3. Smart case must NOT treat uppercase inside group name (?P<ID>...) as case-sensitive literal
+    {
+        var re = try Regex.init(alloc, "(?P<ID>[a-z]+)", .{ .case = .smart });
+        defer re.deinit();
+        try std.testing.expect(re.ignore_case);
+        const hay = "HELLO";
+        const caps = re.findCaptures(hay, 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        const span = caps.byName(&re, "ID") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("HELLO", hay[span.start..span.end]);
+    }
+
+    // 4. Up to 32 capture groups (e.g. 12 and 32)
+    {
+        var re12 = try Regex.init(alloc, "(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)(k)(?P<last>l)", .{});
+        defer re12.deinit();
+        try std.testing.expectEqual(@as(u8, 12), re12.group_count);
+        const caps = re12.findCaptures("abcdefghijkl", 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("j", caps.slice("abcdefghijkl", 10).?);
+        try std.testing.expectEqualStrings("k", caps.slice("abcdefghijkl", 11).?);
+        try std.testing.expectEqualStrings("l", caps.slice("abcdefghijkl", 12).?);
+        const named_last = caps.byName(&re12, "last") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("l", "abcdefghijkl"[named_last.start..named_last.end]);
+
+        var re32 = try Regex.init(
+            alloc,
+            "(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)(k)(l)(m)(n)(o)(p)(q)(r)(s)(t)(u)(v)(w)(x)(y)(z)(0)(1)(2)(3)(4)(?P<g32>5)",
+            .{},
+        );
+        defer re32.deinit();
+        try std.testing.expectEqual(@as(u8, 32), re32.group_count);
+        const hay32 = "abcdefghijklmnopqrstuvwxyz012345";
+        const caps32 = re32.findCaptures(hay32, 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("4", caps32.slice(hay32, 31).?);
+        try std.testing.expectEqualStrings("5", caps32.slice(hay32, 32).?);
+        try std.testing.expectEqualStrings("5", hay32[caps32.byName(&re32, "g32").?.start..caps32.byName(&re32, "g32").?.end]);
+    }
+
+    // 5. Invalid and duplicate group name diagnostics
+    {
+        var diag: CompileDiagnostic = .{};
+        try std.testing.expectError(
+            error.RegexSyntax,
+            Regex.initDiagnostic(alloc, "(?P<1bad>a)", .{}, &diag),
+        );
+        try std.testing.expectEqual(DiagnosticCode.invalid_group_name, diag.code);
+
+        try std.testing.expectError(
+            error.RegexSyntax,
+            Regex.initDiagnostic(alloc, "(?P<dup>a)(?<dup>b)", .{}, &diag),
+        );
+        try std.testing.expectEqual(DiagnosticCode.duplicate_group_name, diag.code);
+    }
+}
+
+test "v0.7.0: hex/unicode escapes, \\Q..\\E, \\a/\\f/\\v/\\Z, POSIX classes, (?x), and (?U)" {
+    const alloc = std.testing.allocator;
+
+    // 1. \xHH, \x{...}, \uHHHH, \u{...} outside and inside [...]
+    {
+        var re = try Regex.init(alloc, "\\x41\\x{1F600}\\u0042\\u{4E2D}", .{});
+        defer re.deinit();
+        const hay = "prefix A😀B中 suffix";
+        const m = re.find(hay, 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("A😀B中", hay[m.start..m.end]);
+
+        var re_cls = try Regex.init(alloc, "[\\x41-\\x43\\u{4E00}-\\u{9FFF}]+", .{});
+        defer re_cls.deinit();
+        const hay_cls = "zzAB你好Czz";
+        const m_cls = re_cls.find(hay_cls, 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("AB你好C", hay_cls[m_cls.start..m_cls.end]);
+
+        var diag: CompileDiagnostic = .{};
+        try std.testing.expectError(error.RegexSyntax, Regex.initDiagnostic(alloc, "\\uD800", .{}, &diag));
+        try std.testing.expectEqual(DiagnosticCode.invalid_escape, diag.code);
+        try std.testing.expectError(error.RegexSyntax, Regex.initDiagnostic(alloc, "\\x{110000}", .{}, &diag));
+        try std.testing.expectEqual(DiagnosticCode.invalid_escape, diag.code);
+    }
+
+    // 2. \Q...\E literal quoting (outside and inside [...], plus empty and unclosed to EOF)
+    {
+        var re = try Regex.init(alloc, "\\Q[a]+.*(b)\\E!", .{});
+        defer re.deinit();
+        try std.testing.expect(re.find("[a]+.*(b)!", 0, .leftmost_first) != null);
+        try std.testing.expect(re.find("aaaxxxb!", 0, .leftmost_first) == null);
+
+        var re_opt = try Regex.init(alloc, "\\Qabc\\E?", .{});
+        defer re_opt.deinit();
+        try std.testing.expect(re_opt.isMatch("xyz"));
+
+        var re_cls_q = try Regex.init(alloc, "[\\Qa-z\\E]+", .{});
+        defer re_cls_q.deinit();
+        try std.testing.expect(re_cls_q.acceptsSpan("a-z", .leftmost_first));
+        try std.testing.expect(!re_cls_q.acceptsSpan("b", .leftmost_first));
+
+        var re_unclosed = try Regex.init(alloc, "\\Qfoo[0", .{});
+        defer re_unclosed.deinit();
+        try std.testing.expect(re_unclosed.isMatch("foo[0"));
+
+        var re_empty_q = try Regex.init(alloc, "a\\Q\\Eb", .{});
+        defer re_empty_q.deinit();
+        try std.testing.expect(re_empty_q.isMatch("ab"));
+    }
+
+    // 3. \a, \f, \v, \Z
+    {
+        var re_ctrl = try Regex.init(alloc, "\\a\\f\\v", .{});
+        defer re_ctrl.deinit();
+        try std.testing.expect(re_ctrl.isMatch("ok\x07\x0C\x0Bdone"));
+
+        var re_z = try Regex.init(alloc, "end\\Z", .{});
+        defer re_z.deinit();
+        const m_eof = re_z.find("end", 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("end", "end"[m_eof.start..m_eof.end]);
+        const m_nl = re_z.find("end\n", 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("end", "end\n"[m_nl.start..m_nl.end]);
+        try std.testing.expect(re_z.find("end\nmore", 0, .leftmost_first) == null);
+    }
+
+    // 4. All 14 POSIX character classes and negation
+    {
+        const cases = [_]struct { pat: []const u8, yes: []const u8, no: []const u8 }{
+            .{ .pat = "^[[:alnum:]]+$", .yes = "aZ09", .no = "a_9" },
+            .{ .pat = "^[[:alpha:]]+$", .yes = "aZb", .no = "a1b" },
+            .{ .pat = "^[[:ascii:]]+$", .yes = "abc~!", .no = "α" },
+            .{ .pat = "^[[:blank:]]+$", .yes = " \t ", .no = " \n " },
+            .{ .pat = "^[[:cntrl:]]+$", .yes = "\x01\x7F", .no = "a" },
+            .{ .pat = "^[[:digit:]]+$", .yes = "0129", .no = "0a" },
+            .{ .pat = "^[[:graph:]]+$", .yes = "a!~", .no = "a b" },
+            .{ .pat = "^[[:lower:]]+$", .yes = "abc", .no = "aBc" },
+            .{ .pat = "^[[:print:]]+$", .yes = "a !~", .no = "a\x07" },
+            .{ .pat = "^[[:punct:]]+$", .yes = ".,!?@[]{}", .no = "a!" },
+            .{ .pat = "^[[:space:]]+$", .yes = " \t\r\x0B\x0C", .no = " x" },
+            .{ .pat = "^[[:upper:]]+$", .yes = "XYZ", .no = "XyZ" },
+            .{ .pat = "^[[:word:]]+$", .yes = "ab_09", .no = "ab-09" },
+            .{ .pat = "^[[:xdigit:]]+$", .yes = "09afAF", .no = "09fg" },
+            .{ .pat = "^[[:^digit:]]+$", .yes = "ab你好!", .no = "a5b" },
+        };
+        for (cases) |tc| {
+            var re = try Regex.init(alloc, tc.pat, .{});
+            defer re.deinit();
+            try std.testing.expect(re.acceptsSpan(tc.yes, .leftmost_first));
+            try std.testing.expect(!re.acceptsSpan(tc.no, .leftmost_first));
+        }
+
+        // Case-insensitive [[:lower:]] and [[:upper:]]
+        var re_ic = try Regex.init(alloc, "(?i)[[:lower:]]+", .{});
+        defer re_ic.deinit();
+        try std.testing.expect(re_ic.acceptsSpan("aBc", .leftmost_first));
+
+        var diag: CompileDiagnostic = .{};
+        try std.testing.expectError(error.RegexSyntax, Regex.initDiagnostic(alloc, "[[:bogus:]]", .{}, &diag));
+        try std.testing.expectEqual(DiagnosticCode.invalid_posix_class, diag.code);
+        try std.testing.expectError(error.RegexSyntax, Regex.initDiagnostic(alloc, "[[:digit:", .{}, &diag));
+        try std.testing.expectEqual(DiagnosticCode.invalid_posix_class, diag.code);
+    }
+
+    // 5. Extended mode (?x) with multi-line layout & comments in single-line mode + (?-x) + RegexSet
+    {
+        const pat =
+            \\(?x)
+            \\  foo     # match prefix
+            \\  _       # underscore
+            \\  [0-9]+  # digits
+            \\  (?-x: bar) # trailing literal space inside non-x group
+        ;
+        var re = try Regex.init(alloc, pat, .{});
+        defer re.deinit();
+        const m = re.find("xxx foo_123 bar yyy", 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("foo_123 bar", "xxx foo_123 bar yyy"[m.start..m.end]);
+
+        var set = try RegexSet.init(alloc, &.{
+            "(?x)\n  alpha  # first\n  _[0-9]+\n",
+            "(?x)\n  beta   # second\n  _[a-z]+\n",
+        }, .{});
+        defer set.deinit();
+        const mset = set.find("test beta_ok done", 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(?u32, 1), mset.pattern_id);
+        try std.testing.expectEqualStrings("beta_ok", "test beta_ok done"[mset.start..mset.end]);
+    }
+
+    // 6. Ungreedy flag (?U) and toggle (?U:...) / (?-U)
+    {
+        var re_u = try Regex.init(alloc, "(?U)a+b+", .{});
+        defer re_u.deinit();
+        const mu = re_u.find("aaabbb", 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("aaab", "aaabbb"[mu.start..mu.end]);
+
+        var re_u_flip = try Regex.init(alloc, "(?U)a+?b+?", .{});
+        defer re_u_flip.deinit();
+        const mf = re_u_flip.find("aaabbb", 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("aaabbb", "aaabbb"[mf.start..mf.end]);
+
+        var re_u_neg = try Regex.init(alloc, "(?U)(?-U)a+b+", .{});
+        defer re_u_neg.deinit();
+        const mn = re_u_neg.find("aaabbb", 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("aaabbb", "aaabbb"[mn.start..mn.end]);
+
+        var re_u_one = try Regex.init(alloc, "(?U)a+", .{});
+        defer re_u_one.deinit();
+        const m1 = re_u_one.find("aaa", 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("a", "aaa"[m1.start..m1.end]);
+
+        var re_u_scoped = try Regex.init(alloc, "(?U:a+)a+b", .{});
+        defer re_u_scoped.deinit();
+        const ms = re_u_scoped.find("aaaab", 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("aaaab", "aaaab"[ms.start..ms.end]);
+    }
+}

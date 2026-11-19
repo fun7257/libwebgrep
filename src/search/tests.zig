@@ -6707,6 +6707,36 @@ test "regressions: carbon final review items 1, 3, 4, 6, and 7" {
     }
 }
 
+test "v0.7.0: replacement templates support ${10}..${32} and named ${name} captures" {
+    const alloc = std.testing.allocator;
+    const re_mod = @import("../regex.zig");
+    var re2 = try re_mod.Regex.init(alloc, "(a)(b)(c)(d)(e)(f)(g)(h)(i)(?P<ten>j):(?<name>[a-z]+)-(?<code_num>[0-9]+)", .{});
+    defer re2.deinit();
+
+    const CaptureReplSink = struct {
+        buf: [128]u8 = undefined,
+        len: usize = 0,
+        pub fn matched(self: *@This(), line: Line) bool {
+            if (line.replaced) |r| {
+                self.len = @min(r.len, self.buf.len);
+                @memcpy(self.buf[0..self.len], r[0..self.len]);
+            }
+            return true;
+        }
+    };
+
+    var s = CaptureReplSink{};
+    const input = "prefix abcdefghij:alice-99 suffix\n";
+    _ = try searchSlice(CaptureReplSink, &s, input, "repl", &re2, .{
+        .allocator = alloc,
+        .replacement = "ten=${10},user=${name},code=${code_num},full=${0}",
+    });
+    try testing.expectEqualStrings(
+        "prefix ten=j,user=alice,code=99,full=abcdefghij:alice-99 suffix",
+        s.buf[0..s.len],
+    );
+}
+
 
 test {
     _ = @import("challenger_test.zig");

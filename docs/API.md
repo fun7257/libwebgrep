@@ -562,7 +562,7 @@ pub fn searchTree(
 ) !Summary
 ```
 
-Searches a virtual `source.Source` tree starting at `root_path`, hierarchical `.gitignore`/`.ignore`/`.rgignore` files inside the virtual tree, glob/type filters, and aggregate request budgets (`max_results`, `max_request_bytes`, `max_decompressed_bytes`, `time_budget_ns`). Does not accept `std.Io.File` or `std.Io.Dir`.
+Searches a virtual `source.Source` tree starting at `root_path`, hierarchical `.gitignore`/`.ignore`/`.rgignore` files inside the virtual tree, glob/type filters, and aggregate request budgets (`max_results`, `max_request_bytes`, `max_decompressed_bytes`, `time_budget_ns`). When `config.max_concurrency > 1` (and no aggregate output/count caps require strict single-stream ordering), `searchTree` dispatches worker threads via `Scheduler` with per-worker `Scratch` pools, thread-safe `source.Memory` slot access, non-interleaved atomic per-file event replay, and automatic sequential fallback on single-threaded targets (`error.ConcurrencyUnavailable`). Does not accept `std.Io.File` or `std.Io.Dir`.
 
 ### searchArchiveSlice
 
@@ -595,6 +595,22 @@ pub fn searchArchive(
 ```
 
 Unpacks an archive stream from `reader` into an in-memory `ArchiveTree` and searches all matching entries via `searchTree`.
+
+### searchTarStream
+
+```zig
+pub fn searchTarStream(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    sink: *S,
+    reader: *std.Io.Reader,
+    matcher_ptr: anytype,
+    config: TreeConfig,
+) !Summary
+```
+
+Streams a `.tar`, `.tar.gz`/`.tgz`, `.tar.zst`, or `.tar.xz` archive from `reader` in a single pass using constant O(buffer_size) memory without buffering the archive or entry payloads in RAM. Enforces path-traversal guards (`error.PathTraversal`), symlink skipping, `entry_filter`, archive resource caps (`error.ArchiveLimit`), globs/types/root `ignore_texts`, and request budgets. Rejects `.zip` archives with `error.UnsupportedFormat`.
 
 ---
 
@@ -668,6 +684,8 @@ pub fn find(self: *const Regex, haystack: []const u8, start: usize, mode: MatchM
 pub fn findWithScratch(self: *const Regex, haystack: []const u8, start: usize, mode: MatchMode, scratch: *RegexScratch) ?Match
 pub fn findWatched(self: *const Regex, haystack: []const u8, start: usize, nul: *?usize) ?Match
 pub fn findCaptures(self: *const Regex, haystack: []const u8, start: usize, mode: MatchMode) ?Captures
+pub fn findCapturesWithScratch(self: *const Regex, haystack: []const u8, start: usize, mode: MatchMode, scratch: *RegexScratch) ?Captures
+pub fn groupIndexByName(self: *const Regex, name: []const u8) ?usize
 pub fn extractCaptures(self: *const Regex, haystack: []const u8, match_span: Match) Captures
 pub fn acceptsSpan(self: *const Regex, span: []const u8, mode: MatchMode) bool
 pub fn requiredLiteral(self: *const Regex) ?RequiredLiteral
@@ -675,12 +693,12 @@ pub fn resetStats(self: *const Regex) void
 ```
 
 Supported regular expression syntax:
-- Literals and escapes: `\d`, `\D`, `\w`, `\W`, `\s`, `\S`, `\b`, `\B` (UAX #29 Unicode word boundaries when `unicode_case = true`), `\A`, `\z`, `\n`, `\r`, `\t`, `\xHH`, `\u{HHHH}`, and escaped metacharacters.
+- Literals and escapes: `\d`, `\D`, `\w`, `\W`, `\s`, `\S`, `\b`, `\B` (UAX #29 Unicode word boundaries when `unicode_case = true`), `\A`, `\z`, `\Z` (before optional trailing `\n` at end of input), `\n`, `\r`, `\t`, `\a`, `\f`, `\v`, `\xHH`, `\x{H...}`, `\uHHHH`, `\u{H...}`, literal quoting `\Q...\E`, and escaped metacharacters.
 - Unicode General Category & Script properties: `\p{L}`, `\p{Lu}`, `\p{Ll}`, `\p{N}`, `\p{Nd}`, `\p{P}`, `\p{S}`, `\p{Sc}`, `\p{Z}`, `\p{ASCII}`, `\p{Han}`, `\p{Hiragana}`, `\p{Katakana}`, `\p{Greek}`, `\p{Cyrillic}`, `\p{Latin}`, and negated `\P{...}` (`src/tables/unicode_prop_table.zig`).
 - Wildcard and anchors: `.` (any valid UTF-8 codepoint except `\n`, or including `\n` when `dot_all = true` and `multiline = true`), `^` (start of line/input), `$` (end of line/input).
-- Character classes: `[a-z0-9_]`, multi-byte UTF-8 classes `[你好α-ω]`, negated `[^a-z]` or `[!a-z]`, and shorthand/property classes inside brackets.
-- Quantifiers: `*`, `+`, `?`, `{m}`, `{m,}`, `{m,n}` (greedy and lazy `*?`, `+?`, `??`, `{m,n}?`, operating on complete UTF-8 codepoints).
-- Alternation, grouping, and inline flags: `a|b`, `(expr)` (numbered capture groups `$1`..`$9`), `(?:expr)`, `(?i)`, `(?m)`, `(?s)`, `(?-i)`, `(?i:expr)`.
+- Character classes: `[a-z0-9_]`, multi-byte UTF-8 classes `[你好α-ω]`, negated `[^a-z]` or `[!a-z]`, all 14 POSIX character classes (`[:alnum:]`, `[:alpha:]`, `[:ascii:]`, `[:blank:]`, `[:cntrl:]`, `[:digit:]`, `[:graph:]`, `[:lower:]`, `[:print:]`, `[:punct:]`, `[:space:]`, `[:upper:]`, `[:word:]`, `[:xdigit:]`) and negated `[:^...:]`, plus shorthand/property classes inside brackets.
+- Quantifiers: `*`, `+`, `?`, `{m}`, `{m,}`, `{m,n}` (greedy and lazy `*?`, `+?`, `??`, `{m,n}?`, operating on complete UTF-8 codepoints; sense inverted under `(?U)` ungreedy mode).
+- Alternation, grouping, and inline flags: `a|b`, numbered capture groups `(expr)` and named capture groups `(?P<name>expr)` / `(?<name>expr)` (`$1`..`$32` / `${name}`), `(?:expr)`, inline and scoped flags `(?i)`, `(?m)`, `(?s)`, `(?U)`, `(?x)` (extended whitespace & `#` comments), `(?-imsUx)`, `(?imsUx:expr)`.
 
 Executes a bounded Hybrid Lazy DFA for eligible patterns with lockstep Thompson NFA / PikeVM fallback, guaranteeing worst-case $O(n)$ time complexity, immunity to catastrophic backtracking (ReDoS), and lock-free `*const Regex` concurrency.
 
@@ -712,7 +730,7 @@ Compiles up to `1,024` regular expressions into a combined Thompson NFA with `ma
 
 ### DiagnosticCode
 
-Structured error classification enum for `CompileDiagnostic` (`none`, `unexpected_end_of_pattern`, `invalid_escape`, `invalid_hex_escape`, `invalid_unicode_escape`, `unknown_unicode_property`, `unclosed_group`, `unmatched_close_paren`, `unclosed_char_class`, `invalid_char_range`, `dangling_quantifier`, `invalid_repeat_quantifier`, `repeat_quantifier_too_large`, `unrecognized_inline_flag`, `invalid_utf8`, `pattern_has_newline`, `recursion_depth_exceeded`, `instruction_limit_exceeded`, `multiline_window_exceeded`, `pattern_count_exceeded`, `pattern_bytes_exceeded`, `out_of_memory`).
+Structured error classification enum for `CompileDiagnostic` (`none`, `unexpected_end_of_pattern`, `invalid_escape`, `invalid_hex_escape`, `invalid_unicode_escape`, `unknown_unicode_property`, `invalid_posix_class`, `unclosed_group`, `unmatched_close_paren`, `invalid_group_name`, `duplicate_group_name`, `unclosed_char_class`, `invalid_char_range`, `dangling_quantifier`, `invalid_repeat_quantifier`, `repeat_quantifier_too_large`, `unrecognized_inline_flag`, `invalid_utf8`, `pattern_has_newline`, `recursion_depth_exceeded`, `instruction_limit_exceeded`, `multiline_window_exceeded`, `pattern_count_exceeded`, `pattern_bytes_exceeded`, `out_of_memory`).
 
 ### CompileDiagnostic
 
@@ -753,14 +771,15 @@ Populated by `Regex.initDiagnostic` and `RegexSet.initDiagnostic` when compilati
 ```zig
 pub const Captures = struct {
     match: Match,
-    groups: [9]?Match = @splat(null),
+    groups: [32]?Match = @splat(null),
     pub fn fullMatch(self: Captures) Match
     pub fn group(self: Captures, index: usize) ?Match
+    pub fn byName(self: Captures, re: anytype, name: []const u8) ?Match
     pub fn slice(self: Captures, haystack: []const u8, index: usize) ?[]const u8
 };
 ```
 
-Holds the full match (`match`) and numbered submatch capture groups `$1`..`$9` (`groups[0..8]`) extracted by `Regex.findCaptures` or `Regex.extractCaptures`, and automatically used by `SearchConfig.replacement` when expanding `$0`, `$&`, `$1`..`$9`, `${1}`..`${9}`, and `$$`.
+Holds the full match (`match`) and up to 32 numbered or named submatch capture groups `$1`..`$32` (`groups[0..31]`) extracted by `Regex.findCaptures`, `Regex.findCapturesWithScratch`, or `Regex.extractCaptures`, and automatically used by `SearchConfig.replacement` when expanding `$0`, `$&`, `$1`..`$32`, `${1}`..`${32}`, `${name}`, and `$$`.
 
 ### regex
 
@@ -1212,12 +1231,15 @@ Generic Chase-Lev work-stealing scheduler executing `initial_tasks` and recursiv
 
 ## C ABI (`include/webgrep.h`)
 
-`zig build` installs static (`libwebgrep.a`) and shared (`libwebgrep.so` / `.dylib`) libraries along with `include/webgrep.h`, exposing 20 C ABI functions (`callconv(.c)`):
-- `webgrep_version`, `webgrep_find_options_default`, `webgrep_regex_options_default`, `webgrep_config_default`, `webgrep_tree_config_default`, `webgrep_probe_options_default`
-- `webgrep_matcher_compile_literal`, `webgrep_matcher_compile_multi`, `webgrep_matcher_compile_regex`, `webgrep_matcher_compile_regex_set`, `webgrep_matcher_free`
-- `webgrep_scratch_new`, `webgrep_scratch_free`
-- `webgrep_find`, `webgrep_regex_set_matches`, `webgrep_probe_line_slice`
-- `webgrep_search_slice`, `webgrep_search_reader`, `webgrep_search_reverse_slice`, `webgrep_search_archive_slice`
+`zig build` installs static (`libwebgrep.a`) and shared (`libwebgrep.so` / `.dylib`) libraries along with `include/webgrep.h`, exposing **52 C ABI functions** (`callconv(.c)` with `WEBGREP_API` DLL import/export macro support):
+- **Version & Defaults**: `webgrep_version`, `webgrep_find_options_default`, `webgrep_regex_options_default`, `webgrep_config_default`, `webgrep_tree_config_default`, `webgrep_probe_options_default`, `webgrep_bloom_config_default`
+- **Matchers & Scratch**: `webgrep_matcher_compile_literal`, `webgrep_matcher_compile_multi`, `webgrep_matcher_compile_regex`, `webgrep_matcher_compile_regex_set`, `webgrep_matcher_free`, `webgrep_scratch_new`, `webgrep_scratch_free`
+- **Direct Find, RegexSet, Captures & Named Groups**: `webgrep_find`, `webgrep_regex_set_matches`, `webgrep_find_captures`, `webgrep_matcher_group_index`
+- **Cancellation Tokens**: `webgrep_cancel_new`, `webgrep_cancel_trigger`, `webgrep_cancel_reset`, `webgrep_cancel_free`
+- **Slice, Streaming, Range, Reverse, Probe & Archive Search**: `webgrep_search_slice`, `webgrep_search_reader`, `webgrep_search_range`, `webgrep_search_reverse_slice`, `webgrep_search_reverse_at`, `webgrep_probe_line_slice`, `webgrep_probe_line_at`, `webgrep_search_archive_slice`, `webgrep_search_archive_reader`
+- **Pull-Mode Iterators**: `webgrep_pull_open_slice`, `webgrep_pull_open_reader`, `webgrep_pull_next`, `webgrep_pull_free`
+- **N-gram Bloom Filter**: `webgrep_bloom_new`, `webgrep_bloom_free`, `webgrep_bloom_add`, `webgrep_bloom_merge`, `webgrep_bloom_may_contain`, `webgrep_bloom_serialize`, `webgrep_bloom_deserialize`
+- **Seekable Zstd Table & Indexed Gzip**: `webgrep_zstd_seek_table_parse`, `webgrep_zstd_seek_table_free`, `webgrep_zstd_seek_table_uncompressed_size`, `webgrep_zstd_seek_table_read_at`, `webgrep_gzip_index_build`, `webgrep_gzip_index_free`, `webgrep_gzip_index_uncompressed_size`, `webgrep_gzip_index_serialize`, `webgrep_gzip_index_deserialize`, `webgrep_gzip_index_read_at`
 
 ---
 

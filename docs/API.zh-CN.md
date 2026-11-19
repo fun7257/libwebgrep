@@ -95,7 +95,7 @@ pub fn deinit(self: *Regex) void
 pub fn find(self: *Regex, haystack: []const u8, start: usize, mode: MatchMode) ?Match
 ```
 
-- **语法支持**：字符类 `[a-z0-9_]` / `[^...]`、预定义类 `\d` `\D` `\w` `\W` `\s` `\S`、通配符 `.`、行/流锚点 `^` `$`、量词 `*` `+` `?` `{m}` `{m,}` `{m,n}`、交替 `a|b` 与分组 `(...)` / `(?:...)`。
+- **语法支持**：字符类 `[a-z0-9_]` / `[^...]`、14 个 POSIX 字符类（`[:alnum:]`..`[:xdigit:]` 及否定形式 `[:^...:]`）、预定义类 `\d` `\D` `\w` `\W` `\s` `\S`、转义序列 `\xHH` `\x{...}` `\uHHHH` `\u{...}` `\a` `\f` `\v` `\Q...\E`、通配符 `.`、行/流锚点 `^` `$` `\A` `\z` `\Z`、贪婪与非贪婪量词 `*` `+` `?` `{m}` `{m,}` `{m,n}`、交替 `a|b`、分组 `(?:...)` / 32 个捕获组 `(...)` / 命名捕获组 `(?P<name>...)` / `(?<name>...)` 及内联标志 `(?i)` `(?m)` `(?s)` `(?U)` `(?x)`。
 - **绝对防 ReDoS**：采用锁步 Thompson NFA / PikeVM 执行，每个输入字节上每条指令最多激活 1 次，最坏时间复杂度严格为 $O(n)$；默认编译指令数上限 `8192`（可通过 `max_inst` 按需上调或下调），超限返回 `error.RegexTooLarge`。
 - **SIMD 字面量双预过滤**：自动从 AST 提取必需的前缀与尾随字面量（`RequiredLiteral`）并挂载 `Finder` 做 42.9 GB/s SIMD 预过滤。
 - **有界窗口跨行（`RegexOptions.multiline`）**：跨行跨度严格限制在 `max_multiline_window`（默认 `64 KiB`，支持调用方按需配置）内，窗口耗尽仍未闭合匹配时立即判定失配。
@@ -409,16 +409,16 @@ pub fn find(self: *Regex, haystack: []const u8, start: usize, mode: MatchMode) ?
 重导出 `src/regex.zig`，即线性时间正则引擎 `Regex`、`RegexScratch`、`RegexSet`、`RegexOptions`、`Captures`、`DiagnosticCode` 与 `CompileDiagnostic` 的定义模块。
 
 ### Regex
-基于有界混合惰性 DFA（Hybrid Lazy DFA）+ 锁步 Thompson NFA / PikeVM 与 SIMD 预过滤的线性时间正则表达式引擎（`*const Regex` 无锁只读，支持 `\p{...}` Unicode 属性、UAX #29 Unicode 单词边界 `\b`/`\B`、非贪婪量词及 `$1`..`$9` 捕获组）。
+基于有界混合惰性 DFA（Hybrid Lazy DFA）+ 锁步 Thompson NFA / PikeVM 与 SIMD 预过滤的线性时间正则表达式引擎（`*const Regex` 无锁只读，支持 `\p{...}` Unicode 属性、14 个 POSIX 字符类 `[:...:]`、UAX #29 Unicode 单词边界 `\b`/`\B`、`\Q...\E` 字面引用、`(?x)`/`(?U)` 标志、命名捕获组 `(?P<name>...)`/`(?<name>...)` 与 `$1`..`$32` 捕获组）。
 
 ### RegexScratch
-供 `Regex.findWithScratch` 复用的线程本地 DFA 状态缓存与 NFA 队列缓冲池，实现稳态零分配正则匹配。
+供 `Regex.findWithScratch` 与 `Regex.findCapturesWithScratch` 复用的线程本地 DFA 状态缓存与 NFA 队列缓冲池，实现稳态零分配正则匹配。
 
 ### RegexSet
 多正则单遍同时匹配引擎（默认上限 `1,024` 条正则、可通过 `max_pattern_count` / `max_pattern_bytes` 配置，编译为合并 Thompson NFA 并自动挂载 `Multi` SIMD 前缀预过滤，支持 `isMatch`、`find` 与单遍获取全部命中模式 ID 的 `matches`）。
 
 ### DiagnosticCode
-正则编译诊断错误码枚举（精确标识未闭合括号、未闭合字符类、未知 Unicode 属性、非法量词、递归深度超限、指令数超限等）。
+正则编译诊断错误码枚举（精确标识未闭合括号、无效/重复捕获组名 `invalid_group_name`/`duplicate_group_name`、无效 POSIX 字符类 `invalid_posix_class`、未闭合字符类、未知 Unicode 属性、非法量词、递归深度超限、指令数超限等）。
 
 ### CompileDiagnostic
 由 `Regex.initDiagnostic` 与 `RegexSet.initDiagnostic` 填充的结构化编译错误诊断信息（含字节偏移 `offset`、1 起始 `line`/`column`、错误描述 `message` 与模式索引 `pattern_index`）。
@@ -427,7 +427,7 @@ pub fn find(self: *Regex, haystack: []const u8, start: usize, mode: MatchMode) ?
 构造 `Regex` 与 `RegexSet` 的配置项：大小写模式（`case` / `unicode_case`）、有界跨行匹配（`multiline` / `max_multiline_window` 默认 `64 KiB`）、`dot_all`、编译限制（`max_inst` / `max_insts: ?usize = null` 默认 `8192`、`max_repeat: usize = 1000`、`max_recursion_depth: usize = 64`）、多模式与预过滤限制（`max_pattern_count: ?usize = null` 默认 `1024`、`max_pattern_bytes: ?usize = null` 默认 `256 KiB`、`max_unicode_variants: usize = 64`）及 DFA 规模限制（`aot_dfa_max_insts: usize = 256`、`max_dfa_states: u16 = 256`）。
 
 ### Captures
-正则子匹配捕获组结构，保存完整匹配（`match`）与编号捕获组 `$1`..`$9`（`groups[0..8]`），供 `Regex.findCaptures`、`Regex.extractCaptures` 及 `SearchConfig.replacement` 替换模板（`$0`/`$&`/`$1`..`$9`/`${1}`..`${9}`/`$$`）使用。
+正则子匹配捕获组结构，保存完整匹配（`match`）与最多 32 个编号/命名捕获组 `$1`..`$32`（`groups[0..31]`、`byName(re, name)`），供 `Regex.findCaptures`、`Regex.findCapturesWithScratch`、`Regex.extractCaptures` 及 `SearchConfig.replacement` 替换模板（`$0`/`$&`/`$1`..`$32`/`${1}`..`${32}`/`${name}`/`$$`）使用。
 
 ### two_way
 重导出 `src/finder/two_way.zig`，提供最坏时间复杂度严格 $O(n)$、零堆分配的 Crochemore-Perrin Two-Way 子串查找器。
@@ -469,13 +469,16 @@ pub fn find(self: *Regex, haystack: []const u8, start: usize, mode: MatchMode) ?
 虚拟树与归档检索配置（聚合 `SearchConfig`、`ArchiveOptions`、Glob/文件类型过滤及配额 `max_glob_rules`/`max_glob_rule_len`/`max_glob_brace_depth`、内存与分层 `.gitignore`/`.ignore`/`.rgignore` 开关及目录深度/文件数配额）。
 
 ### searchTree
-在虚拟 `source.Source` 目录树上执行分层 `.gitignore` 过滤、Glob/类型筛选与多租户预算受控检索（绝不接收物理文件句柄 `std.Io.File` 或 `std.Io.Dir`）。
+在虚拟 `source.Source` 目录树上执行分层 `.gitignore` 过滤、Glob/类型筛选与多租户预算受控检索（绝不接收物理文件句柄 `std.Io.File` 或 `std.Io.Dir`）。当 `max_concurrency > 1` 时自动通过 `Scheduler` 多线程并发扫描，对原子重放保证单文件行事件不交叉，并在单线程目标上自动降级串行执行。
 
 ### searchArchiveSlice
 直接对内存中的归档字节切片（`.tar` / `.tar.gz` / `.tar.zst` / `.tar.xz` / `.zip`）执行零落盘解包与多文件检索。
 
 ### searchArchive
 直接对 `*std.Io.Reader` 归档字节流执行零落盘解包与多文件检索。
+
+### searchTarStream
+以恒定 O(buffer_size) 内存单遍流式扫描 `*std.Io.Reader` 中的 `.tar` / `.tar.gz` / `.tar.zst` / `.tar.xz` 归档，不在内存中缓存整份归档或条目负载；强制执行路径穿越防护、符号链接跳过、`entry_filter` 预过滤、解压炸弹/条目上限及全局请求预算（`.zip` 返回 `error.UnsupportedFormat`）。
 
 ### scheduler
 重导出 `src/scheduler.zig`，提供不依赖任何文件路径或目录句柄的通用无锁 Chase-Lev 工作窃取任务调度器模块。
@@ -508,10 +511,12 @@ pub fn find(self: *Regex, haystack: []const u8, start: usize, mode: MatchMode) ?
 
 ## 八、C ABI 跨语言绑定接口（`include/webgrep.h`）
 
-`zig build` 默认产出静态库（`libwebgrep.a`）、动态库（`libwebgrep.so` / `.dylib`）与标准 C11 头文件 `include/webgrep.h`，导出全部 20 个 C ABI 函数：
-- 默认配置与版本：`webgrep_version`、`webgrep_find_options_default`、`webgrep_regex_options_default`、`webgrep_config_default`、`webgrep_tree_config_default`、`webgrep_probe_options_default`
-- 匹配器与缓冲池：`webgrep_matcher_compile_literal`、`webgrep_matcher_compile_multi`、`webgrep_matcher_compile_regex`、`webgrep_matcher_compile_regex_set`、`webgrep_matcher_free`、`webgrep_scratch_new`、`webgrep_scratch_free`
-- 查找、行探测与流式/反向/归档检索：`webgrep_find`、`webgrep_regex_set_matches`、`webgrep_probe_line_slice`、`webgrep_search_slice`、`webgrep_search_reader`、`webgrep_search_reverse_slice`、`webgrep_search_archive_slice`
+`zig build` 默认产出静态库（`libwebgrep.a`）、动态库（`libwebgrep.so` / `.dylib`）与标准 C99/C11 头文件 `include/webgrep.h`（带 `WEBGREP_API` DLL 导入/导出宏），导出全部 **52 个 C ABI 函数**：
+- 默认配置与版本：`webgrep_version`、`webgrep_find_options_default`、`webgrep_regex_options_default`、`webgrep_config_default`、`webgrep_tree_config_default`、`webgrep_probe_options_default`、`webgrep_bloom_config_default`
+- 匹配器、缓存与取消令牌：`webgrep_matcher_compile_literal`、`webgrep_matcher_compile_multi`、`webgrep_matcher_compile_regex`、`webgrep_matcher_compile_regex_set`、`webgrep_matcher_free`、`webgrep_scratch_new`、`webgrep_scratch_free`、`webgrep_cancel_new`、`webgrep_cancel_trigger`、`webgrep_cancel_reset`、`webgrep_cancel_free`
+- 查找、捕获组与拉式迭代：`webgrep_find`、`webgrep_regex_set_matches`、`webgrep_find_captures`、`webgrep_matcher_group_index`、`webgrep_pull_open_slice`、`webgrep_pull_open_reader`、`webgrep_pull_next`、`webgrep_pull_free`
+- 流式、随机访问与归档检索：`webgrep_search_slice`、`webgrep_search_reader`、`webgrep_search_range`、`webgrep_search_reverse_slice`、`webgrep_search_reverse_at`、`webgrep_probe_line_slice`、`webgrep_probe_line_at`、`webgrep_search_archive_slice`、`webgrep_search_archive_reader`
+- Bloom 预筛与随机解压索引：`webgrep_bloom_new`、`webgrep_bloom_free`、`webgrep_bloom_add`、`webgrep_bloom_merge`、`webgrep_bloom_may_contain`、`webgrep_bloom_serialize`、`webgrep_bloom_deserialize`、`webgrep_zstd_seek_table_parse`、`webgrep_zstd_seek_table_free`、`webgrep_zstd_seek_table_uncompressed_size`、`webgrep_zstd_seek_table_read_at`、`webgrep_gzip_index_build`、`webgrep_gzip_index_free`、`webgrep_gzip_index_uncompressed_size`、`webgrep_gzip_index_serialize`、`webgrep_gzip_index_deserialize`、`webgrep_gzip_index_read_at`
 
 ---
 

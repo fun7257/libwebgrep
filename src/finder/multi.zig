@@ -16,18 +16,24 @@
 //! Only the creator calls `deinit`. Pattern count and total byte limits are checked before allocating tables.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const aho = @import("aho.zig");
 const ascii = @import("ascii.zig");
 const build_options = @import("build_options");
 const byteset = @import("byteset.zig");
+const cpuid = @import("../io/cpuid.zig");
 const matcher = @import("../matcher.zig");
 const memchr = @import("memchr.zig");
 const pairs = @import("pairs.zig");
 const unicode_fold = @import("unicode_fold.zig");
 
-const teddy_on = build_options.teddy != .off;
+const teddy_runtime = (builtin.cpu.arch == .x86_64 and build_options.teddy == .runtime);
+const teddy_static = (build_options.teddy != .off and build_options.teddy != .runtime);
+const teddy_on = teddy_static or teddy_runtime;
 const teddy_mod = if (teddy_on) @import("teddy.zig") else struct {
     pub const Engine = struct {};
+    pub const Ssse3Engine = struct {};
+    pub const RuntimeAvx2Engine = struct {};
 };
 
 pub const Multi = struct {
@@ -53,7 +59,9 @@ pub const Multi = struct {
         bytes: byteset.Set,
         pairs: pairs.Engine,
         ac: aho.Ac,
-        teddy: if (teddy_on) teddy_mod.Engine else void,
+        teddy: if (teddy_static) teddy_mod.Engine else void,
+        teddy_ssse3: if (teddy_runtime) teddy_mod.Ssse3Engine else void,
+        teddy_avx2_rt: if (teddy_runtime) teddy_mod.RuntimeAvx2Engine else void,
         mixed: Mixed,
     };
 
@@ -91,7 +99,7 @@ pub const Multi = struct {
                     .patterns = patterns,
                 };
             }
-            if (comptime teddy_on) {
+            if (comptime teddy_static) {
                 if (preferTeddyOverPairs(patterns)) {
                     return .{
                         .kind = .{ .teddy = teddy_mod.Engine.init(patterns, ignore) },
@@ -102,6 +110,31 @@ pub const Multi = struct {
                         .empty_only = false,
                         .patterns = patterns,
                     };
+                }
+            } else if (comptime teddy_runtime) {
+                if (preferTeddyOverPairs(patterns)) {
+                    const feats = cpuid.detectX86();
+                    if (feats.avx2) {
+                        return .{
+                            .kind = .{ .teddy_avx2_rt = teddy_mod.RuntimeAvx2Engine.init(patterns, ignore) },
+                            .ignore_case = ignore,
+                            .unicode_case = options.unicode_case,
+                            .multiline = options.multiline,
+                            .max_multiline_window = ml_win,
+                            .empty_only = false,
+                            .patterns = patterns,
+                        };
+                    } else if (feats.ssse3) {
+                        return .{
+                            .kind = .{ .teddy_ssse3 = teddy_mod.Ssse3Engine.init(patterns, ignore) },
+                            .ignore_case = ignore,
+                            .unicode_case = options.unicode_case,
+                            .multiline = options.multiline,
+                            .max_multiline_window = ml_win,
+                            .empty_only = false,
+                            .patterns = patterns,
+                        };
+                    }
                 }
             }
             if (try pairs.Engine.create(allocator, patterns, ignore)) |engine| {
@@ -115,7 +148,7 @@ pub const Multi = struct {
                     .patterns = patterns,
                 };
             }
-            if (comptime teddy_on) {
+            if (comptime teddy_static) {
                 if (teddyEligible(patterns)) {
                     return .{
                         .kind = .{ .teddy = teddy_mod.Engine.init(patterns, ignore) },
@@ -126,6 +159,31 @@ pub const Multi = struct {
                         .empty_only = false,
                         .patterns = patterns,
                     };
+                }
+            } else if (comptime teddy_runtime) {
+                if (teddyEligible(patterns)) {
+                    const feats = cpuid.detectX86();
+                    if (feats.avx2) {
+                        return .{
+                            .kind = .{ .teddy_avx2_rt = teddy_mod.RuntimeAvx2Engine.init(patterns, ignore) },
+                            .ignore_case = ignore,
+                            .unicode_case = options.unicode_case,
+                            .multiline = options.multiline,
+                            .max_multiline_window = ml_win,
+                            .empty_only = false,
+                            .patterns = patterns,
+                        };
+                    } else if (feats.ssse3) {
+                        return .{
+                            .kind = .{ .teddy_ssse3 = teddy_mod.Ssse3Engine.init(patterns, ignore) },
+                            .ignore_case = ignore,
+                            .unicode_case = options.unicode_case,
+                            .multiline = options.multiline,
+                            .max_multiline_window = ml_win,
+                            .empty_only = false,
+                            .patterns = patterns,
+                        };
+                    }
                 }
             }
             return .{
@@ -234,7 +292,13 @@ pub const Multi = struct {
             .pairs => |*engine| engine.deinit(),
             .ac => |*ac| ac.deinit(),
             .teddy => |*engine| {
-                if (comptime teddy_on) engine.deinit();
+                if (comptime teddy_static) engine.deinit();
+            },
+            .teddy_ssse3 => |*engine| {
+                if (comptime teddy_runtime) engine.deinit();
+            },
+            .teddy_avx2_rt => |*engine| {
+                if (comptime teddy_runtime) engine.deinit();
             },
             .mixed => |*mixed| mixed.allocator.free(mixed.ignore),
         }
@@ -263,7 +327,7 @@ pub const Multi = struct {
             .bytes => "bytes",
             .pairs => "pairs",
             .ac => "ac",
-            .teddy => "teddy",
+            .teddy, .teddy_ssse3, .teddy_avx2_rt => "teddy",
             .mixed => "mixed",
         };
     }
@@ -301,7 +365,15 @@ pub const Multi = struct {
             .pairs => |*engine| return self.withMappedId(engine.find(haystack, start, mode)),
             .ac => |*ac| return self.withMappedId(ac.find(haystack, start, mode)),
             .teddy => |*engine| {
-                if (comptime teddy_on) return self.withMappedId(engine.find(haystack, start, mode));
+                if (comptime teddy_static) return self.withMappedId(engine.find(haystack, start, mode));
+                unreachable;
+            },
+            .teddy_ssse3 => |*engine| {
+                if (comptime teddy_runtime) return self.withMappedId(engine.find(haystack, start, mode));
+                unreachable;
+            },
+            .teddy_avx2_rt => |*engine| {
+                if (comptime teddy_runtime) return self.withMappedId(engine.find(haystack, start, mode));
                 unreachable;
             },
             .mixed => unreachable,
@@ -494,7 +566,15 @@ pub const Multi = struct {
             .pairs => |*engine| return self.withMappedId(engine.findWatchingNul(haystack, start, .earliest, nul)),
             .ac => |*ac| return self.withMappedId(ac.findWatchingNul(haystack, start, .earliest, nul)),
             .teddy => |*engine| {
-                if (comptime teddy_on) return self.withMappedId(engine.findWatchingNul(haystack, start, .earliest, nul));
+                if (comptime teddy_static) return self.withMappedId(engine.findWatchingNul(haystack, start, .earliest, nul));
+                unreachable;
+            },
+            .teddy_ssse3 => |*engine| {
+                if (comptime teddy_runtime) return self.withMappedId(engine.findWatchingNul(haystack, start, .earliest, nul));
+                unreachable;
+            },
+            .teddy_avx2_rt => |*engine| {
+                if (comptime teddy_runtime) return self.withMappedId(engine.findWatchingNul(haystack, start, .earliest, nul));
                 unreachable;
             },
             .mixed => {
@@ -979,8 +1059,9 @@ test "falls back to Teddy or automaton when adjacent pairs exceed capacity" {
     }
     var multi = try Multi.init(std.testing.allocator, &pats, .{});
     defer multi.deinit();
-    if (teddy_on) {
-        try std.testing.expect(multi.kind == .teddy);
+    const expect_teddy = teddy_static or (teddy_runtime and cpuid.detectX86().ssse3);
+    if (expect_teddy) {
+        try std.testing.expect(multi.kind == .teddy or multi.kind == .teddy_ssse3 or multi.kind == .teddy_avx2_rt);
     } else {
         try std.testing.expect(multi.kind == .ac);
     }
@@ -997,8 +1078,9 @@ test "window boundaries, adjacent pairs, and later-starting match ending earlier
     };
     var multi = try Multi.init(std.testing.allocator, &pats, .{});
     defer multi.deinit();
-    if (comptime teddy_on) {
-        try std.testing.expect(multi.kind == .teddy);
+    const expect_teddy = teddy_static or (teddy_runtime and cpuid.detectX86().ssse3);
+    if (expect_teddy) {
+        try std.testing.expect(multi.kind == .teddy or multi.kind == .teddy_ssse3 or multi.kind == .teddy_avx2_rt);
     } else {
         try std.testing.expect(multi.kind == .pairs);
     }
@@ -1082,8 +1164,9 @@ test "second stride: Teddy 4-window or automaton matches naive search" {
     }
     var multi = try Multi.init(std.testing.allocator, &pats, .{});
     defer multi.deinit();
-    if (teddy_on) {
-        try std.testing.expect(multi.kind == .teddy);
+    const expect_teddy = teddy_static or (teddy_runtime and cpuid.detectX86().ssse3);
+    if (expect_teddy) {
+        try std.testing.expect(multi.kind == .teddy or multi.kind == .teddy_ssse3 or multi.kind == .teddy_avx2_rt);
     } else {
         try std.testing.expect(multi.kind == .ac);
     }
@@ -1138,7 +1221,8 @@ test "benchmark scenario patterns dispatch to their expected engines" {
 
     var teddy = try Multi.init(std.testing.allocator, scenario_teddy, .{});
     defer teddy.deinit();
-    const teddy_name = if (teddy_on) "teddy" else "ac";
+    const expect_teddy = teddy_static or (teddy_runtime and cpuid.detectX86().ssse3);
+    const teddy_name = if (expect_teddy) "teddy" else "ac";
     try std.testing.expectEqualStrings(teddy_name, teddy.engineName());
 
     var ac = try Multi.init(std.testing.allocator, scenario_ac, .{});

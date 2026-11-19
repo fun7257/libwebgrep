@@ -204,6 +204,7 @@ test "public search entry points accept no filesystem handles or paths" {
     try checkSearchFn(@TypeOf(searchTree));
     try checkSearchFn(@TypeOf(searchArchiveSlice));
     try checkSearchFn(@TypeOf(searchArchive));
+    try checkSearchFn(@TypeOf(searchTarStream));
 
     const Collect = struct {
         left: bool = false,
@@ -249,7 +250,7 @@ pub const regex = @import("regex.zig");
 pub const Regex = regex.Regex;
 /// Options for constructing `Regex` and `RegexSet`: case mode, bounded multiline, `dot_all`, and instruction caps.
 pub const RegexOptions = regex.RegexOptions;
-/// Regex submatch capture result holding full match (`match`) and numbered groups `$1`..`$9` (`groups[0..8]`).
+/// Regex submatch capture result holding full match (`match`) and up to 32 numbered or named groups `$1`..`$32` (`groups[0..31]`).
 pub const Captures = regex.Captures;
 /// Reusable per-thread scratch space for `Regex.findWithScratch` and 256-state `HeapDfa`.
 pub const RegexScratch = regex.RegexScratch;
@@ -295,6 +296,10 @@ test {
             .neon => _ = @import("finder/teddy_neon.zig"),
             .ssse3 => _ = @import("finder/teddy_ssse3.zig"),
             .avx2 => _ = @import("finder/teddy_avx2.zig"),
+            .runtime => {
+                _ = @import("finder/teddy_ssse3.zig");
+                _ = @import("finder/teddy_avx2_rt.zig");
+            },
             .off => {},
         }
     }
@@ -333,6 +338,8 @@ pub const searchTree = tree.searchTree;
 pub const searchArchiveSlice = tree.searchArchiveSlice;
 /// Unpacks an archive stream from `*std.Io.Reader` in memory and searches its virtual tree without touching disk.
 pub const searchArchive = tree.searchArchive;
+/// Streams a `.tar`, `.tar.gz`/`.tgz`, `.tar.zst`, or `.tar.xz` archive in constant O(buffer_size) memory without buffering the archive in RAM.
+pub const searchTarStream = tree.searchTarStream;
 /// Generic path-free Chase-Lev work-stealing task scheduler module.
 pub const scheduler = @import("scheduler.zig");
 /// Configuration (`max_threads`, `stop`, `cancel`) for `Scheduler(Task, Context).run`.
@@ -353,6 +360,7 @@ pub const walk_types = @import("walk/types.zig");
 pub const walk_list = @import("walk/list_dir.zig");
 
 test {
+    _ = @import("io/cpuid.zig");
     _ = @import("probe.zig");
     _ = @import("codec/seekable.zig");
     _ = @import("finder/bloom.zig");

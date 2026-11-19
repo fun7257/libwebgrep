@@ -19,31 +19,44 @@ pub fn build(b: *std.Build) void {
         "mmap-windows",
         "Map large files in 8 MiB windows before searching (default: false, uses readPositional)",
     ) orelse false;
-    const TeddyIsa = enum { off, neon, ssse3, avx2 };
+    const TeddyIsa = enum { off, neon, ssse3, avx2, runtime };
     const teddy_default: TeddyIsa = switch (target.result.cpu.arch) {
-        .aarch64 => .neon,
-        .x86_64 => if (std.Target.x86.featureSetHas(target.result.cpu.features, .avx2)) .avx2 else .ssse3,
+        .aarch64 => if (std.Target.aarch64.featureSetHas(target.result.cpu.features, .neon)) .neon else .off,
+        .x86_64 => if (std.Target.x86.featureSetHas(target.result.cpu.features, .avx2))
+            .avx2
+        else if (std.Target.x86.featureSetHas(target.result.cpu.features, .ssse3))
+            .ssse3
+        else
+            .off,
         else => .off,
     };
     const teddy_request = b.option(
         TeddyIsa,
         "teddy",
-        "Multi-pattern Teddy SIMD engine: off, neon, ssse3, avx2 (default: auto-detected per target)",
+        "Multi-pattern Teddy SIMD engine: off, neon, ssse3, avx2, runtime (default: auto-detected per target)",
     ) orelse teddy_default;
     const teddy_matches = switch (teddy_request) {
         .off => true,
         .neon => target.result.cpu.arch == .aarch64,
-        .ssse3, .avx2 => target.result.cpu.arch == .x86_64,
+        .ssse3, .avx2, .runtime => target.result.cpu.arch == .x86_64,
     };
     const teddy: TeddyIsa = if (teddy_matches) teddy_request else .off;
     // x86_64 Debug uses the self-hosted backend which does not encode pshufb/vpshufb.
-    // Use the LLVM backend when SSSE3 or AVX2 Teddy is requested, without linking libc.
-    const use_llvm: ?bool = if (teddy == .ssse3 or teddy == .avx2) true else null;
-    const compile_target = if (teddy == .avx2) blk: {
-        var query = target.query;
-        query.cpu_features_add.addFeature(@backingInt(std.Target.x86.Feature.avx2));
-        break :blk b.resolveTargetQuery(query);
-    } else target;
+    // Use the LLVM backend when SSSE3, AVX2, or runtime x86_64 Teddy is requested, without linking libc.
+    const use_llvm: ?bool = if (teddy == .ssse3 or teddy == .avx2 or teddy == .runtime) true else null;
+    const compile_target = switch (teddy) {
+        .avx2 => blk: {
+            var query = target.query;
+            query.cpu_features_add.addFeature(@backingInt(std.Target.x86.Feature.avx2));
+            break :blk b.resolveTargetQuery(query);
+        },
+        .ssse3 => blk: {
+            var query = target.query;
+            query.cpu_features_add.addFeature(@backingInt(std.Target.x86.Feature.ssse3));
+            break :blk b.resolveTargetQuery(query);
+        },
+        else => target,
+    };
     const linux_getdents = want_linux_getdents and target.result.os.tag == .linux;
     const options = b.addOptions();
     options.addOption(bool, "linux_getdents", linux_getdents);
@@ -210,6 +223,7 @@ pub fn build(b: *std.Build) void {
             .neon => "-Dteddy=neon is only supported on aarch64",
             .ssse3 => "-Dteddy=ssse3 is only supported on x86_64",
             .avx2 => "-Dteddy=avx2 is only supported on x86_64",
+            .runtime => "-Dteddy=runtime is only supported on x86_64",
             .off => unreachable,
         };
         const fail = b.addFail(message);

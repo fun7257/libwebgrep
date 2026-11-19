@@ -1,7 +1,7 @@
 //! [Module] search/format.zig
 //! [Layer] Layer 4 — Match Span Collection, UTF-16 Columns, Lossy Sanitization, & Template Replacement
 //! [Role] Constructs `Line` payloads for matched/context lines, computes UTF-16 code-unit columns/spans,
-//!        sanitizes invalid UTF-8 to U+FFFD on demand, and expands `$0`/`$1`..`$9`/`${name}` replacement templates.
+//!        sanitizes invalid UTF-8 to U+FFFD on demand, and expands `$0`/`$1`..`$32`/`${name}` replacement templates.
 //! [Invariants]
 //!   1. Only executed on matched or emitted context lines (never on non-matching lines).
 //!   2. Uses stack scratch buffers first (`stack_spans`, `text_scratch`, `replace_scratch`), falling back to `text_alloc` only for huge lines.
@@ -349,12 +349,22 @@ pub fn advanceUtf16Span(
     return .{ .start = u16_start, .end = u16_end };
 }
 
+fn isReplacementIdent(s: []const u8) bool {
+    if (s.len == 0) return false;
+    if (!((s[0] >= 'a' and s[0] <= 'z') or (s[0] >= 'A' and s[0] <= 'Z') or s[0] == '_')) return false;
+    for (s[1..]) |ch| {
+        if (!((ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '_')) return false;
+    }
+    return true;
+}
+
 pub fn expandReplacementTemplate(
     repl: []const u8,
     bytes: []const u8,
     cap_source: []const u8,
     from: usize,
     to: usize,
+    re: ?*const regex_mod.Regex,
     caps: ?regex_mod.Captures,
     dest: ?[]u8,
 ) usize {
@@ -389,22 +399,57 @@ pub fn expandReplacementTemplate(
                 }
             }
             i += 2;
-        } else if (next == '{' and i + 3 < repl.len and repl[i + 3] == '}' and repl[i + 2] >= '0' and repl[i + 2] <= '9') {
-            const g: usize = repl[i + 2] - '0';
-            if (g == 0) {
-                const seg = bytes[from..to];
-                if (dest) |d| if (seg.len > 0) @memcpy(d[written .. written + seg.len], seg);
-                written += seg.len;
-            } else if (caps) |c| {
-                if (c.group(g)) |sp| {
-                    const gfrom = @min(sp.start, cap_source.len);
-                    const gto = @min(@max(sp.end, gfrom), cap_source.len);
-                    const seg = cap_source[gfrom..gto];
-                    if (dest) |d| if (seg.len > 0) @memcpy(d[written .. written + seg.len], seg);
-                    written += seg.len;
+        } else if (next == '{') {
+            if (std.mem.indexOfScalarPos(u8, repl, i + 2, '}')) |close_brace| {
+                const inner = repl[i + 2 .. close_brace];
+                if (inner.len > 0) {
+                    var all_digits = true;
+                    for (inner) |b| {
+                        if (b < '0' or b > '9') {
+                            all_digits = false;
+                            break;
+                        }
+                    }
+                    if (all_digits) {
+                        if (std.fmt.parseInt(usize, inner, 10)) |g| {
+                            if (g == 0) {
+                                const seg = bytes[from..to];
+                                if (dest) |d| if (seg.len > 0) @memcpy(d[written .. written + seg.len], seg);
+                                written += seg.len;
+                            } else if (caps) |c| {
+                                if (c.group(g)) |sp| {
+                                    const gfrom = @min(sp.start, cap_source.len);
+                                    const gto = @min(@max(sp.end, gfrom), cap_source.len);
+                                    const seg = cap_source[gfrom..gto];
+                                    if (dest) |d| if (seg.len > 0) @memcpy(d[written .. written + seg.len], seg);
+                                    written += seg.len;
+                                }
+                            }
+                            i = close_brace + 1;
+                            continue;
+                        } else |_| {}
+                    } else if (isReplacementIdent(inner)) {
+                        if (re) |r| {
+                            if (r.groupIndexByName(inner)) |g| {
+                                if (caps) |c| {
+                                    if (c.group(g)) |sp| {
+                                        const gfrom = @min(sp.start, cap_source.len);
+                                        const gto = @min(@max(sp.end, gfrom), cap_source.len);
+                                        const seg = cap_source[gfrom..gto];
+                                        if (dest) |d| if (seg.len > 0) @memcpy(d[written .. written + seg.len], seg);
+                                        written += seg.len;
+                                    }
+                                }
+                            }
+                        }
+                        i = close_brace + 1;
+                        continue;
+                    }
                 }
             }
-            i += 4;
+            if (dest) |d| d[written] = '$';
+            written += 1;
+            i += 1;
         } else {
             if (dest) |d| d[written] = '$';
             written += 1;
@@ -526,7 +571,7 @@ pub fn buildReplaced(
             fallback_cache[idx] = used_fb;
         }
         const cap_src = if (used_fb) bytes else raw_slice;
-        need += expandReplacementTemplate(repl, bytes, cap_src, from, to, caps, null);
+        need += expandReplacementTemplate(repl, bytes, cap_src, from, to, state.capture_regex, caps, null);
         cursor = @max(cursor, to);
     }
     if (cursor < bytes.len) need += bytes.len - cursor;
@@ -551,7 +596,7 @@ pub fn buildReplaced(
             null;
         const cap_src = if (used_fb) bytes else raw_slice;
         const exp_start = out;
-        out += expandReplacementTemplate(repl, bytes, cap_src, from, to, caps, dest[exp_start..]);
+        out += expandReplacementTemplate(repl, bytes, cap_src, from, to, state.capture_regex, caps, dest[exp_start..]);
         item.replacement = dest[exp_start..out];
         cursor = @max(cursor, to);
     }

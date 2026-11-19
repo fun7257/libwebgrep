@@ -1,7 +1,7 @@
 //! [Module] c_api.zig
 //! [Layer] Layer 6 — C ABI & Cross-Language FFI Exports (`F4`)
-//! [Role] Exports 20 C ABI functions (`callconv(.c)`) matching `include/webgrep.h` for embedding
-//!        `libwebgrep` in C, C++, Rust, Go, Python, and Node.js.
+//! [Role] Exports 52 C ABI functions (`callconv(.c)`) across `c_api.zig` and `c_api_ext.zig`
+//!        matching `include/webgrep.h` for embedding `libwebgrep` in C, C++, Rust, Go, Python, and Node.js.
 //! [Invariants]
 //!   1. Zero mutable global state; compiled `webgrep_matcher_t` handles are immutable during search
 //!      and safe to share concurrently across threads without locking.
@@ -24,10 +24,14 @@ const probe_mod = @import("probe.zig");
 const tree_mod = @import("search/tree.zig");
 
 const builtin = @import("builtin");
-const c_alloc = if (builtin.is_test)
+pub const c_alloc = if (builtin.is_test)
     std.testing.allocator
 else if (builtin.link_libc)
     std.heap.c_allocator
+else if (builtin.cpu.arch.isWasm())
+    std.heap.wasm_allocator
+else if (builtin.single_threaded)
+    std.heap.page_allocator
 else
     std.heap.smp_allocator;
 
@@ -60,6 +64,7 @@ pub const WEBGREP_ENTRY_OTHER: i32 = 2;
 
 pub const webgrep_matcher_t = opaque {};
 pub const webgrep_scratch_t = opaque {};
+pub const webgrep_cancel_t = opaque {};
 
 pub const webgrep_pattern_t = extern struct {
     ptr: ?[*]const u8 = null,
@@ -115,7 +120,7 @@ pub const webgrep_span_t = extern struct {
     u16_end: usize = 0,
 };
 
-const empty_spans = [1]webgrep_span_t{.{}};
+pub const empty_spans = [1]webgrep_span_t{.{}};
 
 pub const webgrep_line_event_t = extern struct {
     path_ptr: ?[*]const u8 = null,
@@ -214,6 +219,17 @@ pub const webgrep_config_t = extern struct {
     initial_line_number: u64 = 0,
     line_filter: webgrep_line_filter_cb = null,
     line_filter_ctx: ?*anyopaque = null,
+    charset_ptr: ?[*]const u8 = null,
+    charset_len: usize = 0,
+    contains_ptr: ?[*]const webgrep_pattern_t = null,
+    contains_len: usize = 0,
+    excludes_ptr: ?[*]const webgrep_pattern_t = null,
+    excludes_len: usize = 0,
+    filter_case_insensitive: u8 = 0,
+    filter_smart_case: u8 = 0,
+    cancel: ?*const webgrep_cancel_t = null,
+    resume_from: u64 = 0,
+    progress_interval: u64 = 0,
 };
 
 pub const webgrep_summary_t = extern struct {
@@ -269,7 +285,7 @@ pub const webgrep_read_cb = ?*const fn (buf: [*c]u8, cap: usize, out_n: [*c]usiz
 // Internal Handle Wrappers & Conversion Helpers
 // ============================================================================
 
-const MatcherPayload = union(enum) {
+pub const MatcherPayload = union(enum) {
     literal: struct {
         owned_pattern: []u8,
         finder: finder_mod.Finder,
@@ -283,11 +299,11 @@ const MatcherPayload = union(enum) {
     regex_set: regex_mod.RegexSet,
 };
 
-const MatcherBox = struct {
+pub const MatcherBox = struct {
     payload: MatcherPayload,
     any_matcher: matcher_mod.AnyMatcher = undefined,
 
-    fn bindAnyMatcher(self: *MatcherBox) void {
+    pub fn bindAnyMatcher(self: *MatcherBox) void {
         self.any_matcher = switch (self.payload) {
             .literal => |*lit| matcher_mod.AnyMatcher.init(finder_mod.Finder, &lit.finder),
             .multi => |*m| matcher_mod.AnyMatcher.init(multi_mod.Multi, &m.engine),
@@ -296,7 +312,7 @@ const MatcherBox = struct {
         };
     }
 
-    fn deinit(self: *MatcherBox) void {
+    pub fn deinit(self: *MatcherBox) void {
         switch (self.payload) {
             .literal => |*lit| {
                 if (lit.owned_pattern.len > 0) c_alloc.free(lit.owned_pattern);
@@ -315,8 +331,13 @@ const MatcherBox = struct {
     }
 };
 
-const ScratchBox = struct {
+pub const ScratchBox = struct {
     scratch: searcher.Scratch,
+    regex_scratch: regex_mod.RegexScratch,
+};
+
+pub const CancelBox = struct {
+    flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 
 fn toCaseMode(v: c_int) ?matcher_mod.CaseMode {
@@ -391,11 +412,11 @@ fn mapRegexError(err: regex_mod.Error) c_int {
     };
 }
 
-const CLineFilterBridge = struct {
+pub const CLineFilterBridge = struct {
     cb: *const fn (user_data: ?*anyopaque, cand: *const webgrep_line_filter_candidate_t) callconv(.c) bool,
     user_data: ?*anyopaque,
 
-    fn invoke(raw_ctx: ?*anyopaque, z_cand: config_mod.LineFilterCandidate) bool {
+    pub fn invoke(raw_ctx: ?*anyopaque, z_cand: config_mod.LineFilterCandidate) bool {
         const self: *const @This() = @ptrCast(@alignCast(raw_ctx.?));
         const c_cand = webgrep_line_filter_candidate_t{
             .bytes_ptr = z_cand.bytes.ptr,
@@ -416,11 +437,11 @@ const CLineFilterBridge = struct {
     }
 };
 
-const CArchiveFilterBridge = struct {
+pub const CArchiveFilterBridge = struct {
     cb: *const fn (user_data: ?*anyopaque, meta: *const webgrep_archive_entry_meta_t) callconv(.c) bool,
     user_data: ?*anyopaque,
 
-    fn invoke(raw_ctx: ?*anyopaque, z_meta: archive_mod.ArchiveEntryMeta) bool {
+    pub fn invoke(raw_ctx: ?*anyopaque, z_meta: archive_mod.ArchiveEntryMeta) bool {
         const self: *const @This() = @ptrCast(@alignCast(raw_ctx.?));
         const kind_i32: i32 = switch (z_meta.kind) {
             .file => WEBGREP_ENTRY_FILE,
@@ -440,7 +461,36 @@ const CArchiveFilterBridge = struct {
     }
 };
 
-fn toSearchConfig(cfg: ?*const webgrep_config_t, filter_bridge: *CLineFilterBridge) ?searcher.SearchConfig {
+pub const ConfigGuard = struct {
+    contains_slices: [][]const u8 = &.{},
+    excludes_slices: [][]const u8 = &.{},
+
+    pub fn deinit(self: *ConfigGuard) void {
+        if (self.contains_slices.len > 0) c_alloc.free(self.contains_slices);
+        if (self.excludes_slices.len > 0) c_alloc.free(self.excludes_slices);
+        self.* = .{};
+    }
+};
+
+fn buildPatternSliceArray(ptr: ?[*]const webgrep_pattern_t, len: usize) error{ InvalidArg, OutOfMemory }![][]const u8 {
+    if (len == 0) return &.{};
+    const items = ptr orelse return error.InvalidArg;
+    const out = try c_alloc.alloc([]const u8, len);
+    errdefer c_alloc.free(out);
+    for (0..len) |i| {
+        const item = items[i];
+        if (item.ptr == null and item.len > 0) return error.InvalidArg;
+        out[i] = if (item.ptr) |p| p[0..item.len] else "";
+    }
+    return out;
+}
+
+pub fn buildSearchConfig(
+    cfg: ?*const webgrep_config_t,
+    filter_bridge: *CLineFilterBridge,
+    guard: *ConfigGuard,
+) error{ InvalidArg, OutOfMemory }!searcher.SearchConfig {
+    errdefer guard.deinit();
     var z_cfg: searcher.SearchConfig = .{
         .allocator = c_alloc,
         .decode_allocator = c_alloc,
@@ -455,7 +505,13 @@ fn toSearchConfig(cfg: ?*const webgrep_config_t, filter_bridge: *CLineFilterBrid
     if (c.replacement_ptr) |rp| {
         z_cfg.replacement = rp[0..c.replacement_len];
     } else if (c.replacement_len > 0) {
-        return null;
+        return error.InvalidArg;
+    }
+
+    if (c.charset_ptr) |cp| {
+        if (c.charset_len > 0) z_cfg.charset = cp[0..c.charset_len];
+    } else if (c.charset_len > 0) {
+        return error.InvalidArg;
     }
 
     if (c.before_context > 0) z_cfg.before = c.before_context;
@@ -485,7 +541,7 @@ fn toSearchConfig(cfg: ?*const webgrep_config_t, filter_bridge: *CLineFilterBrid
         4 => .gbk,
         5 => .latin1,
         6 => .none,
-        else => return null,
+        else => return error.InvalidArg,
     };
     z_cfg.compression = switch (c.compression) {
         0 => .none,
@@ -493,24 +549,24 @@ fn toSearchConfig(cfg: ?*const webgrep_config_t, filter_bridge: *CLineFilterBrid
         2 => .gzip,
         3 => .zstd,
         4 => .xz,
-        else => return null,
+        else => return error.InvalidArg,
     };
     z_cfg.binary = switch (c.binary_mode) {
         0 => .quit,
         1 => .report,
         2 => .none,
-        else => return null,
+        else => return error.InvalidArg,
     };
     z_cfg.match_mode = switch (c.match_mode) {
         0 => .earliest,
         1 => .leftmost_first,
-        else => return null,
+        else => return error.InvalidArg,
     };
     z_cfg.line_number_mode = switch (c.line_number_mode) {
         WEBGREP_LINE_NUM_AUTO => if (c.line_number == 0) .unknown else .auto,
         WEBGREP_LINE_NUM_FROM_ONE => if (c.line_number == 0) .unknown else .from_one,
         WEBGREP_LINE_NUM_UNKNOWN => .unknown,
-        else => return null,
+        else => return error.InvalidArg,
     };
 
     z_cfg.invert = c.invert_match != 0;
@@ -540,10 +596,74 @@ fn toSearchConfig(cfg: ?*const webgrep_config_t, filter_bridge: *CLineFilterBrid
         z_cfg.line_filter_ctx = filter_bridge;
     }
 
+    guard.contains_slices = try buildPatternSliceArray(c.contains_ptr, c.contains_len);
+    z_cfg.contains = guard.contains_slices;
+    guard.excludes_slices = try buildPatternSliceArray(c.excludes_ptr, c.excludes_len);
+    z_cfg.excludes = guard.excludes_slices;
+    z_cfg.filter_case_insensitive = c.filter_case_insensitive != 0;
+    z_cfg.filter_smart_case = c.filter_smart_case != 0;
+    if (c.cancel) |cap| {
+        const cbox: *const CancelBox = @ptrCast(@alignCast(cap));
+        z_cfg.cancel = &cbox.flag;
+    }
+    z_cfg.resume_from = c.resume_from;
+    if (c.progress_interval > 0) {
+        z_cfg.progress_interval = c.progress_interval;
+    }
+
     return z_cfg;
 }
 
-const CLineEventSink = struct {
+pub fn buildTreeConfig(
+    c_tcfg: webgrep_tree_config_t,
+    z_search_cfg: searcher.SearchConfig,
+    entry_bridge: *CArchiveFilterBridge,
+) ?tree_mod.TreeConfig {
+    const fmt: archive_mod.ArchiveFormat = switch (c_tcfg.format) {
+        0 => .auto,
+        1 => .tar,
+        2 => .tar_gz,
+        3 => .tar_zst,
+        4 => .tar_xz,
+        5 => .zip,
+        else => return null,
+    };
+
+    var archive_opts = archive_mod.ArchiveOptions{
+        .format = fmt,
+        .max_entries = if (c_tcfg.max_entries > 0) c_tcfg.max_entries else 10_000,
+        .max_entry_bytes = if (c_tcfg.max_entry_bytes > 0) c_tcfg.max_entry_bytes else 64 * 1024 * 1024,
+        .max_total_bytes = if (c_tcfg.max_total_bytes > 0) c_tcfg.max_total_bytes else 256 * 1024 * 1024,
+        .max_compression_ratio = if (c_tcfg.max_compression_ratio > 0) c_tcfg.max_compression_ratio else 100,
+    };
+    if (c_tcfg.entry_filter) |ef| {
+        entry_bridge.* = .{
+            .cb = ef,
+            .user_data = c_tcfg.entry_filter_ctx,
+        };
+        archive_opts.entry_filter = CArchiveFilterBridge.invoke;
+        archive_opts.entry_filter_ctx = entry_bridge;
+    }
+
+    return .{
+        .search = z_search_cfg,
+        .archive = archive_opts,
+        .hidden = c_tcfg.hidden != 0,
+        .skip_git = c_tcfg.skip_git != 0,
+        .respect_gitignore = c_tcfg.respect_gitignore != 0,
+        .respect_ignore = c_tcfg.respect_ignore != 0,
+        .max_depth = if (c_tcfg.max_depth > 0) c_tcfg.max_depth else tree_mod.max_depth_hard_cap,
+        .max_entries = if (c_tcfg.max_entries > 0) @intCast(c_tcfg.max_entries) else tree_mod.default_max_entries,
+        .max_filesize = archive_opts.max_entry_bytes,
+        .max_concurrency = 1,
+        .max_ignore_file_bytes = if (c_tcfg.max_ignore_file_bytes > 0) c_tcfg.max_ignore_file_bytes else tree_mod.max_ignore_file_bytes,
+        .max_glob_rules = if (c_tcfg.max_glob_rules > 0) c_tcfg.max_glob_rules else null,
+        .max_glob_rule_len = if (c_tcfg.max_glob_rule_len > 0) c_tcfg.max_glob_rule_len else null,
+        .max_glob_brace_depth = if (c_tcfg.max_glob_brace_depth > 0) c_tcfg.max_glob_brace_depth else null,
+    };
+}
+
+pub const CLineEventSink = struct {
     on_line: webgrep_line_cb,
     userdata: ?*anyopaque,
     stopped: bool = false,
@@ -619,7 +739,7 @@ const CLineEventSink = struct {
     }
 };
 
-fn populateCSummary(out_summary: ?*webgrep_summary_t, res: sink_mod.Result, stopped_by_cb: bool) void {
+pub fn populateCSummary(out_summary: ?*webgrep_summary_t, res: sink_mod.Result, stopped_by_cb: bool) void {
     const s = out_summary orelse return;
     s.* = .{
         .matched_lines = res.matched_lines,
@@ -641,7 +761,7 @@ fn populateCSummary(out_summary: ?*webgrep_summary_t, res: sink_mod.Result, stop
 // ============================================================================
 
 pub export fn webgrep_version() callconv(.c) [*:0]const u8 {
-    return "0.6.0";
+    return "0.7.0";
 }
 
 pub export fn webgrep_find_options_default() callconv(.c) webgrep_find_options_t {
@@ -854,6 +974,7 @@ pub export fn webgrep_scratch_new() callconv(.c) ?*webgrep_scratch_t {
     const box = c_alloc.create(ScratchBox) catch return null;
     box.* = .{
         .scratch = searcher.Scratch.init(c_alloc),
+        .regex_scratch = regex_mod.RegexScratch.init(c_alloc),
     };
     return @ptrCast(box);
 }
@@ -862,6 +983,7 @@ pub export fn webgrep_scratch_free(scratch: ?*webgrep_scratch_t) callconv(.c) vo
     const ptr = scratch orelse return;
     const box: *ScratchBox = @ptrCast(@alignCast(ptr));
     box.scratch.deinit();
+    box.regex_scratch.deinit();
     c_alloc.destroy(box);
 }
 
@@ -936,7 +1058,12 @@ pub export fn webgrep_search_slice(
     if (data_ptr == null and data_len > 0) return WEBGREP_ERR_INVALID_ARG;
 
     var filter_bridge: CLineFilterBridge = undefined;
-    const z_cfg = toSearchConfig(cfg, &filter_bridge) orelse return WEBGREP_ERR_INVALID_ARG;
+    var cfg_guard: ConfigGuard = .{};
+    defer cfg_guard.deinit();
+    const z_cfg = buildSearchConfig(cfg, &filter_bridge, &cfg_guard) catch |err| return switch (err) {
+        error.InvalidArg => WEBGREP_ERR_INVALID_ARG,
+        error.OutOfMemory => WEBGREP_ERR_OUT_OF_MEMORY,
+    };
     const hay: []const u8 = if (data_ptr) |p| p[0..data_len] else "";
     const box: *const MatcherBox = @ptrCast(@alignCast(m_ptr));
 
@@ -981,7 +1108,12 @@ pub export fn webgrep_search_reader(
     const r_cb = read_cb orelse return WEBGREP_ERR_INVALID_ARG;
 
     var filter_bridge: CLineFilterBridge = undefined;
-    const raw_cfg = toSearchConfig(cfg, &filter_bridge) orelse return WEBGREP_ERR_INVALID_ARG;
+    var cfg_guard: ConfigGuard = .{};
+    defer cfg_guard.deinit();
+    const raw_cfg = buildSearchConfig(cfg, &filter_bridge, &cfg_guard) catch |err| return switch (err) {
+        error.InvalidArg => WEBGREP_ERR_INVALID_ARG,
+        error.OutOfMemory => WEBGREP_ERR_OUT_OF_MEMORY,
+    };
     const z_cfg = config_mod.serviceConfig(raw_cfg);
     const box: *const MatcherBox = @ptrCast(@alignCast(m_ptr));
 
@@ -1060,56 +1192,20 @@ pub export fn webgrep_search_archive_slice(
 
     const c_tcfg = if (tree_cfg) |tc| tc.* else webgrep_tree_config_default();
     var filter_bridge: CLineFilterBridge = undefined;
-    const z_search_cfg = toSearchConfig(&c_tcfg.search, &filter_bridge) orelse return WEBGREP_ERR_INVALID_ARG;
-
-    const fmt: archive_mod.ArchiveFormat = switch (c_tcfg.format) {
-        0 => .auto,
-        1 => .tar,
-        2 => .tar_gz,
-        3 => .tar_zst,
-        4 => .tar_xz,
-        5 => .zip,
-        else => return WEBGREP_ERR_INVALID_ARG,
+    var cfg_guard: ConfigGuard = .{};
+    defer cfg_guard.deinit();
+    const z_search_cfg = buildSearchConfig(&c_tcfg.search, &filter_bridge, &cfg_guard) catch |err| return switch (err) {
+        error.InvalidArg => WEBGREP_ERR_INVALID_ARG,
+        error.OutOfMemory => WEBGREP_ERR_OUT_OF_MEMORY,
     };
 
     var entry_bridge: CArchiveFilterBridge = undefined;
-    var archive_opts = archive_mod.ArchiveOptions{
-        .format = fmt,
-        .max_entries = if (c_tcfg.max_entries > 0) c_tcfg.max_entries else 10_000,
-        .max_entry_bytes = if (c_tcfg.max_entry_bytes > 0) c_tcfg.max_entry_bytes else 64 * 1024 * 1024,
-        .max_total_bytes = if (c_tcfg.max_total_bytes > 0) c_tcfg.max_total_bytes else 256 * 1024 * 1024,
-        .max_compression_ratio = if (c_tcfg.max_compression_ratio > 0) c_tcfg.max_compression_ratio else 100,
-    };
-    if (c_tcfg.entry_filter) |ef| {
-        entry_bridge = .{
-            .cb = ef,
-            .user_data = c_tcfg.entry_filter_ctx,
-        };
-        archive_opts.entry_filter = CArchiveFilterBridge.invoke;
-        archive_opts.entry_filter_ctx = &entry_bridge;
-    }
-
-    const z_tcfg = tree_mod.TreeConfig{
-        .search = z_search_cfg,
-        .archive = archive_opts,
-        .hidden = c_tcfg.hidden != 0,
-        .skip_git = c_tcfg.skip_git != 0,
-        .respect_gitignore = c_tcfg.respect_gitignore != 0,
-        .respect_ignore = c_tcfg.respect_ignore != 0,
-        .max_depth = if (c_tcfg.max_depth > 0) c_tcfg.max_depth else tree_mod.max_depth_hard_cap,
-        .max_entries = if (c_tcfg.max_entries > 0) @intCast(c_tcfg.max_entries) else tree_mod.default_max_entries,
-        .max_filesize = archive_opts.max_entry_bytes,
-        .max_concurrency = if (c_tcfg.max_concurrency > 0) c_tcfg.max_concurrency else 1,
-        .max_ignore_file_bytes = if (c_tcfg.max_ignore_file_bytes > 0) c_tcfg.max_ignore_file_bytes else tree_mod.max_ignore_file_bytes,
-        .max_glob_rules = if (c_tcfg.max_glob_rules > 0) c_tcfg.max_glob_rules else null,
-        .max_glob_rule_len = if (c_tcfg.max_glob_rule_len > 0) c_tcfg.max_glob_rule_len else null,
-        .max_glob_brace_depth = if (c_tcfg.max_glob_brace_depth > 0) c_tcfg.max_glob_brace_depth else null,
-    };
+    const z_tcfg = buildTreeConfig(c_tcfg, z_search_cfg, &entry_bridge) orelse return WEBGREP_ERR_INVALID_ARG;
 
     const archive_bytes: []const u8 = if (archive_ptr) |p| p[0..archive_len] else "";
     const box: *const MatcherBox = @ptrCast(@alignCast(m_ptr));
 
-    var tree = archive_mod.ArchiveTree.initFromSlice(c_alloc, archive_bytes, archive_opts) catch |err| return switch (err) {
+    var tree = archive_mod.ArchiveTree.initFromSlice(c_alloc, archive_bytes, z_tcfg.archive) catch |err| return switch (err) {
         error.OutOfMemory => WEBGREP_ERR_OUT_OF_MEMORY,
         error.ArchiveLimit => WEBGREP_ERR_ARCHIVE_LIMIT,
         error.UnsupportedFormat,
@@ -1127,7 +1223,7 @@ pub export fn webgrep_search_archive_slice(
     const sum = tree_mod.searchTree(
         CLineEventSink,
         c_alloc,
-        undefined,
+        std.Io.failing,
         &sink,
         tree.source(),
         "",
@@ -1210,7 +1306,12 @@ pub export fn webgrep_search_reverse_slice(
     if (data_ptr == null and data_len > 0) return WEBGREP_ERR_INVALID_ARG;
 
     var filter_bridge: CLineFilterBridge = undefined;
-    const z_cfg = toSearchConfig(cfg, &filter_bridge) orelse return WEBGREP_ERR_INVALID_ARG;
+    var cfg_guard: ConfigGuard = .{};
+    defer cfg_guard.deinit();
+    const z_cfg = buildSearchConfig(cfg, &filter_bridge, &cfg_guard) catch |err| return switch (err) {
+        error.InvalidArg => WEBGREP_ERR_INVALID_ARG,
+        error.OutOfMemory => WEBGREP_ERR_OUT_OF_MEMORY,
+    };
     const hay: []const u8 = if (data_ptr) |p| p[0..data_len] else "";
     const box: *const MatcherBox = @ptrCast(@alignCast(m_ptr));
 
@@ -1241,13 +1342,17 @@ pub export fn webgrep_search_reverse_slice(
     return WEBGREP_OK;
 }
 
+comptime {
+    _ = @import("c_api_ext.zig");
+}
+
 // ============================================================================
 // Unit Tests
 // ============================================================================
 
 test "c_api: version and options default" {
     const ver = std.mem.span(webgrep_version());
-    try std.testing.expectEqualStrings("0.6.0", ver);
+    try std.testing.expectEqualStrings("0.7.0", ver);
 
     const fopts = webgrep_find_options_default();
     try std.testing.expectEqual(@as(c_int, 0), fopts.case_mode);

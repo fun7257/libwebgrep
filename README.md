@@ -10,18 +10,18 @@ It ships with **zero external dependencies**, **does not link `libc`**, guarante
 
 ## Key Highlights
 
-- **Blazing SIMD Throughput (24–62 GB/s) & Lock-Free `*const` Matchers**:
-  - **Single-Byte Primitives (`memchr`)**: 4-vector unrolled SIMD loops reaching **48.3–62.4 GB/s**.
-  - **Single-Literal (`Finder`)**: Frequency-ranked `PackedPair` 4-window SIMD filtering with branchless `(block | 0x20)` ASCII case folding (**42.6 GB/s** sensitive, **24.9 GB/s** case-insensitive) and automatic worst-case $O(n)$ `TwoWay` fallback.
+- **Blazing SIMD Throughput (24–62 GB/s), Runtime CPUID Dispatch & Cross-Arch Portability**:
+  - **Baseline x86_64 + Runtime CPUID Dispatch (`-Dteddy=runtime`)**: Safe on baseline SSE2 x86_64 CPUs with zero illegal instructions, while automatically dispatching to AVX2/SSSE3 at runtime via `CPUID + OSXSAVE + XGETBV`, plus full **Big-Endian** (`s390x`) and **WASM / WASI** (`wasm32-wasi`) support.
+  - **Single-Byte & Single-Literal (`memchr` / `Finder`)**: 4-vector unrolled SIMD loops (**48.3–62.4 GB/s**) and frequency-ranked `PackedPair` SIMD filtering (**42.6 GB/s** sensitive, **24.9 GB/s** case-insensitive) with worst-case $O(n)$ `TwoWay` fallback.
   - **4-Tier Multi-Pattern OR Matrix (`Multi`)**: Automatically dispatches across `ByteSet` (**34.2 GB/s**), `RarePair` (**32.2 GB/s**), 8-bucket Slim `Teddy` (`vtbl`/`pshufb`/`vpshufb`, **24.1 GB/s**), and byte-equivalence-compressed `AhoCorasick` DFA with a 64-byte high-nibble SIMD skip loop (**24.3 GB/s**), reporting exact `pattern_id` on every match.
-  - **Hybrid Lazy DFA + Linear-Time Regex (`Regex` & `RegexSet`)**: Lockstep Thompson NFA / PikeVM paired with a bounded Hybrid Lazy DFA (`RegexScratch`), multi-pattern simultaneous `RegexSet`, `\p{...}` Unicode General Category & Script properties, UAX #29 Unicode word boundaries (`\b`/`\B`), structured `CompileDiagnostic`, and automatic SIMD literal/alternation prefiltering (**42.9 GB/s**).
-- **In-Process Bomb-Safe Streaming Decompression, Transcoding & Zero-Disk Archives**:
+  - **Hybrid Lazy DFA + Linear-Time Regex (`Regex` & `RegexSet`)**: Lockstep Thompson NFA / PikeVM paired with a bounded Hybrid Lazy DFA (`RegexScratch`), multi-pattern simultaneous `RegexSet`, up to 32 captures (`$1`..`$32`) with named groups (`(?P<name>...)` / `(?<name>...)` and `${name}` replacement), `\xHH`/`\x{...}`/`\uHHHH`/`\u{...}`, `\Q...\E`, `\a`/`\f`/`\v`/`\Z`, 14 POSIX classes (`[:alnum:]`..`[:xdigit:]`), `(?x)`/`(?U)` flags, `\p{...}` Unicode properties, UAX #29 word boundaries (`\b`/`\B`), structured `CompileDiagnostic`, and automatic SIMD prefiltering (**42.9 GB/s**).
+- **In-Process Bomb-Safe Streaming Decompression, Streaming TAR & Zero-Disk Archives**:
   - Streams **Gzip**, **Zstd**, and **XZ** in-process without spawning external binaries, enforcing both `max_decompressed_bytes` and `max_compression_ratio` (default `100:1`) on every chunk to stop Zip Bombs immediately.
-  - Unpacks `.tar`, `.tar.gz`/`.tgz`, `.tar.zst`, `.tar.xz`, and `.zip` archives directly into an in-memory `ArchiveTree` (`searchArchiveSlice`, `searchArchive`, `searchTree`) with Zip-Slip path traversal protection and zero disk landing.
+  - Streams `.tar`, `.tar.gz`/`.tgz`, `.tar.zst`, and `.tar.xz` archives in constant $O(\text{buffer\_size})$ memory via `searchTarStream`, and unpacks `.tar.*` / `.zip` archives into an in-memory `ArchiveTree` (`searchArchiveSlice`, `searchArchive`, `searchTree`) with parallel `Scheduler` support (`max_concurrency > 1`) and Zip-Slip path traversal protection.
   - Sniffs UTF-8 / UTF-16LE / UTF-16BE BOMs and transcodes **GBK / GB2312 / Latin-1** via WHATWG or HTTP `Content-Type` `charset` hints, while maintaining an `OffsetMap` to report exact original stream offsets (`raw_offset`) alongside UTF-8 byte and UTF-16 code-unit spans.
-- **Hardened for Multi-Tenant Server Embedding & Polyglot FFI**:
+- **Hardened for Multi-Tenant Server Embedding & 52-Function C ABI**:
   - Public search entry points (`searchSource`, `searchSourceSlice`, `resumeSourceSlice`, `openSourcePull`, streaming `openReaderPull`) operate strictly on caller-supplied `std.Io.Reader` streams or memory slices with caller-assigned `source_id`—eliminating path traversal (`CWE-22`) by design.
-  - Reusable `Scratch` buffer pool (`SearchConfig.scratch_pool`), runtime type-erased `AnyMatcher` / `AnyEventSink`, and a zero-`libc` C ABI (`include/webgrep.h`, `-Dc-lib=true`).
+  - Reusable `Scratch` buffer pool (`SearchConfig.scratch_pool`), runtime type-erased `AnyMatcher` / `AnyEventSink`, and an expanded **52-function** zero-`libc` C ABI (`include/webgrep.h`, `WEBGREP_API`).
   - Controlled multi-source pipeline (`walk_glob`, `walk_ignore`, `walk_types`, `searchTree`) supporting nested brace expansion `{a,{b,c}}`, in-memory ignore rules, and work-stealing concurrency strictly bounded by `max_concurrency`.
 
 ---
@@ -131,11 +131,14 @@ defer set.deinit();
 ## Building, Testing, Fuzzing & Cross-Compiling
 
 ```sh
-# Run all unit, E2E, adversarial, fuzz, and compile-checked API documentation tests
+# Run all unit, E2E, adversarial, fuzz, C ABI (52 functions), and compile-checked API documentation tests
 zig build test --summary all
 
-# Build static and shared C ABI libraries (libwebgrep.a / libwebgrep.so) and run C ABI tests
-zig build test -Dc-lib=true --summary all
+# Build static & shared libraries (libwebgrep.a / libwebgrep.so / .dylib) and install include/webgrep.h
+zig build
+
+# Run tests with Teddy SIMD disabled (baseline x86_64 verification)
+zig build test -Dteddy=off --summary all
 
 # Run the dedicated cross-layer differential & Smith fuzz suite
 zig build fuzz --summary all
@@ -147,17 +150,18 @@ zig build bench -Doptimize=ReleaseFast -Dteddy=avx2
 zig build bench -Doptimize=ReleaseFast -Dteddy=avx2 -Dbench-filter=regex_
 
 # Cross-compile verification (no execution required)
-zig build check -Dtarget=x86_64-linux-musl -Doptimize=ReleaseFast
-zig build check -Dtarget=x86_64-linux-musl -Dteddy=avx2
+zig build check -Dtarget=x86_64-linux-musl -Dteddy=runtime
+zig build check -Dtarget=x86_64-linux-musl -Dteddy=off
 zig build check -Dtarget=aarch64-linux-musl
+zig build check -Dtarget=s390x-linux-musl
+zig build -Dtarget=wasm32-wasi
 ```
 
 ### Build Options
 
 | Option | Values | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `-Dteddy` | `off`, `neon`, `ssse3`, `avx2` | `neon` on `aarch64`, `avx2`/`ssse3` on `x86_64` | Selects the SIMD ISA backend for the Slim Teddy multi-pattern engine |
-| `-Dc-lib` | `bool` | `false` | Builds static and shared C ABI libraries (`include/webgrep.h`) |
+| `-Dteddy` | `runtime`, `off`, `neon`, `ssse3`, `avx2` | `runtime` on `x86_64`, `neon` on `aarch64` | Selects static SIMD backend or CPUID runtime dispatch (`runtime`) |
 | `-Dlinux-getdents` | `bool` | `false` | Uses raw `getdents64` syscall for directory enumeration on Linux |
 | `-Dmmap-windows` | `bool` | `false` | Maps large files in 8 MiB rolling windows instead of `readPositional` |
 | `-Dsanitize-thread` | `bool` | `false` | Enables ThreadSanitizer (`TSan`) |

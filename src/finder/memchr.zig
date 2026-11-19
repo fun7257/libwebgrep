@@ -11,6 +11,7 @@
 //! four 1-bits, so its index is `ctz / 4` and the match count is `popcount / 4`.
 //! 32-byte vectors are split into two 16-byte halves processed the same way.
 
+const builtin = @import("builtin");
 const std = @import("std");
 
 /// Default runtime vector width. Capped at 32 until benchmarks justify AVX-512.
@@ -320,10 +321,18 @@ fn mask16(block: @Vector(16, u8), a: u8, b: u8) u64 {
 
 /// Compresses each `0xFF` hit byte into four 1-bits. Used in place of movemask on NEON.
 pub inline fn nibbleMask(flags: @Vector(16, u8)) u64 {
-    const lanes: @Vector(8, u16) = @bitCast(flags);
-    const shifted = lanes >> @as(@Vector(8, u16), @splat(@as(u16, 4)));
-    const narrowed: @Vector(8, u8) = @truncate(shifted);
-    return @bitCast(narrowed);
+    if (comptime builtin.cpu.arch.endian() == .little) {
+        const lanes: @Vector(8, u16) = @bitCast(flags);
+        const shifted = lanes >> @as(@Vector(8, u16), @splat(@as(u16, 4)));
+        const narrowed: @Vector(8, u8) = @truncate(shifted);
+        return @bitCast(narrowed);
+    } else {
+        var mask: u64 = 0;
+        inline for (0..16) |k| {
+            if (flags[k] != 0) mask |= @as(u64, 0xF) << @intCast(k * 4);
+        }
+        return mask;
+    }
 }
 
 /// Returns the byte index of the first hit in a nibble mask, or null if none.

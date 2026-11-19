@@ -148,15 +148,21 @@ pub const RegexSet = struct {
             compiler.saw_scoped_m = false;
             compiler.saw_ignore_case = pat_ignore_case;
             compiler.explicit_neg_m = false;
+            compiler.extended = false;
+            compiler.ungreedy = false;
+            compiler.saw_extended = false;
+            compiler.saw_ungreedy = false;
+            compiler.saw_literal_nl_pos = null;
             compiler.capture_count = 0;
             compiler.capture_positions = @splat(std.math.maxInt(usize));
+            compiler.capture_names = @splat("");
             compiler.pattern_index = idx;
             compiler.match_inst = .{ .match_id = @intCast(idx) };
 
             const frag = try compiler.compile();
             const pat_ml = compiler.multiline or compiler.saw_scoped_m;
             if (!pat_ml) {
-                if (std.mem.indexOfScalar(u8, pat, '\n')) |nl_pos| {
+                if (compiler.saw_literal_nl_pos) |nl_pos| {
                     populateDiagnostic(diag, pat, error.PatternHasNewline, .pattern_has_newline, nl_pos, "pattern contains literal newline in single-line mode", idx);
                     return error.PatternHasNewline;
                 }

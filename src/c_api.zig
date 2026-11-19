@@ -93,6 +93,7 @@ pub const webgrep_regex_options_t = extern struct {
     max_recursion_depth: usize = 0,
     max_patterns: usize = 0,
     max_pattern_bytes: usize = 0,
+    unicode_classes: u8 = 0,
 };
 
 pub const webgrep_compile_diag_t = extern struct {
@@ -230,6 +231,10 @@ pub const webgrep_config_t = extern struct {
     cancel: ?*const webgrep_cancel_t = null,
     resume_from: u64 = 0,
     progress_interval: u64 = 0,
+    contains_regexes_ptr: ?[*]const ?*const webgrep_matcher_t = null,
+    contains_regexes_len: usize = 0,
+    excludes_regexes_ptr: ?[*]const ?*const webgrep_matcher_t = null,
+    excludes_regexes_len: usize = 0,
 };
 
 pub const webgrep_summary_t = extern struct {
@@ -265,6 +270,7 @@ pub const webgrep_tree_config_t = extern struct {
     max_glob_brace_depth: usize = 0,
     entry_filter: webgrep_archive_entry_filter_cb = null,
     entry_filter_ctx: ?*anyopaque = null,
+    max_archive_depth: u32 = 0,
 };
 
 pub const webgrep_tree_summary_t = extern struct {
@@ -378,6 +384,7 @@ fn toRegexOptions(opts: ?*const webgrep_regex_options_t) ?regex_mod.RegexOptions
         .max_recursion_depth = if (o.max_recursion_depth > 0) o.max_recursion_depth else regex_mod.default_max_recursion_depth,
         .max_pattern_count = if (o.max_patterns > 0) o.max_patterns else null,
         .max_pattern_bytes = if (o.max_pattern_bytes > 0) o.max_pattern_bytes else null,
+        .unicode_classes = o.unicode_classes != 0,
     };
 }
 
@@ -464,13 +471,33 @@ pub const CArchiveFilterBridge = struct {
 pub const ConfigGuard = struct {
     contains_slices: [][]const u8 = &.{},
     excludes_slices: [][]const u8 = &.{},
+    contains_regex_vals: []regex_mod.Regex = &.{},
+    excludes_regex_vals: []regex_mod.Regex = &.{},
 
     pub fn deinit(self: *ConfigGuard) void {
         if (self.contains_slices.len > 0) c_alloc.free(self.contains_slices);
         if (self.excludes_slices.len > 0) c_alloc.free(self.excludes_slices);
+        if (self.contains_regex_vals.len > 0) c_alloc.free(self.contains_regex_vals);
+        if (self.excludes_regex_vals.len > 0) c_alloc.free(self.excludes_regex_vals);
         self.* = .{};
     }
 };
+
+fn buildRegexFilterArray(ptr: ?[*]const ?*const webgrep_matcher_t, len: usize) error{ InvalidArg, OutOfMemory }![]regex_mod.Regex {
+    if (len == 0) return &.{};
+    const items = ptr orelse return error.InvalidArg;
+    const out = try c_alloc.alloc(regex_mod.Regex, len);
+    errdefer c_alloc.free(out);
+    for (0..len) |i| {
+        const m_ptr = items[i] orelse return error.InvalidArg;
+        const m_box: *const MatcherBox = @ptrCast(@alignCast(m_ptr));
+        switch (m_box.payload) {
+            .regex => |re| out[i] = re,
+            else => return error.InvalidArg,
+        }
+    }
+    return out;
+}
 
 fn buildPatternSliceArray(ptr: ?[*]const webgrep_pattern_t, len: usize) error{ InvalidArg, OutOfMemory }![][]const u8 {
     if (len == 0) return &.{};
@@ -541,6 +568,16 @@ pub fn buildSearchConfig(
         4 => .gbk,
         5 => .latin1,
         6 => .none,
+        7 => .windows1252,
+        8 => .gb18030,
+        9 => .shift_jis,
+        10 => .euc_jp,
+        11 => .big5,
+        12 => .euc_kr,
+        13 => .windows1251,
+        14 => .utf32le,
+        15 => .utf32be,
+        16 => .detect,
         else => return error.InvalidArg,
     };
     z_cfg.compression = switch (c.compression) {
@@ -549,6 +586,11 @@ pub fn buildSearchConfig(
         2 => .gzip,
         3 => .zstd,
         4 => .xz,
+        5 => .zlib,
+        6 => .deflate,
+        7 => .lz4,
+        8 => .bzip2,
+        9 => .brotli,
         else => return error.InvalidArg,
     };
     z_cfg.binary = switch (c.binary_mode) {
@@ -600,6 +642,10 @@ pub fn buildSearchConfig(
     z_cfg.contains = guard.contains_slices;
     guard.excludes_slices = try buildPatternSliceArray(c.excludes_ptr, c.excludes_len);
     z_cfg.excludes = guard.excludes_slices;
+    guard.contains_regex_vals = try buildRegexFilterArray(c.contains_regexes_ptr, c.contains_regexes_len);
+    z_cfg.contains_regexes = guard.contains_regex_vals;
+    guard.excludes_regex_vals = try buildRegexFilterArray(c.excludes_regexes_ptr, c.excludes_regexes_len);
+    z_cfg.excludes_regexes = guard.excludes_regex_vals;
     z_cfg.filter_case_insensitive = c.filter_case_insensitive != 0;
     z_cfg.filter_smart_case = c.filter_smart_case != 0;
     if (c.cancel) |cap| {
@@ -626,6 +672,8 @@ pub fn buildTreeConfig(
         3 => .tar_zst,
         4 => .tar_xz,
         5 => .zip,
+        6 => .tar_bz2,
+        7 => .tar_lz4,
         else => return null,
     };
 
@@ -635,6 +683,7 @@ pub fn buildTreeConfig(
         .max_entry_bytes = if (c_tcfg.max_entry_bytes > 0) c_tcfg.max_entry_bytes else 64 * 1024 * 1024,
         .max_total_bytes = if (c_tcfg.max_total_bytes > 0) c_tcfg.max_total_bytes else 256 * 1024 * 1024,
         .max_compression_ratio = if (c_tcfg.max_compression_ratio > 0) c_tcfg.max_compression_ratio else 100,
+        .max_archive_depth = c_tcfg.max_archive_depth,
     };
     if (c_tcfg.entry_filter) |ef| {
         entry_bridge.* = .{

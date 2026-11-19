@@ -95,22 +95,37 @@ typedef enum webgrep_binary_policy_e {
 
 /** Character encoding mode. */
 typedef enum webgrep_encoding_e {
-    WEBGREP_ENCODING_AUTO    = 0,
-    WEBGREP_ENCODING_UTF8    = 1,
-    WEBGREP_ENCODING_UTF16LE = 2,
-    WEBGREP_ENCODING_UTF16BE = 3,
-    WEBGREP_ENCODING_GBK     = 4,
-    WEBGREP_ENCODING_LATIN1  = 5,
-    WEBGREP_ENCODING_NONE    = 6
+    WEBGREP_ENCODING_AUTO        = 0,
+    WEBGREP_ENCODING_UTF8        = 1,
+    WEBGREP_ENCODING_UTF16LE     = 2,
+    WEBGREP_ENCODING_UTF16BE     = 3,
+    WEBGREP_ENCODING_GBK         = 4,
+    WEBGREP_ENCODING_LATIN1      = 5,
+    WEBGREP_ENCODING_NONE        = 6,
+    WEBGREP_ENCODING_WINDOWS1252 = 7,
+    WEBGREP_ENCODING_GB18030     = 8,
+    WEBGREP_ENCODING_SHIFT_JIS   = 9,
+    WEBGREP_ENCODING_EUC_JP      = 10,
+    WEBGREP_ENCODING_BIG5        = 11,
+    WEBGREP_ENCODING_EUC_KR      = 12,
+    WEBGREP_ENCODING_WINDOWS1251 = 13,
+    WEBGREP_ENCODING_UTF32LE     = 14,
+    WEBGREP_ENCODING_UTF32BE     = 15,
+    WEBGREP_ENCODING_DETECT      = 16
 } webgrep_encoding_t;
 
 /** Streaming decompression mode. */
 typedef enum webgrep_compression_e {
-    WEBGREP_COMPRESSION_NONE = 0,
-    WEBGREP_COMPRESSION_AUTO = 1,
-    WEBGREP_COMPRESSION_GZIP = 2,
-    WEBGREP_COMPRESSION_ZSTD = 3,
-    WEBGREP_COMPRESSION_XZ   = 4
+    WEBGREP_COMPRESSION_NONE    = 0,
+    WEBGREP_COMPRESSION_AUTO    = 1,
+    WEBGREP_COMPRESSION_GZIP    = 2,
+    WEBGREP_COMPRESSION_ZSTD    = 3,
+    WEBGREP_COMPRESSION_XZ      = 4,
+    WEBGREP_COMPRESSION_ZLIB    = 5,
+    WEBGREP_COMPRESSION_DEFLATE = 6,
+    WEBGREP_COMPRESSION_LZ4     = 7,
+    WEBGREP_COMPRESSION_BZIP2   = 8,
+    WEBGREP_COMPRESSION_BROTLI  = 9
 } webgrep_compression_t;
 
 /** In-memory archive format. */
@@ -120,8 +135,18 @@ typedef enum webgrep_archive_format_e {
     WEBGREP_ARCHIVE_TAR_GZ  = 2,
     WEBGREP_ARCHIVE_TAR_ZST = 3,
     WEBGREP_ARCHIVE_TAR_XZ  = 4,
-    WEBGREP_ARCHIVE_ZIP     = 5
+    WEBGREP_ARCHIVE_ZIP     = 5,
+    WEBGREP_ARCHIVE_TAR_BZ2 = 6,
+    WEBGREP_ARCHIVE_TAR_LZ4 = 7
 } webgrep_archive_format_t;
+
+/** Flow control action returned via `webgrep_flow_t` from `webgrep_flow_line_cb`. */
+typedef enum webgrep_flow_action_e {
+    WEBGREP_FLOW_CONT    = 0,
+    WEBGREP_FLOW_STOP    = 1,
+    WEBGREP_FLOW_PAUSE   = 2,
+    WEBGREP_FLOW_SKIP_TO = 3
+} webgrep_flow_action_t;
 
 /** Budget limit reached during a search. */
 typedef enum webgrep_limit_hit_e {
@@ -172,6 +197,9 @@ typedef struct webgrep_zstd_seek_table_s webgrep_zstd_seek_table_t;
 /** Opaque indexed Gzip checkpoint table handle for random-access decompression. */
 typedef struct webgrep_gzip_index_s webgrep_gzip_index_t;
 
+/** Opaque stateless resume cursor handle for pause/resume pagination (`ResumeState`). */
+typedef struct webgrep_resume_state_s webgrep_resume_state_t;
+
 /* ============================================================================
  * Option, Pattern, Match, Event, & Summary Structures
  * ========================================================================= */
@@ -206,6 +234,7 @@ typedef struct webgrep_regex_options_s {
     size_t   max_recursion_depth;
     size_t   max_patterns;
     size_t   max_pattern_bytes;
+    uint8_t  unicode_classes;
 } webgrep_regex_options_t;
 
 /** Structured compile diagnostic populated when regex compilation fails. */
@@ -357,9 +386,13 @@ typedef struct webgrep_config_s {
     size_t                   excludes_len;
     uint8_t                  filter_case_insensitive;
     uint8_t                  filter_smart_case;
-    const webgrep_cancel_t  *cancel;
-    uint64_t                 resume_from;
-    uint64_t                 progress_interval;
+    const webgrep_cancel_t         *cancel;
+    uint64_t                        resume_from;
+    uint64_t                        progress_interval;
+    const webgrep_matcher_t *const *contains_regexes_ptr;
+    size_t                          contains_regexes_len;
+    const webgrep_matcher_t *const *excludes_regexes_ptr;
+    size_t                          excludes_regexes_len;
 } webgrep_config_t;
 
 #define WEBGREP_MAX_CAPTURE_GROUPS 32
@@ -421,6 +454,7 @@ typedef struct webgrep_tree_config_s {
     size_t                          max_glob_brace_depth;
     webgrep_archive_entry_filter_cb entry_filter;
     void                           *entry_filter_ctx;
+    uint32_t                        max_archive_depth;
 } webgrep_tree_config_t;
 
 /** Summary populated by `webgrep_search_archive_slice`. */
@@ -438,6 +472,25 @@ typedef struct webgrep_tree_summary_s {
 /* ============================================================================
  * Callback Signatures
  * ========================================================================= */
+
+/** Flow control directive populated by `webgrep_flow_line_cb`. */
+typedef struct webgrep_flow_s {
+    int      action;
+    uint64_t skip_to_offset;
+} webgrep_flow_t;
+
+/**
+ * Flow-control line callback invoked synchronously by `webgrep_search_slice_flow` and
+ * `webgrep_search_reader_flow`.
+ * `*out_flow` is initialized to `{ WEBGREP_FLOW_CONT, 0 }` before each invocation.
+ * Set `out_flow->action` to `WEBGREP_FLOW_STOP`, `WEBGREP_FLOW_PAUSE`, or
+ * `WEBGREP_FLOW_SKIP_TO` (with `out_flow->skip_to_offset`) to steer the search engine.
+ */
+typedef void (*webgrep_flow_line_cb)(
+    const webgrep_line_event_t *ev,
+    void                       *userdata,
+    webgrep_flow_t             *out_flow
+);
 
 /**
  * Line callback invoked synchronously for each matched or context line.
@@ -872,6 +925,53 @@ WEBGREP_API int webgrep_gzip_index_read_at(
     uint8_t                    *out_buf,
     size_t                      out_cap,
     size_t                     *out_n
+);
+
+/** 53. Allocates a stateless resume state cursor for pause/resume pagination. Free with `webgrep_resume_state_free`. */
+WEBGREP_API webgrep_resume_state_t *webgrep_resume_state_new(void);
+
+/** 54. Frees a resume state cursor. Safe to call with NULL. */
+WEBGREP_API void webgrep_resume_state_free(webgrep_resume_state_t *state);
+
+/** 55. Resets a resume state cursor back to initial unpaused state. No-op if NULL. */
+WEBGREP_API void webgrep_resume_state_reset(webgrep_resume_state_t *state);
+
+/** 56. Returns the next searchable byte offset recorded in `state` (or 0 if NULL/initial). */
+WEBGREP_API uint64_t webgrep_resume_state_offset(const webgrep_resume_state_t *state);
+
+/** 57. Returns 1 if `state` currently represents a paused search that can be resumed, 0 otherwise. */
+WEBGREP_API uint8_t webgrep_resume_state_is_paused(const webgrep_resume_state_t *state);
+
+/**
+ * 58. Searches an in-memory slice with full `Flow` control (`cont`, `stop`, `pause`, `skip_to`)
+ * and optional stateless `resume_state` pagination.
+ * When `resume_state` is non-NULL and paused, resumes seamlessly without re-emitting `begin`,
+ * and updates `resume_state` upon completion or pause.
+ */
+WEBGREP_API int webgrep_search_slice_flow(
+    const webgrep_matcher_t *matcher,
+    const uint8_t           *data_ptr,
+    size_t                   data_len,
+    const webgrep_config_t  *cfg,
+    webgrep_resume_state_t  *resume_state,
+    webgrep_flow_line_cb     on_line,
+    void                    *userdata,
+    webgrep_summary_t       *out_summary
+);
+
+/**
+ * 59. Searches a streaming `read_cb` source with full `Flow` control (`cont`, `stop`, `pause`, `skip_to`)
+ * and optional stateless `resume_state` pagination.
+ */
+WEBGREP_API int webgrep_search_reader_flow(
+    const webgrep_matcher_t *matcher,
+    webgrep_read_cb          read_cb,
+    void                    *read_userdata,
+    const webgrep_config_t  *cfg,
+    webgrep_resume_state_t  *resume_state,
+    webgrep_flow_line_cb     on_line,
+    void                    *userdata,
+    webgrep_summary_t       *out_summary
 );
 
 #ifdef __cplusplus

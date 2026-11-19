@@ -142,6 +142,26 @@ static int overflow_read_cb(uint8_t *buf, size_t cap, size_t *out_n, void *userd
     return 0;
 }
 
+typedef struct {
+    int      count;
+    uint64_t last_line;
+    int      pause_at_count;
+    int      skip_at_count;
+    uint64_t skip_target;
+} flow_test_ctx_t;
+
+static void flow_test_cb(const webgrep_line_event_t *ev, void *userdata, webgrep_flow_t *out_flow) {
+    flow_test_ctx_t *ctx = (flow_test_ctx_t *)userdata;
+    ctx->count += 1;
+    ctx->last_line = ev->line_number;
+    if (ctx->pause_at_count > 0 && ctx->count == ctx->pause_at_count) {
+        out_flow->action = WEBGREP_FLOW_PAUSE;
+    } else if (ctx->skip_at_count > 0 && ctx->count == ctx->skip_at_count) {
+        out_flow->action = WEBGREP_FLOW_SKIP_TO;
+        out_flow->skip_to_offset = ctx->skip_target;
+    }
+}
+
 /* ============================================================================
  * In-Memory TAR Builder Helper
  * ========================================================================= */
@@ -1174,7 +1194,86 @@ int main(void) {
         assert(webgrep_zstd_seek_table_uncompressed_size(NULL) == 0);
         webgrep_zstd_seek_table_free(NULL);
     }
-    printf("[24/24] N-gram Bloom Filter, Indexed Gzip, & Seekable Zstd checks: PASS\n");
-    printf("=== ALL 24 C ABI TEST SECTIONS PASSED ===\n");
+    printf("[24/25] N-gram Bloom Filter, Indexed Gzip, & Seekable Zstd checks: PASS\n");
+
+    /* 25. v0.8 C ABI: contains_regexes/excludes_regexes, unicode_classes, Flow.skipTo/pause + ResumeState, Windows-1252 */
+    {
+        webgrep_regex_options_t ropts = webgrep_regex_options_default();
+        ropts.unicode_classes = 1;
+        webgrep_matcher_t *m_uni = NULL;
+        assert(webgrep_matcher_compile_regex((const uint8_t *)"\\d+", 3, &ropts, NULL, &m_uni) == WEBGREP_OK);
+        const uint8_t arabic[] = { 'x', ':', 0xD9, 0xA4, 0xD9, 0xA2, '!' };
+        webgrep_match_t mt;
+        assert(webgrep_find(m_uni, arabic, sizeof(arabic), 0, &mt) == 1);
+        assert(mt.start == 2 && mt.end == 6);
+        webgrep_matcher_free(m_uni);
+
+        webgrep_matcher_t *m_err = NULL;
+        webgrep_matcher_t *m_inc = NULL;
+        webgrep_matcher_t *m_exc = NULL;
+        assert(webgrep_matcher_compile_literal((const uint8_t *)"ERR", 3, NULL, &m_err) == WEBGREP_OK);
+        assert(webgrep_matcher_compile_regex((const uint8_t *)"db-[0-9]+", 9, NULL, NULL, &m_inc) == WEBGREP_OK);
+        assert(webgrep_matcher_compile_regex((const uint8_t *)"probe", 5, NULL, NULL, &m_exc) == WEBGREP_OK);
+
+        const webgrep_matcher_t *inc_list[1] = { m_inc };
+        const webgrep_matcher_t *exc_list[1] = { m_exc };
+        webgrep_config_t fcfg = webgrep_config_default();
+        fcfg.contains_regexes_ptr = inc_list;
+        fcfg.contains_regexes_len = 1;
+        fcfg.excludes_regexes_ptr = exc_list;
+        fcfg.excludes_regexes_len = 1;
+
+        const char *flogs = "ERR db-1 ok\nERR db-2 probe\nERR cache\nERR db-3 fail\n";
+        webgrep_summary_t fsum;
+        assert(webgrep_search_slice(m_err, (const uint8_t *)flogs, strlen(flogs), &fcfg, NULL, NULL, &fsum) == WEBGREP_OK);
+        assert(fsum.matched_lines == 2);
+
+        /* Flow.pause + stateless ResumeState across slice */
+        const char *fdoc = "hit 1\nhit 2\nhit 3\n";
+        webgrep_matcher_t *m_hit = NULL;
+        assert(webgrep_matcher_compile_literal((const uint8_t *)"hit", 3, NULL, &m_hit) == WEBGREP_OK);
+        webgrep_resume_state_t *rs = webgrep_resume_state_new();
+        assert(rs != NULL);
+        flow_test_ctx_t pctx = { 0, 0, 1, 0, 0 };
+        webgrep_summary_t psum1, psum2;
+        assert(webgrep_search_slice_flow(m_hit, (const uint8_t *)fdoc, strlen(fdoc), NULL, rs, flow_test_cb, &pctx, &psum1) == WEBGREP_OK);
+        assert(webgrep_resume_state_is_paused(rs) == 1);
+        assert(webgrep_resume_state_offset(rs) == 6);
+        assert(pctx.count == 1 && pctx.last_line == 1);
+
+        pctx.pause_at_count = 0;
+        assert(webgrep_search_slice_flow(m_hit, (const uint8_t *)fdoc, strlen(fdoc), NULL, rs, flow_test_cb, &pctx, &psum2) == WEBGREP_OK);
+        assert(webgrep_resume_state_is_paused(rs) == 0);
+        assert(pctx.count == 3 && pctx.last_line == 3);
+
+        /* Flow.skipTo(offset) */
+        flow_test_ctx_t sctx = { 0, 0, 0, 1, 12 };
+        webgrep_summary_t ssum;
+        assert(webgrep_search_slice_flow(m_hit, (const uint8_t *)fdoc, strlen(fdoc), NULL, NULL, flow_test_cb, &sctx, &ssum) == WEBGREP_OK);
+        assert(sctx.count == 2 && sctx.last_line == 3);
+
+        /* Windows-1252 Euro (0x80) via WEBGREP_ENCODING_WINDOWS1252 */
+        webgrep_matcher_t *m_eur = NULL;
+        const uint8_t eur_utf8[] = { 0xE2, 0x82, 0xAC, '5', '0' };
+        assert(webgrep_matcher_compile_literal(eur_utf8, sizeof(eur_utf8), NULL, &m_eur) == WEBGREP_OK);
+        const uint8_t cp1252[] = { 0x80, '5', '0', '\n' };
+        webgrep_config_t ecfg = webgrep_config_default();
+        ecfg.encoding = WEBGREP_ENCODING_WINDOWS1252;
+        webgrep_summary_t esum;
+        assert(webgrep_search_slice(m_eur, cp1252, sizeof(cp1252), &ecfg, NULL, NULL, &esum) == WEBGREP_OK);
+        assert(esum.matched_lines == 1);
+
+        webgrep_resume_state_reset(rs);
+        assert(webgrep_resume_state_is_paused(rs) == 0);
+        webgrep_resume_state_free(rs);
+        webgrep_resume_state_free(NULL);
+        webgrep_matcher_free(m_eur);
+        webgrep_matcher_free(m_hit);
+        webgrep_matcher_free(m_err);
+        webgrep_matcher_free(m_inc);
+        webgrep_matcher_free(m_exc);
+    }
+    printf("[25/25] v0.8 C ABI (regex filters, unicode_classes, Flow.skipTo/pause, ResumeState, encodings): PASS\n");
+    printf("=== ALL 25 C ABI TEST SECTIONS PASSED ===\n");
     return 0;
 }

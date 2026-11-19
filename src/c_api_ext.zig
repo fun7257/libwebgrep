@@ -31,6 +31,23 @@ pub const webgrep_pull_t = opaque {};
 pub const webgrep_bloom_t = opaque {};
 pub const webgrep_zstd_seek_table_t = opaque {};
 pub const webgrep_gzip_index_t = opaque {};
+pub const webgrep_resume_state_t = opaque {};
+
+pub const WEBGREP_FLOW_CONT: c_int = 0;
+pub const WEBGREP_FLOW_STOP: c_int = 1;
+pub const WEBGREP_FLOW_PAUSE: c_int = 2;
+pub const WEBGREP_FLOW_SKIP_TO: c_int = 3;
+
+pub const webgrep_flow_t = extern struct {
+    action: c_int = WEBGREP_FLOW_CONT,
+    skip_to_offset: u64 = 0,
+};
+
+pub const webgrep_flow_line_cb = ?*const fn (
+    ev: *const api.webgrep_line_event_t,
+    userdata: ?*anyopaque,
+    out_flow: *webgrep_flow_t,
+) callconv(.c) void;
 
 pub const WEBGREP_MAX_CAPTURE_GROUPS: usize = 32;
 
@@ -1379,4 +1396,325 @@ test "c_api_ext: bloom filter, seekable zstd table, and indexed gzip" {
         try std.testing.expectEqual(api.WEBGREP_OK, webgrep_gzip_index_read_at(idx2, SliceMem.readAt, &src, gz_bytes.len, 1, 17, &out, out.len, &got));
         try std.testing.expectEqualStrings(payload[17 .. 17 + got], out[0..got]);
     }
+}
+
+// ============================================================================
+// Flow Control (skipTo / pause) & Stateless ResumeState (Functions 53–59)
+// ============================================================================
+
+const ResumeStateBox = struct {
+    last_result: searcher.Result = .{},
+    has_result: bool = false,
+};
+
+const CFlowEventSink = struct {
+    on_line: webgrep_flow_line_cb,
+    userdata: ?*anyopaque,
+    stopped: bool = false,
+    paused: bool = false,
+
+    pub fn event(self: *CFlowEventSink, ev: sink_mod.Event) sink_mod.FlowAction {
+        return switch (ev) {
+            .match => |le| self.emitLine(le, false),
+            .context => |le| self.emitLine(le, true),
+            else => .cont,
+        };
+    }
+
+    fn emitLine(self: *CFlowEventSink, le: sink_mod.LineEvent, is_context: bool) sink_mod.FlowAction {
+        const cb = self.on_line orelse return .cont;
+
+        var stack_spans: [64]api.webgrep_span_t = undefined;
+        var heap_spans: ?[]api.webgrep_span_t = null;
+        defer if (heap_spans) |hs| c_alloc.free(hs);
+
+        var c_spans: []api.webgrep_span_t = stack_spans[0..0];
+        if (le.matches.len > 0) {
+            if (le.matches.len <= stack_spans.len) {
+                c_spans = stack_spans[0..le.matches.len];
+            } else if (c_alloc.alloc(api.webgrep_span_t, le.matches.len)) |allocated| {
+                heap_spans = allocated;
+                c_spans = allocated;
+            } else |_| {
+                c_spans = stack_spans[0..stack_spans.len];
+            }
+            for (c_spans, 0..) |*dst, idx| {
+                const sp = le.matches[idx];
+                dst.* = .{
+                    .start = sp.start,
+                    .end = sp.end,
+                    .pattern_id = if (sp.pattern_id) |pid| @intCast(pid) else -1,
+                    .u16_start = sp.u16_start,
+                    .u16_end = sp.u16_end,
+                };
+            }
+        }
+
+        const text_slice = if (le.text.len > 0) le.text else le.bytes;
+        const c_ev = api.webgrep_line_event_t{
+            .path_ptr = if (le.source_id.len > 0) le.source_id.ptr else null,
+            .path_len = le.source_id.len,
+            .line_number = le.line_number,
+            .byte_offset = le.absolute_offset,
+            .column = le.column orelse 0,
+            .u16_column = le.u16_column orelse 0,
+            .text_ptr = text_slice.ptr,
+            .text_len = text_slice.len,
+            .bytes_ptr = le.bytes.ptr,
+            .bytes_len = le.bytes.len,
+            .replaced_ptr = if (le.replaced) |r| r.ptr else null,
+            .replaced_len = if (le.replaced) |r| r.len else 0,
+            .matches_ptr = if (c_spans.len > 0) c_spans.ptr else (&api.empty_spans)[0..0].ptr,
+            .matches_len = c_spans.len,
+            .is_context = if (is_context) 1 else 0,
+            .truncated = if (le.truncated) 1 else 0,
+            .line_number_known = if (le.line_number_known) 1 else 0,
+        };
+
+        var flow = webgrep_flow_t{};
+        cb(&c_ev, self.userdata, &flow);
+        return switch (flow.action) {
+            WEBGREP_FLOW_STOP => {
+                self.stopped = true;
+                return .stop;
+            },
+            WEBGREP_FLOW_PAUSE => {
+                self.paused = true;
+                return .pause;
+            },
+            WEBGREP_FLOW_SKIP_TO => .{ .skip_to = flow.skip_to_offset },
+            else => .cont,
+        };
+    }
+};
+
+pub export fn webgrep_resume_state_new() callconv(.c) ?*webgrep_resume_state_t {
+    const box = c_alloc.create(ResumeStateBox) catch return null;
+    box.* = .{};
+    return @ptrCast(box);
+}
+
+pub export fn webgrep_resume_state_free(state: ?*webgrep_resume_state_t) callconv(.c) void {
+    const ptr = state orelse return;
+    const box: *ResumeStateBox = @ptrCast(@alignCast(ptr));
+    c_alloc.destroy(box);
+}
+
+pub export fn webgrep_resume_state_reset(state: ?*webgrep_resume_state_t) callconv(.c) void {
+    const ptr = state orelse return;
+    const box: *ResumeStateBox = @ptrCast(@alignCast(ptr));
+    box.* = .{};
+}
+
+pub export fn webgrep_resume_state_offset(state: ?*const webgrep_resume_state_t) callconv(.c) u64 {
+    const ptr = state orelse return 0;
+    const box: *const ResumeStateBox = @ptrCast(@alignCast(ptr));
+    if (!box.has_result) return 0;
+    return box.last_result.resume_at orelse 0;
+}
+
+pub export fn webgrep_resume_state_is_paused(state: ?*const webgrep_resume_state_t) callconv(.c) u8 {
+    const ptr = state orelse return 0;
+    const box: *const ResumeStateBox = @ptrCast(@alignCast(ptr));
+    if (!box.has_result) return 0;
+    return if (box.last_result.paused) 1 else 0;
+}
+
+pub export fn webgrep_search_slice_flow(
+    matcher: ?*const api.webgrep_matcher_t,
+    data_ptr: ?[*]const u8,
+    data_len: usize,
+    cfg: ?*const api.webgrep_config_t,
+    resume_state: ?*webgrep_resume_state_t,
+    on_line: webgrep_flow_line_cb,
+    userdata: ?*anyopaque,
+    out_summary: ?*api.webgrep_summary_t,
+) callconv(.c) c_int {
+    if (out_summary) |s| s.* = .{};
+    const m_ptr = matcher orelse return api.WEBGREP_ERR_INVALID_ARG;
+    if (data_ptr == null and data_len > 0) return api.WEBGREP_ERR_INVALID_ARG;
+
+    const m_box: *const api.MatcherBox = @ptrCast(@alignCast(m_ptr));
+    const haystack: []const u8 = if (data_ptr) |p| p[0..data_len] else "";
+
+    var filter_bridge: api.CLineFilterBridge = undefined;
+    var guard = api.ConfigGuard{};
+    defer guard.deinit();
+    const z_cfg = api.buildSearchConfig(cfg, &filter_bridge, &guard) catch |err| return switch (err) {
+        error.OutOfMemory => api.WEBGREP_ERR_OUT_OF_MEMORY,
+        error.InvalidArg => api.WEBGREP_ERR_INVALID_ARG,
+    };
+
+    var c_sink = CFlowEventSink{ .on_line = on_line, .userdata = userdata };
+    const r_box: ?*ResumeStateBox = if (resume_state) |rs| @ptrCast(@alignCast(rs)) else null;
+    const res = if (r_box != null and r_box.?.has_result and r_box.?.last_result.paused)
+        (searcher.resumeSourceSlice(CFlowEventSink, &c_sink, "", haystack, &m_box.any_matcher, z_cfg, r_box.?.last_result) catch |err| return switch (err) {
+            error.OutOfMemory => api.WEBGREP_ERR_OUT_OF_MEMORY,
+            error.ContextLinesExceeded, error.BudgetExceeded, error.BufferLimit, error.DecodeLimit => api.WEBGREP_ERR_BUDGET_EXCEEDED,
+        })
+    else
+        (searcher.searchSourceSlice(CFlowEventSink, &c_sink, "", haystack, &m_box.any_matcher, z_cfg) catch |err| return switch (err) {
+            error.OutOfMemory => api.WEBGREP_ERR_OUT_OF_MEMORY,
+            error.ContextLinesExceeded, error.BudgetExceeded, error.BufferLimit, error.DecodeLimit => api.WEBGREP_ERR_BUDGET_EXCEEDED,
+        });
+
+    if (r_box) |rb| {
+        rb.last_result = res;
+        rb.has_result = true;
+    }
+    api.populateCSummary(out_summary, res, c_sink.stopped or c_sink.paused);
+    return api.WEBGREP_OK;
+}
+
+pub export fn webgrep_search_reader_flow(
+    matcher: ?*const api.webgrep_matcher_t,
+    read_cb: api.webgrep_read_cb,
+    read_userdata: ?*anyopaque,
+    cfg: ?*const api.webgrep_config_t,
+    resume_state: ?*webgrep_resume_state_t,
+    on_line: webgrep_flow_line_cb,
+    userdata: ?*anyopaque,
+    out_summary: ?*api.webgrep_summary_t,
+) callconv(.c) c_int {
+    if (out_summary) |s| s.* = .{};
+    const m_ptr = matcher orelse return api.WEBGREP_ERR_INVALID_ARG;
+    const r_cb = read_cb orelse return api.WEBGREP_ERR_INVALID_ARG;
+
+    const m_box: *const api.MatcherBox = @ptrCast(@alignCast(m_ptr));
+
+    var filter_bridge: api.CLineFilterBridge = undefined;
+    var guard = api.ConfigGuard{};
+    defer guard.deinit();
+    const z_cfg = api.buildSearchConfig(cfg, &filter_bridge, &guard) catch |err| return switch (err) {
+        error.OutOfMemory => api.WEBGREP_ERR_OUT_OF_MEMORY,
+        error.InvalidArg => api.WEBGREP_ERR_INVALID_ARG,
+    };
+
+    var c_reader: CStreamIoReader = undefined;
+    c_reader.initInPlace(r_cb, read_userdata);
+    var c_sink = CFlowEventSink{ .on_line = on_line, .userdata = userdata };
+
+    const r_box: ?*ResumeStateBox = if (resume_state) |rs| @ptrCast(@alignCast(rs)) else null;
+    const res = if (r_box != null and r_box.?.has_result and r_box.?.last_result.paused)
+        (searcher.resumeSource(CFlowEventSink, c_alloc, &c_sink, &c_reader.reader, "", &m_box.any_matcher, z_cfg, r_box.?.last_result) catch |err| return switch (err) {
+            error.OutOfMemory => api.WEBGREP_ERR_OUT_OF_MEMORY,
+            error.ContextLinesExceeded, error.BudgetExceeded, error.BufferLimit, error.DecodeLimit => api.WEBGREP_ERR_BUDGET_EXCEEDED,
+            else => api.WEBGREP_ERR_IO,
+        })
+    else
+        (searcher.searchSource(CFlowEventSink, c_alloc, &c_sink, &c_reader.reader, "", &m_box.any_matcher, z_cfg) catch |err| return switch (err) {
+            error.OutOfMemory => api.WEBGREP_ERR_OUT_OF_MEMORY,
+            error.ContextLinesExceeded, error.BudgetExceeded, error.BufferLimit, error.DecodeLimit => api.WEBGREP_ERR_BUDGET_EXCEEDED,
+            else => api.WEBGREP_ERR_IO,
+        });
+
+    if (r_box) |rb| {
+        rb.last_result = res;
+        rb.has_result = true;
+    }
+    api.populateCSummary(out_summary, res, c_sink.stopped or c_sink.paused);
+    if (c_reader.failed or res.soft_error != null) return api.WEBGREP_ERR_IO;
+    return api.WEBGREP_OK;
+}
+
+test "c_api_ext v0.8: contains_regexes, excludes_regexes, unicode_classes, Flow.skipTo, and stateless ResumeState" {
+    // 1. unicode_classes in C ABI regex compilation
+    var ropts = api.webgrep_regex_options_default();
+    ropts.unicode_classes = 1;
+    var m_uni: ?*api.webgrep_matcher_t = null;
+    const pat_uni = "\\d+";
+    try std.testing.expectEqual(api.WEBGREP_OK, api.webgrep_matcher_compile_regex(pat_uni.ptr, pat_uni.len, &ropts, null, &m_uni));
+    defer api.webgrep_matcher_free(m_uni);
+    const arabic_digits = "num:\xd9\xa4\xd9\xa2!";
+    var mat: api.webgrep_match_t = .{};
+    try std.testing.expectEqual(@as(c_int, 1), api.webgrep_find(m_uni, arabic_digits.ptr, arabic_digits.len, 0, &mat));
+    try std.testing.expectEqual(@as(usize, 4), mat.start);
+    try std.testing.expectEqual(@as(usize, 8), mat.end);
+
+    // 2. contains_regexes & excludes_regexes
+    var m_main: ?*api.webgrep_matcher_t = null;
+    try std.testing.expectEqual(api.WEBGREP_OK, api.webgrep_matcher_compile_literal("ERROR", 5, null, &m_main));
+    defer api.webgrep_matcher_free(m_main);
+    var m_inc: ?*api.webgrep_matcher_t = null;
+    try std.testing.expectEqual(api.WEBGREP_OK, api.webgrep_matcher_compile_regex("db-[0-9]+", 9, null, null, &m_inc));
+    defer api.webgrep_matcher_free(m_inc);
+    var m_exc: ?*api.webgrep_matcher_t = null;
+    try std.testing.expectEqual(api.WEBGREP_OK, api.webgrep_matcher_compile_regex("healthcheck", 11, null, null, &m_exc));
+    defer api.webgrep_matcher_free(m_exc);
+
+    const inc_arr = [_]?*const api.webgrep_matcher_t{m_inc};
+    const exc_arr = [_]?*const api.webgrep_matcher_t{m_exc};
+    var cfg = api.webgrep_config_default();
+    cfg.contains_regexes_ptr = &inc_arr;
+    cfg.contains_regexes_len = inc_arr.len;
+    cfg.excludes_regexes_ptr = &exc_arr;
+    cfg.excludes_regexes_len = exc_arr.len;
+
+    const logs =
+        "ERROR db-12 timeout\n" ++
+        "ERROR db-99 healthcheck\n" ++
+        "ERROR cache miss\n" ++
+        "ERROR db-07 deadlock\n";
+    var sum: api.webgrep_summary_t = .{};
+    try std.testing.expectEqual(api.WEBGREP_OK, api.webgrep_search_slice(m_main, logs.ptr, logs.len, &cfg, null, null, &sum));
+    try std.testing.expectEqual(@as(u64, 2), sum.matched_lines);
+
+    // 3. Flow.pause + webgrep_resume_state_t pagination across slice
+    const doc = "hit 1\nhit 2\nhit 3\n";
+    var m_hit: ?*api.webgrep_matcher_t = null;
+    try std.testing.expectEqual(api.WEBGREP_OK, api.webgrep_matcher_compile_literal("hit", 3, null, &m_hit));
+    defer api.webgrep_matcher_free(m_hit);
+
+    const PauseCtx = struct {
+        seen_lines: [4]u64 = .{ 0, 0, 0, 0 },
+        count: usize = 0,
+        pause_after_one: bool = true,
+        fn cb(ev: *const api.webgrep_line_event_t, userdata: ?*anyopaque, out_flow: *webgrep_flow_t) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            if (self.count < 4) self.seen_lines[self.count] = ev.line_number;
+            self.count += 1;
+            if (self.pause_after_one) {
+                out_flow.action = WEBGREP_FLOW_PAUSE;
+            }
+        }
+    };
+
+    const rs = webgrep_resume_state_new().?;
+    defer webgrep_resume_state_free(rs);
+    var pctx = PauseCtx{};
+    var s1: api.webgrep_summary_t = .{};
+    try std.testing.expectEqual(api.WEBGREP_OK, webgrep_search_slice_flow(m_hit, doc.ptr, doc.len, null, rs, PauseCtx.cb, &pctx, &s1));
+    try std.testing.expectEqual(@as(u8, 1), webgrep_resume_state_is_paused(rs));
+    try std.testing.expectEqual(@as(u64, 6), webgrep_resume_state_offset(rs));
+    try std.testing.expectEqual(@as(usize, 1), pctx.count);
+    try std.testing.expectEqual(@as(u64, 1), pctx.seen_lines[0]);
+
+    // Resume to completion
+    pctx.pause_after_one = false;
+    var s2: api.webgrep_summary_t = .{};
+    try std.testing.expectEqual(api.WEBGREP_OK, webgrep_search_slice_flow(m_hit, doc.ptr, doc.len, null, rs, PauseCtx.cb, &pctx, &s2));
+    try std.testing.expectEqual(@as(u8, 0), webgrep_resume_state_is_paused(rs));
+    try std.testing.expectEqual(@as(usize, 3), pctx.count);
+    try std.testing.expectEqual(@as(u64, 2), pctx.seen_lines[1]);
+    try std.testing.expectEqual(@as(u64, 3), pctx.seen_lines[2]);
+
+    // 4. Flow.skipTo(offset)
+    const SkipCtx = struct {
+        count: usize = 0,
+        last_line: u64 = 0,
+        fn cb(ev: *const api.webgrep_line_event_t, userdata: ?*anyopaque, out_flow: *webgrep_flow_t) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.count += 1;
+            self.last_line = ev.line_number;
+            if (self.count == 1) {
+                out_flow.action = WEBGREP_FLOW_SKIP_TO;
+                out_flow.skip_to_offset = 12; // skip "hit 2\n" directly to "hit 3\n"
+            }
+        }
+    };
+    var sk = SkipCtx{};
+    var s3: api.webgrep_summary_t = .{};
+    try std.testing.expectEqual(api.WEBGREP_OK, webgrep_search_slice_flow(m_hit, doc.ptr, doc.len, null, null, SkipCtx.cb, &sk, &s3));
+    try std.testing.expectEqual(@as(usize, 2), sk.count);
+    try std.testing.expectEqual(@as(u64, 3), sk.last_line);
 }

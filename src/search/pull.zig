@@ -324,7 +324,7 @@ pub const PrefixedReader = struct {
 };
 
 pub const StreamDecompressor = struct {
-    pub const Kind = enum { raw, gzip, zstd, xz };
+    pub const Kind = enum { raw, gzip, zstd, xz, zlib, deflate, lz4, bzip2, brotli };
 
     kind: Kind,
     allocator: std.mem.Allocator,
@@ -337,6 +337,9 @@ pub const StreamDecompressor = struct {
     zstd_window: ?[]u8 = null,
 
     xz_dec: ?std.compress.xz.Decompress = null,
+    lz4_dec: ?decompress_mod.lz4.Lz4Decompressor = null,
+    bzip2_dec: ?decompress_mod.bzip2.Bzip2Decompressor = null,
+    brotli_dec: ?decompress_mod.brotli.BrotliDecompressor = null,
 
     decompressed_bytes: u64 = 0,
     max_decompressed_bytes: ?u64 = null,
@@ -404,10 +407,17 @@ pub const StreamDecompressor = struct {
             .gzip => .gzip,
             .zstd => .zstd,
             .xz => .xz,
+            .zlib => .zlib,
+            .deflate => .deflate,
+            .lz4 => .lz4,
+            .bzip2 => .bzip2,
+            .brotli => .brotli,
             .auto => if (mid_seek) .raw else switch (decompress_mod.sniff(sniff_buf[0..sniff_len], true)) {
                 .gzip => .gzip,
                 .zstd => .zstd,
                 .xz => .xz,
+                .lz4 => .lz4,
+                .bzip2 => .bzip2,
                 else => .raw,
             },
         };
@@ -440,6 +450,16 @@ pub const StreamDecompressor = struct {
                     self.flate_window = win;
                     self.flate_dec = std.compress.flate.Decompress.init(&self.prefixed.reader, .gzip, win);
                 },
+                .zlib => {
+                    const win = try allocator.alloc(u8, std.compress.flate.max_window_len);
+                    self.flate_window = win;
+                    self.flate_dec = std.compress.flate.Decompress.init(&self.prefixed.reader, .zlib, win);
+                },
+                .deflate => {
+                    const win = try allocator.alloc(u8, std.compress.flate.max_window_len);
+                    self.flate_window = win;
+                    self.flate_dec = std.compress.flate.Decompress.init(&self.prefixed.reader, .raw, win);
+                },
                 .zstd => {
                     const win_size = std.compress.zstd.default_window_len + std.compress.zstd.block_size_max;
                     const win = try allocator.alloc(u8, win_size);
@@ -452,6 +472,15 @@ pub const StreamDecompressor = struct {
                         self.corrupt_on_init = true;
                         break :blk null;
                     };
+                },
+                .lz4 => {
+                    self.lz4_dec = decompress_mod.lz4.Lz4Decompressor.init(allocator, &self.prefixed.reader);
+                },
+                .bzip2 => {
+                    self.bzip2_dec = decompress_mod.bzip2.Bzip2Decompressor.init(allocator, &self.prefixed.reader);
+                },
+                .brotli => {
+                    self.brotli_dec = decompress_mod.brotli.BrotliDecompressor.init(allocator, &self.prefixed.reader);
                 },
             }
         }
@@ -491,7 +520,7 @@ pub const StreamDecompressor = struct {
                     self.raw_consumed = self.prefixed.totalRead();
                 }
             },
-            .gzip => {
+            .gzip, .zlib, .deflate => {
                 n = self.flate_dec.?.reader.readSliceShort(slice_dest) catch |err| {
                     if (err == error.OutOfMemory) return error.OutOfMemory;
                     return error.CorruptStream;
@@ -509,6 +538,27 @@ pub const StreamDecompressor = struct {
                 n = self.xz_dec.?.reader.readSliceShort(slice_dest) catch |err| {
                     if (err == error.OutOfMemory) return error.OutOfMemory;
                     return error.CorruptStream;
+                };
+                self.raw_consumed = self.prefixed.totalRead();
+            },
+            .lz4 => {
+                n = self.lz4_dec.?.read(slice_dest) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.CorruptStream,
+                };
+                self.raw_consumed = self.prefixed.totalRead();
+            },
+            .bzip2 => {
+                n = self.bzip2_dec.?.read(slice_dest) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.CorruptStream,
+                };
+                self.raw_consumed = self.prefixed.totalRead();
+            },
+            .brotli => {
+                n = self.brotli_dec.?.read(slice_dest) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.CorruptStream,
                 };
                 self.raw_consumed = self.prefixed.totalRead();
             },
@@ -548,6 +598,9 @@ pub const StreamDecompressor = struct {
         if (self.flate_window) |win| self.allocator.free(win);
         if (self.zstd_window) |win| self.allocator.free(win);
         if (self.xz_dec) |*dec| self.allocator.free(dec.reader.buffer);
+        if (self.lz4_dec) |*dec| dec.deinit();
+        if (self.bzip2_dec) |*dec| dec.deinit();
+        if (self.brotli_dec) |*dec| dec.deinit();
         self.allocator.destroy(self);
     }
 };

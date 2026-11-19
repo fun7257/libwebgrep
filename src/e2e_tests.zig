@@ -303,7 +303,9 @@ const ArchiveTree = struct {
                 .gzip => .tar_gz,
                 .zstd => .tar_zst,
                 .xz => .tar_xz,
-                .auto => .auto,
+                .bzip2 => .tar_bz2,
+                .lz4 => .tar_lz4,
+                .zlib, .deflate, .brotli, .auto => .auto,
             };
         }
         return fmt;

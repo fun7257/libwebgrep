@@ -14,11 +14,14 @@ pub const offset_map_mod = @import("offset_map.zig");
 pub const OffsetMap = offset_map_mod.OffsetMap;
 pub const SearchByteOffset = offset_map_mod.SearchByteOffset;
 pub const RawByteOffset = offset_map_mod.RawByteOffset;
+pub const lz4 = @import("lz4.zig");
+pub const bzip2 = @import("bzip2.zig");
+pub const brotli = @import("brotli.zig");
 
 pub const Compression = enum {
     /// Do not decompress by default; process as a raw byte stream.
     none,
-    /// Auto-detect Gzip (`1F 8B`), Zstd (`28 B5 2F FD`), or XZ (`FD 37 7A 58 5A 00`) by magic bytes at the start of the stream.
+    /// Auto-detect Gzip (`1F 8B`), Zstd (`28 B5 2F FD`), XZ (`FD 37 7A 58 5A 00`), Bzip2 (`BZh[1-9]`), or LZ4 Frame (`04 22 4D 18`) by magic bytes.
     auto,
     /// Force Gzip (RFC 1952) decompression.
     gzip,
@@ -26,6 +29,16 @@ pub const Compression = enum {
     zstd,
     /// Force XZ container decompression.
     xz,
+    /// Force zlib (RFC 1950) decompression.
+    zlib,
+    /// Force raw Deflate (RFC 1951) decompression.
+    deflate,
+    /// Force LZ4 Frame decompression.
+    lz4,
+    /// Force Bzip2 decompression.
+    bzip2,
+    /// Force Brotli (RFC 7932) decompression.
+    brotli,
 };
 
 pub const Detected = enum {
@@ -34,6 +47,11 @@ pub const Detected = enum {
     gzip,
     zstd,
     xz,
+    zlib,
+    deflate,
+    lz4,
+    bzip2,
+    brotli,
 };
 
 pub const default_max_compression_ratio: u64 = 100;
@@ -51,10 +69,12 @@ pub const Error = error{
 pub fn sniff(bytes: []const u8, eof: bool) Detected {
     if (bytes.len >= 2 and bytes[0] == 0x1F and bytes[1] == 0x8B) return .gzip;
     if (bytes.len >= 4 and std.mem.eql(u8, bytes[0..4], &.{ 0x28, 0xB5, 0x2F, 0xFD })) return .zstd;
+    if (bytes.len >= 4 and std.mem.eql(u8, bytes[0..4], &.{ 0x04, 0x22, 0x4D, 0x18 })) return .lz4;
+    if (bytes.len >= 4 and bytes[0] == 'B' and bytes[1] == 'Z' and bytes[2] == 'h' and bytes[3] >= '1' and bytes[3] <= '9') return .bzip2;
     if (bytes.len >= 6 and std.mem.eql(u8, bytes[0..6], &.{ 0xFD, '7', 'z', 'X', 'Z', 0x00 })) return .xz;
     if (eof or bytes.len >= 6) return .raw;
     if (bytes.len == 0) return .need_more;
-    if (bytes[0] == 0x1F or bytes[0] == 0x28 or bytes[0] == 0xFD) return .need_more;
+    if (bytes[0] == 0x1F or bytes[0] == 0x28 or bytes[0] == 0xFD or bytes[0] == 0x04 or bytes[0] == 'B') return .need_more;
     return .raw;
 }
 
@@ -75,6 +95,11 @@ pub fn decompressSlice(
         .gzip => .gzip,
         .zstd => .zstd,
         .xz => .xz,
+        .zlib => .zlib,
+        .deflate => .deflate,
+        .lz4 => .lz4,
+        .bzip2 => .bzip2,
+        .brotli => .brotli,
         .auto => sniff(compressed, true),
     };
     if (format == .raw or format == .need_more) return null;
@@ -134,6 +159,84 @@ pub fn decompressSlice(
                 offset_map,
             );
         },
+        .zlib => {
+            var window: [std.compress.flate.max_window_len]u8 = undefined;
+            var dec = std.compress.flate.Decompress.init(&in_reader, .zlib, &window);
+            try pumpDecompress(
+                allocator,
+                &dec.reader,
+                &in_reader,
+                compressed.len,
+                &out_list,
+                &total_decompressed,
+                max_decompressed_bytes,
+                ratio_cap,
+                offset_map,
+            );
+        },
+        .deflate => {
+            var window: [std.compress.flate.max_window_len]u8 = undefined;
+            var dec = std.compress.flate.Decompress.init(&in_reader, .raw, &window);
+            try pumpDecompress(
+                allocator,
+                &dec.reader,
+                &in_reader,
+                compressed.len,
+                &out_list,
+                &total_decompressed,
+                max_decompressed_bytes,
+                ratio_cap,
+                offset_map,
+            );
+        },
+        .lz4 => {
+            var dec = lz4.Lz4Decompressor.init(allocator, &in_reader);
+            defer dec.deinit();
+            try pumpCustomDecompress(
+                lz4.Lz4Decompressor,
+                allocator,
+                &dec,
+                &in_reader,
+                compressed.len,
+                &out_list,
+                &total_decompressed,
+                max_decompressed_bytes,
+                ratio_cap,
+                offset_map,
+            );
+        },
+        .bzip2 => {
+            var dec = bzip2.Bzip2Decompressor.init(allocator, &in_reader);
+            defer dec.deinit();
+            try pumpCustomDecompress(
+                bzip2.Bzip2Decompressor,
+                allocator,
+                &dec,
+                &in_reader,
+                compressed.len,
+                &out_list,
+                &total_decompressed,
+                max_decompressed_bytes,
+                ratio_cap,
+                offset_map,
+            );
+        },
+        .brotli => {
+            var dec = brotli.BrotliDecompressor.init(allocator, &in_reader);
+            defer dec.deinit();
+            try pumpCustomDecompress(
+                brotli.BrotliDecompressor,
+                allocator,
+                &dec,
+                &in_reader,
+                compressed.len,
+                &out_list,
+                &total_decompressed,
+                max_decompressed_bytes,
+                ratio_cap,
+                offset_map,
+            );
+        },
         .raw, .need_more => unreachable,
     }
 
@@ -159,6 +262,59 @@ fn pumpDecompress(
         const n = dec_reader.readSliceShort(&chunk) catch {
             @branchHint(.cold);
             return error.CorruptStream;
+        };
+        if (n == 0) break;
+
+        const out_before: u64 = @intCast(out_list.items.len);
+        try offset_map.record(allocator, out_before, raw_before);
+
+        local_decompressed = std.math.add(u64, local_decompressed, n) catch return error.DecompressLimit;
+        total_decompressed.* = std.math.add(u64, total_decompressed.*, n) catch return error.DecompressLimit;
+        if (max_decompressed_bytes) |cap| {
+            if (total_decompressed.* > cap) {
+                @branchHint(.cold);
+                return error.DecompressLimit;
+            }
+        }
+
+        const raw_consumed: u64 = @max(1, @as(u64, @intCast(@min(raw_reader.seek, total_raw_len))));
+        if (local_decompressed >= ratio_check_min_bytes) {
+            const max_allowed = std.math.mul(u64, raw_consumed, ratio_cap) catch std.math.maxInt(u64);
+            if (local_decompressed > max_allowed) {
+                @branchHint(.cold);
+                return error.DecompressLimit;
+            }
+        }
+
+        try out_list.appendSlice(allocator, chunk[0..n]);
+    }
+    const final_out: u64 = @intCast(out_list.items.len);
+    const final_raw: u64 = @intCast(@min(raw_reader.seek, total_raw_len));
+    try offset_map.record(allocator, final_out, final_raw);
+}
+
+fn pumpCustomDecompress(
+    comptime D: type,
+    allocator: std.mem.Allocator,
+    dec: *D,
+    raw_reader: *const std.Io.Reader,
+    total_raw_len: usize,
+    out_list: *std.ArrayList(u8),
+    total_decompressed: *u64,
+    max_decompressed_bytes: ?u64,
+    ratio_cap: u64,
+    offset_map: *OffsetMap,
+) Error!void {
+    var chunk: [16384]u8 = undefined;
+    var local_decompressed: u64 = 0;
+    while (true) {
+        const raw_before: u64 = @intCast(@min(raw_reader.seek, total_raw_len));
+        const n = dec.read(&chunk) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                @branchHint(.cold);
+                return error.CorruptStream;
+            },
         };
         if (n == 0) break;
 
@@ -321,4 +477,10 @@ test "Zstd decompression and corrupt stream handling" {
         error.CorruptStream,
         decompressSlice(std.testing.allocator, &corrupt_zst, .auto, 0, 1024, 100, &dec_bytes, &map),
     );
+}
+
+test {
+    _ = lz4;
+    _ = bzip2;
+    _ = brotli;
 }

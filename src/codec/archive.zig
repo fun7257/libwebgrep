@@ -13,6 +13,8 @@ pub const ArchiveFormat = enum {
     tar_gz,
     tar_zst,
     tar_xz,
+    tar_bz2,
+    tar_lz4,
     zip,
 };
 
@@ -30,6 +32,8 @@ pub const ArchiveOptions = struct {
     max_entry_bytes: u64 = 64 * 1024 * 1024,
     max_total_bytes: u64 = 256 * 1024 * 1024,
     max_compression_ratio: u64 = 100,
+    /// Maximum nesting depth for expanding inner archives (e.g. `.tar.gz` inside `.zip`). `0` disables nested expansion.
+    max_archive_depth: usize = 0,
     entry_filter: ?*const fn (?*anyopaque, ArchiveEntryMeta) bool = null,
     entry_filter_ctx: ?*anyopaque = null,
 };
@@ -71,42 +75,8 @@ pub const ArchiveTree = struct {
         };
 
         if (archive_bytes.len > 0) {
-            const fmt = try detectFormat(archive_bytes, options.format);
-            switch (fmt) {
-                .tar => try unpackTar(arena_alloc, archive_bytes, root_temp, options),
-                .tar_gz, .tar_zst, .tar_xz => {
-                    var dec_bytes: u64 = 0;
-                    var offset_map = decompress_mod.OffsetMap{};
-                    defer offset_map.deinit(arena_alloc);
-
-                    const comp_mode: decompress_mod.Compression = switch (fmt) {
-                        .tar_gz => .gzip,
-                        .tar_zst => .zstd,
-                        .tar_xz => .xz,
-                        else => unreachable,
-                    };
-
-                    const decompressed = decompress_mod.decompressSlice(
-                        arena_alloc,
-                        archive_bytes,
-                        comp_mode,
-                        0,
-                        options.max_total_bytes,
-                        options.max_compression_ratio,
-                        &dec_bytes,
-                        &offset_map,
-                    ) catch |err| switch (err) {
-                        error.DecompressLimit => return error.ArchiveLimit,
-                        error.CorruptStream => return error.CorruptArchive,
-                        error.OutOfMemory => return error.OutOfMemory,
-                    };
-
-                    const tar_slice = decompressed orelse return error.CorruptArchive;
-                    try unpackTar(arena_alloc, tar_slice, root_temp, options);
-                },
-                .zip => try unpackZip(arena_alloc, archive_bytes, root_temp, options),
-                .auto => unreachable,
-            }
+            var state = UnpackState{};
+            try unpackArchiveSlice(arena_alloc, archive_bytes, root_temp, options, &state);
         } else if (options.format == .zip) {
             return error.CorruptArchive;
         }
@@ -172,6 +142,12 @@ pub fn detectFormat(bytes: []const u8, requested: ArchiveFormat) ArchiveError!Ar
     if (bytes.len >= 4 and std.mem.eql(u8, bytes[0..4], &.{ 0x28, 0xB5, 0x2F, 0xFD })) {
         return .tar_zst;
     }
+    if (bytes.len >= 4 and bytes[0] == 'B' and bytes[1] == 'Z' and bytes[2] == 'h' and bytes[3] >= '1' and bytes[3] <= '9') {
+        return .tar_bz2;
+    }
+    if (bytes.len >= 4 and std.mem.eql(u8, bytes[0..4], &.{ 0x04, 0x22, 0x4D, 0x18 })) {
+        return .tar_lz4;
+    }
     if (bytes.len >= 6 and std.mem.eql(u8, bytes[0..6], &.{ 0xFD, '7', 'z', 'X', 'Z', 0x00 })) {
         return .tar_xz;
     }
@@ -179,6 +155,95 @@ pub fn detectFormat(bytes: []const u8, requested: ArchiveFormat) ArchiveError!Ar
         return .tar;
     }
     return error.CorruptArchive;
+}
+
+const UnpackState = struct {
+    entry_count: usize = 0,
+    total_uncompressed: u64 = 0,
+    depth: usize = 0,
+};
+
+fn unpackArchiveSlice(
+    arena_alloc: std.mem.Allocator,
+    archive_bytes: []const u8,
+    root_temp: *TempNode,
+    options: ArchiveOptions,
+    state: *UnpackState,
+) ArchiveError!void {
+    const fmt = try detectFormat(archive_bytes, if (state.depth == 0) options.format else .auto);
+    switch (fmt) {
+        .tar => try unpackTar(arena_alloc, archive_bytes, root_temp, options, state),
+        .tar_gz, .tar_zst, .tar_xz, .tar_bz2, .tar_lz4 => {
+            var dec_bytes: u64 = 0;
+            var offset_map = decompress_mod.OffsetMap{};
+            defer offset_map.deinit(arena_alloc);
+
+            const comp_mode: decompress_mod.Compression = switch (fmt) {
+                .tar_gz => .gzip,
+                .tar_zst => .zstd,
+                .tar_xz => .xz,
+                .tar_bz2 => .bzip2,
+                .tar_lz4 => .lz4,
+                else => unreachable,
+            };
+
+            const decompressed = decompress_mod.decompressSlice(
+                arena_alloc,
+                archive_bytes,
+                comp_mode,
+                state.total_uncompressed,
+                options.max_total_bytes,
+                options.max_compression_ratio,
+                &dec_bytes,
+                &offset_map,
+            ) catch |err| switch (err) {
+                error.DecompressLimit => return error.ArchiveLimit,
+                error.CorruptStream => return error.CorruptArchive,
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+
+            const tar_slice = decompressed orelse return error.CorruptArchive;
+            try unpackTar(arena_alloc, tar_slice, root_temp, options, state);
+        },
+        .zip => try unpackZip(arena_alloc, archive_bytes, root_temp, options, state),
+        .auto => unreachable,
+    }
+}
+
+fn hasNestedArchiveExt(path: []const u8) bool {
+    const exts = [_][]const u8{ ".zip", ".tar", ".tar.gz", ".tgz", ".tar.zst", ".tar.xz", ".tar.bz2", ".tbz2", ".tar.lz4" };
+    for (exts) |ext| {
+        if (path.len >= ext.len and std.ascii.eqlIgnoreCase(path[path.len - ext.len ..], ext)) return true;
+    }
+    return false;
+}
+
+fn maybeInsertOrExpandNested(
+    arena_alloc: std.mem.Allocator,
+    root: *TempNode,
+    clean: []const u8,
+    payload: []const u8,
+    mtime_val: ?i64,
+    options: ArchiveOptions,
+    state: *UnpackState,
+) ArchiveError!void {
+    if (state.depth < options.max_archive_depth and payload.len > 0 and hasNestedArchiveExt(clean)) {
+        if (detectFormat(payload, .auto)) |_| {
+            const nested_dir_name = try std.fmt.allocPrint(arena_alloc, "{s}!", .{clean});
+            const nested_root = try ensureDirPath(arena_alloc, root, nested_dir_name, mtime_val);
+            state.depth += 1;
+            defer state.depth -= 1;
+            unpackArchiveSlice(arena_alloc, payload, nested_root, options, state) catch |err| switch (err) {
+                error.CorruptArchive, error.UnsupportedFormat => {
+                    try insertFile(arena_alloc, root, clean, payload, mtime_val);
+                    return;
+                },
+                else => return err,
+            };
+            return;
+        } else |_| {}
+    }
+    try insertFile(arena_alloc, root, clean, payload, mtime_val);
 }
 
 fn looksLikeTar(bytes: []const u8) bool {
@@ -424,6 +489,7 @@ fn unpackTar(
     tar_bytes: []const u8,
     root: *TempNode,
     options: ArchiveOptions,
+    state: *UnpackState,
 ) ArchiveError!void {
     if (tar_bytes.len == 0) return;
     if (tar_bytes.len < 512) return error.CorruptArchive;
@@ -440,9 +506,6 @@ fn unpackTar(
         .link_name_buffer = link_name_buf,
         .diagnostics = &diag,
     });
-
-    var entry_count: usize = 0;
-    var total_uncompressed: u64 = 0;
 
     while (true) {
         const maybe_file = it.next() catch |err| switch (err) {
@@ -478,12 +541,12 @@ fn unpackTar(
             }
         }
 
-        entry_count += 1;
-        if (entry_count > options.max_entries) return error.ArchiveLimit;
+        state.entry_count += 1;
+        if (state.entry_count > options.max_entries) return error.ArchiveLimit;
 
         if (file.size > options.max_entry_bytes) return error.ArchiveLimit;
-        total_uncompressed = std.math.add(u64, total_uncompressed, file.size) catch return error.ArchiveLimit;
-        if (total_uncompressed > options.max_total_bytes) return error.ArchiveLimit;
+        state.total_uncompressed = std.math.add(u64, state.total_uncompressed, file.size) catch return error.ArchiveLimit;
+        if (state.total_uncompressed > options.max_total_bytes) return error.ArchiveLimit;
 
         switch (file.kind) {
             .directory => {
@@ -493,11 +556,53 @@ fn unpackTar(
                 const payload = try arena_alloc.alloc(u8, @intCast(file.size));
                 reader.readSliceAll(payload) catch return error.CorruptArchive;
                 it.unread_file_bytes = 0;
-                try insertFile(arena_alloc, root, clean, payload, mtime_val);
+                try maybeInsertOrExpandNested(arena_alloc, root, clean, payload, mtime_val, options, state);
             },
             .sym_link => unreachable,
         }
     }
+}
+
+fn parseZip64ExtraField(
+    extra: []const u8,
+    uncomp_size: *u64,
+    comp_size: *u64,
+    local_offset: *u64,
+) ArchiveError!void {
+    const need_uncomp = (uncomp_size.* == 0xFFFFFFFF);
+    const need_comp = (comp_size.* == 0xFFFFFFFF);
+    const need_off = (local_offset.* == 0xFFFFFFFF);
+    if (!need_uncomp and !need_comp and !need_off) return;
+
+    var pos: usize = 0;
+    while (pos + 4 <= extra.len) {
+        const header_id = std.mem.readInt(u16, extra[pos..][0..2], .little);
+        const data_size = std.mem.readInt(u16, extra[pos + 2 ..][0..2], .little);
+        pos += 4;
+        if (data_size > extra.len - pos) return error.CorruptArchive;
+        if (header_id == 0x0001) {
+            var fp: usize = pos;
+            const fend = pos + data_size;
+            if (need_uncomp) {
+                if (fp + 8 > fend) return error.CorruptArchive;
+                uncomp_size.* = std.mem.readInt(u64, extra[fp..][0..8], .little);
+                fp += 8;
+            }
+            if (need_comp) {
+                if (fp + 8 > fend) return error.CorruptArchive;
+                comp_size.* = std.mem.readInt(u64, extra[fp..][0..8], .little);
+                fp += 8;
+            }
+            if (need_off) {
+                if (fp + 8 > fend) return error.CorruptArchive;
+                local_offset.* = std.mem.readInt(u64, extra[fp..][0..8], .little);
+                fp += 8;
+            }
+            return;
+        }
+        pos += data_size;
+    }
+    return error.CorruptArchive;
 }
 
 fn unpackZip(
@@ -505,6 +610,7 @@ fn unpackZip(
     zip_bytes: []const u8,
     root: *TempNode,
     options: ArchiveOptions,
+    state: *UnpackState,
 ) ArchiveError!void {
     if (zip_bytes.len < 22) return error.CorruptArchive;
 
@@ -524,18 +630,40 @@ fn unpackZip(
     }
     const eocd = eocd_pos orelse return error.CorruptArchive;
 
-    const total_entries = std.mem.readInt(u16, zip_bytes[eocd + 10 ..][0..2], .little);
-    const cd_size = std.mem.readInt(u32, zip_bytes[eocd + 12 ..][0..4], .little);
-    const cd_offset = std.mem.readInt(u32, zip_bytes[eocd + 16 ..][0..4], .little);
+    var total_entries: u64 = std.mem.readInt(u16, zip_bytes[eocd + 10 ..][0..2], .little);
+    var cd_size: u64 = std.mem.readInt(u32, zip_bytes[eocd + 12 ..][0..4], .little);
+    var cd_offset: u64 = std.mem.readInt(u32, zip_bytes[eocd + 16 ..][0..4], .little);
 
-    const cd_end = std.math.add(usize, @as(usize, cd_offset), @as(usize, cd_size)) catch return error.CorruptArchive;
+    // ZIP64 End of Central Directory Locator (0x07064b50) immediately precedes EOCD
+    if ((total_entries == 0xFFFF or cd_size == 0xFFFFFFFF or cd_offset == 0xFFFFFFFF) and eocd >= 20) {
+        const loc = eocd - 20;
+        if (std.mem.readInt(u32, zip_bytes[loc..][0..4], .little) == 0x07064b50) {
+            const eocd64_off_u64 = std.mem.readInt(u64, zip_bytes[loc + 8 ..][0..8], .little);
+            const eocd64_off = std.math.cast(usize, eocd64_off_u64) orelse return error.CorruptArchive;
+            if (eocd64_off + 56 > loc) return error.CorruptArchive;
+            if (std.mem.readInt(u32, zip_bytes[eocd64_off..][0..4], .little) != 0x06064b50) {
+                return error.CorruptArchive;
+            }
+            if (total_entries == 0xFFFF) {
+                total_entries = std.mem.readInt(u64, zip_bytes[eocd64_off + 32 ..][0..8], .little);
+            }
+            if (cd_size == 0xFFFFFFFF) {
+                cd_size = std.mem.readInt(u64, zip_bytes[eocd64_off + 40 ..][0..8], .little);
+            }
+            if (cd_offset == 0xFFFFFFFF) {
+                cd_offset = std.mem.readInt(u64, zip_bytes[eocd64_off + 48 ..][0..8], .little);
+            }
+        }
+    }
+
+    const cd_offset_usize = std.math.cast(usize, cd_offset) orelse return error.CorruptArchive;
+    const cd_size_usize = std.math.cast(usize, cd_size) orelse return error.CorruptArchive;
+    const cd_end = std.math.add(usize, cd_offset_usize, cd_size_usize) catch return error.CorruptArchive;
     if (cd_end > eocd or cd_end > zip_bytes.len) return error.CorruptArchive;
 
-    var cd_pos: usize = @intCast(cd_offset);
-    var entry_count: usize = 0;
-    var total_uncompressed: u64 = 0;
+    var cd_pos: usize = cd_offset_usize;
 
-    var idx: usize = 0;
+    var idx: u64 = 0;
     while (idx < total_entries) : (idx += 1) {
         const hdr_end = std.math.add(usize, cd_pos, 46) catch return error.CorruptArchive;
         if (hdr_end > cd_end) return error.CorruptArchive;
@@ -548,13 +676,13 @@ fn unpackZip(
         const mod_time = std.mem.readInt(u16, zip_bytes[cd_pos + 12 ..][0..2], .little);
         const mod_date = std.mem.readInt(u16, zip_bytes[cd_pos + 14 ..][0..2], .little);
         const expected_crc32 = std.mem.readInt(u32, zip_bytes[cd_pos + 16 ..][0..4], .little);
-        const comp_size = std.mem.readInt(u32, zip_bytes[cd_pos + 20 ..][0..4], .little);
-        const uncomp_size = std.mem.readInt(u32, zip_bytes[cd_pos + 24 ..][0..4], .little);
+        var comp_size: u64 = std.mem.readInt(u32, zip_bytes[cd_pos + 20 ..][0..4], .little);
+        var uncomp_size: u64 = std.mem.readInt(u32, zip_bytes[cd_pos + 24 ..][0..4], .little);
         const name_len = std.mem.readInt(u16, zip_bytes[cd_pos + 28 ..][0..2], .little);
         const extra_len = std.mem.readInt(u16, zip_bytes[cd_pos + 30 ..][0..2], .little);
         const comment_len = std.mem.readInt(u16, zip_bytes[cd_pos + 32 ..][0..2], .little);
         const external_attr = std.mem.readInt(u32, zip_bytes[cd_pos + 38 ..][0..4], .little);
-        const local_offset = std.mem.readInt(u32, zip_bytes[cd_pos + 42 ..][0..4], .little);
+        var local_offset: u64 = std.mem.readInt(u32, zip_bytes[cd_pos + 42 ..][0..4], .little);
 
         const var_len = @as(usize, name_len) + @as(usize, extra_len) + @as(usize, comment_len);
         const rec_end = std.math.add(usize, hdr_end, var_len) catch return error.CorruptArchive;
@@ -564,6 +692,8 @@ fn unpackZip(
         const raw_name = zip_bytes[hdr_end..name_end];
         const extra_slice = zip_bytes[name_end .. name_end + @as(usize, extra_len)];
         cd_pos = rec_end;
+
+        try parseZip64ExtraField(extra_slice, &uncomp_size, &comp_size, &local_offset);
 
         // Check POSIX S_IFLNK (0o120000) in upper 16 bits of external_attr; skip symlinks.
         const unix_mode = (external_attr >> 16) & 0o170000;
@@ -581,8 +711,8 @@ fn unpackZip(
             const meta = ArchiveEntryMeta{
                 .path = clean,
                 .kind = if (is_dir) .directory else .file,
-                .size = @as(u64, uncomp_size),
-                .compressed_size = @as(u64, comp_size),
+                .size = uncomp_size,
+                .compressed_size = comp_size,
                 .mtime = mtime_val,
             };
             if (!filter_fn(options.entry_filter_ctx, meta)) {
@@ -592,8 +722,8 @@ fn unpackZip(
 
         if ((flags & 1) != 0) return error.UnsupportedFormat;
 
-        entry_count += 1;
-        if (entry_count > options.max_entries) return error.ArchiveLimit;
+        state.entry_count += 1;
+        if (state.entry_count > options.max_entries) return error.ArchiveLimit;
 
         if (is_dir) {
             _ = try ensureDirPath(arena_alloc, root, clean, mtime_val);
@@ -601,19 +731,20 @@ fn unpackZip(
         }
 
         if (uncomp_size > options.max_entry_bytes) return error.ArchiveLimit;
-        const projected_total = std.math.add(u64, total_uncompressed, uncomp_size) catch return error.ArchiveLimit;
+        const projected_total = std.math.add(u64, state.total_uncompressed, uncomp_size) catch return error.ArchiveLimit;
         if (projected_total > options.max_total_bytes) return error.ArchiveLimit;
 
         if (uncomp_size >= decompress_mod.ratio_check_min_bytes) {
-            const raw_base: u64 = @max(1, @as(u64, comp_size));
+            const raw_base: u64 = @max(1, comp_size);
             const max_allowed = std.math.mul(u64, raw_base, options.max_compression_ratio) catch std.math.maxInt(u64);
             if (uncomp_size > max_allowed) return error.ArchiveLimit;
         }
 
         // Validate Local File Header (LFH)
-        const lfh_off: usize = @intCast(local_offset);
+        const lfh_off = std.math.cast(usize, local_offset) orelse return error.CorruptArchive;
+        const comp_size_usize = std.math.cast(usize, comp_size) orelse return error.CorruptArchive;
         const lfh_end = std.math.add(usize, lfh_off, 30) catch return error.CorruptArchive;
-        if (lfh_end > cd_offset or lfh_end > zip_bytes.len) return error.CorruptArchive;
+        if (lfh_end > cd_offset_usize or lfh_end > zip_bytes.len) return error.CorruptArchive;
 
         const lfh_sig = std.mem.readInt(u32, zip_bytes[lfh_off..][0..4], .little);
         if (lfh_sig != 0x04034b50) return error.CorruptArchive;
@@ -621,15 +752,15 @@ fn unpackZip(
         const lfh_name_len = std.mem.readInt(u16, zip_bytes[lfh_off + 26 ..][0..2], .little);
         const lfh_extra_len = std.mem.readInt(u16, zip_bytes[lfh_off + 28 ..][0..2], .little);
         const data_start = std.math.add(usize, lfh_end, @as(usize, lfh_name_len) + @as(usize, lfh_extra_len)) catch return error.CorruptArchive;
-        const data_end = std.math.add(usize, data_start, @as(usize, comp_size)) catch return error.CorruptArchive;
-        if (data_end > cd_offset or data_end > zip_bytes.len) return error.CorruptArchive;
+        const data_end = std.math.add(usize, data_start, comp_size_usize) catch return error.CorruptArchive;
+        if (data_end > cd_offset_usize or data_end > zip_bytes.len) return error.CorruptArchive;
 
         const comp_slice = zip_bytes[data_start..data_end];
 
         const payload: []u8 = switch (method) {
             0 => blk: {
                 if (comp_size != uncomp_size) return error.CorruptArchive;
-                total_uncompressed = projected_total;
+                state.total_uncompressed = projected_total;
                 const out = try arena_alloc.dupe(u8, comp_slice);
                 break :blk out;
             },
@@ -641,7 +772,7 @@ fn unpackZip(
                 var out_list = std.ArrayList(u8).empty;
                 var chunk: [16384]u8 = undefined;
                 var entry_dec: u64 = 0;
-                const raw_base: u64 = @max(1, @as(u64, comp_size));
+                const raw_base: u64 = @max(1, comp_size);
 
                 while (true) {
                     const n = decompressor.reader.readSliceShort(&chunk) catch return error.CorruptArchive;
@@ -650,8 +781,73 @@ fn unpackZip(
                     entry_dec = std.math.add(u64, entry_dec, n) catch return error.ArchiveLimit;
                     if (entry_dec > options.max_entry_bytes) return error.ArchiveLimit;
 
-                    total_uncompressed = std.math.add(u64, total_uncompressed, n) catch return error.ArchiveLimit;
-                    if (total_uncompressed > options.max_total_bytes) return error.ArchiveLimit;
+                    state.total_uncompressed = std.math.add(u64, state.total_uncompressed, n) catch return error.ArchiveLimit;
+                    if (state.total_uncompressed > options.max_total_bytes) return error.ArchiveLimit;
+
+                    if (entry_dec >= decompress_mod.ratio_check_min_bytes) {
+                        const max_allowed = std.math.mul(u64, raw_base, options.max_compression_ratio) catch std.math.maxInt(u64);
+                        if (entry_dec > max_allowed) return error.ArchiveLimit;
+                    }
+
+                    try out_list.appendSlice(arena_alloc, chunk[0..n]);
+                }
+
+                if (entry_dec != uncomp_size) return error.CorruptArchive;
+                break :blk try out_list.toOwnedSlice(arena_alloc);
+            },
+            12 => blk: {
+                var in_reader = std.Io.Reader.fixed(comp_slice);
+                var decompressor = decompress_mod.bzip2.Bzip2Decompressor.init(arena_alloc, &in_reader);
+                defer decompressor.deinit();
+
+                var out_list = std.ArrayList(u8).empty;
+                var chunk: [16384]u8 = undefined;
+                var entry_dec: u64 = 0;
+                const raw_base: u64 = @max(1, comp_size);
+
+                while (true) {
+                    const n = decompressor.read(&chunk) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return error.CorruptArchive,
+                    };
+                    if (n == 0) break;
+
+                    entry_dec = std.math.add(u64, entry_dec, n) catch return error.ArchiveLimit;
+                    if (entry_dec > options.max_entry_bytes) return error.ArchiveLimit;
+
+                    state.total_uncompressed = std.math.add(u64, state.total_uncompressed, n) catch return error.ArchiveLimit;
+                    if (state.total_uncompressed > options.max_total_bytes) return error.ArchiveLimit;
+
+                    if (entry_dec >= decompress_mod.ratio_check_min_bytes) {
+                        const max_allowed = std.math.mul(u64, raw_base, options.max_compression_ratio) catch std.math.maxInt(u64);
+                        if (entry_dec > max_allowed) return error.ArchiveLimit;
+                    }
+
+                    try out_list.appendSlice(arena_alloc, chunk[0..n]);
+                }
+
+                if (entry_dec != uncomp_size) return error.CorruptArchive;
+                break :blk try out_list.toOwnedSlice(arena_alloc);
+            },
+            93 => blk: {
+                var in_reader = std.Io.Reader.fixed(comp_slice);
+                const win_buf = try arena_alloc.alloc(u8, std.compress.zstd.default_window_len + std.compress.zstd.block_size_max);
+                var decompressor = std.compress.zstd.Decompress.init(&in_reader, win_buf, .{});
+
+                var out_list = std.ArrayList(u8).empty;
+                var chunk: [16384]u8 = undefined;
+                var entry_dec: u64 = 0;
+                const raw_base: u64 = @max(1, comp_size);
+
+                while (true) {
+                    const n = decompressor.reader.readSliceShort(&chunk) catch return error.CorruptArchive;
+                    if (n == 0) break;
+
+                    entry_dec = std.math.add(u64, entry_dec, n) catch return error.ArchiveLimit;
+                    if (entry_dec > options.max_entry_bytes) return error.ArchiveLimit;
+
+                    state.total_uncompressed = std.math.add(u64, state.total_uncompressed, n) catch return error.ArchiveLimit;
+                    if (state.total_uncompressed > options.max_total_bytes) return error.ArchiveLimit;
 
                     if (entry_dec >= decompress_mod.ratio_check_min_bytes) {
                         const max_allowed = std.math.mul(u64, raw_base, options.max_compression_ratio) catch std.math.maxInt(u64);
@@ -670,7 +866,7 @@ fn unpackZip(
         const actual_crc32 = std.hash.Crc32.hash(payload);
         if (actual_crc32 != expected_crc32) return error.CorruptArchive;
 
-        try insertFile(arena_alloc, root, clean, payload, mtime_val);
+        try maybeInsertOrExpandNested(arena_alloc, root, clean, payload, mtime_val, options, state);
     }
 }
 
@@ -1000,6 +1196,134 @@ test "ArchiveTree handles empty archives" {
     var t2 = try ArchiveTree.initFromSlice(std.testing.allocator, empty_zip, .{});
     defer t2.deinit();
     try std.testing.expectEqual(@as(usize, 0), t2.rootNode().children.len);
+}
+
+test "ArchiveTree v0.8: tar.lz4, ZIP64, ZIP Zstd method 93, and nested archives" {
+    const alloc = std.testing.allocator;
+
+    // 1. .tar.lz4 auto-detection
+    const raw_tar = try buildTestTarAlloc(alloc, &.{
+        .{ .path = "inner/log.txt", .data = "LZ4_TAR_HIT\n" },
+    });
+    defer alloc.free(raw_tar);
+    const tar_lz4 = try decompress_mod.lz4.compressLz4StoredAlloc(alloc, raw_tar);
+    defer alloc.free(tar_lz4);
+    {
+        var tree = try ArchiveTree.initFromSlice(alloc, tar_lz4, .{});
+        defer tree.deinit();
+        const src = tree.source();
+        var buf: [64]u8 = undefined;
+        const h = try src.open(std.Io.failing, "inner/log.txt");
+        defer src.close(std.Io.failing, h);
+        const n = try src.read(std.Io.failing, h, &buf);
+        try std.testing.expectEqualStrings("LZ4_TAR_HIT\n", buf[0..n]);
+    }
+
+    // 2. Nested archive: .tar.gz inside .zip
+    const inner_tgz = try decompress_mod.compressGzipStoredAlloc(alloc, raw_tar);
+    defer alloc.free(inner_tgz);
+    const outer_zip = try buildTestZipAlloc(alloc, &.{
+        .{ .path = "bundle.tar.gz", .data = inner_tgz },
+    });
+    defer alloc.free(outer_zip);
+    {
+        var tree = try ArchiveTree.initFromSlice(alloc, outer_zip, .{ .max_archive_depth = 1 });
+        defer tree.deinit();
+        const src = tree.source();
+        var buf: [64]u8 = undefined;
+        const h = try src.open(std.Io.failing, "bundle.tar.gz!/inner/log.txt");
+        defer src.close(std.Io.failing, h);
+        const n = try src.read(std.Io.failing, h, &buf);
+        try std.testing.expectEqualStrings("LZ4_TAR_HIT\n", buf[0..n]);
+    }
+
+    // 3. ZIP64 + Zstd (method 93) entry
+    {
+        const plain = "ZIP64_ZSTD_PAYLOAD_MATCH\n";
+        const zst_payload = try decompress_mod.compressZstdRawAlloc(alloc, plain);
+        defer alloc.free(zst_payload);
+        const name = "z64.txt";
+        const crc = std.hash.Crc32.hash(plain);
+
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(alloc);
+
+        // Local File Header (method 93)
+        var lfh: [30]u8 = @splat(0);
+        std.mem.writeInt(u32, lfh[0..4], 0x04034b50, .little);
+        std.mem.writeInt(u16, lfh[4..6], 45, .little);
+        std.mem.writeInt(u16, lfh[8..10], 93, .little);
+        std.mem.writeInt(u32, lfh[14..18], crc, .little);
+        std.mem.writeInt(u32, lfh[18..22], @intCast(zst_payload.len), .little);
+        std.mem.writeInt(u32, lfh[22..26], @intCast(plain.len), .little);
+        std.mem.writeInt(u16, lfh[26..28], name.len, .little);
+        try buf.appendSlice(alloc, &lfh);
+        try buf.appendSlice(alloc, name);
+        try buf.appendSlice(alloc, zst_payload);
+
+        const cd_off: u64 = buf.items.len;
+        // ZIP64 Extra Field (0x0001): uncomp_size (8) + comp_size (8) + local_offset (8) = 24 bytes
+        var z64_extra: [28]u8 = undefined;
+        std.mem.writeInt(u16, z64_extra[0..2], 0x0001, .little);
+        std.mem.writeInt(u16, z64_extra[2..4], 24, .little);
+        std.mem.writeInt(u64, z64_extra[4..12], plain.len, .little);
+        std.mem.writeInt(u64, z64_extra[12..20], zst_payload.len, .little);
+        std.mem.writeInt(u64, z64_extra[20..28], 0, .little);
+
+        var cdh: [46]u8 = @splat(0);
+        std.mem.writeInt(u32, cdh[0..4], 0x02014b50, .little);
+        std.mem.writeInt(u16, cdh[4..6], 45, .little);
+        std.mem.writeInt(u16, cdh[6..8], 45, .little);
+        std.mem.writeInt(u16, cdh[10..12], 93, .little);
+        std.mem.writeInt(u32, cdh[16..20], crc, .little);
+        std.mem.writeInt(u32, cdh[20..24], 0xFFFFFFFF, .little);
+        std.mem.writeInt(u32, cdh[24..28], 0xFFFFFFFF, .little);
+        std.mem.writeInt(u16, cdh[28..30], name.len, .little);
+        std.mem.writeInt(u16, cdh[30..32], z64_extra.len, .little);
+        std.mem.writeInt(u32, cdh[42..46], 0xFFFFFFFF, .little);
+        try buf.appendSlice(alloc, &cdh);
+        try buf.appendSlice(alloc, name);
+        try buf.appendSlice(alloc, &z64_extra);
+        const cd_size: u64 = buf.items.len - cd_off;
+
+        // ZIP64 EOCD (56 bytes)
+        const eocd64_off: u64 = buf.items.len;
+        var eocd64: [56]u8 = @splat(0);
+        std.mem.writeInt(u32, eocd64[0..4], 0x06064b50, .little);
+        std.mem.writeInt(u64, eocd64[4..12], 44, .little);
+        std.mem.writeInt(u16, eocd64[12..14], 45, .little);
+        std.mem.writeInt(u16, eocd64[14..16], 45, .little);
+        std.mem.writeInt(u64, eocd64[24..32], 1, .little);
+        std.mem.writeInt(u64, eocd64[32..40], 1, .little);
+        std.mem.writeInt(u64, eocd64[40..48], cd_size, .little);
+        std.mem.writeInt(u64, eocd64[48..56], cd_off, .little);
+        try buf.appendSlice(alloc, &eocd64);
+
+        // ZIP64 EOCD Locator (20 bytes)
+        var loc: [20]u8 = @splat(0);
+        std.mem.writeInt(u32, loc[0..4], 0x07064b50, .little);
+        std.mem.writeInt(u64, loc[8..16], eocd64_off, .little);
+        std.mem.writeInt(u32, loc[16..20], 1, .little);
+        try buf.appendSlice(alloc, &loc);
+
+        // Standard EOCD (22 bytes) with 0xFFFF / 0xFFFFFFFF sentinels
+        var eocd: [22]u8 = @splat(0);
+        std.mem.writeInt(u32, eocd[0..4], 0x06054b50, .little);
+        std.mem.writeInt(u16, eocd[8..10], 0xFFFF, .little);
+        std.mem.writeInt(u16, eocd[10..12], 0xFFFF, .little);
+        std.mem.writeInt(u32, eocd[12..16], 0xFFFFFFFF, .little);
+        std.mem.writeInt(u32, eocd[16..20], 0xFFFFFFFF, .little);
+        try buf.appendSlice(alloc, &eocd);
+
+        var tree = try ArchiveTree.initFromSlice(alloc, buf.items, .{});
+        defer tree.deinit();
+        const src = tree.source();
+        var out: [64]u8 = undefined;
+        const h = try src.open(std.Io.failing, "z64.txt");
+        defer src.close(std.Io.failing, h);
+        const n = try src.read(std.Io.failing, h, &out);
+        try std.testing.expectEqualStrings(plain, out[0..n]);
+    }
 }
 
 test {

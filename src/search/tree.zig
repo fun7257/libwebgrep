@@ -1638,6 +1638,8 @@ pub fn searchTarStream(
             .gzip => break :blk .tar_gz,
             .zstd => break :blk .tar_zst,
             .xz => break :blk .tar_xz,
+            .bzip2 => break :blk .tar_bz2,
+            .lz4 => break :blk .tar_lz4,
             else => {
                 while (sniff_len < 512) {
                     const rn = reader.readSliceShort(sniff_buf[sniff_len..512]) catch return error.CorruptArchive;
@@ -1654,6 +1656,8 @@ pub fn searchTarStream(
         .tar_gz => .gzip,
         .tar_zst => .zstd,
         .tar_xz => .xz,
+        .tar_bz2 => .bzip2,
+        .tar_lz4 => .lz4,
         .zip => return error.UnsupportedFormat,
         .auto => unreachable,
     };

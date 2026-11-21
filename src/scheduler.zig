@@ -460,9 +460,12 @@ pub fn Scheduler(comptime Task: type, comptime Context: type) type {
                 };
             }
 
+            // Spawn `workers - 1` helper tasks and execute worker 0 on the calling thread.
+            // This avoids idling the caller in `group.await` and saves one OS thread/stack
+            // (matching `std.Io.Threaded`'s default `cpu_count - 1` helper budget).
             var group: std.Io.Group = .init;
             var spawn_err: ?anyerror = null;
-            var w_idx: u32 = 0;
+            var w_idx: u32 = 1;
             while (w_idx < workers) : (w_idx += 1) {
                 group.concurrent(io, workerMain, .{ &state, w_idx }) catch |err| {
                     state.requestStop();
@@ -471,8 +474,14 @@ pub fn Scheduler(comptime Task: type, comptime Context: type) type {
                 };
             }
 
+            var self_res: std.Io.Cancelable!void = {};
+            if (spawn_err == null) {
+                self_res = workerMain(&state, 0);
+            }
+
             const await_res = group.await(io);
             if (spawn_err) |err| return err;
+            try self_res;
             try await_res;
             if (state.first_err) |err| return err;
         }

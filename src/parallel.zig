@@ -290,16 +290,26 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, req: Run) !Stats {
     if (workers == 1) {
         try workerMain(&shared, 0);
     } else {
+        // Spawn `workers - 1` helper tasks and execute worker 0 on the calling thread
+        // to avoid an idle coordinator thread and unnecessary stack/scheduler overhead.
         var group: std.Io.Group = .init;
-        var index: u32 = 0;
+        var spawn_err: ?anyerror = null;
+        var index: u32 = 1;
         while (index < workers) : (index += 1) {
             group.concurrent(io, workerMain, .{ &shared, index }) catch |err| {
                 requestStop(&shared);
-                group.await(io) catch {};
-                return err;
+                spawn_err = err;
+                break;
             };
         }
-        try group.await(io);
+        var self_res: std.Io.Cancelable!void = {};
+        if (spawn_err == null) {
+            self_res = workerMain(&shared, 0);
+        }
+        const await_res = group.await(io);
+        if (spawn_err) |err| return err;
+        try self_res;
+        try await_res;
     }
     if (shared.write_failed.load(.acquire)) return error.WriteFailed;
 
@@ -338,6 +348,7 @@ fn pushRoots(worker: *Worker, roots: []const []const u8) !void {
 }
 
 fn workerMain(shared: *Shared, index: u32) std.Io.Cancelable!void {
+    errdefer requestStop(shared);
     var worker = Worker{
         .shared = shared,
         .index = index,

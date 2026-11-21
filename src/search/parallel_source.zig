@@ -53,6 +53,8 @@ pub const default_max_buffered_bytes: usize = 4 * 1024 * 1024;
 pub const max_workers_hard_cap: u32 = 64;
 /// Extra bytes a RandomAccess worker buffer may hold beyond `chunk_size` for lines that straddle a chunk end.
 const ra_overhang: usize = 256 * 1024;
+/// Extra bytes speculatively read past `nom_e` in a single `pread` so chunk boundary alignment stays in-memory.
+const ra_probe_overhang: usize = 4 * 1024;
 
 /// Tuning knobs for intra-source parallel search.
 pub const ParallelOptions = struct {
@@ -163,7 +165,8 @@ fn headerNeedsTransform(head: []const u8, config: SearchConfig) bool {
 // ============================================================================
 
 const Ref = struct {
-    tag: enum(u8) { none, hay, arena } = .none,
+    pub const Tag = enum(u8) { none, hay, slot, arena };
+    tag: Tag = .none,
     off: usize = 0,
     len: usize = 0,
 };
@@ -210,9 +213,21 @@ const Slot = struct {
     overflow: bool = false,
     overflow_offset: u64 = 0,
     overflow_number: ?u64 = null,
+    /// Slot-owned read buffer for RandomAccess match mode so recorded lines borrow zero-copy.
+    buf: []u8 = &.{},
     recs: std.ArrayList(Rec) = .empty,
     arena: std.ArrayList(u8) = .empty,
-    spans: std.ArrayList(SpanRec) = .empty,
+    spans: std.ArrayList(Span) = .empty,
+    /// Populated 1:1 with `spans` only when `config.replacement != null`.
+    span_repls: std.ArrayList(?Ref) = .empty,
+
+    fn ensureBuf(self: *Slot, allocator: std.mem.Allocator, n: usize) error{OutOfMemory}![]u8 {
+        if (self.buf.len >= n) return self.buf;
+        if (self.buf.len != 0) allocator.free(self.buf);
+        self.buf = &.{};
+        self.buf = try allocator.alloc(u8, n);
+        return self.buf;
+    }
 
     fn reset(self: *Slot) void {
         self.start = 0;
@@ -229,117 +244,142 @@ const Slot = struct {
         self.recs.clearRetainingCapacity();
         self.arena.clearRetainingCapacity();
         self.spans.clearRetainingCapacity();
+        self.span_repls.clearRetainingCapacity();
     }
 
     fn deinit(self: *Slot, allocator: std.mem.Allocator) void {
+        if (self.buf.len != 0) allocator.free(self.buf);
+        self.buf = &.{};
         self.recs.deinit(allocator);
         self.arena.deinit(allocator);
         self.spans.deinit(allocator);
+        self.span_repls.deinit(allocator);
     }
 };
 
-/// Records matched lines of one chunk. Slice inputs are borrowed by offset; other bytes are copied.
-const Recorder = struct {
-    allocator: std.mem.Allocator,
-    slot: *Slot,
-    base: u64,
-    data: []const u8,
-    hay: ?[]const u8,
-    cap: usize,
-    used: usize = 0,
-    sep: u8,
-    null_data: bool,
+/// Records matched lines of one chunk. Slice and slot-buffered RA inputs are borrowed by offset;
+/// only transformed/replaced bytes are copied into `slot.arena`.
+fn RecorderType(comptime fast_line: bool) type {
+    return struct {
+        pub const matched_fast_line = fast_line;
 
-    fn within(hay: []const u8, s: []const u8) bool {
-        const lo = @intFromPtr(hay.ptr);
-        const p = @intFromPtr(s.ptr);
-        return p >= lo and p + s.len <= lo + hay.len;
-    }
+        const Self = @This();
+        allocator: std.mem.Allocator,
+        slot: *Slot,
+        base: u64,
+        data: []const u8,
+        borrow: ?[]const u8,
+        borrow_tag: Ref.Tag,
+        has_repl: bool,
+        cap: usize,
+        used: usize = 0,
+        sep: u8,
+        null_data: bool,
 
-    fn costOf(self: *const Recorder, s: []const u8) usize {
-        if (s.len == 0) return 0;
-        if (self.hay) |h| if (within(h, s)) return 0;
-        return s.len;
-    }
+        fn within(buf: []const u8, s: []const u8) bool {
+            const lo = @intFromPtr(buf.ptr);
+            const p = @intFromPtr(s.ptr);
+            return p >= lo and p + s.len <= lo + buf.len;
+        }
 
-    fn ref(self: *Recorder, s: []const u8) error{OutOfMemory}!Ref {
-        if (s.len == 0) return .{};
-        if (self.hay) |h| if (within(h, s)) return .{ .tag = .hay, .off = @intFromPtr(s.ptr) - @intFromPtr(h.ptr), .len = s.len };
-        const off = self.slot.arena.items.len;
-        try self.slot.arena.appendSlice(self.allocator, s);
-        return .{ .tag = .arena, .off = off, .len = s.len };
-    }
+        fn costOf(self: *const Self, s: []const u8) usize {
+            if (s.len == 0) return 0;
+            if (self.borrow) |b| if (within(b, s)) return 0;
+            return s.len;
+        }
 
-    fn spanRec(self: *Recorder, sp: Span) error{OutOfMemory}!SpanRec {
-        var plain = sp;
-        plain.replacement = null;
-        return .{ .span = plain, .repl = if (sp.replacement) |r| try self.ref(r) else null };
-    }
+        fn ref(self: *Self, s: []const u8) error{OutOfMemory}!Ref {
+            if (s.len == 0) return .{};
+            if (self.borrow) |b| if (within(b, s)) return .{ .tag = self.borrow_tag, .off = @intFromPtr(s.ptr) - @intFromPtr(b.ptr), .len = s.len };
+            const off = self.slot.arena.items.len;
+            try self.slot.arena.appendSlice(self.allocator, s);
+            return .{ .tag = .arena, .off = off, .len = s.len };
+        }
 
-    fn record(self: *Recorder, line: Line, rel: usize, line_end_rel: usize, ends_sep: bool) error{OutOfMemory}!void {
-        const same_text = line.text.ptr == line.bytes.ptr and line.text.len == line.bytes.len;
-        const same_raw = line.raw.ptr == line.bytes.ptr and line.raw.len == line.bytes.len;
-        const bytes_ref = try self.ref(line.bytes);
-        const text_ref = if (same_text) bytes_ref else try self.ref(line.text);
-        const raw_ref = if (same_raw) bytes_ref else try self.ref(line.raw);
-        const replaced_ref: ?Ref = if (line.replaced) |r| try self.ref(r) else null;
-        const spans_off = self.slot.spans.items.len;
-        for (line.matches) |sp| try self.slot.spans.append(self.allocator, try self.spanRec(sp));
-        const match_rec: ?SpanRec = if (line.match) |m| try self.spanRec(m) else null;
-        try self.slot.recs.append(self.allocator, .{
-            .offset = self.base + @as(u64, rel),
-            .raw_offset = self.base + line.raw_offset,
-            .line_end = self.base + @as(u64, line_end_rel),
-            .number = line.number,
-            .ends_sep = ends_sep,
-            .bytes = bytes_ref,
-            .text = text_ref,
-            .raw = raw_ref,
-            .replaced = replaced_ref,
-            .spans_off = spans_off,
-            .spans_len = line.matches.len,
-            .match = match_rec,
-            .column = line.column,
-            .u16_column = line.u16_column,
-            .binary_status = line.binary_status,
-            .truncated = line.truncated,
-            .line_len = line.line_len,
-            .window_start = line.window_start,
-        });
-    }
+        fn spanRec(self: *Self, sp: Span) error{OutOfMemory}!SpanRec {
+            var plain = sp;
+            plain.replacement = null;
+            return .{ .span = plain, .repl = if (sp.replacement) |r| try self.ref(r) else null };
+        }
 
-    pub fn matched(self: *Recorder, line: Line) bool {
-        const rel: usize = @intCast(line.offset);
-        var e: usize = rel + @as(usize, @intCast(line.line_len));
-        if (!self.null_data and e < self.data.len and self.data[e] == '\r') e += 1;
-        const ends_sep = e < self.data.len and self.data[e] == self.sep;
-        if (ends_sep) e += 1;
+        fn record(self: *Self, line: Line, rel: usize, line_end_rel: usize, ends_sep: bool) error{OutOfMemory}!void {
+            const same_text = line.text.ptr == line.bytes.ptr and line.text.len == line.bytes.len;
+            const same_raw = line.raw.ptr == line.bytes.ptr and line.raw.len == line.bytes.len;
+            const bytes_ref = try self.ref(line.bytes);
+            const text_ref = if (same_text) bytes_ref else try self.ref(line.text);
+            const raw_ref = if (same_raw) bytes_ref else try self.ref(line.raw);
+            const replaced_ref: ?Ref = if (line.replaced) |r| try self.ref(r) else null;
+            const spans_off = self.slot.spans.items.len;
+            if (self.has_repl) {
+                for (line.matches) |sp| {
+                    var plain = sp;
+                    plain.replacement = null;
+                    const r: ?Ref = if (sp.replacement) |rep| try self.ref(rep) else null;
+                    try self.slot.spans.append(self.allocator, plain);
+                    try self.slot.span_repls.append(self.allocator, r);
+                }
+            } else {
+                try self.slot.spans.appendSlice(self.allocator, line.matches);
+            }
+            const match_rec: ?SpanRec = if (line.match) |m| try self.spanRec(m) else null;
+            try self.slot.recs.append(self.allocator, .{
+                .offset = self.base + @as(u64, rel),
+                .raw_offset = self.base + line.raw_offset,
+                .line_end = self.base + @as(u64, line_end_rel),
+                .number = line.number,
+                .ends_sep = ends_sep,
+                .bytes = bytes_ref,
+                .text = text_ref,
+                .raw = raw_ref,
+                .replaced = replaced_ref,
+                .spans_off = spans_off,
+                .spans_len = line.matches.len,
+                .match = match_rec,
+                .column = line.column,
+                .u16_column = line.u16_column,
+                .binary_status = line.binary_status,
+                .truncated = line.truncated,
+                .line_len = line.line_len,
+                .window_start = line.window_start,
+            });
+        }
 
-        var need: usize = @sizeOf(Rec) + line.matches.len * @sizeOf(SpanRec);
-        need += self.costOf(line.bytes);
-        if (!(line.text.ptr == line.bytes.ptr and line.text.len == line.bytes.len)) need += self.costOf(line.text);
-        if (!(line.raw.ptr == line.bytes.ptr and line.raw.len == line.bytes.len)) need += self.costOf(line.raw);
-        if (line.replaced) |r| need += self.costOf(r);
-        for (line.matches) |sp| if (sp.replacement) |r| {
-            need += self.costOf(r);
-        };
-        if (line.match) |m| if (m.replacement) |r| {
-            need += self.costOf(r);
-        };
+        pub fn matched(self: *Self, line: Line) bool {
+            const rel: usize = @intCast(line.offset);
+            var e: usize = rel + @as(usize, @intCast(line.line_len));
+            if (!self.null_data and e < self.data.len and self.data[e] == '\r') e += 1;
+            const ends_sep = e < self.data.len and self.data[e] == self.sep;
+            if (ends_sep) e += 1;
 
-        if (self.used + need > self.cap) return self.overflowAt(line, rel);
-        self.record(line, rel, e, ends_sep) catch return self.overflowAt(line, rel);
-        self.used += need;
-        return true;
-    }
+            const span_cost: usize = if (self.has_repl) @sizeOf(Span) + @sizeOf(?Ref) else @sizeOf(Span);
+            var need: usize = @sizeOf(Rec) + line.matches.len * span_cost;
+            need += self.costOf(line.bytes);
+            if (!(line.text.ptr == line.bytes.ptr and line.text.len == line.bytes.len)) need += self.costOf(line.text);
+            if (!(line.raw.ptr == line.bytes.ptr and line.raw.len == line.bytes.len)) need += self.costOf(line.raw);
+            if (line.replaced) |r| need += self.costOf(r);
+            if (self.has_repl) {
+                for (line.matches) |sp| if (sp.replacement) |r| {
+                    need += self.costOf(r);
+                };
+                if (line.match) |m| if (m.replacement) |r| {
+                    need += self.costOf(r);
+                };
+            }
 
-    fn overflowAt(self: *Recorder, line: Line, rel: usize) bool {
-        self.slot.overflow = true;
-        self.slot.overflow_offset = self.base + @as(u64, rel);
-        self.slot.overflow_number = line.number;
-        return false;
-    }
-};
+            if (self.used + need > self.cap) return self.overflowAt(line, rel);
+            self.record(line, rel, e, ends_sep) catch return self.overflowAt(line, rel);
+            self.used += need;
+            return true;
+        }
+
+        fn overflowAt(self: *Self, line: Line, rel: usize) bool {
+            self.slot.overflow = true;
+            self.slot.overflow_offset = self.base + @as(u64, rel);
+            self.slot.overflow_number = line.number;
+            return false;
+        }
+    };
+}
 
 /// Count-only sink: lacks `matched`, so the engine takes its allocation-free counting path.
 const CountSink = struct {};
@@ -441,6 +481,8 @@ fn Run(comptime B: type, comptime MT: type) type {
     return struct {
         const Self = @This();
         const count_mode = !@hasDecl(B, "matched");
+        const fast_line_mode = @hasDecl(B, "matched_fast_line") and B.matched_fast_line;
+        const RecSink = RecorderType(fast_line_mode);
         const DS = DirectSink(B);
 
         allocator: std.mem.Allocator,
@@ -562,8 +604,26 @@ fn Run(comptime B: type, comptime MT: type) type {
             _ = self.total_read.fetchAdd(n1, .monotonic);
             if (n1 == 0) return self.ve;
             if (one[0] == self.sep) return nom;
+            return self.alignRaFrom(ra, nom);
+        }
+
+        fn bounds(self: *Self, k: usize) anyerror!struct { u64, u64 } {
+            const nom_s = self.vs + @as(u64, k) * self.chunk;
+            const nom_e = @min(self.ve, nom_s + self.chunk);
+            const last = k + 1 == self.n_chunks;
+            switch (self.input) {
+                .slice => |hay| return self.sliceBounds(hay, k),
+                .ra => |ra| {
+                    const a = if (k == 0) self.vs else try self.alignRa(ra, nom_s);
+                    const b = if (last) self.ve else try self.alignRa(ra, nom_e);
+                    return .{ a, @max(a, b) };
+                },
+            }
+        }
+
+        fn alignRaFrom(self: *Self, ra: RandomAccess, from: u64) anyerror!u64 {
             var probe: [16 * 1024]u8 = undefined;
-            var cur = nom;
+            var cur = from;
             while (cur < self.ve) {
                 const want: usize = @intCast(@min(@as(u64, probe.len), self.ve - cur));
                 const got = try ra.readAtFull(cur, probe[0..want]);
@@ -575,22 +635,13 @@ fn Run(comptime B: type, comptime MT: type) type {
             return self.ve;
         }
 
-        fn bounds(self: *Self, k: usize) anyerror!struct { u64, u64 } {
+        fn sliceBounds(self: *const Self, hay: []const u8, k: usize) struct { u64, u64 } {
             const nom_s = self.vs + @as(u64, k) * self.chunk;
             const nom_e = @min(self.ve, nom_s + self.chunk);
             const last = k + 1 == self.n_chunks;
-            switch (self.input) {
-                .slice => |hay| {
-                    const a = if (k == 0) self.vs else self.alignSlice(hay, nom_s);
-                    const b = if (last) self.ve else self.alignSlice(hay, nom_e);
-                    return .{ a, @max(a, b) };
-                },
-                .ra => |ra| {
-                    const a = if (k == 0) self.vs else try self.alignRa(ra, nom_s);
-                    const b = if (last) self.ve else try self.alignRa(ra, nom_e);
-                    return .{ a, @max(a, b) };
-                },
-            }
+            const a = if (k == 0) self.vs else self.alignSlice(hay, nom_s);
+            const b = if (last) self.ve else self.alignSlice(hay, nom_e);
+            return .{ a, @max(a, b) };
         }
 
         fn countSeps(self: *Self, a: u64, b: u64) anyerror!u64 {
@@ -619,66 +670,168 @@ fn Run(comptime B: type, comptime MT: type) type {
         fn scanChunk(self: *Self, w: *Worker, k: usize) void {
             const slot = &self.slots[k % self.window];
             slot.reset();
-            const ab = self.bounds(k) catch {
-                slot.read_failed = true;
-                return;
-            };
-            slot.start = ab[0];
-            slot.end = ab[1];
-            if (slot.start >= slot.end) return;
-            if (self.abort.load(.acquire)) return;
             switch (self.input) {
-                .slice => |hay| self.scanData(w, slot, hay[@intCast(slot.start)..@intCast(slot.end)], hay),
-                .ra => |ra| {
-                    const len: usize = @intCast(slot.end - slot.start);
-                    if (len > self.buf_cap) {
-                        slot.oversized = true;
-                        return;
-                    }
-                    const buf = w.ensureBuf(self.allocator, len) catch {
-                        slot.err = error.OutOfMemory;
-                        return;
-                    };
-                    const got = ra.readAtFull(slot.start, buf[0..len]) catch {
-                        slot.read_failed = true;
-                        return;
-                    };
-                    _ = self.total_read.fetchAdd(got, .monotonic);
-                    if (got != len) {
-                        slot.read_failed = true;
-                        return;
-                    }
-                    self.scanData(w, slot, buf[0..len], null);
+                .slice => |hay| {
+                    const ab = self.sliceBounds(hay, k);
+                    slot.start = ab[0];
+                    slot.end = ab[1];
+                    if (slot.start >= slot.end) return;
+                    if (self.abort.load(.acquire)) return;
+                    self.scanData(w, slot, hay[@intCast(slot.start)..@intCast(slot.end)], hay, .hay);
                 },
+                .ra => |ra| self.scanChunkRa(w, slot, ra, k),
             }
         }
 
-        fn scanData(self: *Self, w: *Worker, slot: *Slot, data: []const u8, hay: ?[]const u8) void {
-            if (self.numbering) slot.newlines = memchr.count(width, data, 0, data.len, self.sep);
-            slot.counted = true;
+        /// Reads `[nom_s - 1, nom_e + ra_probe_overhang)` in a single `pread` and aligns both
+        /// record boundaries in memory; falls back to `alignRaFrom` only for lines > 4 KiB
+        /// straddling a boundary. In match mode reads directly into `slot.buf` for zero-copy borrow.
+        fn scanChunkRa(self: *Self, w: *Worker, slot: *Slot, ra: RandomAccess, k: usize) void {
+            const nom_s = self.vs + @as(u64, k) * self.chunk;
+            const nom_e = @min(self.ve, nom_s + self.chunk);
+            const last = k + 1 == self.n_chunks;
+            const read_lo: u64 = if (k == 0) self.vs else nom_s - 1;
+            const read_hi: u64 = if (last) self.ve else @min(self.ve, nom_e + ra_probe_overhang);
+            const want: usize = @intCast(read_hi - read_lo);
+
+            const buf = (if (count_mode) w.ensureBuf(self.allocator, want) else slot.ensureBuf(self.allocator, want)) catch {
+                slot.err = error.OutOfMemory;
+                return;
+            };
+            const got = ra.readAtFull(read_lo, buf[0..want]) catch {
+                slot.read_failed = true;
+                return;
+            };
+            _ = self.total_read.fetchAdd(got, .monotonic);
+            if (got != want) {
+                slot.read_failed = true;
+                return;
+            }
+
+            var a: u64 = undefined;
+            if (k == 0) {
+                a = self.vs;
+            } else if (buf[0] == self.sep) {
+                a = nom_s;
+            } else if (memchr.find(width, buf[0..got], 1, self.sep)) |i| {
+                a = read_lo + @as(u64, i) + 1;
+            } else if (read_hi >= self.ve) {
+                a = self.ve;
+            } else {
+                a = self.alignRaFrom(ra, read_hi) catch {
+                    slot.read_failed = true;
+                    return;
+                };
+            }
+
+            var b: u64 = undefined;
+            if (last) {
+                b = self.ve;
+            } else if (a >= nom_e) {
+                b = a;
+            } else {
+                const rel_e: usize = @intCast(nom_e - read_lo);
+                if (buf[rel_e - 1] == self.sep) {
+                    b = nom_e;
+                } else if (memchr.find(width, buf[0..got], rel_e, self.sep)) |i| {
+                    b = read_lo + @as(u64, i) + 1;
+                } else if (read_hi >= self.ve) {
+                    b = self.ve;
+                } else {
+                    b = self.alignRaFrom(ra, read_hi) catch {
+                        slot.read_failed = true;
+                        return;
+                    };
+                }
+            }
+            if (b < a) b = a;
+            slot.start = a;
+            slot.end = b;
+            if (a >= b) return;
+            if (self.abort.load(.acquire)) return;
+
+            if (b <= read_hi) {
+                const off_a: usize = @intCast(a - read_lo);
+                const off_b: usize = @intCast(b - read_lo);
+                if (count_mode) {
+                    self.scanData(w, slot, buf[off_a..off_b], null, .none);
+                } else {
+                    self.scanData(w, slot, buf[off_a..off_b], slot.buf, .slot);
+                }
+                return;
+            }
+
+            // Slow path: line straddling `nom_e` exceeded `ra_probe_overhang`.
+            const len: usize = @intCast(b - a);
+            if (len > self.buf_cap) {
+                slot.oversized = true;
+                return;
+            }
+            const full_buf = (if (count_mode) w.ensureBuf(self.allocator, len) else slot.ensureBuf(self.allocator, len)) catch {
+                slot.err = error.OutOfMemory;
+                return;
+            };
+            const full_got = ra.readAtFull(a, full_buf[0..len]) catch {
+                slot.read_failed = true;
+                return;
+            };
+            _ = self.total_read.fetchAdd(full_got, .monotonic);
+            if (full_got != len) {
+                slot.read_failed = true;
+                return;
+            }
+            if (count_mode) {
+                self.scanData(w, slot, full_buf[0..len], null, .none);
+            } else {
+                self.scanData(w, slot, full_buf[0..len], slot.buf, .slot);
+            }
+        }
+
+        fn scanData(self: *Self, w: *Worker, slot: *Slot, data: []const u8, borrow: ?[]const u8, borrow_tag: Ref.Tag) void {
             var cfg = self.wcfg;
             cfg.scratch_pool = &w.scratch;
             if (count_mode) {
+                if (self.numbering) slot.newlines = memchr.count(width, data, 0, data.len, self.sep);
+                slot.counted = true;
                 var cs = CountSink{};
                 slot.result = sequentialSlice(CountSink, &cs, data, "", self.matcher, cfg) catch |err| {
                     slot.err = err;
                     return;
                 };
             } else {
-                var rec = Recorder{
+                var rec = RecSink{
                     .allocator = self.allocator,
                     .slot = slot,
                     .base = slot.start,
                     .data = data,
-                    .hay = hay,
+                    .borrow = borrow,
+                    .borrow_tag = borrow_tag,
+                    .has_repl = self.config.replacement != null,
                     .cap = self.rec_cap,
                     .sep = self.sep,
                     .null_data = self.config.null_data,
                 };
-                slot.result = sequentialSlice(Recorder, &rec, data, "", self.matcher, cfg) catch |err| {
+                slot.result = sequentialSlice(RecSink, &rec, data, "", self.matcher, cfg) catch |err| {
                     slot.err = err;
                     return;
                 };
+                if (self.numbering) {
+                    // Reuse line numbering already counted up to the last match instead of scanning
+                    // the entire chunk for separators a second time.
+                    if (slot.recs.items.len > 0) {
+                        const last_rec = slot.recs.items[slot.recs.items.len - 1];
+                        if (last_rec.number) |n| {
+                            const tail_off: usize = @intCast(last_rec.line_end - slot.start);
+                            slot.newlines = (n - 1) + @intFromBool(last_rec.ends_sep) +
+                                memchr.count(width, data, tail_off, data.len, self.sep);
+                        } else {
+                            slot.newlines = memchr.count(width, data, 0, data.len, self.sep);
+                        }
+                    } else {
+                        slot.newlines = memchr.count(width, data, 0, data.len, self.sep);
+                    }
+                }
+                slot.counted = true;
             }
         }
 
@@ -688,6 +841,7 @@ fn Run(comptime B: type, comptime MT: type) type {
             return switch (r.tag) {
                 .none => &.{},
                 .hay => self.input.slice[r.off..][0..r.len],
+                .slot => slot.buf[r.off..][0..r.len],
                 .arena => slot.arena.items[r.off..][0..r.len],
             };
         }
@@ -699,10 +853,19 @@ fn Run(comptime B: type, comptime MT: type) type {
         }
 
         fn deliver(self: *Self, sink: *B, G: *State, slot: *const Slot, rec: Rec, line_base: ?u64) SliceError!?Term {
-            self.span_tmp.clearRetainingCapacity();
-            for (slot.spans.items[rec.spans_off..][0..rec.spans_len]) |sr| {
-                try self.span_tmp.append(self.allocator, self.resolveSpan(slot, sr));
-            }
+            const raw_spans = slot.spans.items[rec.spans_off..][0..rec.spans_len];
+            const matches_slice: []const Span = if (self.config.replacement == null)
+                raw_spans
+            else blk: {
+                self.span_tmp.clearRetainingCapacity();
+                const repls = slot.span_repls.items[rec.spans_off..][0..rec.spans_len];
+                for (raw_spans, repls) |sp, maybe_r| {
+                    var resolved = sp;
+                    resolved.replacement = if (maybe_r) |r| self.resolve(slot, r) else null;
+                    try self.span_tmp.append(self.allocator, resolved);
+                }
+                break :blk self.span_tmp.items;
+            };
             const num: ?u64 = if (rec.number) |n| (if (line_base) |b| b + n - 1 else null) else null;
             const line = Line{
                 .bytes = self.resolve(slot, rec.bytes),
@@ -714,7 +877,7 @@ fn Run(comptime B: type, comptime MT: type) type {
                 .number = num,
                 .match = if (rec.match) |m| self.resolveSpan(slot, m) else null,
                 .u16_column = rec.u16_column,
-                .matches = self.span_tmp.items,
+                .matches = matches_slice,
                 .column = rec.column,
                 .binary_status = rec.binary_status,
                 .truncated = rec.truncated,

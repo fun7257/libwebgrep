@@ -271,6 +271,126 @@ pub fn searchSourceReverseAt(
 
 Service entry point for `O(tail)` reverse search over a `RandomAccess` source with default multi-tenant budgets.
 
+### ParallelOptions
+
+```zig
+pub const ParallelOptions = struct {
+    workers: ?u32 = null,             // scanners incl. the calling thread; null = max_concurrency, then CPU count (cap 64)
+    chunk_size: usize = 256 * 1024,   // nominal bytes per chunk task, re-aligned to record boundaries
+    max_inflight: ?u32 = null,        // chunks scanned ahead of the in-order emitter; null = 2 * workers
+    max_buffered_bytes: usize = 4 * 1024 * 1024, // cap on recorded line events across in-flight chunks
+    min_parallel_bytes: ?usize = null, // smaller regions run sequentially; null = 2 * chunk_size
+};
+```
+
+Tuning knobs for intra-source parallel search. A single source is split into record-aligned chunks that `workers - 1` `std.Io.Group.concurrent` tasks and the calling thread scan with the sequential engine; the calling thread replays results strictly in byte order.
+
+Working memory is bounded by `max_buffered_bytes` plus, for `RandomAccess` sources only, one `chunk_size + 256 KiB` read buffer per scanner (slices are borrowed, never copied). On an 8-core Apple M2 searching a 512 MiB file-backed source with 8 scanners, measured peak process RSS stays between roughly 6 and 11 MiB.
+
+Sink callbacks run only on the calling thread, never concurrently, and observe the same event stream, line numbers, offsets, limits (`max_count`, `max_results`, `exists`, `max_output_bytes`), binary handling, and `Flow` (`stop`, `pause`, `skip_to`) semantics as the sequential entry point. Configurations the chunked model cannot reproduce exactly fall back to the sequential engine before any callback runs: context lines, `passthru`, `invert`, multiline matchers, regexes using `\A`/`\z`/`\Z`, transcoding or decompression, `line_filter`, `live`, `resume_from`/`continuation`, `progress_interval`, and `BinaryPolicy.report`. The `allocator` passed to parallel entry points must be thread-safe.
+
+### searchSliceParallel
+
+```zig
+pub fn searchSliceParallel(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    sink: *S,
+    haystack: []const u8,
+    name: []const u8,
+    matcher: anytype,
+    config: SearchConfig,
+    opts: ParallelOptions,
+) SliceError!Result
+```
+
+Legacy callback entry point: multi-core equivalent of `searchSlice`. `Line` callbacks are delivered on the calling thread in byte order.
+
+### searchSourceSliceParallel
+
+```zig
+pub fn searchSourceSliceParallel(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    sink: *S,
+    source_id: []const u8,
+    haystack: []const u8,
+    matcher: anytype,
+    config: SearchConfig,
+    opts: ParallelOptions,
+) SliceError!Result
+```
+
+Service entry point: multi-core equivalent of `searchSourceSlice` for one large in-memory source, with default multi-tenant budgets.
+
+### searchParallelAt
+
+```zig
+pub fn searchParallelAt(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    sink: *S,
+    source: RandomAccess,
+    name: []const u8,
+    matcher: anytype,
+    config: SearchConfig,
+    opts: ParallelOptions,
+) ReadError!Result
+```
+
+Legacy callback entry point: multi-core search of `config.byte_range` (or the whole source) over a handle-free `RandomAccess` source. Each scanner issues its own positional reads. Falls back to `searchRange` when `source.size` is unknown.
+
+### searchSourceParallelAt
+
+```zig
+pub fn searchSourceParallelAt(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    sink: *S,
+    source: RandomAccess,
+    source_id: []const u8,
+    matcher: anytype,
+    config: SearchConfig,
+    opts: ParallelOptions,
+) ReadError!Result
+```
+
+Service entry point: multi-core equivalent of `searchSourceRange` over `config.byte_range` (or the whole source) with default multi-tenant budgets.
+
+### countSliceParallel
+
+```zig
+pub fn countSliceParallel(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    haystack: []const u8,
+    matcher: anytype,
+    config: SearchConfig,
+    opts: ParallelOptions,
+) SliceError!Result
+```
+
+Counts matching lines of one in-memory source on multiple cores without delivering line events (equivalent to `searchSlice` with a sink that has no `matched` callback). Scanners record nothing, so scaling is close to linear in the number of cores.
+
+### countParallelAt
+
+```zig
+pub fn countParallelAt(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source: RandomAccess,
+    matcher: anytype,
+    config: SearchConfig,
+    opts: ParallelOptions,
+) ReadError!Result
+```
+
+Counts matching lines of a `RandomAccess` source on multiple cores without delivering line events.
+
 ### Flow
 
 ```zig

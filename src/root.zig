@@ -109,6 +109,20 @@ pub const searchSourceReverseSlice = searcher.searchSourceReverseSlice;
 pub const searchReverseAt = searcher.searchReverseAt;
 /// Service entry point: searches backward over a handle-free `RandomAccess` source with multi-tenant budgets.
 pub const searchSourceReverseAt = searcher.searchSourceReverseAt;
+/// Tuning knobs (`workers`, `chunk_size`, `max_inflight`, `max_buffered_bytes`) for intra-source parallel search.
+pub const ParallelOptions = searcher.ParallelOptions;
+/// Legacy callback entry point: searches one in-memory slice on multiple cores, delivering `Line` callbacks in byte order.
+pub const searchSliceParallel = searcher.searchSliceParallel;
+/// Service entry point: searches one in-memory source on multiple cores with multi-tenant budgets, events in byte order.
+pub const searchSourceSliceParallel = searcher.searchSourceSliceParallel;
+/// Legacy callback entry point: searches a handle-free `RandomAccess` source on multiple cores in byte order.
+pub const searchParallelAt = searcher.searchParallelAt;
+/// Service entry point: searches a handle-free `RandomAccess` source on multiple cores with multi-tenant budgets.
+pub const searchSourceParallelAt = searcher.searchSourceParallelAt;
+/// Counts matching lines of one in-memory source on multiple cores without delivering line events.
+pub const countSliceParallel = searcher.countSliceParallel;
+/// Counts matching lines of a handle-free `RandomAccess` source on multiple cores without delivering line events.
+pub const countParallelAt = searcher.countParallelAt;
 /// Owned event structure yielded by `SourcePull.next()` and `ReaderPull.next()`.
 pub const PullEvent = searcher.PullEvent;
 /// Pull-based iterator type over service events for an in-memory slice.
@@ -196,6 +210,12 @@ test "public search entry points accept no filesystem handles or paths" {
     try checkSearchFn(@TypeOf(searchSourceReverseSlice));
     try checkSearchFn(@TypeOf(searchReverseAt));
     try checkSearchFn(@TypeOf(searchSourceReverseAt));
+    try checkSearchFn(@TypeOf(searchSliceParallel));
+    try checkSearchFn(@TypeOf(searchSourceSliceParallel));
+    try checkSearchFn(@TypeOf(searchParallelAt));
+    try checkSearchFn(@TypeOf(searchSourceParallelAt));
+    try checkSearchFn(@TypeOf(countSliceParallel));
+    try checkSearchFn(@TypeOf(countParallelAt));
     try checkSearchFn(@TypeOf(openSourcePull));
     try checkSearchFn(@TypeOf(openReaderPull));
     try checkSearchFn(@TypeOf(probeLineSlice));
@@ -366,6 +386,8 @@ test {
     _ = @import("finder/bloom.zig");
     _ = @import("scheduler.zig");
     _ = @import("search/reverse.zig");
+    _ = @import("search/parallel_source.zig");
+    _ = @import("search/parallel_tests.zig");
     _ = @import("source.zig");
     _ = @import("walk/glob.zig");
     _ = @import("walk/ignore.zig");

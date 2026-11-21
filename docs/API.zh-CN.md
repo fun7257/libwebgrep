@@ -348,6 +348,27 @@ pub fn find(self: *Regex, haystack: []const u8, start: usize, mode: MatchMode) ?
 ### searchSourceReverseAt
 服务级 `RandomAccess` 反向尾部搜索入口：以 `O(tail)` 定点读取配合多租户默认预算执行最新日志优先检索。
 
+### ParallelOptions
+单来源多核并行搜索的调优参数：`workers`（含调用线程在内的扫描线程数，`null` 时依次取 `max_concurrency`、CPU 逻辑核数，上限 64）、`chunk_size`（默认 `256 KiB`，按记录边界对齐）、`max_inflight`（领先于有序发射器的分块数，默认 `2 * workers`）、`max_buffered_bytes`（在途分块已记录行事件的总字节上限，默认 `4 MiB`）、`min_parallel_bytes`（小于该值走顺序路径，默认 `2 * chunk_size`）。工作内存上限为 `max_buffered_bytes` 加每个扫描线程一个 `chunk_size + 256 KiB` 读缓冲（仅 `RandomAccess` 来源；切片直接借用、零拷贝），8 核 Apple M2 上以 8 个扫描线程检索 512 MiB 文件型来源时实测进程峰值 RSS 约 6–11 MiB。Sink 回调只在调用线程上按字节顺序执行、绝不并发，行号、偏移、`max_count` / `max_results` / `exists` / `max_output_bytes`、二进制处理与 `Flow`（`stop` / `pause` / `skip_to`）语义与顺序入口完全一致；上下文行、`passthru`、`invert`、跨行匹配器、含 `\A` / `\z` / `\Z` 的正则、转码或解压、`line_filter`、`live`、`resume_from` / `continuation`、`progress_interval` 与 `BinaryPolicy.report` 会在任何回调之前自动回退到顺序引擎。并行入口的 `allocator` 必须线程安全。
+
+### searchSliceParallel
+旧版内存切片多核并行入口：`searchSlice` 的多核等价实现，`Line` 回调在调用线程上按字节顺序交付。
+
+### searchSourceSliceParallel
+服务级内存切片多核并行入口：`searchSourceSlice` 的多核等价实现，适用于单个大型内存来源并自动应用多租户默认预算。
+
+### searchParallelAt
+旧版 `RandomAccess` 多核并行入口：对 `config.byte_range`（或整个来源）分块并行检索，每个扫描线程独立执行定点读取；`source.size` 未知时回退到 `searchRange`。
+
+### searchSourceParallelAt
+服务级 `RandomAccess` 多核并行入口：`searchSourceRange` 的多核等价实现，覆盖 `config.byte_range`（或整个来源）并自动应用多租户默认预算。
+
+### countSliceParallel
+内存切片多核并行计数：不交付行事件，仅统计匹配行（等价于使用无 `matched` 回调的 Sink 调用 `searchSlice`），扫描线程不做任何记录，接近线性扩展。
+
+### countParallelAt
+`RandomAccess` 来源多核并行计数：不交付行事件，仅统计匹配行。
+
 ### openSourcePull
 基于拉式迭代器的切片服务事件搜索入口（返回 `searcher.SourcePull`）。
 

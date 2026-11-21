@@ -24,6 +24,7 @@ pub const long_line_mod = @import("search/long_line.zig");
 pub const pull_mod = @import("search/pull.zig");
 pub const pipeline_mod = @import("search/pipeline.zig");
 pub const reverse_mod = @import("search/reverse.zig");
+pub const parallel_source_mod = @import("search/parallel_source.zig");
 
 pub const Encoding = config_mod.Encoding;
 pub const Compression = config_mod.Compression;
@@ -59,6 +60,13 @@ pub const searchReverseSlice = reverse_mod.searchReverseSlice;
 pub const searchSourceReverseSlice = reverse_mod.searchSourceReverseSlice;
 pub const searchReverseAt = reverse_mod.searchReverseAt;
 pub const searchSourceReverseAt = reverse_mod.searchSourceReverseAt;
+pub const ParallelOptions = parallel_source_mod.ParallelOptions;
+pub const searchSliceParallel = parallel_source_mod.searchSliceParallel;
+pub const searchSourceSliceParallel = parallel_source_mod.searchSourceSliceParallel;
+pub const searchParallelAt = parallel_source_mod.searchParallelAt;
+pub const searchSourceParallelAt = parallel_source_mod.searchSourceParallelAt;
+pub const countSliceParallel = parallel_source_mod.countSliceParallel;
+pub const countParallelAt = parallel_source_mod.countParallelAt;
 
 const serviceConfig = config_mod.serviceConfig;
 const bufferWindow = config_mod.bufferWindow;

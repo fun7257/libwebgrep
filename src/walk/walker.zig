@@ -274,6 +274,8 @@ const FileBatch = struct {
     storage: [4096]u8 = undefined,
     used: usize = 0,
     len: usize = 0,
+    /// Total files already dispatched from this directory, used to adapt batch granularity.
+    dispatched: usize = 0,
 
     fn push(self: *FileBatch, host: *Host, job: *Job, name: []const u8) void {
         if (name.len > self.storage.len) {
@@ -296,47 +298,52 @@ const FileBatch = struct {
     }
 };
 
+fn dispatchFileSlice(host: *Host, job: *Job, names: []const []const u8) void {
+    const child = createFileJob(host, job, names) catch {
+        for (names) |name| {
+            var rel_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const rel = joinRel(&rel_buf, job.rel, name) catch continue;
+            visitCheckedFile(host, job, name, rel);
+        }
+        return;
+    };
+    host.push(host.push_ctx, child) catch |err| {
+        child.destroy(host.io);
+        report(host, job, "", err);
+        for (names) |name| {
+            var rel_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const rel = joinRel(&rel_buf, job.rel, name) catch continue;
+            visitCheckedFile(host, job, name, rel);
+        }
+    };
+}
+
 fn flushFiles(host: *Host, job: *Job, batch: *FileBatch) void {
     if (batch.len == 0) return;
     const count = batch.len;
     batch.len = 0;
     batch.used = 0;
     if (host.config.threads > 1) {
-        for (batch.names[0..count]) |name| {
-            const single = [_][]const u8{name};
-            const child = createFileJob(host, job, &single) catch {
-                var rel_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-                const rel = joinRel(&rel_buf, job.rel, name) catch continue;
-                visitCheckedFile(host, job, name, rel);
-                continue;
-            };
-            host.push(host.push_ctx, child) catch |err| {
-                child.destroy(host.io);
-                report(host, job, "", err);
-                var rel_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-                const rel = joinRel(&rel_buf, job.rel, name) catch continue;
-                visitCheckedFile(host, job, name, rel);
-            };
+        // Dispatch the first 8 files in a directory individually so directories containing a few
+        // large files fan out across all cores immediately; batch subsequent files (8 per job)
+        // to cut `fcntl(F_DUPFD_CLOEXEC)` / `close` / heap overhead in large small-file directories.
+        var idx: usize = 0;
+        while (idx < count and batch.dispatched < 8) : ({
+            idx += 1;
+            batch.dispatched += 1;
+        }) {
+            const single = [_][]const u8{batch.names[idx]};
+            dispatchFileSlice(host, job, &single);
+        }
+        while (idx < count) {
+            const end = @min(idx + 8, count);
+            dispatchFileSlice(host, job, batch.names[idx..end]);
+            batch.dispatched += end - idx;
+            idx = end;
         }
     } else {
-        const names = batch.names[0..count];
-        const child = createFileJob(host, job, names) catch {
-            for (names) |name| {
-                var rel_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-                const rel = joinRel(&rel_buf, job.rel, name) catch continue;
-                visitCheckedFile(host, job, name, rel);
-            }
-            return;
-        };
-        host.push(host.push_ctx, child) catch |err| {
-            child.destroy(host.io);
-            report(host, job, "", err);
-            for (names) |name| {
-                var rel_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-                const rel = joinRel(&rel_buf, job.rel, name) catch continue;
-                visitCheckedFile(host, job, name, rel);
-            }
-        };
+        batch.dispatched += count;
+        dispatchFileSlice(host, job, batch.names[0..count]);
     }
 }
 

@@ -34,6 +34,7 @@ const noteHitLimit = state_mod.noteHitLimit;
 const nextLineNumber = state_mod.nextLineNumber;
 const contentEnd = state_mod.contentEnd;
 const countLines = state_mod.countLines;
+const advanceLineCount = state_mod.advanceLineCount;
 const stopInMatch = state_mod.stopInMatch;
 const maybeProgress = state_mod.maybeProgress;
 const callOpt = state_mod.callOpt;
@@ -181,7 +182,7 @@ pub fn gatherSpans(
             n = 1;
         }
     }
-    std.mem.sort(Span, store[0..n], {}, spanBefore);
+    if (n > 1) std.mem.sort(Span, store[0..n], {}, spanBefore);
     return store[0..n];
 }
 
@@ -679,10 +680,75 @@ pub fn sinkMatched(
         state.matched_lines += 1;
         state.matches += 1;
         state.results_out += 1;
-        countLines(buf, line.end, state, config);
+        advanceLineCount(buf, line, state_mod.effectiveMultiline(matcher, config), state, config);
         if (!maybeProgress(S, sink, state, config)) return false;
         if (!noteHitLimit(state, config, state.abs_base + line.end)) return false;
         return !state.paused;
+    }
+    if (comptime @hasDecl(S, "matched_fast_line") and S.matched_fast_line) {
+        if (config.replacement == null and config.binary != .report) {
+            const preview = previewLine(buf, line, known, config);
+            const line_abs = state.abs_base + line.start;
+            if (!try sinkBreakAt(S, sink, line_abs, state, config)) return false;
+            countLines(buf, line.start, state, config);
+            const bytes = buf[preview.start..preview.end];
+            if (!try guardLine(state, config, bytes.len)) return false;
+            const fast_line = Line{
+                .bytes = bytes,
+                .text = bytes,
+                .raw = bytes,
+                .replaced = null,
+                .offset = line_abs,
+                .raw_offset = line_abs,
+                .number = state.line_number,
+                .match = preview.span,
+                .matches = &.{},
+                .column = null,
+                .u16_column = null,
+                .binary_status = state.binary_status,
+                .truncated = preview.truncated,
+                .line_len = preview.line_len,
+                .window_start = preview.window_start,
+            };
+            const action = callSinkAction(S, "matched", sink, .{fast_line});
+            releaseQueue(state);
+            const line_end_abs = state.abs_base + @as(u64, line.end);
+            state.last_line_visited = line.end;
+            state.last_abs_end = line_end_abs;
+            state.remembered_until = @max(state.remembered_until, line.end);
+            state.after_left = afterCount(config);
+            state.has_sunk = true;
+            state.matched_lines += 1;
+            state.matches += 1;
+            state.results_out += 1;
+            var keep = true;
+            switch (action) {
+                .cont => {},
+                .skip_to => |target| {
+                    if (target > line_end_abs) {
+                        state.after_left = 0;
+                        state.ring.clear();
+                        state.pending_skip_to = target;
+                    }
+                },
+                .pause => {
+                    state.paused = true;
+                    state.resume_at = line_end_abs;
+                    state.resume_line = if (state.line_number != null) nextLineNumber(state, buf, line, config) else 0;
+                    state.stopped = true;
+                    keep = false;
+                },
+                .stop => {
+                    state.stopped = true;
+                    keep = false;
+                },
+            }
+            advanceLineCount(buf, line, state_mod.effectiveMultiline(matcher, config), state, config);
+            if (state.paused) return false;
+            if (keep and !maybeProgress(S, sink, state, config)) return false;
+            if (!noteHitLimit(state, config, line_end_abs)) return false;
+            return keep and !state.paused;
+        }
     }
     const preview = previewLine(buf, line, known, config);
     const line_abs = state.abs_base + line.start;
@@ -755,7 +821,7 @@ pub fn sinkMatched(
             keep = false;
         },
     }
-    countLines(buf, line.end, state, config);
+    advanceLineCount(buf, line, state_mod.effectiveMultiline(matcher, config), state, config);
     if (state.paused) return false;
     if (keep and !maybeProgress(S, sink, state, config)) return false;
     if (!noteHitLimit(state, config, line_end_abs)) return false;

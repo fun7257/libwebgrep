@@ -99,6 +99,7 @@ pub const State = struct {
     label: []const u8 = "",
     started_ns: i128 = 0,
     deadline_armed: bool = false,
+    deadline_ticks: u32 = 0,
     limit_hit: sink_mod.LimitHit = .none,
     resume_at: ?u64 = null,
     soft_error: ?sink_mod.SoftError = null,
@@ -310,6 +311,20 @@ pub fn pastDeadline(state: *const State, config: SearchConfig) bool {
     return readClock(config) - state.started_ns >= @as(i128, budget);
 }
 
+/// Amortized deadline check for tight per-match loops: when using the OS monotonic clock with a
+/// budget >= 1 ms, reads the clock once every 128 checks to avoid per-line syscall/vDSO overhead.
+/// Custom/deterministic clocks and sub-millisecond budgets still check on every call.
+pub inline fn pastDeadlineAmortized(state: *State, config: SearchConfig) bool {
+    if (!state.deadline_armed) return false;
+    const budget = config.time_budget_ns orelse return false;
+    if (config.clock == null and budget >= std.time.ns_per_ms) {
+        const tick = state.deadline_ticks;
+        state.deadline_ticks = tick +% 1;
+        if ((tick & 127) != 0) return false;
+    }
+    return readClock(config) - state.started_ns >= @as(i128, budget);
+}
+
 
 pub fn overBytes(state: *const State, config: SearchConfig) bool {
     const cap = scanCap(config) orelse return false;
@@ -355,8 +370,8 @@ pub fn stopForBudget(state: *State, config: SearchConfig) bool {
     return false;
 }
 
-pub fn stopInMatch(state: *State, config: SearchConfig) bool {
-    if (pastDeadline(state, config)) {
+pub inline fn stopInMatch(state: *State, config: SearchConfig) bool {
+    if (pastDeadlineAmortized(state, config)) {
         noteLimit(state, .deadline);
         return true;
     }
@@ -662,6 +677,21 @@ pub fn countLines(buf: []const u8, upto: usize, state: *State, config: SearchCon
     const n = memchr.count(width, buf, state.last_line_counted, upto, recordSep(config));
     state.line_number = (state.line_number orelse return) + n;
     state.last_line_counted = upto;
+}
+
+/// Fast-path line-number advance past a complete single-line record `[line.start, line.end)`
+/// when `last_line_counted` is already at `line.start`, avoiding a redundant `memchr.count`
+/// over the matched line's bytes.
+pub inline fn advanceLineCount(buf: []const u8, line: Range, is_ml: bool, state: *State, config: SearchConfig) void {
+    if (state.line_number == null) return;
+    if (!is_ml and state.last_line_counted == line.start and line.end > line.start and line.end <= buf.len) {
+        if (buf[line.end - 1] == recordSep(config)) {
+            state.line_number = state.line_number.? + 1;
+        }
+        state.last_line_counted = line.end;
+        return;
+    }
+    countLines(buf, line.end, state, config);
 }
 
 pub fn rollConsumed(buf: []const u8, state: *const State, config: SearchConfig) usize {

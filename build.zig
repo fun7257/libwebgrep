@@ -274,6 +274,22 @@ pub fn build(b: *std.Build) void {
         const install_wg_cli = b.addInstallArtifact(wg_cli, .{});
         bench_cli_step.dependOn(&install_wg_cli.step);
 
+        const par_bench = b.addExecutable(.{
+            .name = "wg-par-bench",
+            .use_llvm = use_llvm,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("bench/parallel.zig"),
+                .target = compile_target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "libwebgrep_internal", .module = internal_mod },
+                },
+            }),
+        });
+        const install_par_bench = b.addInstallArtifact(par_bench, .{});
+        const bench_par_step = b.step("bench-parallel", "Build the intra-source parallel throughput/RSS benchmark (ReleaseFast)");
+        bench_par_step.dependOn(&install_par_bench.step);
+
         if (target.result.os.tag == .linux) {
             const bench_driver = b.addExecutable(.{
                 .name = "bench-driver",

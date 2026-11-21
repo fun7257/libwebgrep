@@ -19,6 +19,7 @@ const deque = @import("walk/deque.zig");
 const finder_mod = @import("finder/finder.zig");
 const matcher = @import("matcher.zig");
 const multi_mod = @import("finder/multi.zig");
+const probe = @import("probe.zig");
 const regex_mod = @import("regex/vm.zig");
 const searcher = @import("searcher.zig");
 const sink_mod = @import("sink.zig");
@@ -70,6 +71,10 @@ pub const Run = struct {
     saw_output: *bool,
     /// Retained field; summaries are now emitted via service-entry summary events rather than terminal text here.
     write_summary: bool = false,
+    /// When true and `on_event == null`, workers format matched lines/counts directly into bounded
+    /// worker-local buffers and batch-flush to `stdout` under `shared.lock`, eliminating per-line
+    /// mutex contention while keeping per-worker output memory bounded.
+    write_output: bool = false,
     /// Optional streaming event callback: delivers events immediately as each source completes without buffering full results for sorting.
     on_event: ?*const fn (*anyopaque, sink_mod.Event) sink_mod.Flow = null,
     event_ctx: ?*anyopaque = null,
@@ -93,6 +98,8 @@ const Shared = struct {
     regex: ?*const regex_mod.Regex = null,
     column: bool,
     use_separator: bool,
+    stdout: *std.Io.Writer,
+    write_output: bool = false,
     saw: *bool,
     lock: std.Io.Mutex = .init,
     /// Guards idle waiting only. Deques remain Chase-Lev and the hot search path does not acquire this lock.
@@ -155,11 +162,55 @@ const Worker = struct {
     index: u32,
     finder: finder_mod.Finder,
     scratch: []u8 = &.{},
-    buf: std.Io.Writer.Allocating,
+    out_buf: std.ArrayList(u8) = .empty,
+    local_searches: u64 = 0,
+    local_searches_with_match: u64 = 0,
+    local_matched_lines: u64 = 0,
+    local_matches: u64 = 0,
+    local_bytes_searched: u64 = 0,
+    local_bytes_printed: u64 = 0,
 
     fn deinit(self: *Worker) void {
         if (self.scratch.len != 0) self.shared.allocator.free(self.scratch);
-        self.buf.deinit();
+        self.out_buf.deinit(self.shared.allocator);
+    }
+
+    fn recordSearch(self: *Worker, result: searcher.Result, matches: u64, bytes: u64) void {
+        self.local_searches += 1;
+        self.local_bytes_searched += bytes;
+        self.local_matched_lines += result.matched_lines;
+        self.local_matches += matches;
+        if (result.matched_lines > 0) {
+            self.local_searches_with_match += 1;
+        }
+    }
+
+    fn flushOut(self: *Worker) void {
+        if (self.out_buf.items.len == 0) return;
+        const data = self.out_buf.items;
+        self.shared.lock.lockUncancelable(self.shared.io);
+        defer self.shared.lock.unlock(self.shared.io);
+        if (!self.shared.write_failed.load(.monotonic)) {
+            self.shared.stdout.writeAll(data) catch {
+                self.shared.write_failed.store(true, .release);
+                requestStop(self.shared);
+            };
+            self.shared.saw.* = true;
+        }
+        self.local_bytes_printed += data.len;
+        self.out_buf.clearRetainingCapacity();
+    }
+
+    fn flushStats(self: *Worker) void {
+        if (self.local_searches > 0) _ = self.shared.searches.fetchAdd(self.local_searches, .monotonic);
+        if (self.local_searches_with_match > 0) {
+            _ = self.shared.searches_with_match.fetchAdd(self.local_searches_with_match, .monotonic);
+            self.shared.any_match.store(true, .release);
+        }
+        if (self.local_matched_lines > 0) _ = self.shared.matched_lines.fetchAdd(self.local_matched_lines, .monotonic);
+        if (self.local_matches > 0) _ = self.shared.matches.fetchAdd(self.local_matches, .monotonic);
+        if (self.local_bytes_searched > 0) _ = self.shared.bytes_searched.fetchAdd(self.local_bytes_searched, .monotonic);
+        if (self.local_bytes_printed > 0) _ = self.shared.bytes_printed.fetchAdd(self.local_bytes_printed, .monotonic);
     }
 
     fn config(self: *Worker) searcher.SearchConfig {
@@ -272,6 +323,8 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, req: Run) !Stats {
         .regex = req.regex,
         .column = req.column,
         .use_separator = req.use_separator and req.emit == .text,
+        .stdout = req.stdout,
+        .write_output = req.write_output,
         .saw = req.saw_output,
         .workers = workers,
         .on_event = req.on_event,
@@ -282,7 +335,6 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, req: Run) !Stats {
         .shared = &shared,
         .index = 0,
         .finder = finder,
-        .buf = .init(allocator),
     };
     defer bootstrap.deinit();
     try pushRoots(&bootstrap, req.roots);
@@ -314,7 +366,6 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, req: Run) !Stats {
     if (shared.write_failed.load(.acquire)) return error.WriteFailed;
 
     _ = started;
-    _ = req.stdout;
     _ = req.write_summary;
     return snapshot(&shared);
 }
@@ -353,9 +404,12 @@ fn workerMain(shared: *Shared, index: u32) std.Io.Cancelable!void {
         .shared = shared,
         .index = index,
         .finder = shared.finder,
-        .buf = .init(shared.allocator),
     };
-    defer worker.deinit();
+    defer {
+        worker.flushOut();
+        worker.flushStats();
+        worker.deinit();
+    }
     try workerLoop(&worker);
 }
 
@@ -559,6 +613,16 @@ fn searchOpen(worker: *Worker, file: std.Io.File, path: []const u8) !void {
 
 const CountTally = struct {};
 
+const FileRa = struct {
+    file: std.Io.File,
+    io: std.Io,
+
+    fn readAt(ctx: ?*anyopaque, offset: u64, dest: []u8) anyerror!usize {
+        const self: *FileRa = @ptrCast(@alignCast(ctx.?));
+        return self.file.readPositional(self.io, &.{dest}, offset);
+    }
+};
+
 fn runFileOrMmap(
     comptime S: type,
     worker: *Worker,
@@ -568,18 +632,19 @@ fn runFileOrMmap(
     engine: anytype,
     cfg: searcher.SearchConfig,
 ) !searcher.Result {
-    if (worker.shared.use_mmap) {
-        const st = file.stat(worker.shared.io) catch null;
+    const shared = worker.shared;
+    if (shared.use_mmap) {
+        const st = file.stat(shared.io) catch null;
         if (st) |info| {
             if (info.kind == .file and info.size > 0 and info.size <= std.math.maxInt(usize)) {
-                var mm = std.Io.File.MemoryMap.create(worker.shared.io, file, .{
+                var mm = std.Io.File.MemoryMap.create(shared.io, file, .{
                     .len = @intCast(info.size),
                     .offset = 0,
                     .protection = .{ .read = true, .write = false },
                     .populate = false,
                 }) catch null;
                 if (mm) |*mapped| {
-                    defer mapped.destroy(worker.shared.io);
+                    defer mapped.destroy(shared.io);
                     if (cfg.binary != .quit or std.mem.indexOfScalar(u8, mapped.memory[0..@min(mapped.memory.len, 4096)], 0) == null) {
                         platform.adviseMappedSequential(mapped.memory);
                     }
@@ -587,48 +652,217 @@ fn runFileOrMmap(
                 }
             }
         }
+    } else if (shared.on_event == null) {
+        const st = file.stat(shared.io) catch null;
+        if (st) |info| {
+            if (info.kind == .file) {
+                if (info.size == 0) {
+                    return searcher.searchSlice(S, sink, &.{}, path, engine, cfg);
+                }
+                if (shared.workers > 1 and info.size >= 16 * 1024 * 1024) {
+                    const idle_now = shared.idle.load(.acquire);
+                    // Escalate huge regular files (>= 16 MiB) to intra-source parallel scanning
+                    // so skewed directories (e.g. 1–2 large logs + many small files) saturate all
+                    // cores instead of starving on a 1–2 thread straggler, without oversubscribing
+                    // uniform medium-file directories (< 16 MiB per file).
+                    const sub_workers: u32 = @max(@min(idle_now + 1, shared.workers), @min(shared.workers, 4));
+                    if (sub_workers >= 2) {
+                        var fra = FileRa{ .file = file, .io = shared.io };
+                        const ra = probe.RandomAccess{
+                            .ctx = &fra,
+                            .read_at = FileRa.readAt,
+                            .size = info.size,
+                        };
+                        return searcher.searchParallelAt(
+                            S,
+                            shared.allocator,
+                            shared.io,
+                            sink,
+                            ra,
+                            path,
+                            engine,
+                            cfg,
+                            .{ .workers = sub_workers },
+                        );
+                    }
+                }
+                // Small regular file fast path: read exact size in one `pread` into reusable
+                // `worker.scratch` and invoke `searchSlice` directly (avoiding EOF second `pread`
+                // and `drive()` streaming state-machine overhead).
+                const small_cap: u64 = 256 * 1024;
+                if (info.size <= small_cap and
+                    cfg.byte_range == null and
+                    cfg.resume_from == 0 and
+                    cfg.max_source_bytes == null and
+                    cfg.max_request_bytes == null and
+                    cfg.compression == .none and
+                    cfg.encoding == .none and
+                    cfg.charset == null)
+                {
+                    const need: usize = @intCast(info.size);
+                    if (worker.scratch.len < need) {
+                        const alloc_sz = @max(need, @as(usize, 64 * 1024));
+                        if (worker.scratch.len != 0) shared.allocator.free(worker.scratch);
+                        worker.scratch = &.{};
+                        worker.scratch = try shared.allocator.alloc(u8, alloc_sz);
+                    }
+                    var got: usize = 0;
+                    while (got < need) {
+                        var iov = [_][]u8{worker.scratch[got..need]};
+                        const n = file.readPositional(shared.io, &iov, got) catch break;
+                        if (n == 0) break;
+                        got += n;
+                    }
+                    return searcher.searchSlice(S, sink, worker.scratch[0..got], path, engine, cfg);
+                }
+            }
+        }
     }
-    return searcher.searchFile(S, worker.shared.allocator, worker.shared.io, sink, file, path, engine, cfg);
+    return searcher.searchFile(S, shared.allocator, shared.io, sink, file, path, engine, cfg);
 }
 
+inline fn appendU64(buf: *std.ArrayList(u8), val: u64) void {
+    var digits: [20]u8 = undefined;
+    var n = val;
+    var i: usize = digits.len;
+    while (true) {
+        i -= 1;
+        digits[i] = @as(u8, @intCast(n % 10)) + '0';
+        n /= 10;
+        if (n == 0) break;
+    }
+    buf.appendSliceAssumeCapacity(digits[i..]);
+}
+
+inline fn appendFormattedLine(
+    alloc: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    path: []const u8,
+    line_number: ?u64,
+    bytes: []const u8,
+) !void {
+    try buf.ensureUnusedCapacity(alloc, path.len + 24 + bytes.len);
+    buf.appendSliceAssumeCapacity(path);
+    buf.appendAssumeCapacity(':');
+    if (line_number) |num| {
+        appendU64(buf, num);
+        buf.appendAssumeCapacity(':');
+    }
+    buf.appendSliceAssumeCapacity(bytes);
+    buf.appendAssumeCapacity('\n');
+}
+
+const FastTextSink = struct {
+    pub const matched_fast_line = true;
+
+    worker: *Worker,
+    path: []const u8,
+    line_numbers: bool,
+    multiline: bool,
+
+    const mid_file_flush_threshold: usize = 256 * 1024;
+
+    pub fn matched(self: *FastTextSink, line: searcher.Line) bool {
+        if (line.binary_status == .detected) return false;
+        const alloc = self.worker.shared.allocator;
+        const buf = &self.worker.out_buf;
+        if (self.multiline and std.mem.indexOfScalar(u8, line.bytes, '\n') != null) {
+            var it = std.mem.splitScalar(u8, line.bytes, '\n');
+            var idx: u64 = 0;
+            while (it.next()) |sub| : (idx += 1) {
+                const ln: ?u64 = if (self.line_numbers) (if (line.number) |n| n + idx else null) else null;
+                appendFormattedLine(alloc, buf, self.path, ln, sub) catch return false;
+            }
+        } else {
+            appendFormattedLine(alloc, buf, self.path, if (self.line_numbers) line.number else null, line.bytes) catch return false;
+        }
+        if (buf.items.len >= mid_file_flush_threshold) {
+            self.worker.flushOut();
+            if (self.worker.shared.write_failed.load(.acquire)) return false;
+        }
+        return true;
+    }
+};
+
 fn searchWith(worker: *Worker, engine: anytype, file: std.Io.File, path: []const u8) !void {
+    const shared = worker.shared;
     var cfg = worker.config();
-    const used = worker.shared.request_used.load(.monotonic);
-    if (worker.shared.request_cap != std.math.maxInt(u64)) {
-        if (used >= worker.shared.request_cap) return;
-        const room = worker.shared.request_cap - used;
+    if (shared.request_cap != std.math.maxInt(u64)) {
+        const used = shared.request_used.load(.monotonic);
+        if (used >= shared.request_cap) return;
+        const room = shared.request_cap - used;
         if (cfg.max_source_bytes) |n| cfg.max_source_bytes = @min(n, room) else cfg.max_source_bytes = room;
         cfg.max_request_bytes = if (cfg.max_request_bytes) |n| @min(n, room) else room;
     }
-    _ = worker.shared.emitEvent(.{ .begin = .{ .source_id = path } });
-    const result = if (worker.shared.emit == .count and worker.shared.count_lines_only) blk: {
+
+    const direct_out = shared.write_output and shared.on_event == null;
+    if (!direct_out and shared.on_event != null) {
+        _ = shared.emitEvent(.{ .begin = .{ .source_id = path } });
+    }
+
+    const result = if (shared.emit == .count and shared.count_lines_only) blk: {
         var count_sink = CountTally{};
         break :blk try runFileOrMmap(CountTally, worker, &count_sink, file, path, engine, cfg);
+    } else if (direct_out and shared.emit == .text) blk: {
+        var text_sink = FastTextSink{
+            .worker = worker,
+            .path = path,
+            .line_numbers = cfg.line_numbers,
+            .multiline = cfg.multiline,
+        };
+        break :blk try runFileOrMmap(FastTextSink, worker, &text_sink, file, path, engine, cfg);
     } else blk: {
         var sink = Tally{
-            .shared = worker.shared,
-            .stop_file = worker.shared.emit == .files_with_matches,
+            .shared = shared,
+            .stop_file = shared.emit == .files_with_matches,
             .source_id = path,
         };
         break :blk try runFileOrMmap(Tally, worker, &sink, file, path, engine, cfg);
     };
+
     noteSoft(worker, path, result);
-    worker.shared.addSearch(result, result.matches, result.bytes_read, 0);
-    _ = worker.shared.emitEvent(.{ .end = .{
-        .source_id = path,
-        .binary_status = if (result.nul_offset == null) .none else if (result.outcome == .binary_quit) .suppressed else .detected,
-        .binary_offset = result.binary_offset,
-        .matched_lines = result.matched_lines,
-        .matches = result.matches,
-        .bytes_read = result.bytes_read,
-        .outcome = result.outcome,
-        .limit_hit = result.limit_hit,
-        .partial = result.partial,
-        .resume_at = result.resume_at,
-        .soft_error = result.soft_error,
-    } });
-    const charged = worker.shared.request_used.fetchAdd(result.bytes_read, .monotonic);
-    if (worker.shared.request_cap != std.math.maxInt(u64) and charged + result.bytes_read >= worker.shared.request_cap) requestStop(worker.shared);
+    worker.recordSearch(result, result.matches, result.bytes_read);
+
+    if (direct_out) {
+        const alloc = shared.allocator;
+        if (shared.emit == .count and shared.count_lines_only) {
+            if (result.matched_lines > 0) {
+                try worker.out_buf.ensureUnusedCapacity(alloc, path.len + 24);
+                worker.out_buf.appendSliceAssumeCapacity(path);
+                worker.out_buf.appendAssumeCapacity(':');
+                appendU64(&worker.out_buf, result.matched_lines);
+                worker.out_buf.appendAssumeCapacity('\n');
+            }
+        } else if (result.outcome == .binary_matched) {
+            const prefix = "Binary file ";
+            const suffix = " matches\n";
+            try worker.out_buf.ensureUnusedCapacity(alloc, prefix.len + path.len + suffix.len);
+            worker.out_buf.appendSliceAssumeCapacity(prefix);
+            worker.out_buf.appendSliceAssumeCapacity(path);
+            worker.out_buf.appendSliceAssumeCapacity(suffix);
+        }
+        if (worker.out_buf.items.len >= 64 * 1024) {
+            worker.flushOut();
+        }
+    } else if (shared.on_event != null) {
+        _ = shared.emitEvent(.{ .end = .{
+            .source_id = path,
+            .binary_status = if (result.nul_offset == null) .none else if (result.outcome == .binary_quit) .suppressed else .detected,
+            .binary_offset = result.binary_offset,
+            .matched_lines = result.matched_lines,
+            .matches = result.matches,
+            .bytes_read = result.bytes_read,
+            .outcome = result.outcome,
+            .limit_hit = result.limit_hit,
+            .partial = result.partial,
+            .resume_at = result.resume_at,
+            .soft_error = result.soft_error,
+        } });
+    }
+    if (shared.request_cap != std.math.maxInt(u64)) {
+        const charged = shared.request_used.fetchAdd(result.bytes_read, .monotonic);
+        if (charged + result.bytes_read >= shared.request_cap) requestStop(shared);
+    }
 }
 
 const Tally = struct {

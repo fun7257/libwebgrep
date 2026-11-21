@@ -33,6 +33,8 @@ const CliArgs = struct {
 const CountSink = struct {};
 
 const PrintSink = struct {
+    pub const matched_fast_line = true;
+
     out: *std.Io.Writer,
     file_path: []const u8 = "",
     prefix_path: ?[]const u8 = null,
@@ -80,54 +82,6 @@ const PrintSink = struct {
     }
 };
 
-const DirEventCtx = struct {
-    out: *std.Io.Writer,
-    count_only: bool,
-    line_numbers: bool,
-
-    fn onEvent(raw_ctx: *anyopaque, ev: libwebgrep.sink.Event) libwebgrep.sink.Flow {
-        const self: *DirEventCtx = @ptrCast(@alignCast(raw_ctx));
-        if (self.count_only) {
-            switch (ev) {
-                .end => |e| {
-                    if (e.matched_lines > 0) {
-                        self.out.print("{s}:{d}\n", .{ e.source_id, e.matched_lines }) catch return .stop;
-                    }
-                },
-                else => {},
-            }
-        } else {
-            switch (ev) {
-                .match => |m| {
-                    if (m.binary_status == .detected) return .cont;
-                    if (std.mem.indexOfScalar(u8, m.bytes, '\n') != null) {
-                        var it = std.mem.splitScalar(u8, m.bytes, '\n');
-                        var idx: u64 = 0;
-                        while (it.next()) |sub| : (idx += 1) {
-                            if (self.line_numbers) {
-                                self.out.print("{s}:{d}:{s}\n", .{ m.source_id, m.line_number + idx, sub }) catch return .stop;
-                            } else {
-                                self.out.print("{s}:{s}\n", .{ m.source_id, sub }) catch return .stop;
-                            }
-                        }
-                    } else if (self.line_numbers) {
-                        self.out.print("{s}:{d}:{s}\n", .{ m.source_id, m.line_number, m.bytes }) catch return .stop;
-                    } else {
-                        self.out.print("{s}:{s}\n", .{ m.source_id, m.bytes }) catch return .stop;
-                    }
-                },
-                .end => |e| {
-                    if (e.outcome == .binary_matched) {
-                        self.out.print("Binary file {s} matches\n", .{e.source_id}) catch return .stop;
-                    }
-                },
-                else => {},
-            }
-        }
-        return .cont;
-    }
-};
-
 const CompiledMatcher = union(enum) {
     finder: libwebgrep.Finder,
     multi: libwebgrep.Multi,
@@ -142,6 +96,16 @@ const CompiledMatcher = union(enum) {
     }
 };
 
+const FileRa = struct {
+    file: std.Io.File,
+    io: std.Io,
+
+    fn readAt(ctx: ?*anyopaque, offset: u64, dest: []u8) anyerror!usize {
+        const self: *FileRa = @ptrCast(@alignCast(ctx.?));
+        return self.file.readPositional(self.io, &.{dest}, offset);
+    }
+};
+
 fn searchSingleFileWithSink(
     comptime S: type,
     gpa: std.mem.Allocator,
@@ -152,6 +116,7 @@ fn searchSingleFileWithSink(
     cm: *const CompiledMatcher,
     cfg: libwebgrep.SearchConfig,
     io_mode: IoMode,
+    threads: u32,
 ) !libwebgrep.Result {
     if (io_mode == .mmap) {
         const st = try file.stat(io);
@@ -167,10 +132,34 @@ fn searchSingleFileWithSink(
                 if (cfg.binary != .quit or std.mem.indexOfScalar(u8, mapped.memory[0..@min(mapped.memory.len, 4096)], 0) == null) {
                     internal.platform.adviseMappedSequential(mapped.memory);
                 }
+                if (threads > 1 and mapped.memory.len >= 512 * 1024) {
+                    return switch (cm.*) {
+                        .finder => |*f| internal.searchSliceParallel(S, gpa, io, sink, mapped.memory, path, f, cfg, .{ .workers = threads }),
+                        .multi => |*m| internal.searchSliceParallel(S, gpa, io, sink, mapped.memory, path, m, cfg, .{ .workers = threads }),
+                        .regex => |*r| internal.searchSliceParallel(S, gpa, io, sink, mapped.memory, path, r, cfg, .{ .workers = threads }),
+                    };
+                }
                 return switch (cm.*) {
                     .finder => |*f| libwebgrep.searchSlice(S, sink, mapped.memory, path, f, cfg),
                     .multi => |*m| libwebgrep.searchSlice(S, sink, mapped.memory, path, m, cfg),
                     .regex => |*r| libwebgrep.searchSlice(S, sink, mapped.memory, path, r, cfg),
+                };
+            }
+        }
+    } else if (threads > 1) {
+        const st = file.stat(io) catch null;
+        if (st) |info| {
+            if (info.kind == .file and info.size >= 512 * 1024) {
+                var fra = FileRa{ .file = file, .io = io };
+                const ra = internal.probe.RandomAccess{
+                    .ctx = &fra,
+                    .read_at = FileRa.readAt,
+                    .size = info.size,
+                };
+                return switch (cm.*) {
+                    .finder => |*f| internal.searchParallelAt(S, gpa, io, sink, ra, path, f, cfg, .{ .workers = threads }),
+                    .multi => |*m| internal.searchParallelAt(S, gpa, io, sink, ra, path, m, cfg, .{ .workers = threads }),
+                    .regex => |*r| internal.searchParallelAt(S, gpa, io, sink, ra, path, r, cfg, .{ .workers = threads }),
                 };
             }
         }
@@ -212,7 +201,7 @@ fn searchOneFile(
 
     if (args.count_only) {
         var csink = CountSink{};
-        const res = try searchSingleFileWithSink(CountSink, gpa, io, file, path, &csink, cm, cfg, args.io_mode);
+        const res = try searchSingleFileWithSink(CountSink, gpa, io, file, path, &csink, cm, cfg, args.io_mode, args.threads);
         if (res.matched_lines > 0) {
             try stdout_writer.print("{d}\n", .{res.matched_lines});
             try stdout_writer.flush();
@@ -225,7 +214,7 @@ fn searchOneFile(
             .prefix_path = null,
             .line_numbers = args.line_numbers,
         };
-        const res = try searchSingleFileWithSink(PrintSink, gpa, io, file, path, &psink, cm, cfg, args.io_mode);
+        const res = try searchSingleFileWithSink(PrintSink, gpa, io, file, path, &psink, cm, cfg, args.io_mode, args.threads);
         return res.matched_lines;
     }
 }
@@ -392,7 +381,7 @@ pub fn main(init: std.process.Init) !u8 {
     };
     defer cm.deinit();
 
-    var stdout_buf: [65536]u8 = undefined;
+    var stdout_buf: [256 * 1024]u8 = undefined;
     var stdout_fw = std.Io.File.stdout().writerStreaming(io, &stdout_buf);
 
     var is_dir = false;
@@ -411,11 +400,6 @@ pub fn main(init: std.process.Init) !u8 {
     } else {
         var saw_output = false;
         const roots = [_][]const u8{cli.target_path};
-        var dir_ctx = DirEventCtx{
-            .out = &stdout_fw.interface,
-            .count_only = cli.count_only,
-            .line_numbers = cli.line_numbers,
-        };
         const stats = try internal.parallel.run(gpa, io, .{
             .pattern = if (cli.fixed_strings and cli.patterns.items.len == 1) cli.patterns.items[0] else "",
             .patterns = if (cli.fixed_strings and cli.patterns.items.len > 1) cli.patterns.items else &.{},
@@ -448,8 +432,7 @@ pub fn main(init: std.process.Init) !u8 {
             .emit = if (cli.count_only) .count else .text,
             .stdout = &stdout_fw.interface,
             .saw_output = &saw_output,
-            .on_event = DirEventCtx.onEvent,
-            .event_ctx = &dir_ctx,
+            .write_output = true,
         });
         try stdout_fw.interface.flush();
         total_matched = stats.matched_lines;

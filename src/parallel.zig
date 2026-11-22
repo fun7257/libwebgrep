@@ -107,6 +107,10 @@ const Shared = struct {
     idle_cv: std.Io.Condition = .init,
     stop: std.atomic.Value(bool) = .init(false),
     idle: std.atomic.Value(u32) = .init(0),
+    /// Number of jobs currently queued across all worker deques.
+    pending_jobs: std.atomic.Value(u32) = .init(0),
+    /// Additional sub-worker threads currently leased to intra-source parallel scans.
+    extra_workers: std.atomic.Value(u32) = .init(0),
     workers: u32,
     searches: std.atomic.Value(u64) = .init(0),
     searches_with_match: std.atomic.Value(u64) = .init(0),
@@ -394,7 +398,9 @@ fn pushRoots(worker: *Worker, roots: []const []const u8) !void {
         worker.shared.deques[0].push(job) catch |err| {
             job.destroy(worker.shared.io);
             worker.shared.note(root, err);
+            continue;
         };
+        _ = worker.shared.pending_jobs.fetchAdd(1, .release);
     }
 }
 
@@ -419,7 +425,7 @@ fn workerLoop(worker: *Worker) !void {
     while (true) {
         try shared.io.checkCancel();
         if (shared.stop.load(.acquire)) return;
-        if (shared.deques[index].pop()) |job| {
+        if (popLocalJob(shared, index)) |job| {
             runJob(worker, job);
             continue;
         }
@@ -435,6 +441,12 @@ fn workerLoop(worker: *Worker) !void {
     }
 }
 
+fn popLocalJob(shared: *Shared, index: u32) ?*walker.Job {
+    const job = shared.deques[index].pop() orelse return null;
+    _ = shared.pending_jobs.fetchSub(1, .acq_rel);
+    return job;
+}
+
 /// Re-checks queues under the lock and sleeps if no work is available. Returns `null` when stopped.
 ///
 /// `Condition.signal` is lost when there are no waiters, and the enqueue side skips locking when the idle count is 0,
@@ -445,7 +457,7 @@ fn park(worker: *Worker) !?*walker.Job {
     try shared.idle_mu.lock(shared.io);
     defer shared.idle_mu.unlock(shared.io);
 
-    if (shared.deques[index].pop()) |job| return job;
+    if (popLocalJob(shared, index)) |job| return job;
     if (stealJob(shared, index)) |job| return job;
 
     var announced = false;
@@ -456,7 +468,7 @@ fn park(worker: *Worker) !?*walker.Job {
     announced = true;
 
     if (idle_now == shared.workers) {
-        if (shared.deques[index].pop()) |job| {
+        if (popLocalJob(shared, index)) |job| {
             _ = shared.idle.fetchSub(1, .acq_rel);
             announced = false;
             return job;
@@ -472,7 +484,7 @@ fn park(worker: *Worker) !?*walker.Job {
     }
 
     while (!shared.stop.load(.acquire)) {
-        if (shared.deques[index].pop()) |job| {
+        if (popLocalJob(shared, index)) |job| {
             _ = shared.idle.fetchSub(1, .acq_rel);
             announced = false;
             return job;
@@ -498,7 +510,10 @@ fn stealJob(shared: *Shared, index: u32) ?*walker.Job {
     var step: u32 = 1;
     while (step < shared.workers) : (step += 1) {
         const other = (index + step) % shared.workers;
-        if (shared.deques[other].steal()) |job| return job;
+        if (shared.deques[other].steal()) |job| {
+            _ = shared.pending_jobs.fetchSub(1, .acq_rel);
+            return job;
+        }
     }
     return null;
 }
@@ -529,6 +544,7 @@ fn pushJob(ctx: *anyopaque, job: *walker.Job) anyerror!void {
     const slot: *Slot = @ptrCast(@alignCast(ctx));
     const shared = slot.worker.shared;
     try shared.deques[slot.worker.index].push(job);
+    _ = shared.pending_jobs.fetchAdd(1, .release);
     if (shared.idle.load(.acquire) == 0) return;
     shared.idle_mu.lockUncancelable(shared.io);
     defer shared.idle_mu.unlock(shared.io);
@@ -623,6 +639,26 @@ const FileRa = struct {
     }
 };
 
+/// Atomically leases spare thread capacity from currently parked top-level workers so that
+/// huge-file escalation accelerates skewed directories without ever oversubscribing `shared.workers`.
+fn claimExtraWorkers(shared: *Shared) u32 {
+    if (shared.workers <= 1) return 0;
+    if (shared.pending_jobs.load(.acquire) != 0) return 0;
+    while (true) {
+        const idle_now = shared.idle.load(.acquire);
+        if (idle_now == 0) return 0;
+        const cur_extra = shared.extra_workers.load(.acquire);
+        const cap = @min(idle_now, shared.workers - 1);
+        if (cur_extra >= cap) return 0;
+        const avail = cap - cur_extra;
+        const busy_top: u32 = if (shared.workers > idle_now) shared.workers - idle_now else 1;
+        const claim: u32 = if (busy_top <= 1) avail else @max(@as(u32, 1), avail / busy_top);
+        if (shared.extra_workers.cmpxchgWeak(cur_extra, cur_extra + claim, .acq_rel, .acquire) == null) {
+            return claim;
+        }
+    }
+}
+
 fn runFileOrMmap(
     comptime S: type,
     worker: *Worker,
@@ -659,14 +695,14 @@ fn runFileOrMmap(
                 if (info.size == 0) {
                     return searcher.searchSlice(S, sink, &.{}, path, engine, cfg);
                 }
-                if (shared.workers > 1 and info.size >= 16 * 1024 * 1024) {
-                    const idle_now = shared.idle.load(.acquire);
+                if (shared.workers > 1 and info.size >= 16 * 1024 * 1024 and !cfg.multiline and cfg.binary != .report) {
                     // Escalate huge regular files (>= 16 MiB) to intra-source parallel scanning
-                    // so skewed directories (e.g. 1–2 large logs + many small files) saturate all
-                    // cores instead of starving on a 1–2 thread straggler, without oversubscribing
-                    // uniform medium-file directories (< 16 MiB per file).
-                    const sub_workers: u32 = @max(@min(idle_now + 1, shared.workers), @min(shared.workers, 4));
-                    if (sub_workers >= 2) {
+                    // only when all queued directory/file jobs are already claimed and parked
+                    // workers exist, leasing strictly bounded spare slots so total active threads
+                    // never exceed `shared.workers`.
+                    const claimed = claimExtraWorkers(shared);
+                    if (claimed >= 1) {
+                        defer _ = shared.extra_workers.fetchSub(claimed, .acq_rel);
                         var fra = FileRa{ .file = file, .io = shared.io };
                         const ra = probe.RandomAccess{
                             .ctx = &fra,
@@ -682,7 +718,7 @@ fn runFileOrMmap(
                             path,
                             engine,
                             cfg,
-                            .{ .workers = sub_workers },
+                            .{ .workers = 1 + claimed },
                         );
                     }
                 }

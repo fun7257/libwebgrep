@@ -824,11 +824,30 @@ pub const Decoder = struct {
     }
 
     fn decodeInto(self: *Decoder, allocator: std.mem.Allocator, dest: []u8, eof: bool) error{OutOfMemory}!usize {
+        return switch (self.coded()) {
+            inline else => |m| self.decodeIntoMode(m, allocator, dest, eof),
+        };
+    }
+
+    fn decodeIntoMode(self: *Decoder, comptime mode: coded_mode, allocator: std.mem.Allocator, dest: []u8, eof: bool) error{OutOfMemory}!usize {
         var filled = self.drainOut(dest);
-        const mode = self.coded();
         while (filled < dest.len) {
             const rest = self.in[self.in_i..self.in_len];
-            const step = decodeMode(mode, rest, eof) orelse break;
+            if (comptime isAsciiCompatible(mode)) {
+                if (self.offset_map == null and rest.len > 0 and rest[0] < 0x80) {
+                    const limit = @min(rest.len, dest.len - filled);
+                    var run: usize = 0;
+                    while (run < limit and rest[run] < 0x80) : (run += 1) {
+                        dest[filled + run] = rest[run];
+                    }
+                    self.in_i += run;
+                    self.raw_consumed += run;
+                    filled += run;
+                    self.out_produced += run;
+                    continue;
+                }
+            }
+            const step = decodeModeComptime(mode, rest, eof) orelse break;
             if (self.offset_map) |m| {
                 try m.record(allocator, self.out_produced, self.raw_consumed);
             }
@@ -913,21 +932,32 @@ fn convertedLen(mode: coded_mode, input: []const u8) usize {
     };
 }
 
+fn isAsciiCompatible(comptime mode: coded_mode) bool {
+    return switch (mode) {
+        .utf8, .gbk, .gb18030, .shift_jis, .euc_jp, .big5, .euc_kr, .latin1, .windows1252, .windows1251 => true,
+        .utf16le, .utf16be, .utf32le, .utf32be => false,
+    };
+}
+
 fn convertedLenMode(comptime mode: coded_mode, input: []const u8) usize {
     var i: usize = 0;
     var n: usize = 0;
     while (i < input.len) {
-        if (mode == .utf16le and i + 2 <= input.len and input[i + 1] == 0 and input[i] < 0x80) {
-            n += 1;
-            i += 2;
-            continue;
+        if (comptime mode == .utf16le) {
+            if (i + 2 <= input.len and input[i + 1] == 0 and input[i] < 0x80) {
+                n += 1;
+                i += 2;
+                continue;
+            }
         }
-        if ((mode == .gbk or mode == .utf8) and input[i] < 0x80) {
-            n += 1;
-            i += 1;
-            continue;
+        if (comptime isAsciiCompatible(mode)) {
+            if (input[i] < 0x80) {
+                n += 1;
+                i += 1;
+                continue;
+            }
         }
-        const step = decodeMode(mode, input[i..], true) orelse break;
+        const step = decodeModeComptime(mode, input[i..], true) orelse break;
         n += utf8Len(step.cp);
         i += step.n;
     }
@@ -944,19 +974,23 @@ fn convertIntoMode(comptime mode: coded_mode, input: []const u8, out: []u8) usiz
     var i: usize = 0;
     var w: usize = 0;
     while (i < input.len) {
-        if (mode == .utf16le and i + 2 <= input.len and input[i + 1] == 0 and input[i] < 0x80) {
-            out[w] = input[i];
-            w += 1;
-            i += 2;
-            continue;
+        if (comptime mode == .utf16le) {
+            if (i + 2 <= input.len and input[i + 1] == 0 and input[i] < 0x80) {
+                out[w] = input[i];
+                w += 1;
+                i += 2;
+                continue;
+            }
         }
-        if ((mode == .gbk or mode == .utf8) and input[i] < 0x80) {
-            out[w] = input[i];
-            w += 1;
-            i += 1;
-            continue;
+        if (comptime isAsciiCompatible(mode)) {
+            if (input[i] < 0x80) {
+                out[w] = input[i];
+                w += 1;
+                i += 1;
+                continue;
+            }
         }
-        const step = decodeMode(mode, input[i..], true) orelse break;
+        const step = decodeModeComptime(mode, input[i..], true) orelse break;
         w += encodeCp(step.cp, out[w..]);
         i += step.n;
     }
@@ -974,12 +1008,24 @@ fn convertIntoWithMap(
     if (offset_map == null) {
         return convertInto(mode, input, out);
     }
-    const m = offset_map.?;
+    return switch (mode) {
+        inline else => |m| convertIntoWithMapMode(m, allocator, input, out, raw_base, offset_map.?),
+    };
+}
+
+fn convertIntoWithMapMode(
+    comptime mode: coded_mode,
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    out: []u8,
+    raw_base: u64,
+    m: *decompress.OffsetMap,
+) error{OutOfMemory}!usize {
     m.base_raw_offset = raw_base;
     var i: usize = 0;
     var w: usize = 0;
     while (i < input.len) {
-        const step = decodeMode(mode, input[i..], true) orelse break;
+        const step = decodeModeComptime(mode, input[i..], true) orelse break;
         try m.record(allocator, w, raw_base + i);
         w += encodeCp(step.cp, out[w..]);
         i += step.n;
@@ -988,7 +1034,7 @@ fn convertIntoWithMap(
     return w;
 }
 
-fn decodeMode(mode: coded_mode, bytes: []const u8, eof: bool) ?Step {
+inline fn decodeModeComptime(comptime mode: coded_mode, bytes: []const u8, eof: bool) ?Step {
     return switch (mode) {
         .utf8 => decodeUtf8(bytes, eof),
         .utf16le => decodeUtf16(bytes, .little, eof),
@@ -1004,6 +1050,12 @@ fn decodeMode(mode: coded_mode, bytes: []const u8, eof: bool) ?Step {
         .windows1251 => decodeWindows1251(bytes),
         .utf32le => decodeUtf32(bytes, .little, eof),
         .utf32be => decodeUtf32(bytes, .big, eof),
+    };
+}
+
+fn decodeMode(mode: coded_mode, bytes: []const u8, eof: bool) ?Step {
+    return switch (mode) {
+        inline else => |m| decodeModeComptime(m, bytes, eof),
     };
 }
 

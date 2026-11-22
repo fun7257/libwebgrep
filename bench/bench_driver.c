@@ -144,13 +144,13 @@ static const Scenario SCENARIOS[] = {
     },
     {
         "S14_dir_all_T1",
-        "zg-corpus/ (2.488 GB, 9 files, 1 thread) directory search (-c)",
+        "zg-corpus/ (2.48 GB, 8 files, 1 thread) directory search (-c)",
         1, 0, 1, NULL, NULL,
         { "-c", "--no-config", "--no-ignore", "-F", "-j", "1", "req=04203afdc6de", NULL }
     },
     {
         "S15_dir_all_T8",
-        "zg-corpus/ (2.488 GB, 9 files, 8 threads) directory search (-c)",
+        "zg-corpus/ (2.48 GB, 8 files, 8 threads) directory search (-c)",
         1, 0, 8, NULL, NULL,
         { "-c", "--no-config", "--no-ignore", "-F", "-j", "8", "req=04203afdc6de", NULL }
     },
@@ -196,7 +196,7 @@ static const Scenario SCENARIOS[] = {
     },
     {
         "S19_dir_multiline_T8",
-        "zg-corpus/ (2.488 GB, 9 files, 8 threads) cross-line directory search (-U -c)",
+        "zg-corpus/ (2.48 GB, 8 files, 8 threads) cross-line directory search (-U -c)",
         1, 0, 8, NULL, NULL,
         {
             "-c", "--no-config", "--no-ignore", "--no-unicode", "-U", "-j", "8",
@@ -444,8 +444,15 @@ typedef struct {
     int exit_code;
     uint64_t total_bytes;
     uint64_t fnv_hash;
+    uint64_t sorted_lines_hash;
     uint64_t parsed_count;
 } CaptureResult;
+
+static int cmp_cstr_ptr(const void *a, const void *b) {
+    const char *sa = *(const char *const *)a;
+    const char *sb = *(const char *const *)b;
+    return strcmp(sa, sb);
+}
 
 static void parse_count_line(const char *line, int is_dir, uint64_t *parsed_count) {
     if (line[0] == '\0') return;
@@ -456,8 +463,23 @@ static void parse_count_line(const char *line, int is_dir, uint64_t *parsed_coun
     if (endp && endp != num_str) *parsed_count += (uint64_t)v;
 }
 
+static void record_count_line(const char *line, int is_dir, uint64_t *parsed_count,
+                              char ***lines_out, size_t *nlines, size_t *cap) {
+    if (line[0] == '\0') return;
+    parse_count_line(line, is_dir, parsed_count);
+    if (*nlines == *cap) {
+        size_t new_cap = (*cap == 0) ? 16 : (*cap * 2);
+        char **grown = (char **)realloc(*lines_out, new_cap * sizeof(char *));
+        if (!grown) return;
+        *lines_out = grown;
+        *cap = new_cap;
+    }
+    char *dup = strdup(line);
+    if (dup) (*lines_out)[(*nlines)++] = dup;
+}
+
 static CaptureResult run_and_capture(const char *bin, const Scenario *sc, const char *io_flag) {
-    CaptureResult cr = { -1, 0, 14695981039346656037ULL, 0 };
+    CaptureResult cr = { -1, 0, 14695981039346656037ULL, 14695981039346656037ULL, 0 };
     int pipefd[2];
     if (pipe(pipefd) != 0) return cr;
 
@@ -466,6 +488,11 @@ static CaptureResult run_and_capture(const char *bin, const Scenario *sc, const 
     build_argv(bin, sc, io_flag, target_buf, sizeof(target_buf), argv);
 
     pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return cr;
+    }
     if (pid == 0) {
         close(pipefd[0]);
         dup2(pipefd[1], STDOUT_FILENO);
@@ -479,6 +506,9 @@ static CaptureResult run_and_capture(const char *bin, const Scenario *sc, const 
 
     char line_buf[4096];
     size_t line_len = 0;
+    char **lines = NULL;
+    size_t nlines = 0;
+    size_t lines_cap = 0;
 
     unsigned char buf[65536];
     ssize_t n;
@@ -489,7 +519,7 @@ static CaptureResult run_and_capture(const char *bin, const Scenario *sc, const 
             if (!sc->check_exact_bytes) {
                 if (buf[i] == '\n') {
                     line_buf[line_len] = '\0';
-                    parse_count_line(line_buf, sc->is_dir, &cr.parsed_count);
+                    record_count_line(line_buf, sc->is_dir, &cr.parsed_count, &lines, &nlines, &lines_cap);
                     line_len = 0;
                 } else if (line_len + 1 < sizeof(line_buf)) {
                     line_buf[line_len++] = (char)buf[i];
@@ -500,9 +530,23 @@ static CaptureResult run_and_capture(const char *bin, const Scenario *sc, const 
     }
     if (!sc->check_exact_bytes && line_len > 0) {
         line_buf[line_len] = '\0';
-        parse_count_line(line_buf, sc->is_dir, &cr.parsed_count);
+        record_count_line(line_buf, sc->is_dir, &cr.parsed_count, &lines, &nlines, &lines_cap);
     }
     close(pipefd[0]);
+
+    if (!sc->check_exact_bytes && nlines > 0) {
+        qsort(lines, nlines, sizeof(char *), cmp_cstr_ptr);
+        for (size_t i = 0; i < nlines; i++) {
+            for (const unsigned char *p = (const unsigned char *)lines[i]; *p; p++) {
+                cr.sorted_lines_hash ^= (uint64_t)(*p);
+                cr.sorted_lines_hash *= 1099511628211ULL;
+            }
+            cr.sorted_lines_hash ^= (uint64_t)'\n';
+            cr.sorted_lines_hash *= 1099511628211ULL;
+            free(lines[i]);
+        }
+    }
+    free(lines);
 
     int status = 0;
     waitpid(pid, &status, 0);
@@ -517,16 +561,21 @@ typedef struct {
     double sys_ms;
     long minflt;
     long majflt;
+    int exit_code;
 } TimedSample;
 
-static TimedSample run_timed_once(const char *bin, const Scenario *sc, const char *io_flag, int devnull_fd) {
-    TimedSample s = { 0, 0, 0, 0, 0 };
+static TimedSample run_timed_once(const char *bin, const Scenario *sc, const char *io_flag, int devnull_fd, int expected_rc) {
+    TimedSample s = { 0, 0, 0, 0, 0, -1 };
     char target_buf[1024];
     char *argv[32];
     build_argv(bin, sc, io_flag, target_buf, sizeof(target_buf), argv);
 
     double t0 = now_ms();
     pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "FATAL: fork() failed for %s (%s): %s\n", bin, sc->id, strerror(errno));
+        exit(2);
+    }
     if (pid == 0) {
         dup2(devnull_fd, STDOUT_FILENO);
         dup2(devnull_fd, STDERR_FILENO);
@@ -535,12 +584,21 @@ static TimedSample run_timed_once(const char *bin, const Scenario *sc, const cha
     }
     int status = 0;
     struct rusage ru;
-    wait4(pid, &status, 0, &ru);
+    if (wait4(pid, &status, 0, &ru) < 0) {
+        fprintf(stderr, "FATAL: wait4() failed for %s (%s): %s\n", bin, sc->id, strerror(errno));
+        exit(2);
+    }
     s.wall_ms = now_ms() - t0;
     s.user_ms = (double)ru.ru_utime.tv_sec * 1000.0 + (double)ru.ru_utime.tv_usec / 1000.0;
     s.sys_ms  = (double)ru.ru_stime.tv_sec * 1000.0 + (double)ru.ru_stime.tv_usec / 1000.0;
     s.minflt  = ru.ru_minflt;
     s.majflt  = ru.ru_majflt;
+    s.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    if (s.exit_code != expected_rc) {
+        fprintf(stderr, "FATAL: timed subprocess '%s %s' exited with rc=%d (expected %d) in %s\n",
+                bin, io_flag ? io_flag : "", s.exit_code, expected_rc, sc->id);
+        exit(2);
+    }
     return s;
 }
 
@@ -597,6 +655,15 @@ typedef struct {
     const char *io_flag;
 } Contender;
 
+static const char *classify_verdict(const Stats *wg_best, const Stats *rg_best) {
+    double rel_diff = fabs(wg_best->median - rg_best->median) / (rg_best->median > 0.0 ? rg_best->median : 1.0);
+    int ranges_overlap = (wg_best->min <= rg_best->max) && (rg_best->min <= wg_best->max);
+    if (rel_diff <= 0.015 || (ranges_overlap && rel_diff <= 0.025)) {
+        return "TIE (WITHIN NOISE)";
+    }
+    return (wg_best->median < rg_best->median) ? "WIN (SURPASSED rg!)" : "LAGGING (NEEDS OPT)";
+}
+
 static int run_scenario(const Scenario *sc, const char *wg_bin, int warm_rounds, int do_cold) {
     pin_cpus(sc->threads);
     uint64_t target_bytes = get_target_bytes(sc);
@@ -610,29 +677,46 @@ static int run_scenario(const Scenario *sc, const char *wg_bin, int warm_rounds,
            (double)target_bytes / 1e6, (double)target_bytes / (1024.0 * 1024.0), sc->threads);
     printf("----------------------------------------------------------------------------------------\n");
 
-    /* Phase 0: Strict Accuracy Verification */
+    /* Phase 0: Strict 4-Way Accuracy Verification */
     CaptureResult rg_cap_nm = run_and_capture(g_rg_bin, sc, "--no-mmap");
     CaptureResult rg_cap_mm = run_and_capture(g_rg_bin, sc, "--mmap");
     CaptureResult wg_cap_nm = run_and_capture(wg_bin, sc, "--no-mmap");
     CaptureResult wg_cap_mm = run_and_capture(wg_bin, sc, "--mmap");
 
+    int expected_rc = rg_cap_nm.exit_code;
+    if (expected_rc != 0 && expected_rc != 1) {
+        fprintf(stderr, "FATAL: unexpected rg exit code %d in %s\n", expected_rc, sc->id);
+        return 1;
+    }
+
     if (sc->check_exact_bytes) {
-        int ok = (rg_cap_nm.exit_code == wg_cap_nm.exit_code) &&
+        int ok = (rg_cap_nm.exit_code == rg_cap_mm.exit_code) &&
+                 (rg_cap_nm.exit_code == wg_cap_nm.exit_code) &&
+                 (rg_cap_nm.exit_code == wg_cap_mm.exit_code) &&
+                 (rg_cap_nm.total_bytes == rg_cap_mm.total_bytes) &&
                  (rg_cap_nm.total_bytes == wg_cap_nm.total_bytes) &&
+                 (rg_cap_nm.total_bytes == wg_cap_mm.total_bytes) &&
+                 (rg_cap_nm.fnv_hash == rg_cap_mm.fnv_hash) &&
                  (rg_cap_nm.fnv_hash == wg_cap_nm.fnv_hash) &&
                  (rg_cap_nm.fnv_hash == wg_cap_mm.fnv_hash);
-        printf("[Accuracy] Exact Byte-for-Byte stdout check: rg=%llu bytes (hash=%016llx) vs wg=%llu bytes (hash=%016llx) -> %s\n",
+        printf("[Accuracy] Exact Byte-for-Byte stdout check (4-way): rg=%llu bytes (hash=%016llx) vs wg=%llu bytes (hash=%016llx) -> %s\n",
                (unsigned long long)rg_cap_nm.total_bytes, (unsigned long long)rg_cap_nm.fnv_hash,
                (unsigned long long)wg_cap_nm.total_bytes, (unsigned long long)wg_cap_nm.fnv_hash,
                ok ? "PASS (100% IDENTICAL)" : "FAIL");
         if (!ok) return 1;
     } else {
-        int ok = (rg_cap_nm.exit_code == wg_cap_nm.exit_code) &&
-                 (rg_cap_mm.exit_code == wg_cap_mm.exit_code) &&
+        int ok = (rg_cap_nm.exit_code == rg_cap_mm.exit_code) &&
+                 (rg_cap_nm.exit_code == wg_cap_nm.exit_code) &&
+                 (rg_cap_nm.exit_code == wg_cap_mm.exit_code) &&
+                 (rg_cap_nm.parsed_count == rg_cap_mm.parsed_count) &&
                  (rg_cap_nm.parsed_count == wg_cap_nm.parsed_count) &&
-                 (rg_cap_nm.parsed_count == wg_cap_mm.parsed_count);
-        printf("[Accuracy] Count & Exit check: rg=%llu (rc=%d) | wg_nommap=%llu wg_mmap=%llu (rc=%d) -> %s\n",
+                 (rg_cap_nm.parsed_count == wg_cap_mm.parsed_count) &&
+                 (rg_cap_nm.sorted_lines_hash == rg_cap_mm.sorted_lines_hash) &&
+                 (rg_cap_nm.sorted_lines_hash == wg_cap_nm.sorted_lines_hash) &&
+                 (rg_cap_nm.sorted_lines_hash == wg_cap_mm.sorted_lines_hash);
+        printf("[Accuracy] Count, Per-File Hash & Exit check (4-way): rg=%llu (rc=%d, hash=%016llx) | wg_nommap=%llu wg_mmap=%llu (rc=%d) -> %s\n",
                (unsigned long long)rg_cap_nm.parsed_count, rg_cap_nm.exit_code,
+               (unsigned long long)rg_cap_nm.sorted_lines_hash,
                (unsigned long long)wg_cap_nm.parsed_count,
                (unsigned long long)wg_cap_mm.parsed_count,
                wg_cap_nm.exit_code,
@@ -652,9 +736,15 @@ static int run_scenario(const Scenario *sc, const char *wg_bin, int warm_rounds,
 
     /* Phase 1: Warm-Cache Interleaved ABBA Benchmark */
     double res_pct = ensure_warm_cache(sc);
+    if (res_pct < 99.9) {
+        res_pct = ensure_warm_cache(sc);
+    }
+    if (res_pct < 99.9) {
+        fprintf(stderr, "WARNING: warm cache residency only %.1f%% (< 99.9%%) for %s\n", res_pct, sc->id);
+    }
     for (int w = 0; w < 2; w++) {
         for (int c = 0; c < 4; c++) {
-            (void)run_timed_once(contenders[c].bin, sc, contenders[c].io_flag, devnull);
+            (void)run_timed_once(contenders[c].bin, sc, contenders[c].io_flag, devnull, expected_rc);
         }
     }
 
@@ -662,7 +752,7 @@ static int run_scenario(const Scenario *sc, const char *wg_bin, int warm_rounds,
     for (int r = 0; r < warm_rounds; r++) {
         for (int step = 0; step < 4; step++) {
             int c = (r % 2 == 0) ? step : (3 - step);
-            warm_samples[c][r] = run_timed_once(contenders[c].bin, sc, contenders[c].io_flag, devnull);
+            warm_samples[c][r] = run_timed_once(contenders[c].bin, sc, contenders[c].io_flag, devnull, expected_rc);
         }
     }
 
@@ -676,15 +766,17 @@ static int run_scenario(const Scenario *sc, const char *wg_bin, int warm_rounds,
                gbs, warm_st[c].med_user, warm_st[c].med_sys, warm_st[c].med_minflt);
     }
 
-    double wg_best_warm = warm_st[0].median < warm_st[1].median ? warm_st[0].median : warm_st[1].median;
-    double rg_best_warm = warm_st[2].median < warm_st[3].median ? warm_st[2].median : warm_st[3].median;
+    const Stats *wg_best_warm_st = (warm_st[0].median < warm_st[1].median) ? &warm_st[0] : &warm_st[1];
+    const Stats *rg_best_warm_st = (warm_st[2].median < warm_st[3].median) ? &warm_st[2] : &warm_st[3];
+    double wg_best_warm = wg_best_warm_st->median;
+    double rg_best_warm = rg_best_warm_st->median;
     double speedup_best   = rg_best_warm / wg_best_warm;
     double speedup_nommap = warm_st[2].median / warm_st[0].median;
     double speedup_mmap   = warm_st[3].median / warm_st[1].median;
 
     printf("  >> WARM VERDICT: wg_best=%.2f ms vs rg_best=%.2f ms => %.2fx [%s] | (no-mmap: %.2fx, mmap: %.2fx)\n",
            wg_best_warm, rg_best_warm, speedup_best,
-           (wg_best_warm <= rg_best_warm) ? "WIN (SURPASSED rg!)" : "LAGGING (NEEDS OPT)",
+           classify_verdict(wg_best_warm_st, rg_best_warm_st),
            speedup_nommap, speedup_mmap);
 
     /* Phase 2: Cold-Disk Interleaved ABBA Benchmark */
@@ -697,13 +789,13 @@ static int run_scenario(const Scenario *sc, const char *wg_bin, int warm_rounds,
                 int c = (r % 2 == 0) ? step : (3 - step);
                 uint64_t rem = evict_and_verify_zero(sc);
                 if (rem != 0) {
-                    fprintf(stderr, "FATAL: cold cache eviction failed (residual pages = %llu > 0)\n",
+                    fprintf(stderr, "FATAL: cold cache eviction failed (residual pages = %llu > 0; note tmpfs cannot be evicted)\n",
                             (unsigned long long)rem);
                     close(devnull);
                     return 2;
                 }
                 if (rem > max_residual_pages) max_residual_pages = rem;
-                cold_samples[c][r] = run_timed_once(contenders[c].bin, sc, contenders[c].io_flag, devnull);
+                cold_samples[c][r] = run_timed_once(contenders[c].bin, sc, contenders[c].io_flag, devnull, expected_rc);
             }
         }
         Stats cold_st[4];
@@ -716,11 +808,13 @@ static int run_scenario(const Scenario *sc, const char *wg_bin, int warm_rounds,
                    contenders[c].label, cold_st[c].median, cold_st[c].min, cold_st[c].max, cold_st[c].cv_pct,
                    gbs, cold_st[c].med_user, cold_st[c].med_sys, cold_st[c].med_majflt);
         }
-        double wg_best_cold = cold_st[0].median < cold_st[1].median ? cold_st[0].median : cold_st[1].median;
-        double rg_best_cold = cold_st[2].median < cold_st[3].median ? cold_st[2].median : cold_st[3].median;
+        const Stats *wg_best_cold_st = (cold_st[0].median < cold_st[1].median) ? &cold_st[0] : &cold_st[1];
+        const Stats *rg_best_cold_st = (cold_st[2].median < cold_st[3].median) ? &cold_st[2] : &cold_st[3];
+        double wg_best_cold = wg_best_cold_st->median;
+        double rg_best_cold = rg_best_cold_st->median;
         printf("  >> COLD VERDICT: wg_best=%.2f ms vs rg_best=%.2f ms => %.2fx [%s] | (no-mmap: %.2fx, mmap: %.2fx)\n",
                wg_best_cold, rg_best_cold, rg_best_cold / wg_best_cold,
-               (wg_best_cold <= rg_best_cold) ? "WIN (SURPASSED rg!)" : "LAGGING (NEEDS OPT)",
+               classify_verdict(wg_best_cold_st, rg_best_cold_st),
                cold_st[2].median / cold_st[0].median,
                cold_st[3].median / cold_st[1].median);
     }

@@ -641,3 +641,188 @@ test "Regex SIMD ByteContextPrefilter, 4-byte suffix Teddy promotion, and Unicod
         try std.testing.expectEqualStrings("baa1", hay[m.start..m.end]);
     }
 }
+
+test "P0-1: Unanchored DFA with \\b[a-z]{6,10}\\s+[0-9]{3,5}\\b (ASCII & Unicode, find & findWatched)" {
+    const alloc = std.testing.allocator;
+
+    // 1. ASCII mode
+    {
+        var re = try Regex.init(alloc, "\\b[a-z]{6,10}\\s+[0-9]{3,5}\\b", .{});
+        defer re.deinit();
+        try std.testing.expect(re.prefilter == null);
+        try std.testing.expect(re.alt_prefilter == null);
+        try std.testing.expect(re.unanchored_dfa != null);
+        const udfa = re.unanchored_dfa.?;
+        try std.testing.expect(!udfa.start_reentrant);
+        try std.testing.expect(udfa.start_skip == .range1);
+        try std.testing.expectEqual(@as(u8, 'a'), udfa.start_skip.range1.lo);
+        try std.testing.expectEqual(@as(u8, 25), udfa.start_skip.range1.span);
+
+        const hay =
+            "2026-11-23T12:00:00Z [INFO] short 123 toolongwordx 456 Xabcdef 789 user_abcdef 123\n" ++
+            "abcdef 12 abcdef 123456 abcdef\n999 Xabcdef 123  latency  12345  done\n" ++
+            "another 987\n";
+        const m1 = re.find(hay, 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("latency  12345", hay[m1.start..m1.end]);
+        const m1_e = re.find(hay, 0, .earliest) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("latency  12345", hay[m1_e.start..m1_e.end]);
+
+        const m2 = re.find(hay, m1.end, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("another 987", hay[m2.start..m2.end]);
+        try std.testing.expect(re.find(hay, m2.end, .leftmost_first) == null);
+
+        // findWatched: no NUL
+        var nul: ?usize = null;
+        const mw = re.findWatched(hay, 0, &nul) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(nul == null);
+        try std.testing.expectEqualStrings("latency  12345", hay[mw.start..mw.end]);
+
+        // findWatched: NUL before match
+        var nul_buf: [128]u8 = @splat(' ');
+        const prefix = "2026 [INFO] Xabcdef 123 ";
+        @memcpy(nul_buf[0..prefix.len], prefix);
+        nul_buf[40] = 0;
+        const good = "worker 4321";
+        @memcpy(nul_buf[60..][0..good.len], good);
+        var nul_at: ?usize = null;
+        try std.testing.expect(re.findWatched(&nul_buf, 0, &nul_at) == null);
+        try std.testing.expectEqual(@as(?usize, 40), nul_at);
+
+        // findWatched: NUL right at m.end (`worker 4321\x00`) must return match with nul == null
+        nul_buf[40] = ' ';
+        nul_buf[60 + good.len] = 0;
+        nul_at = null;
+        const mw2 = re.findWatched(&nul_buf, 0, &nul_at) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(nul_at == null);
+        try std.testing.expectEqualStrings("worker 4321", nul_buf[mw2.start..mw2.end]);
+    }
+
+    // 2. Unicode mode (`\s+` matches NBSP U+00A0 and Ideographic Space U+3000)
+    {
+        var re_u = try Regex.init(alloc, "\\b[a-z]{6,10}\\s+[0-9]{3,5}\\b", .{ .unicode_classes = true });
+        defer re_u.deinit();
+        try std.testing.expect(re_u.unanchored_dfa != null);
+
+        const hay_u = "前缀测试 Xabcdef\u{3000}123  metric\u{00A0}\u{3000}2048  后缀";
+        const mu = re_u.find(hay_u, 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("metric\u{00A0}\u{3000}2048", hay_u[mu.start..mu.end]);
+
+        var nul_u: ?usize = null;
+        const mwu = re_u.findWatched(hay_u, 0, &nul_u) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(nul_u == null);
+        try std.testing.expectEqualStrings("metric\u{00A0}\u{3000}2048", hay_u[mwu.start..mwu.end]);
+
+        // ASCII mode must NOT match U+00A0/U+3000
+        var re_a = try Regex.init(alloc, "\\b[a-z]{6,10}\\s+[0-9]{3,5}\\b", .{ .unicode_classes = false });
+        defer re_a.deinit();
+        try std.testing.expect(re_a.find(hay_u, 0, .leftmost_first) == null);
+    }
+
+    // 3. Zero-length match stays on PikeVM; start-reentrant pattern remains exact
+    {
+        var re_empty = try Regex.init(alloc, "[a-z]*", .{});
+        defer re_empty.deinit();
+        try std.testing.expect(re_empty.unanchored_dfa == null);
+        const me = re_empty.find("123", 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, 0), me.start);
+        try std.testing.expectEqual(@as(usize, 0), me.end);
+
+        var re_reent = try Regex.init(alloc, "(?:[a-b][c-d])*[0-9]{2}", .{});
+        defer re_reent.deinit();
+        if (re_reent.unanchored_dfa) |ud| {
+            try std.testing.expect(ud.start_reentrant);
+        }
+        const mr = re_reent.find("zzacbd42yy", 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("acbd42", "zzacbd42yy"[mr.start..mr.end]);
+    }
+}
+
+test "P1: Leading group alternation prefilter (?:err|warn|fail|crit|fatal)_[a-z]+_[0-9]{3}" {
+    const alloc = std.testing.allocator;
+
+    // 1. Main leading group + suffix `_`
+    {
+        var re = try Regex.init(alloc, "(?:err|warn|fail|crit|fatal)_[a-z]+_[0-9]{3}", .{});
+        defer re.deinit();
+        try std.testing.expect(re.prefilter == null);
+        try std.testing.expect(re.alt_prefilter != null);
+        try std.testing.expect(re.alt_is_prefix);
+        try std.testing.expect(!re.alt_is_exact);
+        try std.testing.expect(re.precomputed_dfa != null);
+        try std.testing.expectEqual(@as(usize, 5), re.alt_literal_slices.len);
+        try std.testing.expectEqualStrings("err_", re.alt_literal_slices[0]);
+        try std.testing.expectEqualStrings("fatal_", re.alt_literal_slices[4]);
+
+        const hay = "ok err_123 warn_abc_12 fail_abc_xyz crit_timeout_503 fatal_oom_999\n";
+        const m1 = re.find(hay, 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("crit_timeout_503", hay[m1.start..m1.end]);
+        const m2 = re.find(hay, m1.end, .earliest) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("fatal_oom_999", hay[m2.start..m2.end]);
+
+        var nul: ?usize = null;
+        const mw = re.findWatched(hay, 0, &nul) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(nul == null);
+        try std.testing.expectEqualStrings("crit_timeout_503", hay[mw.start..mw.end]);
+
+        const hay_nul = "err_123\x00crit_timeout_503\n";
+        var nul2: ?usize = null;
+        try std.testing.expect(re.findWatched(hay_nul, 0, &nul2) == null);
+        try std.testing.expectEqual(@as(?usize, 7), nul2);
+
+        const hay_nul_after = "crit_timeout_503\x00";
+        var nul3: ?usize = null;
+        const mw3 = re.findWatched(hay_nul_after, 0, &nul3) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(nul3 == null);
+        try std.testing.expectEqualStrings("crit_timeout_503", hay_nul_after[mw3.start..mw3.end]);
+    }
+
+    // 2. Optional leading group must NOT assume required alt prefix
+    {
+        var re_opt = try Regex.init(alloc, "(?:err|warn)?_[a-z]+", .{});
+        defer re_opt.deinit();
+        try std.testing.expect(!re_opt.alt_is_prefix);
+        const mo = re_opt.find("foo _abc bar", 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("_abc", "foo _abc bar"[mo.start..mo.end]);
+    }
+
+    // 3. Repeated leading group with `+` must NOT append post-group suffix
+    {
+        var re_plus = try Regex.init(alloc, "(?:err|warn)+_[0-9]{2}", .{});
+        defer re_plus.deinit();
+        try std.testing.expect(re_plus.alt_prefilter != null);
+        try std.testing.expect(re_plus.alt_is_prefix);
+        const mp = re_plus.find("xx errwarn_42 yy", 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("errwarn_42", "xx errwarn_42 yy"[mp.start..mp.end]);
+    }
+}
+
+test "P4: Uniform terminal prefix DFA chain for \"uid\":[0-9]{7} on single-line JSON" {
+    const alloc = std.testing.allocator;
+    var re = try Regex.init(alloc, "\"uid\":[0-9]{7}", .{});
+    defer re.deinit();
+
+    try std.testing.expect(re.req_is_prefix);
+    try std.testing.expect(re.precomputed_dfa != null);
+    const dfa = re.precomputed_dfa.?;
+    try std.testing.expect(dfa.stops_on_crlf);
+    try std.testing.expectEqual(@as(usize, 6), re.dfa_prefix_len);
+    const s0 = re.dfa_prefix_state;
+    try std.testing.expectEqual(@as(u8, 7), dfa.chain_len[s0]);
+    try std.testing.expectEqual(@as(u8, '0'), dfa.chain_uniform_lo[s0]);
+    try std.testing.expectEqual(@as(u8, 9), dfa.chain_uniform_span[s0]);
+    try std.testing.expect(dfa.is_terminal[s0 + 7]);
+
+    const json = "[{\"uid\":123456,\"n\":\"a\"},{\"uid\":\"bad\"},{\"uid\":7654321,\"ok\":true}]";
+    const m = re.find(json, 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("\"uid\":7654321", json[m.start..m.end]);
+
+    var nul: ?usize = null;
+    const mw = re.findWatched(json, 0, &nul) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(nul == null);
+    try std.testing.expectEqualStrings("\"uid\":7654321", json[mw.start..mw.end]);
+
+    const json_nul = "{\"uid\":123456,\x00\"uid\":7654321}";
+    var nul2: ?usize = null;
+    try std.testing.expect(re.findWatched(json_nul, 0, &nul2) == null);
+    try std.testing.expectEqual(@as(?usize, 14), nul2);
+}

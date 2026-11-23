@@ -40,6 +40,7 @@ pub const AssertKind = inst_mod.AssertKind;
 pub const UnicodeRangeList = inst_mod.UnicodeRangeList;
 pub const StackDfa = dfa_mod.StackDfa;
 pub const HeapDfa = dfa_mod.HeapDfa;
+pub const UnanchoredDfa = dfa_mod.UnanchoredDfa;
 
 const Thread = inst_mod.Thread;
 const Compiler = compiler_mod.Compiler;
@@ -170,12 +171,15 @@ pub const Regex = struct {
     alt_literal_slices: [][]const u8 = &.{},
     alt_prefilter: ?Multi = null,
     alt_is_exact: bool = false,
+    alt_is_prefix: bool = false,
     /// Optional longest-common-prefix `Finder` across all alternation branches (e.g., `ALT_TOKEN_` for 32 branches).
     alt_lcp_bytes: []u8 = &.{},
     alt_lcp_finder: ?Finder = null,
     alt_max_branch_len: usize = 0,
-    /// Pre-determinized DFA if full ahead-of-time determinization succeeded.
+    /// Pre-determinized anchored DFA if full ahead-of-time determinization succeeded.
     precomputed_dfa: ?*HeapDfa = null,
+    /// Pre-determinized unanchored Phase-1 DFA for zero-literal patterns (`prefilter == null and alt_prefilter == null`).
+    unanchored_dfa: ?*UnanchoredDfa = null,
     has_lazy: bool = false,
     has_alt: bool = false,
     saw_extended: bool = false,
@@ -319,7 +323,16 @@ pub const Regex = struct {
             self.req_prefix_shift = shift;
         }
         if (options.max_dfa_states > 0 and self.insts.len <= options.aot_dfa_max_insts) {
-            if (allocator.create(HeapDfa)) |heap_dfa| {
+            if (self.prefilter == null and self.alt_prefilter == null and !self.anchored_start) {
+                if (allocator.create(UnanchoredDfa)) |udfa| {
+                    udfa.* = .{};
+                    if (udfa.determinize(self.insts, self.unicode_ranges, self.start_pc, self.multiline, options.max_dfa_states)) {
+                        self.unanchored_dfa = udfa;
+                    } else {
+                        allocator.destroy(udfa);
+                    }
+                } else |_| {}
+            } else if (allocator.create(HeapDfa)) |heap_dfa| {
                 heap_dfa.* = HeapDfa.init();
                 if (heap_dfa.determinize(self.insts, self.unicode_ranges, self.start_pc, self.multiline)) {
                     self.precomputed_dfa = heap_dfa;
@@ -366,6 +379,7 @@ pub const Regex = struct {
         for (self.group_names[0..self.group_count]) |name| {
             if (name.len != 0) self.allocator.free(name);
         }
+        if (self.unanchored_dfa) |ud| self.allocator.destroy(ud);
         if (self.precomputed_dfa) |d| self.allocator.destroy(d);
         if (self.req_literal_bytes.len != 0) self.allocator.free(self.req_literal_bytes);
         if (self.tail_literal_bytes.len != 0) self.allocator.free(self.tail_literal_bytes);
@@ -550,15 +564,62 @@ pub const Regex = struct {
         if (self.req_is_prefix) {
             if (self.prefilter) |*pf| {
                 var pos = start;
-                var cached_win_end: usize = std.math.maxInt(usize);
                 const exact_for_mode = self.dfa_is_exact and !self.has_alt;
-                while (pos <= haystack.len) {
-                    const hit = pf.findReadOnly(haystack, pos, .earliest) orelse return null;
-                    if (self.precomputed_dfa) |dfa| {
-                        const can_skip_prefix = (hit.end - hit.start == self.dfa_prefix_len);
-                        const s0: u16 = if (can_skip_prefix) self.dfa_prefix_state else dfa_mod.start_state;
-                        const p0: usize = if (can_skip_prefix) self.dfa_prefix_len else 0;
-                        if (exact_for_mode and dfa.stops_on_crlf) {
+                if (self.precomputed_dfa) |dfa| {
+                    if (exact_for_mode and dfa.stops_on_crlf) {
+                        const fixed_prefix = self.dfa_prefix_len > 0 and self.dfa_prefix_len == self.req_literal_bytes.len and (!self.ignore_case or !self.unicode_case);
+                        if (fixed_prefix) {
+                            const s0 = self.dfa_prefix_state;
+                            const p0 = self.dfa_prefix_len;
+                            const shift = self.req_prefix_shift;
+                            const clen: usize = dfa.chain_len[s0];
+                            if (clen >= 2 and dfa.chain_uniform_span[s0] != 0xFF and dfa.is_terminal[s0 + clen]) {
+                                const u_lo = dfa.chain_uniform_lo[s0];
+                                const u_sp = dfa.chain_uniform_span[s0];
+                                while (pos <= haystack.len) {
+                                    const hit = pf.findReadOnly(haystack, pos, .earliest) orelse return null;
+                                    const rem_start = hit.start + p0;
+                                    if (rem_start + clen <= haystack.len) {
+                                        const p = haystack[rem_start..][0..clen];
+                                        if ((p[clen - 1] -% u_lo) <= u_sp) {
+                                            var ok = true;
+                                            for (p[0 .. clen - 1]) |ch| {
+                                                if ((ch -% u_lo) > u_sp) {
+                                                    ok = false;
+                                                    break;
+                                                }
+                                            }
+                                            if (ok) {
+                                                return Match{
+                                                    .start = hit.start,
+                                                    .end = rem_start + clen,
+                                                    .pattern_id = null,
+                                                };
+                                            }
+                                        }
+                                    }
+                                    pos = hit.start + shift;
+                                }
+                                return null;
+                            }
+                            while (pos <= haystack.len) {
+                                const hit = pf.findReadOnly(haystack, pos, .earliest) orelse return null;
+                                if (dfa.matchPrefixDeterminized(haystack[hit.start..], s0, p0, false)) |match_len| {
+                                    return Match{
+                                        .start = hit.start,
+                                        .end = hit.start + match_len,
+                                        .pattern_id = null,
+                                    };
+                                }
+                                pos = hit.start + shift;
+                            }
+                            return null;
+                        }
+                        while (pos <= haystack.len) {
+                            const hit = pf.findReadOnly(haystack, pos, .earliest) orelse return null;
+                            const can_skip_prefix = (hit.end - hit.start == self.dfa_prefix_len);
+                            const s0: u16 = if (can_skip_prefix) self.dfa_prefix_state else dfa_mod.start_state;
+                            const p0: usize = if (can_skip_prefix) self.dfa_prefix_len else 0;
                             if (dfa.matchPrefixDeterminized(haystack[hit.start..], s0, p0, false)) |match_len| {
                                 return Match{
                                     .start = hit.start,
@@ -567,8 +628,15 @@ pub const Regex = struct {
                                 };
                             }
                             pos = hit.start + self.req_prefix_shift;
-                            continue;
                         }
+                        return null;
+                    }
+                    var cached_win_end: usize = std.math.maxInt(usize);
+                    while (pos <= haystack.len) {
+                        const hit = pf.findReadOnly(haystack, pos, .earliest) orelse return null;
+                        const can_skip_prefix = (hit.end - hit.start == self.dfa_prefix_len);
+                        const s0: u16 = if (can_skip_prefix) self.dfa_prefix_state else dfa_mod.start_state;
+                        const p0: usize = if (can_skip_prefix) self.dfa_prefix_len else 0;
                         const win_end = if (!self.multiline and cached_win_end != std.math.maxInt(usize) and hit.start <= cached_win_end)
                             cached_win_end
                         else blk: {
@@ -589,8 +657,12 @@ pub const Regex = struct {
                             }
                         }
                         pos = hit.start + self.req_prefix_shift;
-                        continue;
                     }
+                    return null;
+                }
+                var cached_win_end: usize = std.math.maxInt(usize);
+                while (pos <= haystack.len) {
+                    const hit = pf.findReadOnly(haystack, pos, .earliest) orelse return null;
                     const win_end = if (!self.multiline and cached_win_end != std.math.maxInt(usize) and hit.start <= cached_win_end)
                         cached_win_end
                     else blk: {
@@ -806,6 +878,46 @@ pub const Regex = struct {
             var pos = start;
             var min_start = start;
             var cached_win_end: usize = std.math.maxInt(usize);
+            if (self.alt_is_prefix) {
+                if (self.precomputed_dfa) |dfa| {
+                    if (dfa.stops_on_crlf) {
+                        while (pos <= haystack.len) {
+                            const hit = ap.find(haystack, pos, .leftmost_first) orelse return null;
+                            if (dfa.matchPrefixDeterminized(haystack[hit.start..], dfa_mod.start_state, 0, true)) |_| {
+                                const win_end = if (!self.multiline and cached_win_end != std.math.maxInt(usize) and hit.start <= cached_win_end)
+                                    cached_win_end
+                                else blk: {
+                                    const w = self.windowLimit(haystack, hit.start);
+                                    cached_win_end = w;
+                                    break :blk w;
+                                };
+                                if (self.runRangeAllowed(haystack, hit.start, hit.start, win_end, mode, AllowAny{}, steps, scratch)) |m| {
+                                    return m;
+                                }
+                            }
+                            pos = hit.start + 1;
+                        }
+                        return null;
+                    }
+                    while (pos <= haystack.len) {
+                        const hit = ap.find(haystack, pos, .leftmost_first) orelse return null;
+                        const win_end = if (!self.multiline and cached_win_end != std.math.maxInt(usize) and hit.start <= cached_win_end)
+                            cached_win_end
+                        else blk: {
+                            const w = self.windowLimit(haystack, hit.start);
+                            cached_win_end = w;
+                            break :blk w;
+                        };
+                        if (dfa.matchPrefixDeterminized(haystack[hit.start..win_end], dfa_mod.start_state, 0, true)) |_| {
+                            if (self.runRangeAllowed(haystack, hit.start, hit.start, win_end, mode, AllowAny{}, steps, scratch)) |m| {
+                                return m;
+                            }
+                        }
+                        pos = hit.start + 1;
+                    }
+                    return null;
+                }
+            }
             while (pos <= haystack.len) {
                 const hit = ap.find(haystack, pos, .leftmost_first) orelse return null;
                 const search_from = if (!self.multiline)
@@ -836,7 +948,7 @@ pub const Regex = struct {
             return null;
         }
 
-        // General path: run two-phase Lazy DFA + PikeVM hybrid engine
+        // General path: run two-phase Unanchored AOT DFA or Lazy DFA + PikeVM hybrid engine
         return self.runWithDfa(haystack, start, haystack.len, mode, steps, scratch);
     }
 
@@ -850,6 +962,10 @@ pub const Regex = struct {
         scratch: ?*RegexScratch,
     ) ?Match {
         if (self.insts.len == 0 or start > limit) return null;
+        if (self.unanchored_dfa) |udfa| {
+            var unused_nul: ?usize = null;
+            return self.runUnanchoredDfa(udfa, haystack, start, limit, mode, steps, scratch, false, &unused_nul);
+        }
         if (scratch) |sc| {
             if (sc.ensureDfa()) |heap_dfa| {
                 return self.runWithDfaGeneric(HeapDfa, heap_dfa, haystack, start, limit, mode, steps, scratch);
@@ -857,6 +973,237 @@ pub const Regex = struct {
         }
         var stack_dfa = StackDfa.init();
         return self.runWithDfaGeneric(StackDfa, &stack_dfa, haystack, start, limit, mode, steps, scratch);
+    }
+
+    fn runUnanchoredDfa(
+        self: *const Regex,
+        dfa: *const UnanchoredDfa,
+        haystack: []const u8,
+        start: usize,
+        limit: usize,
+        mode: MatchMode,
+        steps: ?*usize,
+        scratch: ?*RegexScratch,
+        comptime watch_nul: bool,
+        nul: *?usize,
+    ) ?Match {
+        if (start > limit) return null;
+        const start_id = UnanchoredDfa.start_id;
+        const match_start = dfa.match_start;
+        const trans = &dfa.trans;
+
+        var scan_limit: usize = limit;
+        var nul_checked_to: usize = start;
+        var nul_found: ?usize = null;
+
+        var pos: usize = start;
+        var search_floor: usize = start;
+        var active_since: usize = start;
+        var s: u8 = start_id;
+        var cached_win_end: usize = std.math.maxInt(usize);
+        var cached_line_start: usize = start;
+
+        var local_steps: usize = 0;
+        defer if (comptime builtin.is_test) {
+            if (steps) |st| {
+                if (local_steps > 0) _ = @atomicRmw(usize, st, .Add, local_steps, .monotonic);
+            }
+        };
+
+        while (pos < scan_limit) {
+            if (watch_nul and pos >= nul_checked_to) {
+                const check_end = @min(scan_limit, pos + 32768);
+                if (memchr.find(memchr.native_width, haystack[0..check_end], pos, 0)) |z| {
+                    nul_found = z;
+                    scan_limit = z;
+                    nul_checked_to = z;
+                    if (pos >= scan_limit) break;
+                } else {
+                    nul_checked_to = check_end;
+                }
+            }
+            const chunk_limit = if (watch_nul) @min(scan_limit, nul_checked_to) else scan_limit;
+
+            while (pos < chunk_limit) {
+                if (s == start_id) {
+                    const s_next = trans[start_id][haystack[pos]];
+                    if (comptime builtin.is_test) local_steps += 1;
+                    if (s_next == start_id) {
+                        pos += 1;
+                        if (pos < chunk_limit) {
+                            const s_next2 = trans[start_id][haystack[pos]];
+                            if (comptime builtin.is_test) local_steps += 1;
+                            if (s_next2 == start_id) {
+                                pos += 1;
+                                if (dfa.start_skip != .none and chunk_limit - pos >= memchr.native_width) {
+                                    if (dfa.skipStartBytes(haystack, pos, chunk_limit)) |next_pos| {
+                                        if (comptime builtin.is_test) local_steps += next_pos - pos;
+                                        pos = next_pos;
+                                    } else {
+                                        if (comptime builtin.is_test) local_steps += chunk_limit - pos;
+                                        pos = chunk_limit;
+                                        break;
+                                    }
+                                }
+                                continue;
+                            }
+                            active_since = pos;
+                            s = s_next2;
+                            pos += 1;
+                            if (s >= match_start) break;
+                            continue;
+                        }
+                        break;
+                    }
+                    active_since = pos;
+                    s = s_next;
+                    pos += 1;
+                    if (s >= match_start) break;
+                }
+
+                // Active non-start state: 4x unrolled table-driven DFA loop (no is_match[] lookup)
+                while (pos + 4 <= chunk_limit) {
+                    const s1 = trans[s][haystack[pos]];
+                    if (s1 >= match_start) {
+                        if (comptime builtin.is_test) local_steps += 1;
+                        s = s1;
+                        pos += 1;
+                        break;
+                    }
+                    const s2 = trans[s1][haystack[pos + 1]];
+                    if (s2 >= match_start) {
+                        if (comptime builtin.is_test) local_steps += 2;
+                        s = s2;
+                        pos += 2;
+                        break;
+                    }
+                    const s3 = trans[s2][haystack[pos + 2]];
+                    if (s3 >= match_start) {
+                        if (comptime builtin.is_test) local_steps += 3;
+                        s = s3;
+                        pos += 3;
+                        break;
+                    }
+                    const s4 = trans[s3][haystack[pos + 3]];
+                    if (comptime builtin.is_test) local_steps += 4;
+                    s = s4;
+                    pos += 4;
+                    if (s >= match_start or s == start_id) break;
+                }
+                if (s >= match_start) break;
+                if (s == start_id) continue;
+
+                while (pos < chunk_limit) {
+                    s = trans[s][haystack[pos]];
+                    if (comptime builtin.is_test) local_steps += 1;
+                    pos += 1;
+                    if (s >= match_start or s == start_id) break;
+                }
+                if (s >= match_start) break;
+            }
+
+            if (s < match_start) continue;
+
+            // Phase-2 exact PikeVM verification on candidate ending at `pos`
+            if (!self.multiline) {
+                if (cached_win_end == std.math.maxInt(usize) or pos > cached_win_end) {
+                    cached_win_end = self.windowLimit(haystack, pos);
+                    cached_line_start = @max(search_floor, lineStartAt(haystack, pos));
+                }
+                var win_end = @min(scan_limit, cached_win_end);
+                if (watch_nul and win_end > nul_checked_to) {
+                    if (memchr.find(memchr.native_width, haystack[0..win_end], nul_checked_to, 0)) |z| {
+                        nul_found = z;
+                        scan_limit = z;
+                        win_end = z;
+                        nul_checked_to = z;
+                    } else {
+                        nul_checked_to = win_end;
+                    }
+                }
+                const line_start = @max(search_floor, cached_line_start);
+
+                if (dfa.start_reentrant) {
+                    if (self.runRangeAllowed(haystack, line_start, win_end, win_end, mode, AllowAny{}, steps, scratch)) |m| {
+                        return m;
+                    }
+                    if (win_end >= scan_limit) {
+                        pos = scan_limit;
+                        break;
+                    }
+                    pos = win_end + 1;
+                    if (watch_nul and pos > nul_checked_to) nul_checked_to = pos;
+                    search_floor = pos;
+                    active_since = pos;
+                    s = start_id;
+                    continue;
+                }
+
+                const search_lo = @max(line_start, active_since);
+                const start_hi = pos - 1;
+                if (search_lo <= start_hi) {
+                    if (self.runRangeAllowed(haystack, search_lo, start_hi, win_end, mode, AllowAny{}, steps, scratch)) |m| {
+                        if (mode == .earliest and m.end > pos) {
+                            const earlier_lim = @min(m.end, win_end);
+                            if (pos <= earlier_lim) {
+                                if (self.runRangeAllowed(haystack, pos, earlier_lim, earlier_lim, .earliest, AllowAny{}, steps, scratch)) |m2| {
+                                    if (m2.end < m.end or (m2.end == m.end and m2.start < m.start)) {
+                                        return m2;
+                                    }
+                                }
+                            }
+                        }
+                        return m;
+                    }
+                }
+                search_floor = pos;
+                active_since = pos;
+                s = start_id;
+            } else {
+                const search_lo = blk: {
+                    var lo = @max(search_floor, pos -| self.max_multiline_window);
+                    if (!dfa.start_reentrant) lo = @max(lo, active_since);
+                    break :blk lo;
+                };
+                const raw_verify_limit = @min(scan_limit, (pos - 1) +| self.max_multiline_window);
+                if (watch_nul and raw_verify_limit > nul_checked_to) {
+                    if (memchr.find(memchr.native_width, haystack[0..raw_verify_limit], nul_checked_to, 0)) |z| {
+                        nul_found = z;
+                        scan_limit = z;
+                        nul_checked_to = z;
+                    } else {
+                        nul_checked_to = raw_verify_limit;
+                    }
+                }
+                const eff_verify_limit = @min(raw_verify_limit, scan_limit);
+                const start_hi = pos - 1;
+                if (search_lo <= start_hi) {
+                    if (self.runRangeAllowed(haystack, search_lo, start_hi, eff_verify_limit, mode, AllowAny{}, steps, scratch)) |m| {
+                        if (mode == .earliest and m.end > pos) {
+                            const earlier_lim = @min(m.end, eff_verify_limit);
+                            if (pos <= earlier_lim) {
+                                if (self.runRangeAllowed(haystack, pos, earlier_lim, earlier_lim, .earliest, AllowAny{}, steps, scratch)) |m2| {
+                                    if (m2.end < m.end or (m2.end == m.end and m2.start < m.start)) {
+                                        return m2;
+                                    }
+                                }
+                            }
+                        }
+                        return m;
+                    }
+                }
+                search_floor = pos;
+                active_since = pos;
+                s = start_id;
+            }
+        }
+
+        if (watch_nul) {
+            if (nul_found) |z| {
+                nul.* = z;
+            }
+        }
+        return null;
     }
 
     fn runWithDfaGeneric(
@@ -933,6 +1280,7 @@ pub const Regex = struct {
                         pos += 1;
                         active_since = pos;
                         curr_state = dfa_mod.start_state;
+                        restarts = 0;
                     } else {
                         pos = active_since + 1;
                         active_since = pos;
@@ -1033,15 +1381,62 @@ pub const Regex = struct {
             if (self.req_is_prefix) {
                 if (self.prefilter) |*pf| {
                     var pos = start;
-                    var cached_win_end: usize = std.math.maxInt(usize);
                     const exact_for_mode = self.dfa_is_exact and !self.has_alt;
-                    while (pos <= haystack.len) {
-                        const hit = pf.findWatched(haystack, pos, nul) orelse return null;
-                        if (self.precomputed_dfa) |dfa| {
-                            const can_skip_prefix = (hit.end - hit.start == self.dfa_prefix_len);
-                            const s0: u16 = if (can_skip_prefix) self.dfa_prefix_state else dfa_mod.start_state;
-                            const p0: usize = if (can_skip_prefix) self.dfa_prefix_len else 0;
-                            if (exact_for_mode and dfa.stops_on_crlf) {
+                    if (self.precomputed_dfa) |dfa| {
+                        if (exact_for_mode and dfa.stops_on_crlf) {
+                            const fixed_prefix = self.dfa_prefix_len > 0 and self.dfa_prefix_len == self.req_literal_bytes.len and (!self.ignore_case or !self.unicode_case);
+                            if (fixed_prefix) {
+                                const s0 = self.dfa_prefix_state;
+                                const p0 = self.dfa_prefix_len;
+                                const shift = self.req_prefix_shift;
+                                const clen: usize = dfa.chain_len[s0];
+                                if (clen >= 2 and dfa.chain_uniform_span[s0] != 0xFF and dfa.is_terminal[s0 + clen]) {
+                                    const u_lo = dfa.chain_uniform_lo[s0];
+                                    const u_sp = dfa.chain_uniform_span[s0];
+                                    while (pos <= haystack.len) {
+                                        const hit = pf.findWatched(haystack, pos, nul) orelse return null;
+                                        const rem_start = hit.start + p0;
+                                        if (rem_start + clen <= haystack.len) {
+                                            const p = haystack[rem_start..][0..clen];
+                                            if ((p[clen - 1] -% u_lo) <= u_sp) {
+                                                var ok = true;
+                                                for (p[0 .. clen - 1]) |ch| {
+                                                    if ((ch -% u_lo) > u_sp) {
+                                                        ok = false;
+                                                        break;
+                                                    }
+                                                }
+                                                if (ok) {
+                                                    return checkWatchedMatch(haystack, hit.end, Match{
+                                                        .start = hit.start,
+                                                        .end = rem_start + clen,
+                                                        .pattern_id = null,
+                                                    }, nul);
+                                                }
+                                            }
+                                        }
+                                        pos = hit.start + shift;
+                                    }
+                                    return null;
+                                }
+                                while (pos <= haystack.len) {
+                                    const hit = pf.findWatched(haystack, pos, nul) orelse return null;
+                                    if (dfa.matchPrefixDeterminized(haystack[hit.start..], s0, p0, false)) |match_len| {
+                                        return checkWatchedMatch(haystack, hit.end, Match{
+                                            .start = hit.start,
+                                            .end = hit.start + match_len,
+                                            .pattern_id = null,
+                                        }, nul);
+                                    }
+                                    pos = hit.start + shift;
+                                }
+                                return null;
+                            }
+                            while (pos <= haystack.len) {
+                                const hit = pf.findWatched(haystack, pos, nul) orelse return null;
+                                const can_skip_prefix = (hit.end - hit.start == self.dfa_prefix_len);
+                                const s0: u16 = if (can_skip_prefix) self.dfa_prefix_state else dfa_mod.start_state;
+                                const p0: usize = if (can_skip_prefix) self.dfa_prefix_len else 0;
                                 if (dfa.matchPrefixDeterminized(haystack[hit.start..], s0, p0, false)) |match_len| {
                                     return checkWatchedMatch(haystack, hit.end, Match{
                                         .start = hit.start,
@@ -1058,8 +1453,15 @@ pub const Regex = struct {
                                     }
                                 }
                                 pos = next_pos;
-                                continue;
                             }
+                            return null;
+                        }
+                        var cached_win_end: usize = std.math.maxInt(usize);
+                        while (pos <= haystack.len) {
+                            const hit = pf.findWatched(haystack, pos, nul) orelse return null;
+                            const can_skip_prefix = (hit.end - hit.start == self.dfa_prefix_len);
+                            const s0: u16 = if (can_skip_prefix) self.dfa_prefix_state else dfa_mod.start_state;
+                            const p0: usize = if (can_skip_prefix) self.dfa_prefix_len else 0;
                             const win_end = if (!self.multiline and cached_win_end != std.math.maxInt(usize) and hit.start <= cached_win_end)
                                 cached_win_end
                             else blk: {
@@ -1088,8 +1490,12 @@ pub const Regex = struct {
                                 }
                             }
                             pos = next_pos;
-                            continue;
                         }
+                        return null;
+                    }
+                    var cached_win_end: usize = std.math.maxInt(usize);
+                    while (pos <= haystack.len) {
+                        const hit = pf.findWatched(haystack, pos, nul) orelse return null;
                         const win_end = if (!self.multiline and cached_win_end != std.math.maxInt(usize) and hit.start <= cached_win_end)
                             cached_win_end
                         else blk: {
@@ -1309,6 +1715,58 @@ pub const Regex = struct {
                 var pos = start;
                 var min_start = start;
                 var cached_win_end: usize = std.math.maxInt(usize);
+                if (self.alt_is_prefix) {
+                    if (self.precomputed_dfa) |dfa| {
+                        if (dfa.stops_on_crlf) {
+                            while (pos <= haystack.len) {
+                                const raw_hit = ap.findWatched(haystack, pos, nul) orelse return null;
+                                const lo = @max(pos, raw_hit.end -| max_ap_len);
+                                const hi_slice = @min(haystack.len, raw_hit.start +| max_ap_len);
+                                const hit = if (lo < raw_hit.start)
+                                    (ap.find(haystack[0..hi_slice], lo, .leftmost_first) orelse raw_hit)
+                                else
+                                    raw_hit;
+                                if (dfa.matchPrefixDeterminized(haystack[hit.start..], dfa_mod.start_state, 0, true)) |_| {
+                                    const win_end = if (!self.multiline and cached_win_end != std.math.maxInt(usize) and hit.start <= cached_win_end)
+                                        cached_win_end
+                                    else blk: {
+                                        const w = self.windowLimit(haystack, hit.start);
+                                        cached_win_end = w;
+                                        break :blk w;
+                                    };
+                                    if (self.runRangeAllowed(haystack, hit.start, hit.start, win_end, .earliest, AllowAny{}, null, null)) |m| {
+                                        return checkWatchedMatch(haystack, raw_hit.end, m, nul);
+                                    }
+                                }
+                                pos = hit.start + 1;
+                            }
+                            return null;
+                        }
+                        while (pos <= haystack.len) {
+                            const raw_hit = ap.findWatched(haystack, pos, nul) orelse return null;
+                            const lo = @max(pos, raw_hit.end -| max_ap_len);
+                            const hi_slice = @min(haystack.len, raw_hit.start +| max_ap_len);
+                            const hit = if (lo < raw_hit.start)
+                                (ap.find(haystack[0..hi_slice], lo, .leftmost_first) orelse raw_hit)
+                            else
+                                raw_hit;
+                            const win_end = if (!self.multiline and cached_win_end != std.math.maxInt(usize) and hit.start <= cached_win_end)
+                                cached_win_end
+                            else blk: {
+                                const w = self.windowLimit(haystack, hit.start);
+                                cached_win_end = w;
+                                break :blk w;
+                            };
+                            if (dfa.matchPrefixDeterminized(haystack[hit.start..win_end], dfa_mod.start_state, 0, true)) |_| {
+                                if (self.runRangeAllowed(haystack, hit.start, hit.start, win_end, .earliest, AllowAny{}, null, null)) |m| {
+                                    return checkWatchedMatch(haystack, raw_hit.end, m, nul);
+                                }
+                            }
+                            pos = hit.start + 1;
+                        }
+                        return null;
+                    }
+                }
                 while (pos <= haystack.len) {
                     const raw_hit = ap.findWatched(haystack, pos, nul) orelse return null;
                     const lo = @max(pos, raw_hit.end -| max_ap_len);
@@ -1346,6 +1804,9 @@ pub const Regex = struct {
                     min_start = pos;
                 }
                 return null;
+            }
+            if (self.unanchored_dfa) |udfa| {
+                return self.runUnanchoredDfa(udfa, haystack, start, haystack.len, .earliest, null, null, true, nul);
             }
         }
         const hit = self.find(haystack, start, .earliest);

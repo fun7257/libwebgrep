@@ -381,6 +381,10 @@ pub fn extractLiterals(self: anytype, pattern: []const u8, options: inst_mod.Reg
             self.tail_finder = Finder.init(self.tail_literal_bytes, find_opts) catch null;
         }
     } else if (best_lit.items.len >= 1) {
+        if (best_lit.items.len <= 2) {
+            try tryExtractLeadingAltPrefixes(self, pattern, find_opts);
+            if (self.alt_prefilter != null) return;
+        }
         self.req_literal_bytes = try self.allocator.dupe(u8, best_lit.items);
         self.req_literal_offset = best_offset;
         self.req_is_prefix = false;
@@ -393,6 +397,9 @@ pub fn extractLiterals(self: anytype, pattern: []const u8, options: inst_mod.Reg
         }
     } else {
         try tryExtractAltLiterals(self, pattern, find_opts);
+        if (self.alt_prefilter == null) {
+            try tryExtractLeadingAltPrefixes(self, pattern, find_opts);
+        }
     }
 }
 
@@ -669,6 +676,7 @@ pub fn tryExtractAltLiterals(self: anytype, pattern: []const u8, find_opts: matc
     if (Multi.init(self.allocator, owned_slices, find_opts)) |m| {
         self.alt_literal_slices = owned_slices;
         self.alt_prefilter = m;
+        self.alt_is_prefix = true;
         var max_br_len: usize = 0;
         for (owned_slices) |s| {
             if (s.len > max_br_len) max_br_len = s.len;
@@ -705,6 +713,324 @@ pub fn tryExtractAltLiterals(self: anytype, pattern: []const u8, find_opts: matc
                 } else |_| {}
             }
         }
+    } else |_| {
+        for (owned_slices) |s| self.allocator.free(s);
+        self.allocator.free(owned_slices);
+    }
+}
+
+/// Extracts branch prefix literals from a leading alternation group `(?:b1|b2|...|bk)...`
+/// (up to 32 branches, non-empty required literal prefix per branch, no top-level `|` outside the group,
+/// and optional fixed literal suffix immediately after `)` appended to exact branches).
+/// Populates `alt_prefilter` (`Multi` -> AVX2 Teddy) with `alt_is_exact = false` and `alt_is_prefix = true`.
+pub fn tryExtractLeadingAltPrefixes(self: anytype, pattern: []const u8, find_opts: matcher.FindOptions) !void {
+    if (self.saw_extended) return;
+    if (inst_mod.hasTopLevelAlt(pattern)) return;
+
+    var start_idx: usize = 0;
+    // Allow optional leading standalone inline flags `(?i)` / `(?m)` / `(?s)` / `(?U)` / `(?u)` (without `-` or `x`)
+    if (pattern.len >= 4 and pattern[0] == '(' and pattern[1] == '?') {
+        var j: usize = 2;
+        var only_flags = false;
+        var has_neg = false;
+        while (j < pattern.len and (pattern[j] == 'i' or pattern[j] == 'm' or pattern[j] == 's' or pattern[j] == 'U' or pattern[j] == 'u' or pattern[j] == 'x' or pattern[j] == '-')) : (j += 1) {
+            only_flags = true;
+            if (pattern[j] == 'x') return;
+            if (pattern[j] == '-') has_neg = true;
+        }
+        if (j < pattern.len and pattern[j] == ')' and only_flags and !has_neg) {
+            start_idx = j + 1;
+        }
+    }
+
+    if (start_idx + 3 >= pattern.len or pattern[start_idx] != '(') return;
+
+    // Locate the matching ')' for the opening '(' at `start_idx`
+    var close_idx: ?usize = null;
+    {
+        var depth: usize = 0;
+        var in_class = false;
+        var j: usize = start_idx;
+        while (j < pattern.len) : (j += 1) {
+            const ch = pattern[j];
+            if (ch == '\\' and j + 1 < pattern.len) {
+                if (pattern[j + 1] == 'Q') {
+                    j += 2;
+                    while (j + 1 < pattern.len and !(pattern[j] == '\\' and pattern[j + 1] == 'E')) : (j += 1) {}
+                    if (j + 1 < pattern.len) j += 1;
+                    continue;
+                }
+                j += 1;
+                continue;
+            }
+            if (in_class) {
+                if (ch == '[' and j + 1 < pattern.len and pattern[j + 1] == ':') {
+                    if (std.mem.findPos(u8, pattern, j + 2, ":]")) |end_posix| {
+                        j = end_posix + 1;
+                        continue;
+                    }
+                }
+                if (ch == ']') in_class = false;
+                continue;
+            }
+            if (ch == '[') {
+                in_class = true;
+                if (j + 1 < pattern.len and (pattern[j + 1] == '^' or pattern[j + 1] == '!')) j += 1;
+                if (j + 1 < pattern.len and pattern[j + 1] == ']') j += 1;
+            } else if (ch == '(') {
+                depth += 1;
+            } else if (ch == ')') {
+                depth -= 1;
+                if (depth == 0) {
+                    close_idx = j;
+                    break;
+                }
+            }
+        }
+    }
+    const c_idx = close_idx orelse return;
+    if (c_idx <= start_idx + 1) return;
+
+    const group_slice = pattern[start_idx .. c_idx + 1];
+    const inner: []const u8 = if (std.mem.startsWith(u8, group_slice, "(?:"))
+        group_slice[3 .. group_slice.len - 1]
+    else if (std.mem.startsWith(u8, group_slice, "(?P<")) blk: {
+        const gt = std.mem.findScalarPos(u8, group_slice, 4, '>') orelse return;
+        break :blk group_slice[gt + 1 .. group_slice.len - 1];
+    } else if (std.mem.startsWith(u8, group_slice, "(?<")) blk: {
+        const gt = std.mem.findScalarPos(u8, group_slice, 3, '>') orelse return;
+        break :blk group_slice[gt + 1 .. group_slice.len - 1];
+    } else if (group_slice[1] != '?')
+        group_slice[1 .. group_slice.len - 1]
+    else
+        return;
+
+    // Check quantifier immediately after closing ')'
+    const after = c_idx + 1;
+    var allow_suffix = true;
+    if (after < pattern.len) {
+        switch (pattern[after]) {
+            '*', '?' => return, // Leading group is optional
+            '+' => allow_suffix = false,
+            '{' => {
+                var j = after + 1;
+                var min_val: usize = 0;
+                var has_digit = false;
+                while (j < pattern.len and std.ascii.isDigit(pattern[j])) : (j += 1) {
+                    has_digit = true;
+                    min_val = min_val *| 10 +| (pattern[j] - '0');
+                }
+                if (!has_digit or min_val == 0) return; // Leading group is optional
+                allow_suffix = false;
+            },
+            else => {},
+        }
+    } else {
+        allow_suffix = false;
+    }
+
+    // Split `inner` on top-level `|` (up to 32 branches)
+    const max_leading_branches: usize = 32;
+    var branches = std.ArrayList([]const u8).empty;
+    defer branches.deinit(self.allocator);
+    {
+        var branch_start: usize = 0;
+        var depth: usize = 0;
+        var in_class = false;
+        var i: usize = 0;
+        while (i < inner.len) : (i += 1) {
+            const ch = inner[i];
+            if (ch == '\\' and i + 1 < inner.len) {
+                if (inner[i + 1] == 'Q') {
+                    i += 2;
+                    while (i + 1 < inner.len and !(inner[i] == '\\' and inner[i + 1] == 'E')) : (i += 1) {}
+                    if (i + 1 < inner.len) i += 1;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            if (in_class) {
+                if (ch == '[' and i + 1 < inner.len and inner[i + 1] == ':') {
+                    if (std.mem.findPos(u8, inner, i + 2, ":]")) |end_posix| {
+                        i = end_posix + 1;
+                        continue;
+                    }
+                }
+                if (ch == ']') in_class = false;
+                continue;
+            }
+            if (ch == '[') {
+                in_class = true;
+                if (i + 1 < inner.len and (inner[i + 1] == '^' or inner[i + 1] == '!')) i += 1;
+                if (i + 1 < inner.len and inner[i + 1] == ']') i += 1;
+            } else if (ch == '(') {
+                depth += 1;
+            } else if (ch == ')') {
+                if (depth > 0) depth -= 1;
+            } else if (ch == '|' and depth == 0) {
+                if (branches.items.len + 1 >= max_leading_branches) return;
+                try branches.append(self.allocator, inner[branch_start..i]);
+                branch_start = i + 1;
+            }
+        }
+        try branches.append(self.allocator, inner[branch_start..]);
+    }
+    if (branches.items.len < 2 or branches.items.len > max_leading_branches) return;
+
+    // Extract optional fixed literal suffix immediately after ')' (e.g. `_` in `(?:err|warn)_[a-z]+`)
+    var suffix_buf = std.ArrayList(u8).empty;
+    defer suffix_buf.deinit(self.allocator);
+    if (allow_suffix and after < pattern.len) {
+        const tail = pattern[after..];
+        var t: usize = 0;
+        while (t < tail.len) {
+            const c = tail[t];
+            switch (c) {
+                '.', '^', '$', '[', '(', ')', '|' => break,
+                '*', '?' => {
+                    popLastUtf8Codepoint(&suffix_buf);
+                    break;
+                },
+                '{' => {
+                    var j = t + 1;
+                    var min_val: usize = 0;
+                    var has_digit = false;
+                    while (j < tail.len and std.ascii.isDigit(tail[j])) : (j += 1) {
+                        has_digit = true;
+                        min_val = min_val *| 10 +| (tail[j] - '0');
+                    }
+                    if (!has_digit or min_val == 0) {
+                        popLastUtf8Codepoint(&suffix_buf);
+                    }
+                    break;
+                },
+                '+' => break,
+                '\\' => {
+                    if (t + 1 >= tail.len) break;
+                    const next_c = tail[t + 1];
+                    if (next_c == 'p' or next_c == 'P' or next_c == 'A' or next_c == 'z' or next_c == 'Z' or
+                        next_c == 'x' or next_c == 'u' or next_c == 'Q' or
+                        next_c == 'd' or next_c == 'D' or next_c == 'w' or next_c == 'W' or
+                        next_c == 's' or next_c == 'S' or next_c == 'b' or next_c == 'B' or next_c == '0')
+                    {
+                        break;
+                    }
+                    const lit_b: u8 = switch (next_c) {
+                        'a' => 0x07,
+                        'f' => 0x0C,
+                        'v' => 0x0B,
+                        'n' => if (!self.multiline) break else '\n',
+                        'r' => '\r',
+                        't' => '\t',
+                        else => next_c,
+                    };
+                    try suffix_buf.append(self.allocator, lit_b);
+                    t += 2;
+                },
+                else => {
+                    if (c == '\n' and !self.multiline) break;
+                    const seq_len = utf8SeqLenAt(tail, t, tail.len);
+                    try suffix_buf.appendSlice(self.allocator, tail[t .. t + seq_len]);
+                    t += seq_len;
+                },
+            }
+        }
+    }
+
+    var prefixes = std.ArrayList([]const u8).empty;
+    errdefer {
+        for (prefixes.items) |s| self.allocator.free(s);
+        prefixes.deinit(self.allocator);
+    }
+
+    var prefix_buf = std.ArrayList(u8).empty;
+    defer prefix_buf.deinit(self.allocator);
+
+    for (branches.items) |br| {
+        prefix_buf.clearRetainingCapacity();
+        var k: usize = 0;
+        var br_exact = true;
+        while (k < br.len) {
+            const c = br[k];
+            switch (c) {
+                '.', '^', '$', '[', '(', ')' => {
+                    br_exact = false;
+                    break;
+                },
+                '*', '?', '{' => {
+                    popLastUtf8Codepoint(&prefix_buf);
+                    br_exact = false;
+                    break;
+                },
+                '+' => {
+                    br_exact = false;
+                    break;
+                },
+                '\\' => {
+                    if (k + 1 >= br.len) {
+                        br_exact = false;
+                        break;
+                    }
+                    const next_c = br[k + 1];
+                    if (next_c == 'p' or next_c == 'P' or next_c == 'A' or next_c == 'z' or next_c == 'Z' or
+                        next_c == 'x' or next_c == 'u' or next_c == 'Q' or
+                        next_c == 'd' or next_c == 'D' or next_c == 'w' or next_c == 'W' or
+                        next_c == 's' or next_c == 'S' or next_c == 'b' or next_c == 'B' or next_c == '0')
+                    {
+                        br_exact = false;
+                        break;
+                    }
+                    const lit_b: u8 = switch (next_c) {
+                        'a' => 0x07,
+                        'f' => 0x0C,
+                        'v' => 0x0B,
+                        'n' => if (!self.multiline) {
+                            br_exact = false;
+                            break;
+                        } else '\n',
+                        'r' => '\r',
+                        't' => '\t',
+                        else => next_c,
+                    };
+                    try prefix_buf.append(self.allocator, lit_b);
+                    k += 2;
+                },
+                else => {
+                    if (c == '\n' and !self.multiline) {
+                        br_exact = false;
+                        break;
+                    }
+                    const seq_len = utf8SeqLenAt(br, k, br.len);
+                    try prefix_buf.appendSlice(self.allocator, br[k .. k + seq_len]);
+                    k += seq_len;
+                },
+            }
+        }
+        if (prefix_buf.items.len == 0) {
+            for (prefixes.items) |s| self.allocator.free(s);
+            prefixes.deinit(self.allocator);
+            return;
+        }
+        if (br_exact and k == br.len and suffix_buf.items.len > 0) {
+            try prefix_buf.appendSlice(self.allocator, suffix_buf.items);
+        }
+        if (prefix_buf.items.len < 2) {
+            for (prefixes.items) |s| self.allocator.free(s);
+            prefixes.deinit(self.allocator);
+            return;
+        }
+        const duped = try self.allocator.dupe(u8, prefix_buf.items);
+        errdefer self.allocator.free(duped);
+        try prefixes.append(self.allocator, duped);
+    }
+
+    const owned_slices = try prefixes.toOwnedSlice(self.allocator);
+    if (Multi.init(self.allocator, owned_slices, find_opts)) |m| {
+        self.alt_literal_slices = owned_slices;
+        self.alt_prefilter = m;
+        self.alt_is_exact = false;
+        self.alt_is_prefix = true;
     } else |_| {
         for (owned_slices) |s| self.allocator.free(s);
         self.allocator.free(owned_slices);

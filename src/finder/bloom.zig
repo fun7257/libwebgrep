@@ -775,7 +775,14 @@ test "NgramBloom: zero false negatives across sensitive, insensitive, smart, Uni
         try std.testing.expect(!re_alt_miss.isMatch(corpus));
         try std.testing.expect(!bloom.mayContainRegex(&re_alt_miss));
 
-        var re_alt_fallback = try Regex.init(alloc, "(?:kerberos_err|ldap_failure|tls_alert)_[0-9]+", .{});
+        // Leading non-optional alternation extracts {kerberos_err_, ldap_failure_, tls_alert_}, all absent -> true negative.
+        var re_alt_leading_miss = try Regex.init(alloc, "(?:kerberos_err|ldap_failure|tls_alert)_[0-9]+", .{});
+        defer re_alt_leading_miss.deinit();
+        try std.testing.expect(!re_alt_leading_miss.isMatch(corpus));
+        try std.testing.expect(!bloom.mayContainRegex(&re_alt_leading_miss));
+
+        // Optional leading alternation cannot require any branch -> falls back conservatively to true.
+        var re_alt_fallback = try Regex.init(alloc, "(?:kerberos_err|ldap_failure|tls_alert)?_[0-9]+", .{});
         defer re_alt_fallback.deinit();
         try std.testing.expect(bloom.mayContainRegex(&re_alt_fallback));
 

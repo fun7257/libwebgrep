@@ -192,9 +192,9 @@ pub fn EngineFor(comptime kind: IsaKind) type {
             var best: ?Cand = null;
             var pos = start;
             var nul_checked = start;
-            const fast_extra: usize = fp - 1;
 
             if (comptime is_avx2_rt) {
+                const fast_extra: usize = fp - 1;
                 const rt_stride: usize = 32;
                 if (haystack.len >= rt_stride + fast_extra) {
                     const limit = haystack.len - (rt_stride + fast_extra);
@@ -256,49 +256,16 @@ pub fn EngineFor(comptime kind: IsaKind) type {
                     }
                 }
             } else {
-                const stride = lanes * 4;
-                const zero: Vec = @splat(0);
-
-                outer: while (pos + stride + fast_extra <= haystack.len) {
-                    if (best != null and self.done(best, pos, mode)) break;
-                    var accs: [4]Vec = undefined;
-                    var nul_hit: @Vector(lanes, bool) = @splat(false);
-                    inline for (0..4) |w| {
-                        const at = pos + w * lanes;
-                        const b0: Vec = haystack[at..][0..lanes].*;
-                        var acc = nibbleVec(isa, Vec, lo_tab[0], hi_tab[0], b0);
-                        if (comptime fp > 1) {
-                            const b1: Vec = haystack[at + 1 ..][0..lanes].*;
-                            acc &= nibbleVec(isa, Vec, lo_tab[1], hi_tab[1], b1);
-                        }
-                        accs[w] = acc;
-                        if (watch_nul) nul_hit = nul_hit | (b0 == zero);
+                // When >8 patterns share 8 buckets and fp == 3, evaluating the 3rd fingerprint byte
+                // inline avoids frequent false-positive exits from the 4-vector fast loop.
+                if (comptime fp == 3) {
+                    if (self.patterns.len > num_buckets) {
+                        if (self.scanStaticSimd(fp, true, watch_nul, haystack, start, mode, &pos, &nul_checked, &best, &lo_tab, &hi_tab, nul_out)) return null;
+                    } else {
+                        if (self.scanStaticSimd(fp, false, watch_nul, haystack, start, mode, &pos, &nul_checked, &best, &lo_tab, &hi_tab, nul_out)) return null;
                     }
-                    const combined = (accs[0] | accs[1]) | (accs[2] | accs[3]);
-                    const check_v = if (watch_nul) combined | @as(Vec, @intFromBool(nul_hit)) else combined;
-                    if (@reduce(.Or, check_v) == 0) {
-                        pos += stride;
-                        if (watch_nul and best == null) nul_checked = pos;
-                        continue;
-                    }
-                    inline for (0..4) |w| {
-                        const at = pos + w * lanes;
-                        if (best != null and self.done(best, at, mode)) break :outer;
-                        if (@reduce(.Or, accs[w]) != 0) {
-                            const acc = evalRefine(fp, accs[w], haystack, at, &lo_tab, &hi_tab);
-                            if (@reduce(.Or, acc) != 0) {
-                                if (self.scanVec(haystack, at, start, mode, &best, acc)) break :outer;
-                            }
-                        }
-                    }
-                    if (watch_nul and best == null and @reduce(.Or, nul_hit)) {
-                        if (memchr.find(lanes, haystack[0 .. pos + stride], nul_checked, 0)) |nul_at| {
-                            nul_out.* = nul_at;
-                            return null;
-                        }
-                        nul_checked = pos + stride;
-                    }
-                    pos += stride;
+                } else {
+                    if (self.scanStaticSimd(fp, false, watch_nul, haystack, start, mode, &pos, &nul_checked, &best, &lo_tab, &hi_tab, nul_out)) return null;
                 }
             }
 
@@ -328,6 +295,84 @@ pub fn EngineFor(comptime kind: IsaKind) type {
                 }
             }
             return .{ .start = chosen.start, .end = chosen.end, .pattern_id = chosen.id };
+        }
+
+        inline fn scanStaticSimd(
+            self: *const Self,
+            comptime fp: u8,
+            comptime inline_fp3: bool,
+            comptime watch_nul: bool,
+            haystack: []const u8,
+            start: usize,
+            mode: matcher.MatchMode,
+            pos_ref: *usize,
+            nul_checked_ref: *usize,
+            best: *?Cand,
+            lo_tab: *const [fp]Vec,
+            hi_tab: *const [fp]Vec,
+            nul_out: *?usize,
+        ) bool {
+            const stride = lanes * 4;
+            const fast_extra: usize = fp - 1;
+            const zero: Vec = @splat(0);
+            var pos = pos_ref.*;
+            defer pos_ref.* = pos;
+
+            outer: while (pos + stride + fast_extra <= haystack.len) {
+                if (best.* != null and self.done(best.*, pos, mode)) break;
+                var accs: [4]Vec = undefined;
+                var min_b: Vec = @splat(1);
+                inline for (0..4) |w| {
+                    const at = pos + w * lanes;
+                    const b0: Vec = haystack[at..][0..lanes].*;
+                    var acc = nibbleVec(isa, Vec, lo_tab[0], hi_tab[0], b0);
+                    if (comptime fp > 1) {
+                        const b1: Vec = haystack[at + 1 ..][0..lanes].*;
+                        acc &= nibbleVec(isa, Vec, lo_tab[1], hi_tab[1], b1);
+                    }
+                    if (comptime inline_fp3) {
+                        const b2: Vec = haystack[at + 2 ..][0..lanes].*;
+                        acc &= nibbleVec(isa, Vec, lo_tab[2], hi_tab[2], b2);
+                    }
+                    accs[w] = acc;
+                    if (watch_nul) {
+                        min_b = if (w == 0) b0 else @min(min_b, b0);
+                    }
+                }
+                const combined = (accs[0] | accs[1]) | (accs[2] | accs[3]);
+                const nul_mask: Vec = if (watch_nul)
+                    @select(u8, min_b == zero, @as(Vec, @splat(0xFF)), zero)
+                else
+                    zero;
+                const check_v = if (watch_nul) combined | nul_mask else combined;
+                if (@reduce(.Or, check_v) == 0) {
+                    pos += stride;
+                    if (watch_nul and best.* == null) nul_checked_ref.* = pos;
+                    continue;
+                }
+                inline for (0..4) |w| {
+                    const at = pos + w * lanes;
+                    if (best.* != null and self.done(best.*, at, mode)) break :outer;
+                    if (@reduce(.Or, accs[w]) != 0) {
+                        const acc = if (comptime inline_fp3)
+                            accs[w]
+                        else
+                            evalRefine(fp, accs[w], haystack, at, lo_tab, hi_tab);
+                        if (@reduce(.Or, acc) != 0) {
+                            if (self.scanVec(haystack, at, start, mode, best, acc)) break :outer;
+                        }
+                    }
+                }
+                if (watch_nul and best.* == null and @reduce(.Or, nul_mask) != 0) {
+                    if (memchr.find(lanes, haystack[0 .. pos + stride], nul_checked_ref.*, 0)) |nul_at| {
+                        nul_out.* = nul_at;
+                        return true;
+                    }
+                    nul_checked_ref.* = pos + stride;
+                }
+                pos += stride;
+            }
+            return false;
         }
 
         inline fn evalRefine(

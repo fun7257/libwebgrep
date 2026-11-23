@@ -1,10 +1,18 @@
-//! Dense Aho-Corasick DFA with byte equivalence classes.
+//! Hybrid Dense-Prefix + Compact Contiguous-NFA Aho-Corasick automaton with byte equivalence classes.
 //!
 //! Memory is allocated only during automaton construction; searches do not allocate.
-//! Equivalence classes group bytes that share identical transitions across all states,
-//! storing the transition table by class.
-//! When there are at most 16 distinct anchor bytes, search first scans for those bytes
-//! with SIMD vectors and then verifies only the patterns attached to them.
+//! Construction builds a compact linked-edge trie (20 bytes/node, zero per-node heap allocations),
+//! computes failure links in BFS order, derives exact O(256) byte equivalence classes (every byte
+//! appearing in a pattern gets a distinct class; all absent bytes share dead class 0), and shares
+//! output lists via suffix links in O(patterns) space.
+//!
+//! States are ordered by BFS depth so depth 0 (root), all depth-1 states, and hot depth-2 states
+//! form a cache-resident pre-multiplied dense DFA table (~16–256 KiB, with `MATCH_BIT` and
+//! `SPARSE_BIT` packed into each `u32` transition to eliminate multiplies and per-byte `out_head`
+//! loads). Deeper states (for 500–2,000+ pattern sets) use a compact contiguous sorted-edge NFA
+//! whose failure links drop back into the dense prefix in O(1).
+//! When there are at most 16 distinct anchor bytes, search first scans for those bytes with SIMD
+//! vectors and verifies only the patterns attached to them.
 //! Implemented directly from the Aho and Corasick failure function without copying third-party source.
 
 const std = @import("std");
@@ -17,25 +25,54 @@ const frequency = @import("frequency.zig");
 const matcher = @import("../matcher.zig");
 const memchr = @import("memchr.zig");
 
-const static_nibble_isa = switch (builtin.cpu.arch) {
+const static_avx2_nibble = builtin.cpu.arch == .x86_64 and build_options.teddy == .avx2 and
+    std.Target.x86.featureSetHas(builtin.cpu.features, .avx2);
+const static_nibble_isa = static_avx2_nibble or switch (builtin.cpu.arch) {
     .aarch64 => std.Target.aarch64.featureSetHas(builtin.cpu.features, .neon),
     .x86_64 => std.Target.x86.featureSetHas(builtin.cpu.features, .ssse3),
     else => false,
 };
 const runtime_nibble_isa = !static_nibble_isa and builtin.cpu.arch == .x86_64 and build_options.teddy == .runtime;
 const has_nibble_isa = static_nibble_isa or runtime_nibble_isa;
-const nibble_isa = if (has_nibble_isa) switch (builtin.cpu.arch) {
+const nibble_isa = if (static_avx2_nibble)
+    @import("teddy_avx2.zig")
+else if (has_nibble_isa) switch (builtin.cpu.arch) {
     .aarch64 => @import("teddy_neon.zig"),
     .x86_64 => @import("teddy_ssse3.zig"),
     else => struct {},
 } else struct {};
+const nibble_lanes: usize = if (has_nibble_isa) nibble_isa.lanes else 16;
+const NibbleVec = @Vector(nibble_lanes, u8);
 
 const sentinel: u32 = 0;
+
+/// Bit 31 marks a state with at least one matching pattern output.
+const match_bit: u32 = 0x8000_0000;
+/// Bit 30 marks a sparse (contiguous NFA) state; clear means pre-multiplied dense row offset.
+const sparse_bit: u32 = 0x4000_0000;
+/// Lower 30 bits hold either `dense_state_idx * nclasses` (dense) or `state_idx - dense_count` (sparse).
+const payload_mask: u32 = 0x3FFF_FFFF;
+
+/// Dense table cell budget (~263 KiB max): fits cleanly in L2 cache while guaranteeing depth 0 and
+/// all depth-1 states remain 100% dense even for a full 256-byte alphabet.
+const dense_budget_cells: usize = 65_792;
+
+/// Chunk size for cache-hot periodic NUL detection in `findWatchingNul` when not using SIMD skip.
+const nul_chunk_bytes: usize = 32 * 1024;
 
 const Out = struct {
     len: u32,
     id: u32,
     next: u32,
+};
+
+const SparseState = struct {
+    /// Pre-encoded failure state (`dense_row_off` if `< sparse_bit`, else `sparse_bit | sparse_idx`).
+    /// `match_bit` is never set here.
+    fail: u32,
+    edge_off: u32,
+    edge_len: u16,
+    _pad: u16 = 0,
 };
 
 const Cand = struct {
@@ -65,8 +102,13 @@ const AnchorSet = struct {
 
 pub const Ac = struct {
     dense: []u32,
-    class_of: [256]u16,
+    dense_count: u32,
+    class_of: [256]u8,
     nclasses: u16,
+    inv_nclasses: u64,
+    sparse_states: []SparseState,
+    sparse_edge_bytes: []u8,
+    sparse_edge_next: []u32,
     out_head: []u32,
     outs: []Out,
     max_len: u32,
@@ -85,16 +127,22 @@ pub const Ac = struct {
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *Ac) void {
-        self.allocator.free(self.dense);
-        self.allocator.free(self.out_head);
-        self.allocator.free(self.outs);
+        if (self.dense.len != 0) self.allocator.free(self.dense);
+        if (self.sparse_states.len != 0) self.allocator.free(self.sparse_states);
+        if (self.sparse_edge_bytes.len != 0) self.allocator.free(self.sparse_edge_bytes);
+        if (self.sparse_edge_next.len != 0) self.allocator.free(self.sparse_edge_next);
+        if (self.out_head.len != 0) self.allocator.free(self.out_head);
+        if (self.outs.len != 0) self.allocator.free(self.outs);
         if (self.use_anchor) self.allocator.free(self.anchored);
         self.* = undefined;
     }
 
     pub fn find(self: *const Ac, haystack: []const u8, start: usize, mode: matcher.MatchMode) ?matcher.Match {
         var unused: ?usize = null;
-        return self.findImpl(haystack, start, mode, false, &unused);
+        return switch (mode) {
+            .earliest => self.findImpl(haystack, start, .earliest, false, &unused),
+            .leftmost_first => self.findImpl(haystack, start, .leftmost_first, false, &unused),
+        };
     }
 
     pub fn findWatchingNul(
@@ -104,14 +152,17 @@ pub const Ac = struct {
         mode: matcher.MatchMode,
         nul_out: *?usize,
     ) ?matcher.Match {
-        return self.findImpl(haystack, start, mode, true, nul_out);
+        return switch (mode) {
+            .earliest => self.findImpl(haystack, start, .earliest, true, nul_out),
+            .leftmost_first => self.findImpl(haystack, start, .leftmost_first, true, nul_out),
+        };
     }
 
     noinline fn findImpl(
         self: *const Ac,
         haystack: []const u8,
         start: usize,
-        mode: matcher.MatchMode,
+        comptime mode: matcher.MatchMode,
         comptime watch_nul: bool,
         nul_out: *?usize,
     ) ?matcher.Match {
@@ -120,7 +171,8 @@ pub const Ac = struct {
         var best: ?Cand = null;
         if (self.empty_id) |id| {
             consider(&best, start, start, id, mode);
-            if (mode == .earliest or id == 0) return toMatch(best);
+            if (comptime mode == .earliest) return toMatch(best);
+            if (id == 0) return toMatch(best);
         }
         if (self.max_len == 0 or start == haystack.len) {
             if (watch_nul and best == null and start < haystack.len) {
@@ -129,61 +181,182 @@ pub const Ac = struct {
             return toMatch(best);
         }
 
-        const lo_v: @Vector(16, u8) = self.start_lo;
-        const hi_v: @Vector(16, u8) = self.start_hi;
-        var state: u32 = 0;
-        var i = start;
-        var nul_checked = start;
+        const dense = self.dense.ptr;
+        const class_of = &self.class_of;
 
-        outer: while (i < haystack.len) {
+        const LoopState = struct {
+            state: u32 = 0, // Invariant: (state & match_bit) == 0 at outer/loop boundaries
+            i: usize,
+            scan_end: usize,
+            step_limit: usize = 0,
+            nul_checked: usize,
+            skip_cooldown: usize,
+            skip_backoff: usize = 64,
+        };
+        var ls = LoopState{
+            .i = start,
+            .scan_end = haystack.len,
+            .nul_checked = start,
+            .skip_cooldown = start,
+        };
+        if (comptime mode == .leftmost_first) {
+            if (best) |chosen| {
+                ls.scan_end = @min(haystack.len, chosen.start +| @as(usize, self.max_len));
+            }
+        }
+
+        outer: while (ls.i < ls.scan_end) {
             if (comptime has_nibble_isa) {
-                if (self.use_nibble_skip and state == 0 and best == null and i + 64 <= haystack.len) {
-                    const skip_res = nibbleSkip64(
+                const nibble_stride = nibble_lanes * 4;
+                if (self.use_nibble_skip and ls.state == 0 and best == null and
+                    ls.i >= ls.skip_cooldown and ls.i + nibble_stride <= ls.scan_end)
+                {
+                    // Flush any unchecked scalar gap [ls.nul_checked .. ls.i) before nibbleSkip
+                    // advances ls.nul_checked past ls.i. Safe because state == 0 and best == null
+                    // guarantees any future match starts >= ls.i.
+                    if (watch_nul and ls.nul_checked < ls.i) {
+                        if (memchr.find(memchr.native_width, haystack[0..ls.i], ls.nul_checked, 0)) |nul_at| {
+                            nul_out.* = nul_at;
+                            return null;
+                        }
+                        ls.nul_checked = ls.i;
+                    }
+                    const lo_v: NibbleVec = std.simd.repeat(nibble_lanes, @as(@Vector(16, u8), self.start_lo));
+                    const hi_v: NibbleVec = std.simd.repeat(nibble_lanes, @as(@Vector(16, u8), self.start_hi));
+                    const before = ls.i;
+                    const skip_res = nibbleSkip(
                         lo_v,
                         hi_v,
                         haystack,
-                        i,
+                        ls.i,
                         watch_nul,
-                        &nul_checked,
+                        &ls.nul_checked,
                         nul_out,
                     );
                     if (skip_res.nul_hit) return null;
-                    i = skip_res.pos;
+                    ls.i = skip_res.pos;
+                    if (ls.i >= ls.scan_end) break :outer;
+                    if (ls.i > before) {
+                        ls.skip_backoff = 64;
+                        ls.skip_cooldown = ls.i + 16;
+                    } else {
+                        ls.skip_cooldown = ls.i + ls.skip_backoff;
+                        if (ls.skip_backoff < 4096) ls.skip_backoff *= 2;
+                    }
                 }
             }
 
-            const step_limit = if (state == 0 and best == null) @min(haystack.len, i + 16) else haystack.len;
-            while (i < step_limit) : (i += 1) {
-                const raw = haystack[i];
-                const idx = @as(usize, state) * @as(usize, self.nclasses) + self.class_of[raw];
-                state = self.dense[idx];
-                const end = i + 1;
-                var link = self.out_head[state];
-                while (link != sentinel) {
-                    const item = self.outs[link - 1];
-                    if (item.len <= end) {
-                        consider(&best, end - item.len, end, item.id, mode);
-                    }
-                    link = item.next;
+            ls.step_limit = ls.scan_end;
+            if (comptime has_nibble_isa) {
+                if (self.use_nibble_skip and best == null and ls.skip_cooldown > ls.i and ls.skip_cooldown < ls.step_limit) {
+                    ls.step_limit = ls.skip_cooldown;
                 }
-                if (best) |chosen| {
-                    if (mode == .earliest and chosen.end == end) break :outer;
-                    if (mode == .leftmost_first) {
-                        const next_end = end + 1;
-                        const future = if (next_end > self.max_len) next_end - self.max_len else 0;
-                        if (future > chosen.start) break :outer;
+            }
+            if (watch_nul and best == null) {
+                const nul_limit = ls.i +| nul_chunk_bytes;
+                if (nul_limit < ls.step_limit) ls.step_limit = nul_limit;
+            }
+
+            var i = ls.i;
+            var state = ls.state;
+            while (i < ls.step_limit) {
+                if (state >= sparse_bit) {
+                    const next = self.stepSparse(state & payload_mask, haystack[i]);
+                    i += 1;
+                    if ((next & match_bit) != 0) {
+                        @branchHint(.unlikely);
+                        self.recordMatches(next, i, mode, &best, &ls.scan_end);
+                        if (comptime mode == .earliest) {
+                            ls.i = i;
+                            ls.state = next & ~match_bit;
+                            break :outer;
+                        }
+                        if (ls.scan_end < ls.step_limit) ls.step_limit = ls.scan_end;
                     }
+                    state = next & ~match_bit;
+                    continue;
+                }
+
+                // Hot 4x unrolled dense prefix loop: zero multiplies, zero out_head loads.
+                const step_limit = ls.step_limit;
+                while (i + 4 <= step_limit) {
+                    const s0 = dense[state + class_of[haystack[i]]];
+                    if (s0 >= sparse_bit) {
+                        state = s0;
+                        break;
+                    }
+                    const s1 = dense[s0 + class_of[haystack[i + 1]]];
+                    if (s1 >= sparse_bit) {
+                        state = s1;
+                        i += 1;
+                        break;
+                    }
+                    const s2 = dense[s1 + class_of[haystack[i + 2]]];
+                    if (s2 >= sparse_bit) {
+                        state = s2;
+                        i += 2;
+                        break;
+                    }
+                    const s3 = dense[s2 + class_of[haystack[i + 3]]];
+                    if (s3 >= sparse_bit) {
+                        state = s3;
+                        i += 3;
+                        break;
+                    }
+                    state = s3;
+                    i += 4;
+                }
+
+                if (state < sparse_bit) {
+                    while (i < step_limit) {
+                        const next = dense[state + class_of[haystack[i]]];
+                        if (next >= sparse_bit) {
+                            state = next;
+                            break;
+                        }
+                        state = next;
+                        i += 1;
+                    }
+                }
+
+                if (state >= sparse_bit) {
+                    i += 1;
+                    if ((state & match_bit) != 0) {
+                        @branchHint(.unlikely);
+                        self.recordMatches(state, i, mode, &best, &ls.scan_end);
+                        if (comptime mode == .earliest) {
+                            ls.i = i;
+                            ls.state = state & ~match_bit;
+                            break :outer;
+                        }
+                        if (ls.scan_end < ls.step_limit) ls.step_limit = ls.scan_end;
+                        state &= ~match_bit;
+                    }
+                }
+            }
+            ls.i = i;
+            ls.state = state;
+
+            if (watch_nul and best == null) {
+                const safe_end = if (ls.state == 0) ls.i else ls.i -| @as(usize, self.max_len);
+                if (safe_end > ls.nul_checked and (safe_end - ls.nul_checked >= nul_chunk_bytes or ls.i >= ls.scan_end)) {
+                    if (memchr.find(memchr.native_width, haystack[0..safe_end], ls.nul_checked, 0)) |nul_at| {
+                        nul_out.* = nul_at;
+                        return null;
+                    }
+                    ls.nul_checked = safe_end;
                 }
             }
         }
+
         const chosen = best orelse {
-            if (watch_nul and nul_checked < haystack.len) {
-                if (memchr.find(memchr.native_width, haystack, nul_checked, 0)) |nul_at| nul_out.* = nul_at;
+            if (watch_nul and ls.nul_checked < haystack.len) {
+                if (memchr.find(memchr.native_width, haystack, ls.nul_checked, 0)) |nul_at| nul_out.* = nul_at;
             }
             return null;
         };
-        if (watch_nul and nul_checked < chosen.start) {
-            if (memchr.find(memchr.native_width, haystack[0..chosen.start], nul_checked, 0)) |nul_at| {
+        if (watch_nul and ls.nul_checked < chosen.start) {
+            if (memchr.find(memchr.native_width, haystack[0..chosen.start], ls.nul_checked, 0)) |nul_at| {
                 nul_out.* = nul_at;
                 return null;
             }
@@ -191,55 +364,123 @@ pub const Ac = struct {
         return .{ .start = chosen.start, .end = chosen.end, .pattern_id = chosen.id };
     }
 
+    inline fn stepSparse(self: *const Ac, start_sparse_idx: u32, raw: u8) u32 {
+        const b = if (self.ignore_case) ascii.fold(raw) else raw;
+        var s_idx = start_sparse_idx;
+        while (true) {
+            const st = self.sparse_states[s_idx];
+            const len = st.edge_len;
+            if (len != 0) {
+                const off = st.edge_off;
+                if (len == 1) {
+                    if (self.sparse_edge_bytes[off] == b) return self.sparse_edge_next[off];
+                } else if (len <= 8) {
+                    const bytes = self.sparse_edge_bytes[off..][0..len];
+                    for (bytes, 0..) |eb, k| {
+                        if (eb == b) return self.sparse_edge_next[off + k];
+                    }
+                } else {
+                    const bytes = self.sparse_edge_bytes[off..][0..len];
+                    var lo: usize = 0;
+                    var hi: usize = len;
+                    while (lo < hi) {
+                        const mid = lo + (hi - lo) / 2;
+                        const eb = bytes[mid];
+                        if (eb == b) return self.sparse_edge_next[off + mid];
+                        if (eb < b) lo = mid + 1 else hi = mid;
+                    }
+                }
+            }
+            const fail = st.fail;
+            if (fail < sparse_bit) {
+                return self.dense[fail + self.class_of[raw]];
+            }
+            s_idx = fail & payload_mask;
+        }
+    }
+
+    inline fn recordMatches(
+        self: *const Ac,
+        encoded_state: u32,
+        end: usize,
+        comptime mode: matcher.MatchMode,
+        best: *?Cand,
+        scan_end: *usize,
+    ) void {
+        const payload = encoded_state & payload_mask;
+        const state_idx: usize = if ((encoded_state & sparse_bit) != 0)
+            @as(usize, self.dense_count) + payload
+        else
+            divNclasses(payload, self.inv_nclasses);
+        var link = self.out_head[state_idx];
+        while (link != sentinel) {
+            const item = self.outs[link - 1];
+            consider(best, end - item.len, end, item.id, mode);
+            link = item.next;
+        }
+        if (comptime mode == .leftmost_first) {
+            if (best.*) |chosen| {
+                const limit = chosen.start +| @as(usize, self.max_len);
+                if (limit < scan_end.*) scan_end.* = limit;
+            }
+        }
+    }
+
     const NibbleSkipResult = struct {
         pos: usize,
         nul_hit: bool = false,
     };
 
-    noinline fn nibbleSkip64(
-        lo_v: @Vector(16, u8),
-        hi_v: @Vector(16, u8),
+    noinline fn nibbleSkip(
+        lo_v: NibbleVec,
+        hi_v: NibbleVec,
         haystack: []const u8,
         start_i: usize,
         comptime watch_nul: bool,
         nul_checked: *usize,
         nul_out: *?usize,
     ) NibbleSkipResult {
-        const zero: @Vector(16, u8) = @splat(0);
-        const stride = 64;
+        const zero: NibbleVec = @splat(0);
+        const stride = nibble_lanes * 4;
         var i = start_i;
         while (i + stride <= haystack.len) {
-            var accs: [4]@Vector(16, u8) = undefined;
-            var nul_hit: @Vector(16, bool) = @splat(false);
+            var accs: [4]NibbleVec = undefined;
+            var min_b: NibbleVec = @splat(1);
             inline for (0..4) |w| {
-                const b: @Vector(16, u8) = haystack[i + w * 16 ..][0..16].*;
-                const lo_idx = b & @as(@Vector(16, u8), @splat(0x0f));
-                const hi_idx = b >> @as(@Vector(16, u8), @splat(@as(u8, 4)));
+                const b: NibbleVec = haystack[i + w * nibble_lanes ..][0..nibble_lanes].*;
+                const lo_idx = b & @as(NibbleVec, @splat(0x0f));
+                const hi_idx = b >> @as(NibbleVec, @splat(@as(u8, 4)));
                 accs[w] = nibble_isa.lookup(lo_v, lo_idx) & nibble_isa.lookup(hi_v, hi_idx);
-                if (watch_nul) nul_hit = nul_hit | (b == zero);
+                if (watch_nul) {
+                    min_b = if (w == 0) b else @min(min_b, b);
+                }
             }
             const combined = (accs[0] | accs[1]) | (accs[2] | accs[3]);
-            const check_v = if (watch_nul) combined | @as(@Vector(16, u8), @intFromBool(nul_hit)) else combined;
+            const nul_mask: NibbleVec = if (watch_nul)
+                @select(u8, min_b == zero, @as(NibbleVec, @splat(0xFF)), zero)
+            else
+                zero;
+            const check_v = if (watch_nul) combined | nul_mask else combined;
             if (@reduce(.Or, check_v) == 0) {
                 i += stride;
                 if (watch_nul) nul_checked.* = i;
                 continue;
             }
             if (watch_nul and @reduce(.Or, combined) == 0) {
-                if (memchr.find(16, haystack[0 .. i + stride], nul_checked.*, 0)) |nul_at| {
+                if (memchr.find(nibble_lanes, haystack[0 .. i + stride], nul_checked.*, 0)) |nul_at| {
                     nul_out.* = nul_at;
                     return .{ .pos = i, .nul_hit = true };
                 }
             }
             inline for (0..4) |w| {
                 if (@reduce(.Or, accs[w]) != 0) {
-                    if (watch_nul and @reduce(.Or, nul_hit)) {
-                        if (memchr.find(16, haystack[0 .. i + w * 16], nul_checked.*, 0)) |nul_at| {
+                    if (watch_nul and @reduce(.Or, nul_mask) != 0) {
+                        if (memchr.find(nibble_lanes, haystack[0 .. i + w * nibble_lanes], nul_checked.*, 0)) |nul_at| {
                             nul_out.* = nul_at;
                             return .{ .pos = i, .nul_hit = true };
                         }
                     }
-                    i += w * 16;
+                    i += w * nibble_lanes;
                     if (watch_nul and i > nul_checked.*) nul_checked.* = i;
                     break;
                 }
@@ -353,17 +594,30 @@ pub const Ac = struct {
     }
 };
 
+const BuildNode = struct {
+    first_child: u32 = 0,
+    next_sibling: u32 = 0,
+    fail: u32 = 0,
+    out_head: u32 = 0,
+    child_count: u16 = 0,
+    edge_byte: u8 = 0,
+};
+
+const BuildOut = struct {
+    len: u32,
+    id: u32,
+    next: u32,
+};
+
 pub fn build(
     allocator: std.mem.Allocator,
     patterns: []const []const u8,
     ignore_case: bool,
 ) !Ac {
-    var nodes: std.ArrayList(Node) = .empty;
-    errdefer deinitNodes(allocator, &nodes);
-    try nodes.append(allocator, blankNode());
-
     var max_len: u32 = 0;
     var empty_id: ?u32 = null;
+    var total_pat_bytes: usize = 0;
+    var non_empty_count: usize = 0;
     for (patterns, 0..) |pat, id_usize| {
         if (pat.len > std.math.maxInt(u32)) return error.OutOfMemory;
         const id: u32 = @intCast(id_usize);
@@ -371,100 +625,313 @@ pub fn build(
             if (empty_id == null) empty_id = id;
             continue;
         }
+        non_empty_count += 1;
+        total_pat_bytes +|= pat.len;
         max_len = @max(max_len, @as(u32, @intCast(pat.len)));
-        var state: usize = 0;
+    }
+
+    // Fast path: if all non-empty patterns fit within 16 distinct rarest anchor bytes,
+    // search uses SIMD anchor scanning directly and never touches the automaton tables.
+    const anchor = try buildAnchor(allocator, patterns, ignore_case);
+    if (anchor.use) {
+        return .{
+            .dense = &.{},
+            .dense_count = 0,
+            .class_of = @splat(0),
+            .nclasses = 1,
+            .inv_nclasses = @as(u64, 1) << 32,
+            .sparse_states = &.{},
+            .sparse_edge_bytes = &.{},
+            .sparse_edge_next = &.{},
+            .out_head = &.{},
+            .outs = &.{},
+            .max_len = max_len,
+            .empty_id = empty_id,
+            .ignore_case = ignore_case,
+            .patterns = patterns,
+            .anchored = anchor.items,
+            .spans = anchor.spans,
+            .members = anchor.members,
+            .max_off = anchor.max_off,
+            .min_len = anchor.min_len,
+            .use_anchor = true,
+            .use_nibble_skip = false,
+            .start_lo = @splat(0),
+            .start_hi = @splat(0),
+            .allocator = allocator,
+        };
+    }
+
+    // 1. Build compact linked-edge trie (20 bytes/node, zero per-node heap allocations).
+    var nodes: std.ArrayList(BuildNode) = .empty;
+    defer nodes.deinit(allocator);
+    try nodes.ensureTotalCapacity(allocator, @min(total_pat_bytes +| 1, 65_536));
+    try nodes.append(allocator, .{});
+
+    var build_outs: std.ArrayList(BuildOut) = .empty;
+    defer build_outs.deinit(allocator);
+    try build_outs.ensureTotalCapacity(allocator, @min(non_empty_count, 65_536));
+
+    var root_children: [256]u32 = @splat(0);
+    var used_bytes: [256]bool = @splat(false);
+
+    for (patterns, 0..) |pat, id_usize| {
+        if (pat.len == 0) continue;
+        const id: u32 = @intCast(id_usize);
+        var state: u32 = 0;
         for (pat) |raw| {
             const byte = if (ignore_case) ascii.fold(raw) else raw;
-            const child = nodes.items[state].next[byte];
-            if (child < 0) {
-                const created: i32 = @intCast(nodes.items.len);
-                try nodes.append(allocator, blankNode());
-                nodes.items[state].next[byte] = created;
-                state = @intCast(created);
+            used_bytes[byte] = true;
+            if (state == 0) {
+                const child = root_children[byte];
+                if (child == 0) {
+                    if (nodes.items.len > payload_mask) return error.OutOfMemory;
+                    const created: u32 = @intCast(nodes.items.len);
+                    try nodes.append(allocator, .{ .edge_byte = byte });
+                    root_children[byte] = created;
+                    nodes.items[0].child_count += 1;
+                    state = created;
+                } else {
+                    state = child;
+                }
             } else {
-                state = @intCast(child);
+                if (findChild(nodes.items, state, byte)) |child| {
+                    state = child;
+                } else {
+                    if (nodes.items.len > payload_mask) return error.OutOfMemory;
+                    const created: u32 = @intCast(nodes.items.len);
+                    const prev_first = nodes.items[state].first_child;
+                    try nodes.append(allocator, .{
+                        .next_sibling = prev_first,
+                        .edge_byte = byte,
+                    });
+                    nodes.items[state].first_child = created;
+                    nodes.items[state].child_count += 1;
+                    state = created;
+                }
             }
         }
-        try nodes.items[state].out.append(allocator, .{
+        const prev_out = nodes.items[state].out_head;
+        try build_outs.append(allocator, .{
             .len = @intCast(pat.len),
             .id = id,
+            .next = prev_out,
         });
+        nodes.items[state].out_head = @intCast(build_outs.items.len);
     }
 
-    var queue: std.ArrayList(u32) = .empty;
-    defer queue.deinit(allocator);
-    var byte: usize = 0;
-    while (byte < 256) : (byte += 1) {
-        const child = nodes.items[0].next[byte];
-        if (child >= 0) {
-            const id: u32 = @intCast(child);
-            nodes.items[id].fail = 0;
-            try appendOuts(allocator, &nodes, id, 0);
-            try queue.append(allocator, id);
-        } else {
-            nodes.items[0].next[byte] = 0;
+    const nstates: usize = nodes.items.len;
+
+    // 2. BFS traversal: compute failure links in O(nstates) and establish BFS state numbering
+    //    (depth 0, then all depth 1, then all depth 2, ...).
+    const bfs_order = try allocator.alloc(u32, nstates);
+    defer allocator.free(bfs_order);
+    const old_to_new = try allocator.alloc(u32, nstates);
+    defer allocator.free(old_to_new);
+
+    bfs_order[0] = 0;
+    old_to_new[0] = 0;
+    var q_len: usize = 1;
+    for (0..256) |b| {
+        const cid = root_children[b];
+        if (cid != 0) {
+            nodes.items[cid].fail = 0;
+            old_to_new[cid] = @intCast(q_len);
+            bfs_order[q_len] = cid;
+            q_len += 1;
         }
     }
-    var q_at: usize = 0;
-    while (q_at < queue.items.len) : (q_at += 1) {
-        const current = queue.items[q_at];
-        byte = 0;
-        while (byte < 256) : (byte += 1) {
-            const child = nodes.items[current].next[byte];
-            const fail = nodes.items[current].fail;
-            const via = nodes.items[fail].next[byte];
-            if (child >= 0) {
-                const id: u32 = @intCast(child);
-                const dest: u32 = if (via >= 0) @intCast(via) else 0;
-                nodes.items[id].fail = dest;
-                try appendOuts(allocator, &nodes, id, dest);
-                try queue.append(allocator, id);
-            } else {
-                nodes.items[current].next[byte] = if (via >= 0) via else 0;
+
+    var q_at: usize = 1;
+    while (q_at < q_len) : (q_at += 1) {
+        const u = bfs_order[q_at];
+        var v = nodes.items[u].first_child;
+        while (v != 0) : (v = nodes.items[v].next_sibling) {
+            const b = nodes.items[v].edge_byte;
+            var f = nodes.items[u].fail;
+            var dest: u32 = 0;
+            while (true) {
+                if (f == 0) {
+                    dest = root_children[b];
+                    break;
+                }
+                if (findChild(nodes.items, f, b)) |hit| {
+                    dest = hit;
+                    break;
+                }
+                f = nodes.items[f].fail;
             }
+            nodes.items[v].fail = dest;
+            old_to_new[v] = @intCast(q_len);
+            bfs_order[q_len] = v;
+            q_len += 1;
         }
     }
+    std.debug.assert(q_len == nstates);
 
-    const nstates = nodes.items.len;
-    var class_of: [256]u16 = undefined;
-    @memset(&class_of, 0);
+    // 3. O(256) exact byte equivalence classes: in an AC trie every active byte has a unique
+    //    incoming edge label so no two active bytes can merge; all unused bytes share dead class 0.
+    var used_count: usize = 0;
+    for (used_bytes) |u_flag| {
+        if (u_flag) used_count += 1;
+    }
+    var class_of: [256]u8 = @splat(0);
     var nclasses: u16 = 1;
-    for (nodes.items) |node| {
-        var keys: [256]u64 = undefined;
-        var vals: [256]u16 = undefined;
-        var nkeys: usize = 0;
-        var next_class: u16 = 0;
-        var new_of: [256]u16 = undefined;
+    if (used_count == 256) {
+        for (0..256) |b| class_of[b] = @intCast(b);
+        nclasses = 256;
+    } else {
+        var next_cls: u8 = 1;
         for (0..256) |b| {
-            const dest: u32 = if (node.next[b] >= 0) @intCast(node.next[b]) else 0;
-            const key = (@as(u64, class_of[b]) << 32) | dest;
-            const slot = std.mem.findScalar(u64, keys[0..nkeys], key);
-            if (slot) |at| {
-                new_of[b] = vals[at];
-            } else {
-                keys[nkeys] = key;
-                vals[nkeys] = next_class;
-                new_of[b] = next_class;
-                nkeys += 1;
-                next_class += 1;
+            if (used_bytes[b]) {
+                class_of[b] = next_cls;
+                next_cls +%= 1;
             }
         }
-        class_of = new_of;
-        nclasses = next_class;
-    }
-
-    const cells = nstates * @as(usize, nclasses);
-    const dense = try allocator.alloc(u32, cells);
-    errdefer allocator.free(dense);
-    for (nodes.items, 0..) |node, state| {
-        for (0..256) |b| {
-            const dest: u32 = if (node.next[b] >= 0) @intCast(node.next[b]) else 0;
-            dense[state * @as(usize, nclasses) + class_of[b]] = dest;
-        }
+        nclasses = @intCast(used_count + 1);
     }
     if (ignore_case) {
         for ('A'..'Z' + 1) |b| class_of[b] = class_of[b + 32];
     }
+    const inv_nclasses: u64 = ((@as(u64, 1) << 32) + @as(u64, nclasses) - 1) / @as(u64, nclasses);
+
+    // 4. Shared suffix-linked output lists in BFS order: O(patterns) space, never quadratic.
+    const out_head = try allocator.alloc(u32, nstates);
+    errdefer allocator.free(out_head);
+    const outs = if (build_outs.items.len != 0)
+        try allocator.alloc(Out, build_outs.items.len)
+    else
+        @as([]Out, &.{});
+    errdefer if (outs.len != 0) allocator.free(outs);
+
+    out_head[0] = sentinel;
+    var out_cursor: usize = 0;
+    for (1..nstates) |new_s| {
+        const old_s = bfs_order[new_s];
+        const fail_new = old_to_new[nodes.items[old_s].fail];
+        const inherited = out_head[fail_new];
+        var b_link = nodes.items[old_s].out_head;
+        if (b_link == sentinel) {
+            out_head[new_s] = inherited;
+        } else {
+            out_head[new_s] = @intCast(out_cursor + 1);
+            while (b_link != sentinel) {
+                const bo = build_outs.items[b_link - 1];
+                const next_b = bo.next;
+                outs[out_cursor] = .{
+                    .len = bo.len,
+                    .id = bo.id,
+                    .next = if (next_b != sentinel) @intCast(out_cursor + 2) else inherited,
+                };
+                out_cursor += 1;
+                b_link = next_b;
+            }
+        }
+    }
+    std.debug.assert(out_cursor == build_outs.items.len);
+
+    // 5. Build cache-resident dense prefix (BFS states 0..dense_count-1) + compact sparse NFA tail.
+    const dense_count_usize: usize = @max(@as(usize, 1), @min(nstates, dense_budget_cells / @as(usize, nclasses)));
+    const dense_count: u32 = @intCast(dense_count_usize);
+    const dense_cells = dense_count_usize * @as(usize, nclasses);
+    const dense = try allocator.alloc(u32, dense_cells);
+    errdefer allocator.free(dense);
+
+    // Root row (state 0)
+    @memset(dense[0..nclasses], 0);
+    for (0..256) |b| {
+        const cid = root_children[b];
+        if (cid != 0) {
+            dense[class_of[b]] = encodeState(old_to_new[cid], dense_count, nclasses, out_head);
+        }
+    }
+
+    // Dense rows 1..dense_count-1: in BFS order fail[s] < s < dense_count ALWAYS, so inheriting
+    // failure transitions is a single row memcpy followed by direct trie child overwrites.
+    for (1..dense_count_usize) |new_s| {
+        const old_s = bfs_order[new_s];
+        const fail_new: usize = old_to_new[nodes.items[old_s].fail];
+        std.debug.assert(fail_new < new_s);
+        const dst_off = new_s * @as(usize, nclasses);
+        const src_off = fail_new * @as(usize, nclasses);
+        @memcpy(dense[dst_off..][0..nclasses], dense[src_off..][0..nclasses]);
+        var v = nodes.items[old_s].first_child;
+        while (v != 0) : (v = nodes.items[v].next_sibling) {
+            dense[dst_off + class_of[nodes.items[v].edge_byte]] =
+                encodeState(old_to_new[v], dense_count, nclasses, out_head);
+        }
+    }
+
+    // Compact sparse NFA states (dense_count..nstates-1)
+    const sparse_count = nstates - dense_count_usize;
+    var sparse_states: []SparseState = &.{};
+    var sparse_edge_bytes: []u8 = &.{};
+    var sparse_edge_next: []u32 = &.{};
+
+    if (sparse_count != 0) {
+        var total_sparse_edges: usize = 0;
+        for (dense_count_usize..nstates) |new_s| {
+            total_sparse_edges += nodes.items[bfs_order[new_s]].child_count;
+        }
+        sparse_states = try allocator.alloc(SparseState, sparse_count);
+        errdefer allocator.free(sparse_states);
+        if (total_sparse_edges != 0) {
+            sparse_edge_bytes = try allocator.alloc(u8, total_sparse_edges);
+            errdefer allocator.free(sparse_edge_bytes);
+            sparse_edge_next = try allocator.alloc(u32, total_sparse_edges);
+            errdefer allocator.free(sparse_edge_next);
+        }
+
+        var edge_cursor: usize = 0;
+        var tmp_bytes: [256]u8 = undefined;
+        var tmp_next: [256]u32 = undefined;
+
+        for (0..sparse_count) |s_idx| {
+            const new_s = dense_count_usize + s_idx;
+            const old_s = bfs_order[new_s];
+            const fail_new = old_to_new[nodes.items[old_s].fail];
+            const fail_enc: u32 = if (fail_new < dense_count)
+                fail_new * @as(u32, nclasses)
+            else
+                sparse_bit | (fail_new - dense_count);
+
+            var cnt: usize = 0;
+            var v = nodes.items[old_s].first_child;
+            while (v != 0) : (v = nodes.items[v].next_sibling) {
+                tmp_bytes[cnt] = nodes.items[v].edge_byte;
+                tmp_next[cnt] = encodeState(old_to_new[v], dense_count, nclasses, out_head);
+                cnt += 1;
+            }
+            // Insertion sort edges by byte ascending for binary search when cnt > 8.
+            if (cnt > 1) {
+                var a: usize = 1;
+                while (a < cnt) : (a += 1) {
+                    const kb = tmp_bytes[a];
+                    const kn = tmp_next[a];
+                    var j = a;
+                    while (j > 0 and tmp_bytes[j - 1] > kb) : (j -= 1) {
+                        tmp_bytes[j] = tmp_bytes[j - 1];
+                        tmp_next[j] = tmp_next[j - 1];
+                    }
+                    tmp_bytes[j] = kb;
+                    tmp_next[j] = kn;
+                }
+            }
+            if (cnt != 0) {
+                @memcpy(sparse_edge_bytes[edge_cursor..][0..cnt], tmp_bytes[0..cnt]);
+                @memcpy(sparse_edge_next[edge_cursor..][0..cnt], tmp_next[0..cnt]);
+            }
+            sparse_states[s_idx] = .{
+                .fail = fail_enc,
+                .edge_off = @intCast(edge_cursor),
+                .edge_len = @intCast(cnt),
+            };
+            edge_cursor += cnt;
+        }
+        std.debug.assert(edge_cursor == total_sparse_edges);
+    }
+
+    // 6. Start-byte nibble SIMD prefilter tables.
     var start_lo: [16]u8 = @splat(0);
     var start_hi: [16]u8 = @splat(0);
     for (0..256) |b| {
@@ -474,41 +941,30 @@ pub fn build(
             start_hi[b >> 4] |= bit;
         }
     }
-
-    var outs: std.ArrayList(Out) = .empty;
-    errdefer outs.deinit(allocator);
-    const out_head = try allocator.alloc(u32, nstates);
-    errdefer allocator.free(out_head);
-    @memset(out_head, sentinel);
-    for (nodes.items, 0..) |node, state| {
-        if (node.out.items.len == 0) continue;
-        out_head[state] = @intCast(outs.items.len + 1);
-        for (node.out.items, 0..) |item, k| {
-            const last = k + 1 == node.out.items.len;
-            try outs.append(allocator, .{
-                .len = item.len,
-                .id = item.id,
-                .next = if (last) sentinel else @intCast(outs.items.len + 2),
-            });
-        }
+    var nibble_pass: usize = 0;
+    for (0..256) |b| {
+        if ((start_lo[b & 0x0f] & start_hi[b >> 4]) != 0) nibble_pass += 1;
     }
 
-    const owned_outs = try outs.toOwnedSlice(allocator);
-    errdefer allocator.free(owned_outs);
-    const anchor = try buildAnchor(allocator, patterns, ignore_case);
-    deinitNodes(allocator, &nodes);
-    const use_nibble_skip = if (comptime static_nibble_isa)
+    const isa_ok = if (comptime static_nibble_isa)
         true
     else if (comptime runtime_nibble_isa)
         cpuid.detectX86().ssse3
     else
         false;
+    const use_nibble_skip = isa_ok and nibble_pass <= 160;
+
     return .{
         .dense = dense,
+        .dense_count = dense_count,
         .class_of = class_of,
         .nclasses = nclasses,
+        .inv_nclasses = inv_nclasses,
+        .sparse_states = sparse_states,
+        .sparse_edge_bytes = sparse_edge_bytes,
+        .sparse_edge_next = sparse_edge_next,
         .out_head = out_head,
-        .outs = owned_outs,
+        .outs = outs,
         .max_len = max_len,
         .empty_id = empty_id,
         .ignore_case = ignore_case,
@@ -518,7 +974,7 @@ pub fn build(
         .members = anchor.members,
         .max_off = anchor.max_off,
         .min_len = anchor.min_len,
-        .use_anchor = anchor.use,
+        .use_anchor = false,
         .use_nibble_skip = use_nibble_skip,
         .start_lo = start_lo,
         .start_hi = start_hi,
@@ -526,37 +982,24 @@ pub fn build(
     };
 }
 
-const OwnedOut = struct { len: u32, id: u32 };
-
-const Node = struct {
-    next: [256]i32,
-    fail: u32,
-    out: std.ArrayList(OwnedOut),
-};
-
-fn blankNode() Node {
-    var node = Node{
-        .next = undefined,
-        .fail = 0,
-        .out = .empty,
-    };
-    @memset(&node.next, -1);
-    return node;
+inline fn findChild(nodes: []const BuildNode, parent: u32, byte: u8) ?u32 {
+    var cur = nodes[parent].first_child;
+    while (cur != 0) : (cur = nodes[cur].next_sibling) {
+        if (nodes[cur].edge_byte == byte) return cur;
+    }
+    return null;
 }
 
-fn deinitNodes(allocator: std.mem.Allocator, nodes: *std.ArrayList(Node)) void {
-    for (nodes.items) |*node| node.out.deinit(allocator);
-    nodes.deinit(allocator);
+inline fn encodeState(new_s: u32, dense_count: u32, nclasses: u16, out_head: []const u32) u32 {
+    const match_flag: u32 = if (out_head[new_s] != sentinel) match_bit else 0;
+    if (new_s < dense_count) {
+        return match_flag | (new_s * @as(u32, nclasses));
+    }
+    return match_flag | sparse_bit | (new_s - dense_count);
 }
 
-fn appendOuts(
-    allocator: std.mem.Allocator,
-    nodes: *std.ArrayList(Node),
-    dest: u32,
-    from: u32,
-) !void {
-    if (dest == from) return;
-    try nodes.items[dest].out.appendSlice(allocator, nodes.items[from].out.items);
+inline fn divNclasses(row_off: u32, inv_nclasses: u64) usize {
+    return @intCast((@as(u64, row_off) * inv_nclasses) >> 32);
 }
 
 fn consider(best: *?Cand, start: usize, end: usize, id: u32, mode: matcher.MatchMode) void {
@@ -594,7 +1037,9 @@ fn buildAnchor(allocator: std.mem.Allocator, patterns: []const []const u8, ignor
     for (patterns) |pat| {
         if (pat.len != 0) n += 1;
     }
-    if (n == 0) return .{};
+    // Linear per-anchor verification is only faster than the hybrid dense+sparse automaton on
+    // small pattern sets; large sets (>64 patterns) would verify too many candidates per hit.
+    if (n == 0 or n > 64) return .{};
 
     const Draft = struct { byte: u8, offset: u32, id: u32 };
     const draft = try allocator.alloc(Draft, n);
@@ -702,13 +1147,23 @@ test "anchor prefilter matches dense automaton at the same position" {
 }
 
 fn scalarAc(hay: []const u8, start: usize, pats: []const []const u8, mode: matcher.MatchMode) ?matcher.Match {
+    return scalarAcCase(hay, start, pats, false, mode);
+}
+
+fn scalarAcCase(
+    hay: []const u8,
+    start: usize,
+    pats: []const []const u8,
+    ignore_case: bool,
+    mode: matcher.MatchMode,
+) ?matcher.Match {
     const Pick = struct { start: usize, end: usize, id: u32 };
     var best: ?Pick = null;
     var i = start;
     while (i <= hay.len) : (i += 1) {
         for (pats, 0..) |pat, id_usize| {
             if (i + pat.len > hay.len) continue;
-            if (!std.mem.eql(u8, pat, hay[i..][0..pat.len])) continue;
+            if (!equalAt(pat, hay[i..][0..pat.len], ignore_case)) continue;
             const cand = Pick{ .start = i, .end = i + pat.len, .id = @intCast(id_usize) };
             if (best) |cur| {
                 const replace = switch (mode) {
@@ -756,4 +1211,177 @@ test "anchor prefilter skips first stride and matches naive search on second str
     const dense_hit = dense.find(&long, 0, .leftmost_first).?;
     try std.testing.expectEqual(stride + 1, dense_hit.start);
     try std.testing.expectEqual(scalarAc(&long, 0, &dense_pats, .leftmost_first).?.end, dense_hit.end);
+}
+
+test "large 500-pattern hybrid dense+sparse automaton: modes, overlaps, ignore_case, and findWatchingNul" {
+    const alloc = std.testing.allocator;
+    const n_pats = 520;
+    var storage = try alloc.alloc([24]u8, n_pats);
+    defer alloc.free(storage);
+    var pats = try alloc.alloc([]const u8, n_pats);
+    defer alloc.free(pats);
+
+    const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_-";
+    for (0..500) |i| {
+        const c0 = alphabet[i % alphabet.len];
+        const c1 = alphabet[(i * 7 + 3) % alphabet.len];
+        const c2 = alphabet[(i * 13 + 5) % alphabet.len];
+        const slice = try std.fmt.bufPrint(&storage[i], "{c}{c}{c}_tok{d:0>4}end", .{ c0, c1, c2, i });
+        pats[i] = slice;
+    }
+    // Overlapping patterns at various depths (testing leftmost_first vs earliest & suffix links)
+    pats[500] = "alpha_overlap_long";
+    pats[501] = "overlap";
+    pats[502] = "alpha_overlap";
+    pats[503] = "lap_lo";
+    // Shared prefix with >8 branching children in sparse region (triggers binary search in stepSparse)
+    for (0..16) |k| {
+        const slice = try std.fmt.bufPrint(&storage[504 + k], "shared_deep_pfx_{c}", .{@as(u8, 'a' + @as(u8, @intCast(k)))});
+        pats[504 + k] = slice;
+    }
+
+    inline for (.{ false, true }) |ignore_case| {
+        var ac = try build(alloc, pats, ignore_case);
+        defer ac.deinit();
+        try std.testing.expect(!ac.use_anchor);
+        try std.testing.expect(ac.sparse_states.len > 0);
+
+        // 1. Overlapping match ordering: earliest vs leftmost_first
+        const overlap_hay = if (ignore_case)
+            "xxxx ALPHA_OVERLAP_LONG yyyy"
+        else
+            "xxxx alpha_overlap_long yyyy";
+        inline for (.{ .earliest, .leftmost_first }) |mode| {
+            const got = ac.find(overlap_hay, 0, mode).?;
+            const want = scalarAcCase(overlap_hay, 0, pats, ignore_case, mode).?;
+            try std.testing.expectEqual(want.start, got.start);
+            try std.testing.expectEqual(want.end, got.end);
+            try std.testing.expectEqual(want.pattern_id, got.pattern_id);
+        }
+
+        // 2. Deep sparse binary-search branch hit (branch index 11 -> 'l')
+        const deep_hay = if (ignore_case)
+            "noise SHARED_DEEP_PFX_L tail"
+        else
+            "noise shared_deep_pfx_l tail";
+        const deep_hit = ac.find(deep_hay, 0, .earliest).?;
+        try std.testing.expectEqual(@as(usize, 6), deep_hit.start);
+        try std.testing.expectEqual(@as(?u32, 504 + 11), deep_hit.pattern_id);
+
+        // 3. findWatchingNul: NUL before match vs NUL after match vs NUL inside chunk (> 32 KiB)
+        var nul_before: ?usize = null;
+        const hay_nul_before = "prefix\x00noise shared_deep_pfx_a tail";
+        try std.testing.expect(ac.findWatchingNul(hay_nul_before, 0, .earliest, &nul_before) == null);
+        try std.testing.expectEqual(@as(?usize, 6), nul_before);
+
+        var nul_after: ?usize = null;
+        const hay_nul_after = "prefix shared_deep_pfx_a\x00tail";
+        const after_hit = ac.findWatchingNul(hay_nul_after, 0, .earliest, &nul_after).?;
+        try std.testing.expectEqual(@as(usize, 7), after_hit.start);
+        try std.testing.expectEqual(@as(?usize, null), nul_after);
+    }
+}
+
+test "large 2000-pattern hybrid automaton: deep sparse matches, chunk-boundary NUL, and start offset" {
+    const alloc = std.testing.allocator;
+    const n_pats = 2000;
+    var storage = try alloc.alloc([20]u8, n_pats);
+    defer alloc.free(storage);
+    var pats = try alloc.alloc([]const u8, n_pats);
+    defer alloc.free(pats);
+
+    const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_-./:";
+    const n_alpha = alphabet.len;
+    for (0..n_pats) |i| {
+        const c0 = alphabet[i % n_alpha];
+        const c1 = alphabet[(i / n_alpha) % n_alpha];
+        const c2 = alphabet[(i * 17 + i / n_alpha + 7) % n_alpha];
+        const c3 = alphabet[(i * 31 + (i / 13) + 13) % n_alpha];
+        const c4 = alphabet[(i * 43 + (i / 29) + 19) % n_alpha];
+        const slice = try std.fmt.bufPrint(&storage[i], "{c}{c}{c}{c}_pat_{d:0>4}_{c}", .{ c0, c1, c2, c3, i, c4 });
+        pats[i] = slice;
+    }
+
+    var ac = try build(alloc, pats, false);
+    defer ac.deinit();
+    try std.testing.expect(!ac.use_anchor);
+    try std.testing.expect(ac.sparse_states.len > 10_000);
+    // Dense prefix must stay bounded within L2 budget (~263 KiB).
+    try std.testing.expect(ac.dense.len <= dense_budget_cells);
+
+    // Build a >64 KiB haystack spanning multiple nul_chunk_bytes boundaries
+    const hay_len = nul_chunk_bytes * 2 + 1024;
+    const hay = try alloc.alloc(u8, hay_len);
+    defer alloc.free(hay);
+    @memset(hay, ' ');
+    // Plant a match straddling the 32 KiB chunk boundary and another near the end
+    const target_a = pats[1999];
+    const pos_a = nul_chunk_bytes - 4;
+    @memcpy(hay[pos_a..][0..target_a.len], target_a);
+    const target_b = pats[777];
+    const pos_b = hay_len - 64;
+    @memcpy(hay[pos_b..][0..target_b.len], target_b);
+
+    // 1. Both modes find exact boundary-straddling match and second match from start > pos_a
+    inline for (.{ .earliest, .leftmost_first }) |mode| {
+        const h1 = ac.find(hay, 0, mode).?;
+        try std.testing.expectEqual(pos_a, h1.start);
+        try std.testing.expectEqual(pos_a + target_a.len, h1.end);
+        try std.testing.expectEqual(@as(?u32, 1999), h1.pattern_id);
+
+        const h2 = ac.find(hay, pos_a + 1, mode).?;
+        try std.testing.expectEqual(pos_b, h2.start);
+        try std.testing.expectEqual(pos_b + target_b.len, h2.end);
+        try std.testing.expectEqual(@as(?u32, 777), h2.pattern_id);
+    }
+
+    // 2. NUL placed AFTER pos_a (after boundary-straddling match) must NOT suppress pos_a
+    hay[pos_a + target_a.len + 2] = 0;
+    var nul_pos: ?usize = null;
+    const watched_ok = ac.findWatchingNul(hay, 0, .earliest, &nul_pos).?;
+    try std.testing.expectEqual(pos_a, watched_ok.start);
+    try std.testing.expectEqual(@as(?usize, null), nul_pos);
+
+    // 3. Starting after pos_a hits the NUL before pos_b
+    const watched_nul = ac.findWatchingNul(hay, pos_a + 1, .earliest, &nul_pos);
+    try std.testing.expect(watched_nul == null);
+    try std.testing.expectEqual(@as(?usize, pos_a + target_a.len + 2), nul_pos);
+
+    // 4. NUL in first chunk suppresses everything after it
+    hay[17] = 0;
+    nul_pos = null;
+    try std.testing.expect(ac.findWatchingNul(hay, 0, .earliest, &nul_pos) == null);
+    try std.testing.expectEqual(@as(?usize, 17), nul_pos);
+}
+
+test "divNclasses exactness across all nclasses 1..256 and OOM safety" {
+    for (1..257) |d_usize| {
+        const d: u32 = @intCast(d_usize);
+        const inv: u64 = ((@as(u64, 1) << 32) + @as(u64, d) - 1) / @as(u64, d);
+        const max_q: u32 = @intCast(dense_budget_cells / d_usize);
+        var q: u32 = 0;
+        while (q <= max_q) : (q += 1) {
+            try std.testing.expectEqual(@as(usize, q), divNclasses(q * d, inv));
+        }
+    }
+
+    // OOM safety across every allocation point in hybrid dense+sparse build
+    var storage: [64][8]u8 = undefined;
+    var pats: [64][]const u8 = undefined;
+    for (0..64) |i| {
+        pats[i] = try std.fmt.bufPrint(&storage[i], "{c}{c}_x{d:0>2}y", .{
+            @as(u8, 'a' + @as(u8, @intCast(i % 26))),
+            @as(u8, 'A' + @as(u8, @intCast((i * 7) % 26))),
+            i,
+        });
+    }
+    var fail_idx: usize = 0;
+    while (fail_idx < 32) : (fail_idx += 1) {
+        var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_idx });
+        if (build(fa.allocator(), &pats, false)) |*built| {
+            var mut = built.*;
+            mut.deinit();
+            break;
+        } else |_| {}
+    }
 }

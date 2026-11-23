@@ -31,7 +31,9 @@ fn defaultRank() [256]u8 {
     while (digit <= '9') : (digit += 1) rank[digit] = 70;
 
     for ("_./-=") |c| rank[c] = 160;
-    for (",;:'\"()[]{}") |c| rank[c] = 140;
+    for (",;'()[]{}") |c| rank[c] = 140;
+    rank[':'] = 175;
+    rank['"'] = 175;
     for ("*#@$%^&!~`|\\<>?+") |c| rank[c] = 25;
 
     return rank;
@@ -44,4 +46,6 @@ test "more frequent bytes have higher rank" {
     try std.testing.expect(rank[0] < rank['e']);
     try std.testing.expect(rank['q'] < rank[' ']);
     try std.testing.expect(rank['*'] < rank['_']);
+    try std.testing.expect(rank['u'] < rank['"']);
+    try std.testing.expect(rank['d'] < rank[':']);
 }

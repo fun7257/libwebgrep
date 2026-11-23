@@ -31,10 +31,30 @@ const teddy_runtime = (builtin.cpu.arch == .x86_64 and build_options.teddy == .r
 const teddy_static = (build_options.teddy != .off and build_options.teddy != .runtime);
 const teddy_on = teddy_static or teddy_runtime;
 const teddy_mod = if (teddy_on) @import("teddy.zig") else struct {
+    const Stub = @This();
     pub const Engine = struct {};
     pub const Ssse3Engine = struct {};
     pub const RuntimeAvx2Engine = struct {};
+    pub const VerifyResult = union(enum) {
+        accept: usize,
+        reject,
+        abort,
+    };
+    pub const VerifiedMatch = struct {
+        start: usize,
+        end: usize,
+        id: usize,
+    };
+    pub const VerifiedStep = union(enum) {
+        match: Stub.VerifiedMatch,
+        none,
+        aborted: usize,
+    };
 };
+
+pub const VerifyResult = teddy_mod.VerifyResult;
+pub const VerifiedMatch = teddy_mod.VerifiedMatch;
+pub const VerifiedStep = teddy_mod.VerifiedStep;
 
 pub const Multi = struct {
     kind: Kind,
@@ -590,7 +610,393 @@ pub const Multi = struct {
             },
         }
     }
+
+    pub fn findVerified(
+        self: *const Multi,
+        haystack: []const u8,
+        start: usize,
+        mode: matcher.MatchMode,
+        verifier: anytype,
+    ) VerifiedStep {
+        if (start > haystack.len) return .none;
+        switch (self.kind) {
+            .teddy => |*engine| {
+                if (comptime teddy_static) return self.teddyFindVerified(engine, haystack, start, mode, verifier);
+                unreachable;
+            },
+            .teddy_ssse3 => |*engine| {
+                if (comptime teddy_runtime) return self.teddyFindVerified(engine, haystack, start, mode, verifier);
+                unreachable;
+            },
+            .teddy_avx2_rt => |*engine| {
+                if (comptime teddy_runtime) return self.teddyFindVerified(engine, haystack, start, mode, verifier);
+                unreachable;
+            },
+            else => return self.findVerifiedFallback(haystack, start, mode, verifier),
+        }
+    }
+
+    pub fn findVerifiedWatched(
+        self: *const Multi,
+        haystack: []const u8,
+        start: usize,
+        mode: matcher.MatchMode,
+        nul_pos: *?usize,
+        verifier: anytype,
+    ) VerifiedStep {
+        if (start > haystack.len) return .none;
+        switch (self.kind) {
+            .teddy => |*engine| {
+                if (comptime teddy_static) return self.teddyFindVerifiedWatched(engine, haystack, start, mode, nul_pos, verifier);
+                unreachable;
+            },
+            .teddy_ssse3 => |*engine| {
+                if (comptime teddy_runtime) return self.teddyFindVerifiedWatched(engine, haystack, start, mode, nul_pos, verifier);
+                unreachable;
+            },
+            .teddy_avx2_rt => |*engine| {
+                if (comptime teddy_runtime) return self.teddyFindVerifiedWatched(engine, haystack, start, mode, nul_pos, verifier);
+                unreachable;
+            },
+            else => return self.findVerifiedWatchedFallback(haystack, start, mode, nul_pos, verifier),
+        }
+    }
+
+    fn MappedVerifier(comptime V: type) type {
+        return struct {
+            multi: *const Multi,
+            inner: V,
+
+            pub fn verify(self: @This(), haystack: []const u8, pat_start: usize, pat_end: usize, pat_id: usize) VerifyResult {
+                const mapped = self.multi.mapPatternId(@intCast(pat_id)) orelse @as(u32, @intCast(pat_id));
+                return self.inner.verify(haystack, pat_start, pat_end, @as(usize, mapped));
+            }
+        };
+    }
+
+    inline fn mapVerifiedStep(self: *const Multi, step: VerifiedStep) VerifiedStep {
+        return switch (step) {
+            .match => |m| .{ .match = .{
+                .start = m.start,
+                .end = m.end,
+                .id = @as(usize, self.mapPatternId(@intCast(m.id)) orelse @as(u32, @intCast(m.id))),
+            } },
+            .none => .none,
+            .aborted => |pos| .{ .aborted = pos },
+        };
+    }
+
+    inline fn teddyFindVerified(
+        self: *const Multi,
+        engine: anytype,
+        haystack: []const u8,
+        start: usize,
+        mode: matcher.MatchMode,
+        verifier: anytype,
+    ) VerifiedStep {
+        if (self.owned_pattern_ids == null) {
+            return engine.findVerified(haystack, start, mode, verifier);
+        }
+        const wrapped = MappedVerifier(@TypeOf(verifier)){ .multi = self, .inner = verifier };
+        return self.mapVerifiedStep(engine.findVerified(haystack, start, mode, wrapped));
+    }
+
+    inline fn teddyFindVerifiedWatched(
+        self: *const Multi,
+        engine: anytype,
+        haystack: []const u8,
+        start: usize,
+        mode: matcher.MatchMode,
+        nul_pos: *?usize,
+        verifier: anytype,
+    ) VerifiedStep {
+        if (self.owned_pattern_ids == null) {
+            return engine.findVerifiedWatchingNul(haystack, start, mode, nul_pos, verifier);
+        }
+        const wrapped = MappedVerifier(@TypeOf(verifier)){ .multi = self, .inner = verifier };
+        return self.mapVerifiedStep(engine.findVerifiedWatchingNul(haystack, start, mode, nul_pos, wrapped));
+    }
+
+    fn maxPatternLen(self: *const Multi) usize {
+        var max_len: usize = 0;
+        for (self.patterns) |pat| {
+            if (pat.len > max_len) max_len = pat.len;
+        }
+        if (self.unicode_case) max_len *|= 3;
+        return max_len;
+    }
+
+    fn verifyLeftmostAllAt(
+        self: *const Multi,
+        haystack: []const u8,
+        at: usize,
+        verifier: anytype,
+    ) VerifiedStep {
+        for (self.patterns, 0..) |pat, id_usize| {
+            const pid: usize = self.mapPatternId(@intCast(id_usize)) orelse @as(u32, @intCast(id_usize));
+            const fold = self.foldOf(id_usize);
+            const match_len: usize = if (self.unicode_case and fold)
+                unicode_fold.matchFoldedPrefix(pat, haystack[at..]) orelse continue
+            else blk: {
+                if (at + pat.len > haystack.len) continue;
+                if (!ascii.eql(pat, haystack[at..][0..pat.len], fold)) continue;
+                break :blk pat.len;
+            };
+            const pat_end = at + match_len;
+            switch (verifier.verify(haystack, at, pat_end, pid)) {
+                .accept => |end| return .{ .match = .{ .start = at, .end = end, .id = pid } },
+                .abort => return .{ .aborted = at },
+                .reject => {},
+            }
+        }
+        return .none;
+    }
+
+    fn verifyLeftmostAt(
+        self: *const Multi,
+        haystack: []const u8,
+        hit: matcher.Match,
+        verifier: anytype,
+    ) VerifiedStep {
+        const hit_id: usize = hit.pattern_id orelse 0;
+        switch (verifier.verify(haystack, hit.start, hit.end, hit_id)) {
+            .accept => |end| return .{ .match = .{ .start = hit.start, .end = end, .id = hit_id } },
+            .abort => return .{ .aborted = hit.start },
+            .reject => {},
+        }
+        if (self.patterns.len <= 1) return .none;
+        const at = hit.start;
+        for (self.patterns, 0..) |pat, id_usize| {
+            const pid: usize = self.mapPatternId(@intCast(id_usize)) orelse @as(u32, @intCast(id_usize));
+            const fold = self.foldOf(id_usize);
+            const match_len: usize = if (self.unicode_case and fold)
+                unicode_fold.matchFoldedPrefix(pat, haystack[at..]) orelse continue
+            else blk: {
+                if (at + pat.len > haystack.len) continue;
+                if (!ascii.eql(pat, haystack[at..][0..pat.len], fold)) continue;
+                break :blk pat.len;
+            };
+            const pat_end = at + match_len;
+            if (pid == hit_id and pat_end == hit.end) continue;
+            switch (verifier.verify(haystack, at, pat_end, pid)) {
+                .accept => |end| return .{ .match = .{ .start = at, .end = end, .id = pid } },
+                .abort => return .{ .aborted = at },
+                .reject => {},
+            }
+        }
+        return .none;
+    }
+
+    fn verifyEarliestAt(
+        self: *const Multi,
+        haystack: []const u8,
+        hit: matcher.Match,
+        best: *?VerifiedMatch,
+        verifier: anytype,
+    ) ?usize {
+        if (self.patterns.len <= 1) {
+            const hit_id: usize = hit.pattern_id orelse 0;
+            switch (verifier.verify(haystack, hit.start, hit.end, hit_id)) {
+                .accept => |end| {
+                    const cand = VerifiedMatch{ .start = hit.start, .end = end, .id = hit_id };
+                    if (best.*) |cur| {
+                        if (preferVerifiedEarliest(cand, cur)) best.* = cand;
+                    } else best.* = cand;
+                },
+                .abort => {
+                    if (best.* == null) return hit.start;
+                },
+                .reject => {},
+            }
+            return null;
+        }
+        const at = hit.start;
+        for (self.patterns, 0..) |pat, id_usize| {
+            const pid: usize = self.mapPatternId(@intCast(id_usize)) orelse @as(u32, @intCast(id_usize));
+            const fold = self.foldOf(id_usize);
+            const match_len: usize = if (self.unicode_case and fold)
+                unicode_fold.matchFoldedPrefix(pat, haystack[at..]) orelse continue
+            else blk: {
+                if (at + pat.len > haystack.len) continue;
+                if (!ascii.eql(pat, haystack[at..][0..pat.len], fold)) continue;
+                break :blk pat.len;
+            };
+            const pat_end = at + match_len;
+            switch (verifier.verify(haystack, at, pat_end, pid)) {
+                .accept => |end| {
+                    const cand = VerifiedMatch{ .start = at, .end = end, .id = pid };
+                    if (best.*) |cur| {
+                        if (preferVerifiedEarliest(cand, cur)) best.* = cand;
+                    } else best.* = cand;
+                },
+                .abort => {
+                    if (best.* == null) return at;
+                },
+                .reject => {},
+            }
+        }
+        return null;
+    }
+
+    fn findVerifiedFallback(
+        self: *const Multi,
+        haystack: []const u8,
+        start: usize,
+        mode: matcher.MatchMode,
+        verifier: anytype,
+    ) VerifiedStep {
+        if (mode == .leftmost_first) {
+            var pos = start;
+            while (pos <= haystack.len) {
+                const hit = self.find(haystack, pos, .leftmost_first) orelse return .none;
+                switch (self.verifyLeftmostAt(haystack, hit, verifier)) {
+                    .match => |m| return .{ .match = m },
+                    .aborted => |resume_pos| return .{ .aborted = resume_pos },
+                    .none => {},
+                }
+                if (hit.start >= haystack.len) return .none;
+                pos = hit.start + 1;
+            }
+            return .none;
+        }
+
+        var best: ?VerifiedMatch = null;
+        var pos = start;
+        while (pos <= haystack.len) {
+            if (best) |cur| {
+                if (pos > cur.end) break;
+            }
+            const hit = self.find(haystack, pos, .leftmost_first) orelse break;
+            if (best) |cur| {
+                if (hit.start > cur.end) break;
+            }
+            if (self.verifyEarliestAt(haystack, hit, &best, verifier)) |abort_pos| {
+                return .{ .aborted = abort_pos };
+            }
+            if (hit.start >= haystack.len) break;
+            pos = hit.start + 1;
+        }
+        if (best) |m| return .{ .match = m };
+        return .none;
+    }
+
+    fn findVerifiedWatchedFallback(
+        self: *const Multi,
+        haystack: []const u8,
+        start: usize,
+        mode: matcher.MatchMode,
+        nul_pos: *?usize,
+        verifier: anytype,
+    ) VerifiedStep {
+        const max_pat_len = self.maxPatternLen();
+        var nul_checked = start;
+
+        if (mode == .leftmost_first) {
+            var pos = start;
+            while (pos <= haystack.len) {
+                const raw_hit = self.findWatched(haystack, pos, nul_pos) orelse return .none;
+                const lo = @max(pos, raw_hit.end -| max_pat_len);
+                const hi_slice = @min(haystack.len, raw_hit.start +| max_pat_len);
+                const used_leftmost = lo < raw_hit.start;
+                const hit = if (used_leftmost)
+                    (self.find(haystack[0..hi_slice], lo, .leftmost_first) orelse raw_hit)
+                else
+                    raw_hit;
+                if (hit.start > nul_checked) nul_checked = hit.start;
+                const step = if (used_leftmost or self.patterns.len <= 1)
+                    self.verifyLeftmostAt(haystack, hit, verifier)
+                else
+                    self.verifyLeftmostAllAt(haystack, hit.start, verifier);
+                switch (step) {
+                    .match => |m| {
+                        const check_end = @min(haystack.len, m.end);
+                        if (nul_checked < check_end) {
+                            if (memchr.find(memchr.native_width, haystack[0..check_end], nul_checked, 0)) |z| {
+                                nul_pos.* = z;
+                                return .none;
+                            }
+                        }
+                        return .{ .match = m };
+                    },
+                    .aborted => |resume_pos| {
+                        if (nul_checked < resume_pos) {
+                            if (memchr.find(memchr.native_width, haystack[0..resume_pos], nul_checked, 0)) |z| {
+                                nul_pos.* = z;
+                                return .none;
+                            }
+                        }
+                        return .{ .aborted = resume_pos };
+                    },
+                    .none => {},
+                }
+                if (hit.start < haystack.len and haystack[hit.start] == 0) {
+                    nul_pos.* = hit.start;
+                    return .none;
+                }
+                if (hit.start >= haystack.len) return .none;
+                pos = hit.start + 1;
+                if (pos > nul_checked) nul_checked = pos;
+            }
+            return .none;
+        }
+
+        var best: ?VerifiedMatch = null;
+        var pos = start;
+        outer: while (pos <= haystack.len) {
+            if (best) |cur| {
+                if (pos > cur.end) break;
+            }
+            const hit = if (best == null) blk: {
+                const raw_hit = self.findWatched(haystack, pos, nul_pos) orelse return .none;
+                const lo = @max(pos, raw_hit.end -| max_pat_len);
+                const hi_slice = @min(haystack.len, raw_hit.start +| max_pat_len);
+                const left_hit = if (lo < raw_hit.start)
+                    (self.find(haystack[0..hi_slice], lo, .leftmost_first) orelse raw_hit)
+                else
+                    raw_hit;
+                if (left_hit.start > nul_checked) nul_checked = left_hit.start;
+                break :blk left_hit;
+            } else blk: {
+                const left_hit = self.find(haystack, pos, .leftmost_first) orelse break :outer;
+                if (left_hit.start > best.?.end) break :outer;
+                break :blk left_hit;
+            };
+            if (self.verifyEarliestAt(haystack, hit, &best, verifier)) |abort_pos| {
+                if (nul_checked < abort_pos) {
+                    if (memchr.find(memchr.native_width, haystack[0..abort_pos], nul_checked, 0)) |z| {
+                        nul_pos.* = z;
+                        return .none;
+                    }
+                }
+                return .{ .aborted = abort_pos };
+            }
+            if (best == null) {
+                if (hit.start < haystack.len and haystack[hit.start] == 0) {
+                    nul_pos.* = hit.start;
+                    return .none;
+                }
+            }
+            if (hit.start >= haystack.len) break;
+            pos = hit.start + 1;
+            if (best == null and pos > nul_checked) nul_checked = pos;
+        }
+        const chosen = best orelse return .none;
+        const check_end = @min(haystack.len, chosen.end);
+        if (nul_checked < check_end) {
+            if (memchr.find(memchr.native_width, haystack[0..check_end], nul_checked, 0)) |z| {
+                nul_pos.* = z;
+                return .none;
+            }
+        }
+        return .{ .match = chosen };
+    }
 };
+
+fn preferVerifiedEarliest(a: VerifiedMatch, b: VerifiedMatch) bool {
+    if (a.end != b.end) return a.end < b.end;
+    if (a.start != b.start) return a.start < b.start;
+    return a.id < b.id;
+}
 
 inline fn callAllowAny(allow: anytype, haystack: []const u8, start: usize, end: usize) bool {
     const T = @TypeOf(allow);
@@ -1382,6 +1788,104 @@ test "Multi pattern_id attribution and Challenger bug regressions" {
             mut_m.deinit();
             break;
         } else |_| {}
+    }
+}
+
+test "Multi findVerified and findVerifiedWatched across Teddy and fallback engines" {
+    const alloc = std.testing.allocator;
+
+    // 1. Teddy (5+ patterns): reject decoys, accept extended match, watch NUL inside verified match
+    {
+        var m = try Multi.init(alloc, &.{ "err_", "warn_", "fail_", "crit_", "fatal_" }, .{});
+        defer m.deinit();
+        var hay: [256]u8 = @splat(' ');
+        @memcpy(hay[10..18], "err_nope");
+        @memcpy(hay[60..71], "fatal_OK999");
+
+        const V = struct {
+            pub fn verify(_: @This(), h: []const u8, _: usize, pat_end: usize, _: usize) VerifyResult {
+                if (pat_end + 5 <= h.len and std.mem.eql(u8, h[pat_end .. pat_end + 2], "OK")) {
+                    return .{ .accept = pat_end + 5 };
+                }
+                return .reject;
+            }
+        };
+        switch (m.findVerified(&hay, 0, .leftmost_first, V{})) {
+            .match => |hit| {
+                try std.testing.expectEqual(@as(usize, 60), hit.start);
+                try std.testing.expectEqual(@as(usize, 71), hit.end);
+                try std.testing.expectEqual(@as(usize, 4), hit.id);
+            },
+            else => return error.TestExpectedEqual,
+        }
+
+        hay[68] = 0; // NUL inside verified suffix
+        var nul_in: ?usize = null;
+        try std.testing.expect(m.findVerifiedWatched(&hay, 0, .leftmost_first, &nul_in, V{}) == .none);
+        try std.testing.expectEqual(@as(?usize, 68), nul_in);
+    }
+
+    // 2. Pairs fallback: co-starting overlapping patterns ("foobar", "foo") priority & rejection
+    {
+        var m = try Multi.init(alloc, &.{ "foobar", "foo" }, .{});
+        defer m.deinit();
+        try std.testing.expectEqualStrings("pairs", m.engineName());
+
+        const AcceptAll = struct {
+            pub fn verify(_: @This(), _: []const u8, _: usize, pat_end: usize, _: usize) VerifyResult {
+                return .{ .accept = pat_end };
+            }
+        };
+        var nul_a: ?usize = null;
+        switch (m.findVerifiedWatched("foobar", 0, .leftmost_first, &nul_a, AcceptAll{})) {
+            .match => |hit| {
+                try std.testing.expectEqual(@as(usize, 0), hit.start);
+                try std.testing.expectEqual(@as(usize, 6), hit.end);
+                try std.testing.expectEqual(@as(usize, 0), hit.id);
+            },
+            else => return error.TestExpectedEqual,
+        }
+        try std.testing.expectEqual(@as(?usize, null), nul_a);
+
+        const OnlyId1 = struct {
+            pub fn verify(_: @This(), _: []const u8, _: usize, pat_end: usize, pat_id: usize) VerifyResult {
+                return if (pat_id == 1) .{ .accept = pat_end + 2 } else .reject;
+            }
+        };
+        switch (m.findVerified("foobar", 0, .leftmost_first, OnlyId1{})) {
+            .match => |hit| {
+                try std.testing.expectEqual(@as(usize, 0), hit.start);
+                try std.testing.expectEqual(@as(usize, 5), hit.end);
+                try std.testing.expectEqual(@as(usize, 1), hit.id);
+            },
+            else => return error.TestExpectedEqual,
+        }
+
+        // NUL inside verified suffix on pairs fallback
+        var nul_b: ?usize = null;
+        try std.testing.expect(m.findVerifiedWatched("foo\x00ar", 0, .leftmost_first, &nul_b, OnlyId1{}) == .none);
+        try std.testing.expectEqual(@as(?usize, 3), nul_b);
+    }
+
+    // 3. Byteset fallback: abort + resume
+    {
+        var m = try Multi.init(alloc, &.{ "q", "z" }, .{});
+        defer m.deinit();
+        try std.testing.expectEqualStrings("bytes", m.engineName());
+
+        const AbortOnQ = struct {
+            pub fn verify(_: @This(), _: []const u8, _: usize, pat_end: usize, pat_id: usize) VerifyResult {
+                if (pat_id == 0) return .abort;
+                return .{ .accept = pat_end };
+            }
+        };
+        var nul_c: ?usize = null;
+        const step = m.findVerifiedWatched("aaqbbz", 0, .leftmost_first, &nul_c, AbortOnQ{});
+        switch (step) {
+            .aborted => |pos| try std.testing.expectEqual(@as(usize, 2), pos),
+            else => return error.TestExpectedEqual,
+        }
+        try std.testing.expectEqual(@as(?usize, null), nul_c);
     }
 }
 

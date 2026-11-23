@@ -339,6 +339,19 @@ fn isAnyMatcherRegex(any_m: matcher_mod.AnyMatcher) bool {
         any_m.vtable == matcher_mod.AnyMatcher.init(*const regex_mod.Regex, ptr_const).vtable;
 }
 
+inline fn shouldSwitchToPrepass(
+    config: SearchConfig,
+    fused_hits: usize,
+    initial_pos: usize,
+    pos: usize,
+    view_len: usize,
+) bool {
+    if (config.max_count != null or config.max_results != null or config.exists) return false;
+    if (fused_hits < 4) return false;
+    return (pos <= initial_pos +| (32 * 1024) and view_len > pos +| (64 * 1024)) or
+        (pos <= initial_pos +| (512 * 1024) and view_len > pos +| (2 * 1024 * 1024));
+}
+
 pub fn searchPrepared(
     comptime S: type,
     sink: *S,
@@ -658,7 +671,7 @@ pub fn searchPrepared(
                     break;
                 }
                 fused_hits += 1;
-                if (fused_hits >= 4 and state.pos <= initial_pos + 32 * 1024 and view.len > state.pos + 64 * 1024) {
+                if (shouldSwitchToPrepass(config, fused_hits, initial_pos, state.pos, view.len)) {
                     switched_to_prepass = true;
                     break;
                 }
@@ -685,7 +698,7 @@ pub fn searchPrepared(
                 state.pending_skip_to = null;
             } else if (!state.stopped and !state.exceeded(config) and state.pos == hit_line_end) {
                 fused_hits += 1;
-                if (fused_hits >= 4 and state.pos <= initial_pos + 32 * 1024 and view.len > state.pos + 64 * 1024) {
+                if (shouldSwitchToPrepass(config, fused_hits, initial_pos, state.pos, view.len)) {
                     switched_to_prepass = true;
                     break;
                 }

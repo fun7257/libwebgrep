@@ -281,7 +281,7 @@ pub fn compileGlobs(
                 anchored = true;
                 pat = pat[1..];
             }
-            if (std.mem.indexOfScalar(u8, pat, '/') != null) anchored = true;
+            if (std.mem.findScalar(u8, pat, '/') != null) anchored = true;
             var g = classifyWithCase(pat, options.case_insensitive);
             g.negated = negated;
             g.dir_only = dir_only;
@@ -305,14 +305,14 @@ pub fn matchGlobs(globs: []const Glob, rel: []const u8, base: []const u8, is_dir
 }
 
 fn classifyClass(text: []const u8) Class {
-    const meta = std.mem.indexOfAny(u8, text, "*?[") != null;
+    const meta = std.mem.findAny(u8, text, "*?[") != null;
     if (!meta) return .exact;
-    if (text.len >= 2 and text[0] == '*' and std.mem.indexOfAny(u8, text[1..], "*?[") == null) {
+    if (text.len >= 2 and text[0] == '*' and std.mem.findAny(u8, text[1..], "*?[") == null) {
         if (text[1] == '.') return .ext;
         return .suffix;
     }
     if (text.len >= 1 and text[text.len - 1] == '*' and
-        std.mem.indexOfAny(u8, text[0 .. text.len - 1], "*?[") == null and
+        std.mem.findAny(u8, text[0 .. text.len - 1], "*?[") == null and
         (text.len < 2 or text[text.len - 2] != '*'))
     {
         return .prefix;
@@ -393,7 +393,7 @@ fn matchSegment(pat: []const u8, text: []const u8, case_insensitive: bool) bool 
                     continue;
                 }
             } else if (pat[pi] == '[') {
-                if (std.mem.indexOfScalarPos(u8, pat, pi + 1, ']')) |close| {
+                if (std.mem.findScalarPos(u8, pat, pi + 1, ']')) |close| {
                     if (classMatch(pat[pi + 1 .. close], text[ti], case_insensitive)) {
                         pi = close + 1;
                         ti += 1;
@@ -422,7 +422,7 @@ fn matchSegment(pat: []const u8, text: []const u8, case_insensitive: bool) bool 
             if (dstar_ti < text.len) {
                 if (pat[dspi - 1] == '/') {
                     // `**/` must resume at a segment boundary
-                    if (std.mem.indexOfScalarPos(u8, text, dstar_ti, '/')) |slash| {
+                    if (std.mem.findScalarPos(u8, text, dstar_ti, '/')) |slash| {
                         dstar_ti = slash + 1;
                     } else {
                         return false;
@@ -472,7 +472,7 @@ fn classMatch(spec: []const u8, byte: u8, case_insensitive: bool) bool {
 }
 
 pub fn basename(path: []const u8) []const u8 {
-    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return path;
+    const slash = std.mem.findScalarLast(u8, path, '/') orelse return path;
     return path[slash + 1 ..];
 }
 

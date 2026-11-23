@@ -128,9 +128,9 @@ pub fn sniff(bytes: []const u8, eof: bool) Sniff {
 /// Parse a WHATWG charset label or HTTP Content-Type header (such as `text/plain; charset=gbk`) into an `Encoding`.
 pub fn fromCharset(label_or_header: []const u8) ?Encoding {
     var token = label_or_header;
-    if (asciiIndexOfIgnoreCase(token, "charset=")) |idx| {
+    if (std.ascii.findIgnoreCase(token, "charset=")) |idx| {
         token = token[idx + "charset=".len ..];
-        if (std.mem.indexOfAny(u8, token, "; \t\r\n")) |end| {
+        if (std.mem.findAny(u8, token, "; \t\r\n")) |end| {
             token = token[0..end];
         }
     }
@@ -273,15 +273,6 @@ pub fn detectEncoding(sample: []const u8) Encoding {
     return .windows1252;
 }
 
-fn asciiIndexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
-    if (needle.len == 0 or haystack.len < needle.len) return null;
-    var i: usize = 0;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
-    }
-    return null;
-}
-
 pub fn resolveHint(encoding: Encoding, charset: ?[]const u8) Encoding {
     if (encoding != .auto) return encoding;
     if (charset) |hint| {
@@ -290,23 +281,28 @@ pub fn resolveHint(encoding: Encoding, charset: ?[]const u8) Encoding {
     return .auto;
 }
 
-pub inline fn isAsciiSlice(bytes: []const u8) bool {
+inline fn firstNonAscii(bytes: []const u8) ?usize {
     const V = @Vector(memchr.native_width, u8);
     const msb: V = @splat(0x80);
+    const zero: V = @splat(0);
     var i: usize = 0;
     while (i + memchr.native_width <= bytes.len) : (i += memchr.native_width) {
         const v: V = bytes[i..][0..memchr.native_width].*;
-        if (@reduce(.Or, (v & msb) != @as(V, @splat(0)))) return false;
+        if (@reduce(.Or, (v & msb) != zero)) return i;
     }
     while (i < bytes.len) : (i += 1) {
-        if (bytes[i] >= 0x80) return false;
+        if (bytes[i] >= 0x80) return i;
     }
-    return true;
+    return null;
+}
+
+pub inline fn isAsciiSlice(bytes: []const u8) bool {
+    return firstNonAscii(bytes) == null;
 }
 
 pub fn validUtf8(bytes: []const u8) bool {
-    if (isAsciiSlice(bytes)) return true;
-    return unicode.utf8ValidateSlice(bytes);
+    const off = firstNonAscii(bytes) orelse return true;
+    return unicode.utf8ValidateSlice(bytes[off..]);
 }
 
 pub fn lossyLen(bytes: []const u8) usize {
@@ -806,7 +802,7 @@ pub const Decoder = struct {
     fn compactIn(self: *Decoder) void {
         if (self.in_i == 0) return;
         const rest = self.in_len - self.in_i;
-        if (rest != 0) std.mem.copyForwards(u8, self.in[0..rest], self.in[self.in_i..self.in_len]);
+        if (rest != 0) @memmove(self.in[0..rest], self.in[self.in_i..self.in_len]);
         self.in_len = rest;
         self.in_i = 0;
     }
@@ -833,6 +829,33 @@ pub const Decoder = struct {
         var filled = self.drainOut(dest);
         while (filled < dest.len) {
             const rest = self.in[self.in_i..self.in_len];
+            if (comptime mode == .utf16le) {
+                if (self.offset_map == null) {
+                    if (comptime std.simd.suggestVectorLength(u16)) |chunk_len| {
+                        const byte_step = chunk_len * 2;
+                        const Vec16 = @Vector(chunk_len, u16);
+                        const mask: Vec16 = @splat(std.mem.nativeToLittle(u16, 0x7F));
+                        var run_in: usize = 0;
+                        var run_out: usize = 0;
+                        while (run_in + byte_step <= rest.len and filled + run_out + chunk_len <= dest.len) {
+                            const raw_bytes: @Vector(byte_step, u8) = rest[run_in..][0..byte_step].*;
+                            const chunk: Vec16 = @bitCast(raw_bytes);
+                            if (@reduce(.Or, (chunk | mask) != mask)) break;
+                            const ascii_chunk: @Vector(chunk_len, u8) = @truncate(std.mem.nativeToLittle(Vec16, chunk));
+                            dest[filled + run_out ..][0..chunk_len].* = ascii_chunk;
+                            run_in += byte_step;
+                            run_out += chunk_len;
+                        }
+                        if (run_out != 0) {
+                            self.in_i += run_in;
+                            self.raw_consumed += run_in;
+                            filled += run_out;
+                            self.out_produced += run_out;
+                            continue;
+                        }
+                    }
+                }
+            }
             if (comptime isAsciiCompatible(mode)) {
                 if (self.offset_map == null and rest.len > 0 and rest[0] < 0x80) {
                     const limit = @min(rest.len, dest.len - filled);
@@ -944,6 +967,21 @@ fn convertedLenMode(comptime mode: coded_mode, input: []const u8) usize {
     var n: usize = 0;
     while (i < input.len) {
         if (comptime mode == .utf16le) {
+            if (comptime std.simd.suggestVectorLength(u16)) |chunk_len| {
+                const byte_step = chunk_len * 2;
+                const Vec16 = @Vector(chunk_len, u16);
+                const mask: Vec16 = @splat(std.mem.nativeToLittle(u16, 0x7F));
+                var progressed = false;
+                while (i + byte_step <= input.len) {
+                    const raw_bytes: @Vector(byte_step, u8) = input[i..][0..byte_step].*;
+                    const chunk: Vec16 = @bitCast(raw_bytes);
+                    if (@reduce(.Or, (chunk | mask) != mask)) break;
+                    n += chunk_len;
+                    i += byte_step;
+                    progressed = true;
+                }
+                if (progressed) continue;
+            }
             if (i + 2 <= input.len and input[i + 1] == 0 and input[i] < 0x80) {
                 n += 1;
                 i += 2;
@@ -973,8 +1011,36 @@ fn convertInto(mode: coded_mode, input: []const u8, out: []u8) usize {
 fn convertIntoMode(comptime mode: coded_mode, input: []const u8, out: []u8) usize {
     var i: usize = 0;
     var w: usize = 0;
+    if (comptime mode == .utf16le) {
+        const even_len = input.len & ~@as(usize, 1);
+        if (even_len != 0 and (@intFromPtr(input.ptr) & 1) == 0) {
+            const aligned_bytes: []align(2) const u8 = @alignCast(input[0..even_len]);
+            if (unicode.utf16LeToUtf8(out, std.mem.bytesAsSlice(u16, aligned_bytes))) |written| {
+                w = written;
+                i = even_len;
+                if (i == input.len) return w;
+            } else |_| {}
+        }
+    }
     while (i < input.len) {
         if (comptime mode == .utf16le) {
+            if (comptime std.simd.suggestVectorLength(u16)) |chunk_len| {
+                const byte_step = chunk_len * 2;
+                const Vec16 = @Vector(chunk_len, u16);
+                const mask: Vec16 = @splat(std.mem.nativeToLittle(u16, 0x7F));
+                var progressed = false;
+                while (i + byte_step <= input.len) {
+                    const raw_bytes: @Vector(byte_step, u8) = input[i..][0..byte_step].*;
+                    const chunk: Vec16 = @bitCast(raw_bytes);
+                    if (@reduce(.Or, (chunk | mask) != mask)) break;
+                    const ascii_chunk: @Vector(chunk_len, u8) = @truncate(std.mem.nativeToLittle(Vec16, chunk));
+                    out[w..][0..chunk_len].* = ascii_chunk;
+                    w += chunk_len;
+                    i += byte_step;
+                    progressed = true;
+                }
+                if (progressed) continue;
+            }
             if (i + 2 <= input.len and input[i + 1] == 0 and input[i] < 0x80) {
                 out[w] = input[i];
                 w += 1;
@@ -1255,44 +1321,16 @@ fn decodeUtf16(bytes: []const u8, endian: std.builtin.Endian, eof: bool) ?Step {
     return .{ .n = 2, .cp = unit };
 }
 
-fn utf8Len(cp: u21) usize {
-    if (cp < 0x80) return 1;
-    if (cp < 0x800) return 2;
-    if (cp < 0x10000) return 3;
-    return 4;
+inline fn utf8Len(cp: u21) usize {
+    return unicode.utf8CodepointSequenceLength(cp) catch 3;
 }
 
 fn encodeCp(cp: u21, out: []u8) usize {
-    if (cp < 0x80) {
-        out[0] = @intCast(cp);
-        return 1;
-    }
-    if (cp < 0x800) {
-        out[0] = @intCast(0xC0 | (cp >> 6));
-        out[1] = @intCast(0x80 | (cp & 0x3F));
-        return 2;
-    }
-    if (cp < 0x10000) {
-        if (cp >= 0xD800 and cp <= 0xDFFF) {
-            const rep = unicode.replacement_character_utf8;
-            @memcpy(out[0..rep.len], &rep);
-            return rep.len;
-        }
-        out[0] = @intCast(0xE0 | (cp >> 12));
-        out[1] = @intCast(0x80 | ((cp >> 6) & 0x3F));
-        out[2] = @intCast(0x80 | (cp & 0x3F));
-        return 3;
-    }
-    if (cp <= 0x10FFFF) {
-        out[0] = @intCast(0xF0 | (cp >> 18));
-        out[1] = @intCast(0x80 | ((cp >> 12) & 0x3F));
-        out[2] = @intCast(0x80 | ((cp >> 6) & 0x3F));
-        out[3] = @intCast(0x80 | (cp & 0x3F));
-        return 4;
-    }
-    const rep = unicode.replacement_character_utf8;
-    @memcpy(out[0..rep.len], &rep);
-    return rep.len;
+    return unicode.utf8Encode(cp, out) catch {
+        const rep = unicode.replacement_character_utf8;
+        @memcpy(out[0..rep.len], &rep);
+        return rep.len;
+    };
 }
 
 const testing = std.testing;

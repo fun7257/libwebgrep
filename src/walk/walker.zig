@@ -195,7 +195,7 @@ pub const Session = struct {
 
 fn openRoot(io: std.Io, path: []const u8) !std.Io.Dir {
     const options = withoutLinkResolve(std.Io.Dir.OpenOptions{ .iterate = true });
-    if (std.fs.path.isAbsolute(path)) return std.Io.Dir.openDirAbsolute(io, path, options);
+    if (std.Io.Dir.path.isAbsolute(path)) return std.Io.Dir.openDirAbsolute(io, path, options);
     return std.Io.Dir.cwd().openDir(io, path, options);
 }
 
@@ -688,9 +688,8 @@ fn displayPath(allocator: std.mem.Allocator, root: []const u8, rel: []const u8) 
 
 fn trimSlash(path: []const u8) []const u8 {
     if (path.len <= 1) return path;
-    var end = path.len;
-    while (end > 1 and (path[end - 1] == '/' or path[end - 1] == '\\')) end -= 1;
-    return path[0..end];
+    const trimmed = std.mem.trimEnd(u8, path, "/\\");
+    return if (trimmed.len == 0) path[0..1] else trimmed;
 }
 
 fn report(host: *Host, job: *Job, name: []const u8, err: anyerror) void {
@@ -890,7 +889,7 @@ fn collectWalk(root: []const u8, config: Config, found: *std.ArrayList([]u8)) !v
 
 test "does not read gitignore or exclude above search root" {
     inline for (@typeInfo(Config).@"struct".field_names) |field| {
-        try std.testing.expect(std.mem.indexOf(u8, field, "parent") == null);
+        try std.testing.expect(std.mem.find(u8, field, "parent") == null);
     }
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -917,8 +916,8 @@ test "does not read gitignore or exclude above search root" {
 
 test "does not read global excludes" {
     inline for (@typeInfo(Config).@"struct".field_names) |field| {
-        try std.testing.expect(std.mem.indexOf(u8, field, "global") == null);
-        try std.testing.expect(std.mem.indexOf(u8, field, "excludes") == null);
+        try std.testing.expect(std.mem.find(u8, field, "global") == null);
+        try std.testing.expect(std.mem.find(u8, field, "excludes") == null);
     }
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

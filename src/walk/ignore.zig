@@ -78,7 +78,7 @@ pub fn parseIntoWithOptions(
     const max_len = options.max_rule_len orelse glob.rule_len_hard_cap;
     var line_start: usize = 0;
     while (line_start <= text.len) {
-        const line_end = std.mem.indexOfScalarPos(u8, text, line_start, '\n') orelse text.len;
+        const line_end = std.mem.findScalarPos(u8, text, line_start, '\n') orelse text.len;
         var line = text[line_start..line_end];
         if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
         if (try parseLineWithLimits(allocator, line, options.case_insensitive, max_len)) |item| {
@@ -183,7 +183,7 @@ pub fn parseLineWithLimits(
         anchored = true;
         pattern = pattern[1..];
     }
-    if (std.mem.indexOfScalar(u8, pattern, '/') != null) anchored = true;
+    if (std.mem.findScalar(u8, pattern, '/') != null) anchored = true;
     if (pattern.len == 0) {
         raw.deinit(allocator);
         return null;
@@ -311,7 +311,7 @@ fn freeze(
 pub fn isIgnored(set: *const Set, rel: []const u8, is_dir: bool, scratch: []u8) bool {
     if (!is_dir) {
         var end = rel.len;
-        while (std.mem.lastIndexOfScalar(u8, rel[0..end], '/')) |slash| {
+        while (std.mem.findScalarLast(u8, rel[0..end], '/')) |slash| {
             if (decide(set, rel[0..slash], true, scratch)) return true;
             end = slash;
         }
@@ -376,7 +376,7 @@ fn considerOne(set: *const Set, index: u32, is_dir: bool, best: *?u32) void {
 }
 
 fn extensionOf(base: []const u8) ?[]const u8 {
-    const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse return null;
+    const dot = std.mem.findScalarLast(u8, base, '.') orelse return null;
     if (dot == 0) return null;
     return base[dot..];
 }

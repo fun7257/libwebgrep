@@ -214,7 +214,7 @@ pub fn probeLineSlice(haystack: []const u8, offset: u64, options: ProbeOptions) 
     const d_right_usize: ?usize = if (haystack[off] == options.delimiter)
         off
     else
-        memchr.find(memchr.native_width, haystack[0..fwd_hi], off + 1, options.delimiter);
+        std.mem.findScalarPos(u8, haystack[0..fwd_hi], off + 1, options.delimiter);
 
     const d_right: ?u64 = if (d_right_usize) |dr| @intCast(dr) else null;
     const eof_right: ?u64 = if (d_right == null and fwd_hi == haystack.len) @intCast(haystack.len) else null;
@@ -272,7 +272,7 @@ fn planRandomAccess(
 
     if (chunk_buf[0] == options.delimiter) {
         d_right = offset;
-    } else if (memchr.find(memchr.native_width, chunk_buf[0..first_n], 1, options.delimiter)) |rel| {
+    } else if (std.mem.findScalarPos(u8, chunk_buf[0..first_n], 1, options.delimiter)) |rel| {
         d_right = offset + rel;
         byte_before_d_right = chunk_buf[rel - 1];
     } else if (first_n < first_want) {
@@ -288,7 +288,7 @@ fn planRandomAccess(
                 eof_right = cur;
                 break;
             }
-            if (memchr.find(memchr.native_width, chunk_buf[0..n], 0, options.delimiter)) |rel| {
+            if (std.mem.findScalarPos(u8, chunk_buf[0..n], 0, options.delimiter)) |rel| {
                 d_right = cur + rel;
                 byte_before_d_right = if (rel > 0) chunk_buf[rel - 1] else prev_last;
                 break;

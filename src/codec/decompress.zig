@@ -348,35 +348,15 @@ fn pumpCustomDecompress(
 
 /// Helper to generate a valid Gzip byte stream (using Stored Deflate blocks + CRC32 + ISIZE) for unit tests constructing normal compressed streams and high-ratio bombs.
 pub fn compressGzipStoredAlloc(allocator: std.mem.Allocator, payload: []const u8) error{OutOfMemory}![]u8 {
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
 
-    // 10-byte Gzip header
-    try out.appendSlice(allocator, &[_]u8{ 0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03 });
+    var raw_buf: [4096]u8 = undefined;
+    var raw = std.compress.flate.Compress.Raw.init(&out.writer, &raw_buf, .gzip) catch return error.OutOfMemory;
+    raw.writer.writeAll(payload) catch return error.OutOfMemory;
+    raw.finish() catch return error.OutOfMemory;
 
-    var pos: usize = 0;
-    while (true) {
-        const rem = payload.len - pos;
-        const block_len: u16 = @intCast(@min(rem, 65535));
-        const is_final: u8 = if (pos + block_len >= payload.len) 1 else 0;
-        try out.append(allocator, is_final); // BFINAL=is_final, BTYPE=00 (stored)
-        var len_bytes: [4]u8 = undefined;
-        std.mem.writeInt(u16, len_bytes[0..2], block_len, .little);
-        std.mem.writeInt(u16, len_bytes[2..4], ~block_len, .little);
-        try out.appendSlice(allocator, &len_bytes);
-        try out.appendSlice(allocator, payload[pos .. pos + block_len]);
-        pos += block_len;
-        if (is_final == 1) break;
-    }
-
-    var crc = std.hash.Crc32.init();
-    crc.update(payload);
-    var footer: [8]u8 = undefined;
-    std.mem.writeInt(u32, footer[0..4], crc.final(), .little);
-    std.mem.writeInt(u32, footer[4..8], @truncate(payload.len), .little);
-    try out.appendSlice(allocator, &footer);
-
-    return out.toOwnedSlice(allocator);
+    return out.toOwnedSlice();
 }
 
 /// Helper to generate a valid Zstd frame (uncompressed Raw Block) for unit tests.

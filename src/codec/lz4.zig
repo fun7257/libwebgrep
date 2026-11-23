@@ -343,7 +343,7 @@ pub const Lz4Decompressor = struct {
 
             var hc_byte: [1]u8 = undefined;
             try readExactStrict(self.upstream, &hc_byte);
-            const expected_hc: u8 = @truncate(XxHash32.hash(0, hdr[0..hdr_len]) >> 8);
+            const expected_hc: u8 = @truncate(std.hash.XxHash32.hash(0, hdr[0..hdr_len]) >> 8);
             if (hc_byte[0] != expected_hc) return error.CorruptStream;
 
             self.block_max_size = block_max;
@@ -366,7 +366,7 @@ pub const Lz4Decompressor = struct {
             self.dict_len += chunk.len;
         } else {
             const keep = 65536 - chunk.len;
-            std.mem.copyForwards(u8, self.dict_buf[0..keep], self.dict_buf[self.dict_len - keep .. self.dict_len]);
+            @memmove(self.dict_buf[0..keep], self.dict_buf[self.dict_len - keep .. self.dict_len]);
             @memcpy(self.dict_buf[keep..65536], chunk);
             self.dict_len = 65536;
         }
@@ -407,7 +407,7 @@ pub const Lz4Decompressor = struct {
                 var bcs_bytes: [4]u8 = undefined;
                 try readExactStrict(self.upstream, &bcs_bytes);
                 const expected_bcs = std.mem.readInt(u32, &bcs_bytes, .little);
-                if (XxHash32.hash(0, read_target) != expected_bcs) return error.CorruptStream;
+                if (std.hash.XxHash32.hash(0, read_target) != expected_bcs) return error.CorruptStream;
             }
 
             const dec_len: usize = if (is_uncompressed)
@@ -451,7 +451,7 @@ pub fn compressLz4StoredAlloc(allocator: std.mem.Allocator, payload: []const u8)
 
     // FLG = 0x64 (version=01, B.Indep=1, C.Checksum=1), BD = 0x40 (64 KiB max block)
     const hdr = [2]u8{ 0x64, 0x40 };
-    const hc: u8 = @truncate(XxHash32.hash(0, &hdr) >> 8);
+    const hc: u8 = @truncate(std.hash.XxHash32.hash(0, &hdr) >> 8);
     try out.appendSlice(allocator, &hdr);
     try out.append(allocator, hc);
 

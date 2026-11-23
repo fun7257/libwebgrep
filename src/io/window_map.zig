@@ -115,14 +115,11 @@ fn readPositional(self: *Reader, dest: []u8) ReadError!usize {
 
 fn adviseDontNeed(memory: []align(std.heap.page_size_min) u8) void {
     switch (comptime builtin.os.tag) {
-        .linux => {
-            // musl targets do not link libc automatically; invoke the syscall directly and ignore failures since read bytes are unaffected.
-            _ = std.os.linux.madvise(memory.ptr, memory.len, std.os.linux.MADV.DONTNEED);
-        },
         .windows, .wasi => {},
         else => {
-            if (comptime @TypeOf(std.c.MADV) == void) return;
-            _ = std.c.madvise(memory.ptr, memory.len, std.c.MADV.DONTNEED);
+            if (comptime @TypeOf(std.posix.MADV) == void) return;
+            if (comptime !@hasDecl(std.posix.MADV, "DONTNEED")) return;
+            std.posix.madvise(memory.ptr, memory.len, std.posix.MADV.DONTNEED) catch {};
         },
     }
 }

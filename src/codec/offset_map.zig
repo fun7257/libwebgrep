@@ -77,16 +77,11 @@ pub const OffsetMap = struct {
         if (items.len == 0) return out_offset + self.base_raw_offset;
 
         // Binary search for the last `anchor.out_offset <= out_offset`
-        var lo: usize = 0;
-        var hi: usize = items.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (items[mid].out_offset <= out_offset) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
+        const lo = std.sort.partitionPoint(Anchor, items, out_offset, struct {
+            fn pred(target: SearchByteOffset, a: Anchor) bool {
+                return a.out_offset <= target;
             }
-        }
+        }.pred);
         if (lo == 0) return items[0].raw_offset;
         const idx = lo - 1;
         const cur = items[idx];

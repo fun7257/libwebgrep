@@ -7,13 +7,8 @@ pub fn build(b: *std.Build) void {
     const fuzz_filter = b.option([]const u8, "fuzz-filter", "Run only tests whose name contains this substring");
     const bench_filter = b.option([]const u8, "bench-filter", "Run only benchmark scenarios whose name contains this substring");
     // OS- and ISA-specific optimizations are controlled via build options.
-    // Windowed mmap and raw getdents64 are disabled by default.
+    // Windowed mmap is disabled by default.
     // Teddy defaults to neon on aarch64 and off on other architectures.
-    const want_linux_getdents = b.option(
-        bool,
-        "linux-getdents",
-        "Use raw getdents64 syscall for directory enumeration on Linux (default: false, uses std.Io.Dir.Reader)",
-    ) orelse false;
     const window_map = b.option(
         bool,
         "mmap-windows",
@@ -57,9 +52,7 @@ pub fn build(b: *std.Build) void {
         },
         else => target,
     };
-    const linux_getdents = want_linux_getdents and target.result.os.tag == .linux;
     const options = b.addOptions();
-    options.addOption(bool, "linux_getdents", linux_getdents);
     options.addOption(bool, "window_map", window_map);
     options.addOption(TeddyIsa, "teddy", teddy);
     const test_filters: []const []const u8 = if (fuzz_filter) |filter| &.{filter} else &.{};
@@ -212,12 +205,6 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&webgrep_shared.step);
     check_step.dependOn(&example_tests.step);
     check_step.dependOn(&example_zh_tests.step);
-    if (want_linux_getdents and target.result.os.tag != .linux) {
-        const fail = b.addFail("-Dlinux-getdents is only supported when targeting Linux");
-        test_step.dependOn(&fail.step);
-        check_step.dependOn(&fail.step);
-        b.getInstallStep().dependOn(&fail.step);
-    }
     if (!teddy_matches) {
         const message = switch (teddy_request) {
             .neon => "-Dteddy=neon is only supported on aarch64",

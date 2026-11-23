@@ -129,8 +129,8 @@ pub fn detectFormat(bytes: []const u8, requested: ArchiveFormat) ArchiveError!Ar
     if (bytes.len == 0) return .tar;
 
     if (bytes.len >= 4) {
-        if (std.mem.eql(u8, bytes[0..4], "PK\x03\x04") or
-            std.mem.eql(u8, bytes[0..4], "PK\x05\x06") or
+        if (std.mem.eql(u8, bytes[0..4], &std.zip.local_file_header_sig) or
+            std.mem.eql(u8, bytes[0..4], &std.zip.end_record_sig) or
             std.mem.eql(u8, bytes[0..4], "PK\x07\x08"))
         {
             return .zip;
@@ -272,8 +272,8 @@ fn hasValidTarChecksum(block: *const [512]u8) bool {
 }
 
 pub fn sanitizeArchivePath(raw_path: []const u8) ArchiveError!?[]const u8 {
-    if (std.mem.indexOfScalar(u8, raw_path, 0) != null) return error.PathTraversal;
-    if (std.mem.indexOfScalar(u8, raw_path, '\\') != null) return error.PathTraversal;
+    if (std.mem.findScalar(u8, raw_path, 0) != null) return error.PathTraversal;
+    if (std.mem.findScalar(u8, raw_path, '\\') != null) return error.PathTraversal;
     if (raw_path.len >= 2 and std.ascii.isAlphabetic(raw_path[0]) and raw_path[1] == ':') {
         return error.PathTraversal;
     }
@@ -345,7 +345,7 @@ fn insertFile(
     payload: []const u8,
     mtime: ?i64,
 ) ArchiveError!void {
-    const parent, const base = if (std.mem.lastIndexOfScalar(u8, clean_path, '/')) |slash| blk: {
+    const parent, const base = if (std.mem.findScalarLast(u8, clean_path, '/')) |slash| blk: {
         const dir = try ensureDirPath(arena_alloc, root, clean_path[0..slash], null);
         break :blk .{ dir, clean_path[slash + 1 ..] };
     } else .{ root, clean_path };
@@ -440,7 +440,7 @@ pub fn dosDateTimeToUnix(mod_time: u16, mod_date: u16) i64 {
 
 /// Converts UTC Unix epoch seconds into MS-DOS 16-bit time and date (clamped to 1980..2107).
 pub fn unixToDosDateTime(unix_sec: i64) struct { mod_time: u16, mod_date: u16 } {
-    const clamped = std.math.clamp(unix_sec, 315532800, 4354819199);
+    const clamped = std.math.clamp(unix_sec, std.time.epoch.dos, 4354819199);
     const days: i64 = @divFloor(clamped, 86400);
     const rem_sec: u32 = @intCast(clamped - days * 86400);
     const hour: u16 = @intCast(rem_sec / 3600);
@@ -618,7 +618,7 @@ fn unpackZip(
     const min_pos = zip_bytes.len -| (22 + 65535);
     var pos: usize = zip_bytes.len - 22;
     while (true) {
-        if (std.mem.readInt(u32, zip_bytes[pos..][0..4], .little) == 0x06054b50) {
+        if (std.mem.eql(u8, zip_bytes[pos..][0..4], &std.zip.end_record_sig)) {
             const comment_len = std.mem.readInt(u16, zip_bytes[pos + 20 ..][0..2], .little);
             if (pos + 22 + comment_len <= zip_bytes.len) {
                 eocd_pos = pos;
@@ -637,11 +637,11 @@ fn unpackZip(
     // ZIP64 End of Central Directory Locator (0x07064b50) immediately precedes EOCD
     if ((total_entries == 0xFFFF or cd_size == 0xFFFFFFFF or cd_offset == 0xFFFFFFFF) and eocd >= 20) {
         const loc = eocd - 20;
-        if (std.mem.readInt(u32, zip_bytes[loc..][0..4], .little) == 0x07064b50) {
+        if (std.mem.eql(u8, zip_bytes[loc..][0..4], &std.zip.end_locator64_sig)) {
             const eocd64_off_u64 = std.mem.readInt(u64, zip_bytes[loc + 8 ..][0..8], .little);
             const eocd64_off = std.math.cast(usize, eocd64_off_u64) orelse return error.CorruptArchive;
             if (eocd64_off + 56 > loc) return error.CorruptArchive;
-            if (std.mem.readInt(u32, zip_bytes[eocd64_off..][0..4], .little) != 0x06064b50) {
+            if (!std.mem.eql(u8, zip_bytes[eocd64_off..][0..4], &std.zip.end_record64_sig)) {
                 return error.CorruptArchive;
             }
             if (total_entries == 0xFFFF) {
@@ -668,8 +668,7 @@ fn unpackZip(
         const hdr_end = std.math.add(usize, cd_pos, 46) catch return error.CorruptArchive;
         if (hdr_end > cd_end) return error.CorruptArchive;
 
-        const sig = std.mem.readInt(u32, zip_bytes[cd_pos..][0..4], .little);
-        if (sig != 0x02014b50) return error.CorruptArchive;
+        if (!std.mem.eql(u8, zip_bytes[cd_pos..][0..4], &std.zip.central_file_header_sig)) return error.CorruptArchive;
 
         const flags = std.mem.readInt(u16, zip_bytes[cd_pos + 8 ..][0..2], .little);
         const method = std.mem.readInt(u16, zip_bytes[cd_pos + 10 ..][0..2], .little);
@@ -746,8 +745,7 @@ fn unpackZip(
         const lfh_end = std.math.add(usize, lfh_off, 30) catch return error.CorruptArchive;
         if (lfh_end > cd_offset_usize or lfh_end > zip_bytes.len) return error.CorruptArchive;
 
-        const lfh_sig = std.mem.readInt(u32, zip_bytes[lfh_off..][0..4], .little);
-        if (lfh_sig != 0x04034b50) return error.CorruptArchive;
+        if (!std.mem.eql(u8, zip_bytes[lfh_off..][0..4], &std.zip.local_file_header_sig)) return error.CorruptArchive;
 
         const lfh_name_len = std.mem.readInt(u16, zip_bytes[lfh_off + 26 ..][0..2], .little);
         const lfh_extra_len = std.mem.readInt(u16, zip_bytes[lfh_off + 28 ..][0..2], .little);
@@ -929,24 +927,15 @@ pub fn buildTestTarAlloc(allocator: std.mem.Allocator, entries: []const TestArch
 }
 
 pub fn deflateRawStoredAlloc(allocator: std.mem.Allocator, payload: []const u8) ![]u8 {
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
 
-    var pos: usize = 0;
-    while (true) {
-        const rem = payload.len - pos;
-        const block_len: u16 = @intCast(@min(rem, 65535));
-        const is_final: u8 = if (pos + block_len >= payload.len) 1 else 0;
-        try out.append(allocator, is_final);
-        var len_bytes: [4]u8 = undefined;
-        std.mem.writeInt(u16, len_bytes[0..2], block_len, .little);
-        std.mem.writeInt(u16, len_bytes[2..4], ~block_len, .little);
-        try out.appendSlice(allocator, &len_bytes);
-        try out.appendSlice(allocator, payload[pos .. pos + block_len]);
-        pos += block_len;
-        if (is_final == 1) break;
-    }
-    return out.toOwnedSlice(allocator);
+    var raw_buf: [4096]u8 = undefined;
+    var raw = std.compress.flate.Compress.Raw.init(&out.writer, &raw_buf, .raw) catch return error.OutOfMemory;
+    raw.writer.writeAll(payload) catch return error.OutOfMemory;
+    raw.finish() catch return error.OutOfMemory;
+
+    return out.toOwnedSlice();
 }
 
 pub fn buildTestZipAlloc(allocator: std.mem.Allocator, entries: []const TestArchiveEntry) ![]u8 {
@@ -995,7 +984,7 @@ pub fn buildTestZipAlloc(allocator: std.mem.Allocator, entries: []const TestArch
 
         // Local File Header (30 bytes)
         var lfh: [30]u8 = @splat(0);
-        std.mem.writeInt(u32, lfh[0..4], 0x04034b50, .little);
+        lfh[0..4].* = std.zip.local_file_header_sig;
         std.mem.writeInt(u16, lfh[4..6], 20, .little);
         std.mem.writeInt(u16, lfh[8..10], method, .little);
         std.mem.writeInt(u16, lfh[10..12], mod_time, .little);
@@ -1032,7 +1021,7 @@ pub fn buildTestZipAlloc(allocator: std.mem.Allocator, entries: []const TestArch
     for (cd_recs.items) |rec| {
         const extra_len: u16 = if (rec.ext_mtime != null) 9 else 0;
         var cdh: [46]u8 = @splat(0);
-        std.mem.writeInt(u32, cdh[0..4], 0x02014b50, .little);
+        cdh[0..4].* = std.zip.central_file_header_sig;
         std.mem.writeInt(u16, cdh[4..6], 0x0314, .little); // UNIX, 2.0
         std.mem.writeInt(u16, cdh[6..8], 20, .little);
         std.mem.writeInt(u16, cdh[10..12], rec.method, .little);
@@ -1059,7 +1048,7 @@ pub fn buildTestZipAlloc(allocator: std.mem.Allocator, entries: []const TestArch
     const cd_size: u32 = @intCast(out.items.len - cd_offset);
 
     var eocd: [22]u8 = @splat(0);
-    std.mem.writeInt(u32, eocd[0..4], 0x06054b50, .little);
+    eocd[0..4].* = std.zip.end_record_sig;
     std.mem.writeInt(u16, eocd[8..10], @intCast(cd_recs.items.len), .little);
     std.mem.writeInt(u16, eocd[10..12], @intCast(cd_recs.items.len), .little);
     std.mem.writeInt(u32, eocd[12..16], cd_size, .little);
@@ -1250,7 +1239,7 @@ test "ArchiveTree v0.8: tar.lz4, ZIP64, ZIP Zstd method 93, and nested archives"
 
         // Local File Header (method 93)
         var lfh: [30]u8 = @splat(0);
-        std.mem.writeInt(u32, lfh[0..4], 0x04034b50, .little);
+        lfh[0..4].* = std.zip.local_file_header_sig;
         std.mem.writeInt(u16, lfh[4..6], 45, .little);
         std.mem.writeInt(u16, lfh[8..10], 93, .little);
         std.mem.writeInt(u32, lfh[14..18], crc, .little);
@@ -1271,7 +1260,7 @@ test "ArchiveTree v0.8: tar.lz4, ZIP64, ZIP Zstd method 93, and nested archives"
         std.mem.writeInt(u64, z64_extra[20..28], 0, .little);
 
         var cdh: [46]u8 = @splat(0);
-        std.mem.writeInt(u32, cdh[0..4], 0x02014b50, .little);
+        cdh[0..4].* = std.zip.central_file_header_sig;
         std.mem.writeInt(u16, cdh[4..6], 45, .little);
         std.mem.writeInt(u16, cdh[6..8], 45, .little);
         std.mem.writeInt(u16, cdh[10..12], 93, .little);
@@ -1289,7 +1278,7 @@ test "ArchiveTree v0.8: tar.lz4, ZIP64, ZIP Zstd method 93, and nested archives"
         // ZIP64 EOCD (56 bytes)
         const eocd64_off: u64 = buf.items.len;
         var eocd64: [56]u8 = @splat(0);
-        std.mem.writeInt(u32, eocd64[0..4], 0x06064b50, .little);
+        eocd64[0..4].* = std.zip.end_record64_sig;
         std.mem.writeInt(u64, eocd64[4..12], 44, .little);
         std.mem.writeInt(u16, eocd64[12..14], 45, .little);
         std.mem.writeInt(u16, eocd64[14..16], 45, .little);
@@ -1301,14 +1290,14 @@ test "ArchiveTree v0.8: tar.lz4, ZIP64, ZIP Zstd method 93, and nested archives"
 
         // ZIP64 EOCD Locator (20 bytes)
         var loc: [20]u8 = @splat(0);
-        std.mem.writeInt(u32, loc[0..4], 0x07064b50, .little);
+        loc[0..4].* = std.zip.end_locator64_sig;
         std.mem.writeInt(u64, loc[8..16], eocd64_off, .little);
         std.mem.writeInt(u32, loc[16..20], 1, .little);
         try buf.appendSlice(alloc, &loc);
 
         // Standard EOCD (22 bytes) with 0xFFFF / 0xFFFFFFFF sentinels
         var eocd: [22]u8 = @splat(0);
-        std.mem.writeInt(u32, eocd[0..4], 0x06054b50, .little);
+        eocd[0..4].* = std.zip.end_record_sig;
         std.mem.writeInt(u16, eocd[8..10], 0xFFFF, .little);
         std.mem.writeInt(u16, eocd[10..12], 0xFFFF, .little);
         std.mem.writeInt(u32, eocd[12..16], 0xFFFFFFFF, .little);

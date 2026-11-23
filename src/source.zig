@@ -97,13 +97,13 @@ const ReadError = error{ InvalidHandle, NotFile };
 const ListError = error{ InvalidHandle, NotDir };
 
 pub fn lookupNode(node: *const Node, path: []const u8) ?*const Node {
-    if (std.mem.indexOfScalar(u8, path, '\\') != null) return null;
-    if (std.mem.indexOfScalar(u8, path, 0) != null) return null;
+    if (std.mem.findScalar(u8, path, '\\') != null) return null;
+    if (std.mem.findScalar(u8, path, 0) != null) return null;
     if (path.len == 0 or std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, ".")) return node;
     var rest = if (path[0] == '/') path[1..] else path;
     var current = node;
     while (rest.len > 0) {
-        const slash = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
+        const slash = std.mem.findScalar(u8, rest, '/') orelse rest.len;
         const name = rest[0..slash];
         if (std.mem.eql(u8, name, "..")) return null;
         if (name.len > 0 and !std.mem.eql(u8, name, ".")) {

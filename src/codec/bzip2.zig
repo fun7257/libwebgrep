@@ -20,27 +20,7 @@ const group_size: usize = 50;
 const block_magic: u48 = 0x314159265359;
 const eos_magic: u48 = 0x177245385090;
 
-const bzip2_crc_table: [256]u32 = blk: {
-    @setEvalBranchQuota(4000);
-    var table: [256]u32 = undefined;
-    for (0..256) |i| {
-        var c: u32 = @as(u32, @intCast(i)) << 24;
-        for (0..8) |_| {
-            if ((c & 0x80000000) != 0) {
-                c = (c << 1) ^ 0x04C11DB7;
-            } else {
-                c <<= 1;
-            }
-        }
-        table[i] = c;
-    }
-    break :blk table;
-};
-
-inline fn updateCrc(crc: u32, byte: u8) u32 {
-    const idx: usize = @intCast(((crc >> 24) ^ byte) & 0xFF);
-    return (crc << 8) ^ bzip2_crc_table[idx];
-}
+const Bzip2Crc = std.hash.crc.@"CRC-32/BZIP2";
 
 const BitReader = struct {
     upstream: *std.Io.Reader,
@@ -169,7 +149,7 @@ pub const Bzip2Decompressor = struct {
     block_rem: usize = 0,
     t_pos: u32 = 0,
     expected_block_crc: u32 = 0,
-    running_crc: u32 = 0xFFFFFFFF,
+    running_crc: Bzip2Crc = Bzip2Crc.init(),
 
     // RLE2 state
     rle_byte: u8 = 0,
@@ -343,7 +323,7 @@ pub const Bzip2Decompressor = struct {
                     const mtf_idx: usize = next_sym - 1;
                     if (mtf_idx >= n_in_use) return error.CorruptStream;
                     const idx_val = mtf[mtf_idx];
-                    std.mem.copyBackwards(u8, mtf[1 .. mtf_idx + 1], mtf[0..mtf_idx]);
+                    @memmove(mtf[1 .. mtf_idx + 1], mtf[0..mtf_idx]);
                     mtf[0] = idx_val;
                     const ch = seq_to_unseq[idx_val];
                     if (nblock >= self.block_size) return error.CorruptStream;
@@ -379,7 +359,7 @@ pub const Bzip2Decompressor = struct {
             self.t_pos = self.tt[orig_ptr] >> 8;
             self.block_rem = nblock;
             self.expected_block_crc = block_crc;
-            self.running_crc = 0xFFFFFFFF;
+            self.running_crc = Bzip2Crc.init();
             self.rle_byte = 0;
             self.rle_same_count = 0;
             self.rle_pending = 0;
@@ -398,11 +378,11 @@ pub const Bzip2Decompressor = struct {
     pub fn read(self: *Bzip2Decompressor, dest: []u8) Error!usize {
         if (dest.len == 0 or self.eof) return 0;
         var written: usize = 0;
+        var block_crc_start: usize = 0;
 
         while (written < dest.len) {
             if (self.rle_pending > 0) {
                 dest[written] = self.rle_byte;
-                self.running_crc = updateCrc(self.running_crc, self.rle_byte);
                 self.rle_pending -= 1;
                 written += 1;
                 continue;
@@ -410,10 +390,15 @@ pub const Bzip2Decompressor = struct {
 
             if (!self.block_active) {
                 if (!(try self.decodeNextBlock())) break;
+                block_crc_start = written;
             }
 
             if (self.block_rem == 0) {
-                const final_crc = ~self.running_crc;
+                if (written > block_crc_start) {
+                    self.running_crc.update(dest[block_crc_start..written]);
+                    block_crc_start = written;
+                }
+                const final_crc = self.running_crc.final();
                 if (final_crc != self.expected_block_crc) return error.CorruptStream;
                 self.combined_crc = std.math.rotl(u32, self.combined_crc, 1) ^ final_crc;
                 self.block_active = false;
@@ -435,8 +420,11 @@ pub const Bzip2Decompressor = struct {
             }
 
             dest[written] = ch;
-            self.running_crc = updateCrc(self.running_crc, ch);
             written += 1;
+        }
+
+        if (self.block_active and written > block_crc_start) {
+            self.running_crc.update(dest[block_crc_start..written]);
         }
 
         return written;

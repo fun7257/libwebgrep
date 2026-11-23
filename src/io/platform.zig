@@ -26,9 +26,9 @@ pub inline fn adviseMappedSequential(memory: []align(std.heap.page_size_min) con
     switch (comptime builtin.os.tag) {
         .linux => {
             const ptr: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(@intFromPtr(memory.ptr));
-            _ = std.os.linux.madvise(ptr, memory.len, std.os.linux.MADV.SEQUENTIAL);
-            if (@hasDecl(std.os.linux.MADV, "HUGEPAGE")) {
-                _ = std.os.linux.madvise(ptr, memory.len, std.os.linux.MADV.HUGEPAGE);
+            std.posix.madvise(ptr, memory.len, std.posix.MADV.SEQUENTIAL) catch {};
+            if (comptime @hasDecl(std.posix.MADV, "HUGEPAGE")) {
+                std.posix.madvise(ptr, memory.len, std.posix.MADV.HUGEPAGE) catch {};
             }
         },
         else => {},

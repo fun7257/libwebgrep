@@ -503,7 +503,7 @@ fn decodeContextMap(allocator: std.mem.Allocator, br: *BitReader, map_size: usiz
             const val = mtf[idx];
             slot.* = val;
             if (idx > 0) {
-                std.mem.copyBackwards(u8, mtf[1 .. idx + 1], mtf[0..idx]);
+                @memmove(mtf[1 .. idx + 1], mtf[0..idx]);
                 mtf[0] = val;
             }
         }
@@ -889,7 +889,7 @@ pub const BrotliDecompressor = struct {
         if (self.read_pos > self.max_window and self.read_pos > 256 * 1024) {
             const drop = self.read_pos - self.max_window;
             const remain = self.out.items.len - drop;
-            std.mem.copyForwards(u8, self.out.items[0..remain], self.out.items[drop..]);
+            @memmove(self.out.items[0..remain], self.out.items[drop..]);
             self.out.shrinkRetainingCapacity(remain);
             self.read_pos -= drop;
         }

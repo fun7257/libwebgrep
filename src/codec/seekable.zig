@@ -36,127 +36,7 @@ pub const Error = error{
     FrameTooLarge,
 };
 
-// ============================================================================
-// Pure-Zig XXH64 (RFC 8878 / Official xxHash64 Specification)
-// ============================================================================
-
-const prime64_1: u64 = 0x9E3779B185EBCA87;
-const prime64_2: u64 = 0xC2B2AE3D27D4EB4F;
-const prime64_3: u64 = 0x165667B19E3779F9;
-const prime64_4: u64 = 0x85EBCA77C2B2AE63;
-const prime64_5: u64 = 0x27D4EB2F165667C5;
-
-inline fn xxh64Round(acc: u64, input_lane: u64) u64 {
-    const x = acc +% (input_lane *% prime64_2);
-    return std.math.rotl(u64, x, 31) *% prime64_1;
-}
-
-inline fn xxh64MergeRound(acc: u64, val: u64) u64 {
-    const x = acc ^ xxh64Round(0, val);
-    return (x *% prime64_1) +% prime64_4;
-}
-
-pub const XxHash64 = struct {
-    v1: u64,
-    v2: u64,
-    v3: u64,
-    v4: u64,
-    total_len: u64 = 0,
-    mem: [32]u8 = undefined,
-    mem_size: usize = 0,
-
-    pub fn init(seed: u64) XxHash64 {
-        return .{
-            .v1 = seed +% prime64_1 +% prime64_2,
-            .v2 = seed +% prime64_2,
-            .v3 = seed,
-            .v4 = seed -% prime64_1,
-        };
-    }
-
-    pub fn update(self: *XxHash64, input: []const u8) void {
-        if (input.len == 0) return;
-        self.total_len +%= input.len;
-        var p: usize = 0;
-
-        if (self.mem_size + input.len < 32) {
-            @memcpy(self.mem[self.mem_size .. self.mem_size + input.len], input);
-            self.mem_size += input.len;
-            return;
-        }
-
-        if (self.mem_size > 0) {
-            const fill = 32 - self.mem_size;
-            @memcpy(self.mem[self.mem_size..32], input[0..fill]);
-            self.v1 = xxh64Round(self.v1, std.mem.readInt(u64, self.mem[0..8], .little));
-            self.v2 = xxh64Round(self.v2, std.mem.readInt(u64, self.mem[8..16], .little));
-            self.v3 = xxh64Round(self.v3, std.mem.readInt(u64, self.mem[16..24], .little));
-            self.v4 = xxh64Round(self.v4, std.mem.readInt(u64, self.mem[24..32], .little));
-            self.mem_size = 0;
-            p = fill;
-        }
-
-        while (p + 32 <= input.len) : (p += 32) {
-            const stripe = input[p .. p + 32];
-            self.v1 = xxh64Round(self.v1, std.mem.readInt(u64, stripe[0..8], .little));
-            self.v2 = xxh64Round(self.v2, std.mem.readInt(u64, stripe[8..16], .little));
-            self.v3 = xxh64Round(self.v3, std.mem.readInt(u64, stripe[16..24], .little));
-            self.v4 = xxh64Round(self.v4, std.mem.readInt(u64, stripe[24..32], .little));
-        }
-
-        if (p < input.len) {
-            const rem = input.len - p;
-            @memcpy(self.mem[0..rem], input[p..]);
-            self.mem_size = rem;
-        }
-    }
-
-    pub fn final(self: *const XxHash64) u64 {
-        var acc: u64 = if (self.total_len >= 32) blk: {
-            var a = std.math.rotl(u64, self.v1, 1) +%
-                std.math.rotl(u64, self.v2, 7) +%
-                std.math.rotl(u64, self.v3, 12) +%
-                std.math.rotl(u64, self.v4, 18);
-            a = xxh64MergeRound(a, self.v1);
-            a = xxh64MergeRound(a, self.v2);
-            a = xxh64MergeRound(a, self.v3);
-            a = xxh64MergeRound(a, self.v4);
-            break :blk a;
-        } else self.v3 +% prime64_5;
-
-        acc +%= self.total_len;
-
-        const tail = self.mem[0..self.mem_size];
-        var i: usize = 0;
-        while (i + 8 <= tail.len) : (i += 8) {
-            const k1 = xxh64Round(0, std.mem.readInt(u64, tail[i..][0..8], .little));
-            acc ^= k1;
-            acc = (std.math.rotl(u64, acc, 27) *% prime64_1) +% prime64_4;
-        }
-        if (i + 4 <= tail.len) {
-            acc ^= @as(u64, std.mem.readInt(u32, tail[i..][0..4], .little)) *% prime64_1;
-            acc = (std.math.rotl(u64, acc, 23) *% prime64_2) +% prime64_3;
-            i += 4;
-        }
-        while (i < tail.len) : (i += 1) {
-            acc ^= @as(u64, tail[i]) *% prime64_5;
-            acc = std.math.rotl(u64, acc, 11) *% prime64_1;
-        }
-
-        acc ^= acc >> 33;
-        acc *%= prime64_2;
-        acc ^= acc >> 29;
-        acc *%= prime64_3;
-        acc ^= acc >> 32;
-        return acc;
-    }
-
-    pub fn hash(seed: u64, input: []const u8) u64 {
-        var h = XxHash64.init(seed);
-        h.update(input);
-        return h.final();
-    }
-};
+pub const XxHash64 = std.hash.XxHash64;
 
 // ============================================================================
 // Zstandard Seekable Format (`ZstdSeekTable` & `SeekableZstdReader`)
@@ -354,7 +234,7 @@ pub const ZstdSeekTable = struct {
                     .compressed_size = c_u32,
                     .uncomp_offset = uncomp_off,
                     .uncompressed_size = 0,
-                    .checksum = @truncate(XxHash64.hash(0, &.{})),
+                    .checksum = @truncate(XxHash64.hash(0, "")),
                 });
                 comp_off += c_u32;
                 pos += skip_total;
@@ -443,18 +323,11 @@ pub const ZstdSeekTable = struct {
         if (uncomp_offset >= self.total_uncompressed_size or self.entries.len == 0) return null;
 
         // Find the first entry with (uncomp_offset + uncompressed_size) > target.
-        var lo: usize = 0;
-        var hi: usize = self.entries.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            const e = self.entries[mid];
-            const end_off = e.uncomp_offset + @as(u64, e.uncompressed_size);
-            if (end_off <= uncomp_offset) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
+        const lo = std.sort.partitionPoint(FrameEntry, self.entries, uncomp_offset, struct {
+            fn pred(target: u64, e: FrameEntry) bool {
+                return e.uncomp_offset + @as(u64, e.uncompressed_size) <= target;
             }
-        }
+        }.pred);
         if (lo >= self.entries.len) return null;
         return self.entries[lo];
     }
@@ -596,58 +469,29 @@ pub const SeekableZstdReader = struct {
 };
 
 fn scanZstdFrameLength(buf: []const u8) Error!usize {
-    if (buf.len < 6) return error.CorruptStream;
-    if (std.mem.readInt(u32, buf[0..4], .little) != zstd_frame_magic) return error.CorruptStream;
+    const ZstdFrame = std.compress.zstd.Decompress.Frame;
+    var reader = std.Io.Reader.fixed(buf);
+    const magic = reader.takeInt(u32, .little) catch return error.CorruptStream;
+    if (magic != @backingInt(ZstdFrame.Zstandard.magic)) return error.CorruptStream;
 
-    const fhd = buf[4];
-    if ((fhd & 0x08) != 0) return error.CorruptStream; // Reserved bit must be 0
-    const single_segment = ((fhd >> 5) & 1) != 0;
-    const has_checksum = ((fhd >> 2) & 1) != 0;
-    const dict_id_len: usize = switch (fhd & 0x03) {
-        0 => 0,
-        1 => 1,
-        2 => 2,
-        3 => 4,
-        else => unreachable,
-    };
-    const fcs_len: usize = switch (fhd >> 6) {
-        0 => if (single_segment) 1 else 0,
-        1 => 2,
-        2 => 4,
-        3 => 8,
-        else => unreachable,
-    };
-
-    var pos: usize = 5;
-    if (!single_segment) pos += 1;
-    pos += dict_id_len + fcs_len;
-    if (pos > buf.len) return error.CorruptStream;
+    const header = ZstdFrame.Zstandard.Header.decode(&reader) catch return error.CorruptStream;
 
     while (true) {
-        if (buf.len - pos < 3) return error.CorruptStream;
-        const bh = std.mem.readInt(u24, buf[pos..][0..3], .little);
-        pos += 3;
-        const last_block = (bh & 1) != 0;
-        const block_type: u2 = @truncate(bh >> 1);
-        const block_size: usize = @intCast(bh >> 3);
-
-        const payload_bytes: usize = switch (block_type) {
-            0 => block_size, // Raw_Block
-            1 => 1, // RLE_Block
-            2 => block_size, // Compressed_Block
-            3 => return error.CorruptStream, // Reserved_Block
+        const bh = reader.takeStruct(ZstdFrame.Zstandard.Block.Header, .little) catch return error.CorruptStream;
+        const payload_bytes: usize = switch (bh.type) {
+            .raw => bh.size,
+            .rle => 1,
+            .compressed => bh.size,
+            .reserved => return error.CorruptStream,
         };
-        if (payload_bytes > buf.len - pos) return error.CorruptStream;
-        pos += payload_bytes;
-
-        if (last_block) break;
+        reader.discardAll(payload_bytes) catch return error.CorruptStream;
+        if (bh.last) break;
     }
 
-    if (has_checksum) {
-        if (buf.len - pos < 4) return error.CorruptStream;
-        pos += 4;
+    if (header.descriptor.content_checksum_flag) {
+        reader.discardAll(4) catch return error.CorruptStream;
     }
-    return pos;
+    return reader.seek;
 }
 
 /// Compresses `payload` as independent Zstd frames of at most `max_frame_size` uncompressed bytes
@@ -1440,16 +1284,11 @@ pub const GzipIndex = struct {
     pub fn locateOffset(self: *const GzipIndex, uncomp_offset: u64) ?*const Checkpoint {
         if (uncomp_offset >= self.total_uncompressed_size or self.checkpoints.len == 0) return null;
 
-        var lo: usize = 0;
-        var hi: usize = self.checkpoints.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (self.checkpoints[mid].uncomp_offset <= uncomp_offset) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
+        const lo = std.sort.partitionPoint(Checkpoint, self.checkpoints, uncomp_offset, struct {
+            fn pred(target: u64, cp: Checkpoint) bool {
+                return cp.uncomp_offset <= target;
             }
-        }
+        }.pred);
         if (lo == 0) return &self.checkpoints[0];
         return &self.checkpoints[lo - 1];
     }

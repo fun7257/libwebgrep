@@ -4,6 +4,8 @@
 //! of an index byte is 1, the result is 0; callers pass nibbles with high bit 0 and low 4 bits as the table index.
 //! `palignr` concatenates the destination register (low 16 bytes) and source register (high 16 bytes) and shifts right by bytes.
 
+const std = @import("std");
+
 pub const lanes: usize = 16;
 
 pub inline fn lookup(table_v: @Vector(16, u8), idx: @Vector(16, u8)) @Vector(16, u8) {
@@ -17,12 +19,5 @@ pub inline fn lookup(table_v: @Vector(16, u8), idx: @Vector(16, u8)) @Vector(16,
 }
 
 pub inline fn shift(a: @Vector(16, u8), b: @Vector(16, u8), comptime n: u8) @Vector(16, u8) {
-    const mask = comptime blk: {
-        var m: [lanes]i32 = undefined;
-        for (0..lanes) |i| {
-            m[i] = if (i + n < lanes) @intCast(i + n) else -@as(i32, @intCast(i + n - lanes)) - 1;
-        }
-        break :blk m;
-    };
-    return @shuffle(u8, a, b, mask);
+    return std.simd.mergeShift(a, b, @intCast(n));
 }

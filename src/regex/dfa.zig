@@ -610,14 +610,7 @@ fn computeEpsilonClosure(
         const pc = stack[sp];
         if (pc >= insts.len or pc > std.math.maxInt(u16)) return false;
 
-        var seen = false;
-        for (visited_pcs[0..visited_len]) |v| {
-            if (v == pc) {
-                seen = true;
-                break;
-            }
-        }
-        if (seen) continue;
+        if (std.mem.findScalar(u32, visited_pcs[0..visited_len], pc) != null) continue;
         if (visited_len >= visited_pcs.len) return false;
         visited_pcs[visited_len] = pc;
         visited_len += 1;
@@ -650,14 +643,7 @@ fn computeEpsilonClosure(
             },
             .byte, .any, .any_cont, .class, .unicode_class => {
                 const pc16: u16 = @intCast(pc);
-                var already_in_out = false;
-                for (out_pcs[0..out_len.*]) |existing| {
-                    if (existing == pc16) {
-                        already_in_out = true;
-                        break;
-                    }
-                }
-                if (!already_in_out) {
+                if (std.mem.findScalar(u16, out_pcs[0..out_len.*], pc16) == null) {
                     if (out_len.* >= max_closure_pcs) return false;
                     out_pcs[out_len.*] = pc16;
                     out_len.* += 1;

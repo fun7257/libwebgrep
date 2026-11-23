@@ -103,7 +103,13 @@ pub const Finder = struct {
             const b = pattern[i];
             const slen: usize = if (b < 0x80) 1 else (std.unicode.utf8ByteSequenceLength(b) catch return null);
             if (i + slen > pattern.len) return null;
-            const cp: u21 = if (slen == 1) b else (std.unicode.utf8Decode(pattern[i .. i + slen]) catch return null);
+            const cp: u21 = switch (slen) {
+                1 => b,
+                2 => std.unicode.utf8Decode2(pattern[i..][0..2].*) catch return null,
+                3 => std.unicode.utf8Decode3(pattern[i..][0..3].*) catch return null,
+                4 => std.unicode.utf8Decode4(pattern[i..][0..4].*) catch return null,
+                else => unreachable,
+            };
             var eq: [4]u21 = undefined;
             const n_eq = unicode_fold.foldEquivalents(cp, &eq);
             if (n_eq == 1) {

@@ -52,7 +52,7 @@ pub fn extractLiterals(self: anytype, pattern: []const u8, options: inst_mod.Reg
                         prefix_active = false;
                         exact_only = false;
                         fixed_offset = null;
-                        if (std.mem.indexOfScalarPos(u8, pattern, i + 4, '>')) |gt| {
+                        if (std.mem.findScalarPos(u8, pattern, i + 4, '>')) |gt| {
                             i = gt + 1;
                         } else {
                             return;
@@ -70,7 +70,7 @@ pub fn extractLiterals(self: anytype, pattern: []const u8, options: inst_mod.Reg
                         prefix_active = false;
                         exact_only = false;
                         fixed_offset = null;
-                        if (std.mem.indexOfScalarPos(u8, pattern, i + 3, '>')) |gt| {
+                        if (std.mem.findScalarPos(u8, pattern, i + 3, '>')) |gt| {
                             i = gt + 1;
                         } else {
                             return;
@@ -180,7 +180,7 @@ pub fn extractLiterals(self: anytype, pattern: []const u8, options: inst_mod.Reg
                 if (i < pattern.len and pattern[i] == ']') i += 1;
                 while (i < pattern.len and pattern[i] != ']') {
                     if (pattern[i] == '[' and i + 1 < pattern.len and pattern[i + 1] == ':') {
-                        if (std.mem.indexOfPos(u8, pattern, i + 2, ":]")) |end_posix| {
+                        if (std.mem.findPos(u8, pattern, i + 2, ":]")) |end_posix| {
                             if (pattern[i + 2] == '^') class_fixed_one = false;
                             i = end_posix + 2;
                             continue;
@@ -192,7 +192,7 @@ pub fn extractLiterals(self: anytype, pattern: []const u8, options: inst_mod.Reg
                         if (esc == 'Q') {
                             class_fixed_one = false;
                             i += 2;
-                            if (std.mem.indexOfPos(u8, pattern, i, "\\E")) |e_pos| {
+                            if (std.mem.findPos(u8, pattern, i, "\\E")) |e_pos| {
                                 i = e_pos + 2;
                             } else {
                                 i = pattern.len;
@@ -239,7 +239,7 @@ pub fn extractLiterals(self: anytype, pattern: []const u8, options: inst_mod.Reg
                     exact_only = false;
                     fixed_offset = null;
                     i += 2;
-                    if (std.mem.indexOfPos(u8, pattern, i, "\\E")) |e_pos| {
+                    if (std.mem.findPos(u8, pattern, i, "\\E")) |e_pos| {
                         i = e_pos + 2;
                     } else {
                         i = pattern.len;
@@ -432,7 +432,7 @@ pub fn extractRequiredPrefix(allocator: std.mem.Allocator, pattern: []const u8, 
                 var j = i + 1;
                 var min_val: usize = 0;
                 var has_digit = false;
-                while (j < pattern.len and pattern[j] >= '0' and pattern[j] <= '9') : (j += 1) {
+                while (j < pattern.len and std.ascii.isDigit(pattern[j])) : (j += 1) {
                     has_digit = true;
                     min_val = min_val *| 10 +| (pattern[j] - '0');
                 }
@@ -499,7 +499,7 @@ pub fn tryExtractAltLiterals(self: anytype, pattern: []const u8, find_opts: matc
             }
             if (in_class) {
                 if (ch == '[' and j + 1 < inner.len and inner[j + 1] == ':') {
-                    if (std.mem.indexOfPos(u8, inner, j + 2, ":]")) |end_posix| {
+                    if (std.mem.findPos(u8, inner, j + 2, ":]")) |end_posix| {
                         j = end_posix + 1;
                         continue;
                     }
@@ -525,11 +525,11 @@ pub fn tryExtractAltLiterals(self: anytype, pattern: []const u8, find_opts: matc
             if (std.mem.startsWith(u8, inner, "(?:")) {
                 inner = inner[3 .. inner.len - 1];
             } else if (std.mem.startsWith(u8, inner, "(?P<")) {
-                if (std.mem.indexOfScalarPos(u8, inner, 4, '>')) |gt| {
+                if (std.mem.findScalarPos(u8, inner, 4, '>')) |gt| {
                     inner = inner[gt + 1 .. inner.len - 1];
                 }
             } else if (std.mem.startsWith(u8, inner, "(?<")) {
-                if (std.mem.indexOfScalarPos(u8, inner, 3, '>')) |gt| {
+                if (std.mem.findScalarPos(u8, inner, 3, '>')) |gt| {
                     inner = inner[gt + 1 .. inner.len - 1];
                 }
             } else if (inner[1] != '?') {
@@ -559,7 +559,7 @@ pub fn tryExtractAltLiterals(self: anytype, pattern: []const u8, find_opts: matc
         }
         if (in_class) {
             if (ch == '[' and i + 1 < inner.len and inner[i + 1] == ':') {
-                if (std.mem.indexOfPos(u8, inner, i + 2, ":]")) |end_posix| {
+                if (std.mem.findPos(u8, inner, i + 2, ":]")) |end_posix| {
                     i = end_posix + 1;
                     continue;
                 }

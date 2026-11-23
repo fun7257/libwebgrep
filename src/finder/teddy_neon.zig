@@ -18,14 +18,7 @@ pub inline fn lookup(table_v: @Vector(16, u8), idx: @Vector(16, u8)) @Vector(16,
 }
 
 pub inline fn shift(a: @Vector(16, u8), b: @Vector(16, u8), comptime n: u8) @Vector(16, u8) {
-    const mask = comptime blk: {
-        var m: [lanes]i32 = undefined;
-        for (0..lanes) |i| {
-            m[i] = if (i + n < lanes) @intCast(i + n) else -@as(i32, @intCast(i + n - lanes)) - 1;
-        }
-        break :blk m;
-    };
-    return @shuffle(u8, a, b, mask);
+    return std.simd.mergeShift(a, b, @intCast(n));
 }
 
 test "NEON shift aligns lane i with start offset i" {

@@ -589,11 +589,7 @@ pub const MaskedPair = struct {
 fn confirm(self: PackedPair, haystack: []const u8, origin: usize) bool {
     const pat = self.pattern;
     const window = haystack[origin..][0..pat.len];
-    if (!self.ignore_case) return std.mem.eql(u8, pat, window);
-    for (pat, window) |p, h| {
-        if (!ascii.eq(p, h, true)) return false;
-    }
-    return true;
+    return if (self.ignore_case) std.ascii.eqlIgnoreCase(pat, window) else std.mem.eql(u8, pat, window);
 }
 
 inline fn byteMask(comptime width: comptime_int, block: @Vector(width, u8), byte: u8, comptime fold: bool) @Vector(width, bool) {

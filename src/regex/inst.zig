@@ -163,6 +163,16 @@ pub fn populateDiagnostic(
     };
 }
 
+pub inline fn decodeUtf8(bytes: []const u8) !u21 {
+    return switch (bytes.len) {
+        1 => bytes[0],
+        2 => std.unicode.utf8Decode2(bytes[0..2].*),
+        3 => std.unicode.utf8Decode3(bytes[0..3].*),
+        4 => std.unicode.utf8Decode4(bytes[0..4].*),
+        else => unreachable,
+    };
+}
+
 /// Returns the byte offset of the first invalid UTF-8 byte sequence in `slice`, or `null` if valid UTF-8.
 pub fn findInvalidUtf8Offset(slice: []const u8) ?usize {
     var i: usize = 0;
@@ -174,7 +184,7 @@ pub fn findInvalidUtf8Offset(slice: []const u8) ?usize {
         }
         const seq_len = std.unicode.utf8ByteSequenceLength(b) catch return i;
         if (i + seq_len > slice.len) return i;
-        _ = std.unicode.utf8Decode(slice[i .. i + seq_len]) catch return i;
+        _ = decodeUtf8(slice[i .. i + seq_len]) catch return i;
         i += seq_len;
     }
     return null;
@@ -320,7 +330,7 @@ pub fn utf8SeqLenAt(haystack: []const u8, pos: usize, limit: usize) usize {
     if (b0 < 0x80) return 1;
     const seq_len = std.unicode.utf8ByteSequenceLength(b0) catch return 1;
     if (pos + seq_len > limit) return 1;
-    _ = std.unicode.utf8Decode(haystack[pos .. pos + seq_len]) catch return 1;
+    _ = decodeUtf8(haystack[pos .. pos + seq_len]) catch return 1;
     return seq_len;
 }
 
@@ -331,7 +341,7 @@ pub inline fn decodeValidUtf8At(haystack: []const u8, pos: usize, limit: usize) 
     if (b0 < 0x80) return .{ .cp = b0, .len = 1 };
     const seq_len = std.unicode.utf8ByteSequenceLength(b0) catch return null;
     if (pos + seq_len > limit) return null;
-    const cp = std.unicode.utf8Decode(haystack[pos .. pos + seq_len]) catch return null;
+    const cp = decodeUtf8(haystack[pos .. pos + seq_len]) catch return null;
     return .{ .cp = cp, .len = seq_len };
 }
 
@@ -365,7 +375,7 @@ pub fn hasTopLevelAlt(pattern: []const u8) bool {
     while (i < pattern.len) : (i += 1) {
         const c = pattern[i];
         if (!in_class and extended) {
-            if (c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 0x0B or c == 0x0C) continue;
+            if (std.ascii.isWhitespace(c)) continue;
             if (c == '#') {
                 while (i + 1 < pattern.len and pattern[i + 1] != '\n') : (i += 1) {}
                 continue;
@@ -383,7 +393,7 @@ pub fn hasTopLevelAlt(pattern: []const u8) bool {
         }
         if (in_class) {
             if (c == '[' and i + 1 < pattern.len and pattern[i + 1] == ':') {
-                if (std.mem.indexOfPos(u8, pattern, i + 2, ":]")) |end_posix| {
+                if (std.mem.findPos(u8, pattern, i + 2, ":]")) |end_posix| {
                     i = end_posix + 1;
                     continue;
                 }
@@ -430,10 +440,7 @@ pub fn lineStartAt(haystack: []const u8, pos: usize) usize {
 }
 
 pub fn isWordChar(b: u8) bool {
-    return switch (b) {
-        '0'...'9', 'A'...'Z', 'a'...'z', '_' => true,
-        else => false,
-    };
+    return std.ascii.isAlphanumeric(b) or b == '_';
 }
 
 pub fn checkAssert(kind: AssertKind, haystack: []const u8, pos: usize) bool {
@@ -463,7 +470,7 @@ pub fn hasLiteralUpper(pattern: []const u8, unicode_case: bool) bool {
     while (i < pattern.len) {
         if (!in_class and extended) {
             const w = pattern[i];
-            if (w == ' ' or w == '\t' or w == '\n' or w == '\r' or w == 0x0B or w == 0x0C) {
+            if (std.ascii.isWhitespace(w)) {
                 i += 1;
                 continue;
             }
@@ -480,11 +487,11 @@ pub fn hasLiteralUpper(pattern: []const u8, unicode_case: bool) bool {
                         i += 2;
                         break;
                     }
-                    if (pattern[i] >= 'A' and pattern[i] <= 'Z') return true;
+                    if (std.ascii.isUpper(pattern[i])) return true;
                     if (unicode_case and pattern[i] >= 0x80) {
                         const qlen = utf8SeqLenAt(pattern, i, pattern.len);
                         if (qlen > 1) {
-                            const cp = std.unicode.utf8Decode(pattern[i .. i + qlen]) catch {
+                            const cp = decodeUtf8(pattern[i .. i + qlen]) catch {
                                 i += 1;
                                 continue;
                             };
@@ -524,7 +531,7 @@ pub fn hasLiteralUpper(pattern: []const u8, unicode_case: bool) bool {
         }
         if (in_class) {
             if (pattern[i] == '[' and i + 1 < pattern.len and pattern[i + 1] == ':') {
-                if (std.mem.indexOfPos(u8, pattern, i + 2, ":]")) |end_posix| {
+                if (std.mem.findPos(u8, pattern, i + 2, ":]")) |end_posix| {
                     i = end_posix + 2;
                     continue;
                 }
@@ -543,12 +550,12 @@ pub fn hasLiteralUpper(pattern: []const u8, unicode_case: bool) bool {
         }
         if (!in_class and pattern[i] == '(' and i + 1 < pattern.len and pattern[i + 1] == '?') {
             if (i + 2 < pattern.len and pattern[i + 2] == 'P' and i + 3 < pattern.len and pattern[i + 3] == '<') {
-                if (std.mem.indexOfScalarPos(u8, pattern, i + 4, '>')) |gt| {
+                if (std.mem.findScalarPos(u8, pattern, i + 4, '>')) |gt| {
                     i = gt + 1;
                     continue;
                 }
             } else if (i + 2 < pattern.len and pattern[i + 2] == '<') {
-                if (std.mem.indexOfScalarPos(u8, pattern, i + 3, '>')) |gt| {
+                if (std.mem.findScalarPos(u8, pattern, i + 3, '>')) |gt| {
                     i = gt + 1;
                     continue;
                 }
@@ -567,11 +574,11 @@ pub fn hasLiteralUpper(pattern: []const u8, unicode_case: bool) bool {
             }
             continue;
         }
-        if (pattern[i] >= 'A' and pattern[i] <= 'Z') return true;
+        if (std.ascii.isUpper(pattern[i])) return true;
         if (unicode_case and pattern[i] >= 0x80) {
             const seq_len = utf8SeqLenAt(pattern, i, pattern.len);
             if (seq_len > 1) {
-                const cp = std.unicode.utf8Decode(pattern[i .. i + seq_len]) catch {
+                const cp = decodeUtf8(pattern[i .. i + seq_len]) catch {
                     i += 1;
                     continue;
                 };

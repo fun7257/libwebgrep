@@ -500,7 +500,7 @@ test "MatcherTraits validates custom plug-and-play matcher at comptime" {
         prefix: []const u8,
         pub fn find(self: *const @This(), haystack: []const u8, start: usize, _: MatchMode) ?Match {
             if (start > haystack.len) return null;
-            const rel = std.mem.indexOfPos(u8, haystack, start, self.prefix) orelse return null;
+            const rel = std.mem.findPos(u8, haystack, start, self.prefix) orelse return null;
             return .{ .start = rel, .end = rel + self.prefix.len, .pattern_id = 7 };
         }
     };

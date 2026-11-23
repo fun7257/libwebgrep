@@ -89,7 +89,7 @@ pub const Compiler = struct {
         if (!self.extended) return;
         while (self.pos < self.pattern.len) {
             const b = self.pattern[self.pos];
-            if (b == ' ' or b == '\t' or b == '\n' or b == '\r' or b == 0x0B or b == 0x0C) {
+            if (std.ascii.isWhitespace(b)) {
                 self.pos += 1;
                 continue;
             }
@@ -257,14 +257,7 @@ pub const Compiler = struct {
             sp -= 1;
             const pc = stack[sp];
             if (pc >= items.len) return false;
-            var already = false;
-            for (visited[0..visited_len]) |v| {
-                if (v == pc) {
-                    already = true;
-                    break;
-                }
-            }
-            if (already) continue;
+            if (std.mem.findScalar(u32, visited[0..visited_len], pc) != null) continue;
             if (visited_len >= visited.len) return false;
             visited[visited_len] = pc;
             visited_len += 1;
@@ -520,7 +513,7 @@ pub const Compiler = struct {
         const brace_pos = self.pos;
         self.pos += 1; // skip '{'
         // If there is no closing '}' anywhere after '{', report unclosed_repeat_braces
-        if (std.mem.indexOfScalarPos(u8, self.pattern, self.pos, '}') == null) {
+        if (std.mem.findScalarPos(u8, self.pattern, self.pos, '}') == null) {
             return self.fail(error.RegexSyntax, .unclosed_repeat_braces, brace_pos, "unclosed repeat braces '{'");
         }
         if (self.pos < self.pattern.len and self.pattern[self.pos] == '}') {
@@ -559,7 +552,7 @@ pub const Compiler = struct {
     fn parseNumber(self: *Compiler, brace_pos: usize) Error!usize {
         const start = self.pos;
         var val: usize = 0;
-        while (self.pos < self.pattern.len and self.pattern[self.pos] >= '0' and self.pattern[self.pos] <= '9') : (self.pos += 1) {
+        while (self.pos < self.pattern.len and std.ascii.isDigit(self.pattern[self.pos])) : (self.pos += 1) {
             val = std.math.mul(usize, val, 10) catch {
                 return self.fail(error.RegexTooLarge, .instruction_limit_exceeded, brace_pos, "repeat count overflow");
             };
@@ -652,15 +645,15 @@ pub const Compiler = struct {
                     if (is_py_named or is_pl_named) {
                         self.pos += if (is_py_named) @as(usize, 2) else @as(usize, 1);
                         const name_start = self.pos;
-                        const close_gt = std.mem.indexOfScalarPos(u8, self.pattern, name_start, '>') orelse {
+                        const close_gt = std.mem.findScalarPos(u8, self.pattern, name_start, '>') orelse {
                             return self.fail(error.RegexSyntax, .invalid_group_name, paren_pos, "unclosed named capture group name");
                         };
                         const name = self.pattern[name_start..close_gt];
-                        if (name.len == 0 or !((name[0] >= 'a' and name[0] <= 'z') or (name[0] >= 'A' and name[0] <= 'Z') or name[0] == '_')) {
+                        if (name.len == 0 or !(std.ascii.isAlphabetic(name[0]) or name[0] == '_')) {
                             return self.fail(error.RegexSyntax, .invalid_group_name, paren_pos, "invalid capture group name");
                         }
                         for (name[1..]) |ch| {
-                            if (!((ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '_')) {
+                            if (!(std.ascii.isAlphanumeric(ch) or ch == '_')) {
                                 return self.fail(error.RegexSyntax, .invalid_group_name, paren_pos, "invalid character in capture group name");
                             }
                         }
@@ -899,7 +892,7 @@ pub const Compiler = struct {
                     const seq_len = utf8SeqLenAt(self.pattern, self.pos, self.pattern.len);
                     if (seq_len > 1) {
                         const raw = self.pattern[self.pos .. self.pos + seq_len];
-                        const cp = std.unicode.utf8Decode(raw) catch unreachable;
+                        const cp = inst_mod.decodeUtf8(raw) catch unreachable;
                         self.pos += seq_len;
                         return self.emitCodepoint(cp, raw);
                     }
@@ -929,7 +922,7 @@ pub const Compiler = struct {
         var raw_name: []const u8 = undefined;
         if (self.pattern[self.pos] == '{') {
             self.pos += 1; // skip '{'
-            const close_idx = std.mem.indexOfScalarPos(u8, self.pattern, self.pos, '}') orelse {
+            const close_idx = std.mem.findScalarPos(u8, self.pattern, self.pos, '}') orelse {
                 return self.fail(error.RegexSyntax, .unclosed_unicode_property, prop_start_pos, "unclosed Unicode property '{'");
             };
             raw_name = self.pattern[self.pos..close_idx];
@@ -980,7 +973,7 @@ pub const Compiler = struct {
                 return self.fail(error.RegexSyntax, .invalid_escape, slash_pos, "invalid or unclosed braced hex escape");
             }
             self.pos += 1; // skip '}'
-            if (val > 0x10FFFF or (val >= 0xD800 and val <= 0xDFFF)) {
+            if (val > 0x10FFFF or !std.unicode.utf8ValidCodepoint(@intCast(val))) {
                 return self.fail(error.RegexSyntax, .invalid_escape, slash_pos, "hex escape is not a valid Unicode scalar value");
             }
             return @intCast(val);
@@ -998,7 +991,7 @@ pub const Compiler = struct {
             val = (val << 4) | d;
         }
         self.pos += expected;
-        if (val >= 0xD800 and val <= 0xDFFF) {
+        if (std.unicode.isSurrogateCodepoint(@intCast(val))) {
             return self.fail(error.RegexSyntax, .invalid_escape, slash_pos, "hex escape is a surrogate code point");
         }
         return @intCast(val);
@@ -1015,7 +1008,7 @@ pub const Compiler = struct {
             const seq_len = utf8SeqLenAt(self.pattern, self.pos, self.pattern.len);
             if (seq_len > 1) {
                 const raw = self.pattern[self.pos .. self.pos + seq_len];
-                const cp = std.unicode.utf8Decode(raw) catch unreachable;
+                const cp = inst_mod.decodeUtf8(raw) catch unreachable;
                 self.pos += seq_len;
                 return self.emitCodepoint(cp, raw);
             }
@@ -1051,7 +1044,7 @@ pub const Compiler = struct {
                 if (self.multiline) self.saw_scoped_m = true;
                 const lit_start = self.pos;
                 var end_pos = self.pattern.len;
-                if (std.mem.indexOfPos(u8, self.pattern, lit_start, "\\E")) |e_pos| {
+                if (std.mem.findPos(u8, self.pattern, lit_start, "\\E")) |e_pos| {
                     end_pos = e_pos;
                     self.pos = e_pos + 2;
                 } else {
@@ -1070,7 +1063,7 @@ pub const Compiler = struct {
                     const seq_len: usize = if (ch >= 0x80) utf8SeqLenAt(verbatim, idx, verbatim.len) else 1;
                     const raw = verbatim[idx .. idx + seq_len];
                     const piece: Frag = if (seq_len > 1) blk: {
-                        const cp = std.unicode.utf8Decode(raw) catch unreachable;
+                        const cp = inst_mod.decodeUtf8(raw) catch unreachable;
                         break :blk try self.emitCodepoint(cp, raw);
                     } else if (self.ignore_case and self.unicode_case and (ch == 'k' or ch == 'K' or ch == 's' or ch == 'S')) blk: {
                         break :blk try self.emitCodepoint(ch, raw);
@@ -1299,7 +1292,7 @@ pub const Compiler = struct {
             // Check for POSIX class [:name:] / [:^name:] inside [...]
             if (c == '[' and self.pos + 1 < self.pattern.len and self.pattern[self.pos + 1] == ':') {
                 const posix_pos = self.pos;
-                const close_idx = std.mem.indexOfPos(u8, self.pattern, self.pos + 2, ":]") orelse {
+                const close_idx = std.mem.findPos(u8, self.pattern, self.pos + 2, ":]") orelse {
                     return self.fail(error.RegexSyntax, .invalid_posix_class, posix_pos, "unclosed POSIX character class '[:'");
                 };
                 var raw_name = self.pattern[self.pos + 2 .. close_idx];
@@ -1327,7 +1320,7 @@ pub const Compiler = struct {
             if (c == '\\' and self.pos + 1 < self.pattern.len and self.pattern[self.pos + 1] == 'Q') {
                 const lit_start = self.pos + 2;
                 var end_pos = self.pattern.len;
-                if (std.mem.indexOfPos(u8, self.pattern, lit_start, "\\E")) |e_pos| {
+                if (std.mem.findPos(u8, self.pattern, lit_start, "\\E")) |e_pos| {
                     end_pos = e_pos;
                     self.pos = e_pos + 2;
                 } else {
@@ -1340,7 +1333,7 @@ pub const Compiler = struct {
                     if (ch == '\n') self.recordLiteralNewline(lit_start + idx);
                     const seq_len: usize = if (ch >= 0x80) utf8SeqLenAt(verbatim, idx, verbatim.len) else 1;
                     if (seq_len > 1) {
-                        const lo_cp = std.unicode.utf8Decode(verbatim[idx .. idx + seq_len]) catch unreachable;
+                        const lo_cp = inst_mod.decodeUtf8(verbatim[idx .. idx + seq_len]) catch unreachable;
                         has_unicode_ranges = true;
                         try unicode_list.append(self.allocator, .{ .start = lo_cp, .end = lo_cp });
                         if (self.ignore_case and self.unicode_case) {
@@ -1498,56 +1491,76 @@ pub const Compiler = struct {
         }
     }
 
+    const PosixClass = enum { alnum, alpha, ascii, blank, cntrl, digit, graph, lower, print, punct, space, upper, word, xdigit };
+    const posix_class_map = std.StaticStringMap(PosixClass).initComptime(.{
+        .{ "alnum", PosixClass.alnum },
+        .{ "alpha", PosixClass.alpha },
+        .{ "ascii", PosixClass.ascii },
+        .{ "blank", PosixClass.blank },
+        .{ "cntrl", PosixClass.cntrl },
+        .{ "digit", PosixClass.digit },
+        .{ "graph", PosixClass.graph },
+        .{ "lower", PosixClass.lower },
+        .{ "print", PosixClass.print },
+        .{ "punct", PosixClass.punct },
+        .{ "space", PosixClass.space },
+        .{ "upper", PosixClass.upper },
+        .{ "word", PosixClass.word },
+        .{ "xdigit", PosixClass.xdigit },
+    });
+
     fn addPosixClass(set: *ByteSet, name: []const u8, negated: bool, ignore_case: bool) bool {
+        const cls = posix_class_map.get(name) orelse return false;
         var tmp = ByteSet{};
-        if (std.mem.eql(u8, name, "alnum")) {
-            tmp.setRange('0', '9', false);
-            tmp.setRange('A', 'Z', false);
-            tmp.setRange('a', 'z', false);
-        } else if (std.mem.eql(u8, name, "alpha")) {
-            tmp.setRange('A', 'Z', false);
-            tmp.setRange('a', 'z', false);
-        } else if (std.mem.eql(u8, name, "ascii")) {
-            tmp.setRange(0x00, 0x7F, false);
-        } else if (std.mem.eql(u8, name, "blank")) {
-            tmp.set(' ');
-            tmp.set('\t');
-        } else if (std.mem.eql(u8, name, "cntrl")) {
-            tmp.setRange(0x00, 0x1F, false);
-            tmp.set(0x7F);
-        } else if (std.mem.eql(u8, name, "digit")) {
-            tmp.setRange('0', '9', false);
-        } else if (std.mem.eql(u8, name, "graph")) {
-            tmp.setRange(0x21, 0x7E, false);
-        } else if (std.mem.eql(u8, name, "lower")) {
-            tmp.setRange('a', 'z', ignore_case);
-        } else if (std.mem.eql(u8, name, "print")) {
-            tmp.setRange(0x20, 0x7E, false);
-        } else if (std.mem.eql(u8, name, "punct")) {
-            tmp.setRange('!', '/', false);
-            tmp.setRange(':', '@', false);
-            tmp.setRange('[', '`', false);
-            tmp.setRange('{', '~', false);
-        } else if (std.mem.eql(u8, name, "space")) {
-            tmp.set(' ');
-            tmp.set('\t');
-            tmp.set('\n');
-            tmp.set('\r');
-            tmp.set(0x0B);
-            tmp.set(0x0C);
-        } else if (std.mem.eql(u8, name, "upper")) {
-            tmp.setRange('A', 'Z', ignore_case);
-        } else if (std.mem.eql(u8, name, "word")) {
-            tmp.setRange('0', '9', false);
-            tmp.setRange('A', 'Z', false);
-            tmp.setRange('a', 'z', false);
-            tmp.set('_');
-        } else if (std.mem.eql(u8, name, "xdigit")) {
-            tmp.setRange('0', '9', false);
-            tmp.setRange('A', 'F', false);
-            tmp.setRange('a', 'f', false);
-        } else {
-            return false;
+        switch (cls) {
+            .alnum => {
+                tmp.setRange('0', '9', false);
+                tmp.setRange('A', 'Z', false);
+                tmp.setRange('a', 'z', false);
+            },
+            .alpha => {
+                tmp.setRange('A', 'Z', false);
+                tmp.setRange('a', 'z', false);
+            },
+            .ascii => tmp.setRange(0x00, 0x7F, false),
+            .blank => {
+                tmp.set(' ');
+                tmp.set('\t');
+            },
+            .cntrl => {
+                tmp.setRange(0x00, 0x1F, false);
+                tmp.set(0x7F);
+            },
+            .digit => tmp.setRange('0', '9', false),
+            .graph => tmp.setRange(0x21, 0x7E, false),
+            .lower => tmp.setRange('a', 'z', ignore_case),
+            .print => tmp.setRange(0x20, 0x7E, false),
+            .punct => {
+                tmp.setRange('!', '/', false);
+                tmp.setRange(':', '@', false);
+                tmp.setRange('[', '`', false);
+                tmp.setRange('{', '~', false);
+            },
+            .space => {
+                tmp.set(' ');
+                tmp.set('\t');
+                tmp.set('\n');
+                tmp.set('\r');
+                tmp.set(0x0B);
+                tmp.set(0x0C);
+            },
+            .upper => tmp.setRange('A', 'Z', ignore_case),
+            .word => {
+                tmp.setRange('0', '9', false);
+                tmp.setRange('A', 'Z', false);
+                tmp.setRange('a', 'z', false);
+                tmp.set('_');
+            },
+            .xdigit => {
+                tmp.setRange('0', '9', false);
+                tmp.setRange('A', 'F', false);
+                tmp.setRange('a', 'f', false);
+            },
         }
         if (negated) tmp.invert();
         for (0..4) |i| set.bits[i] |= tmp.bits[i];
@@ -1569,7 +1582,7 @@ pub const Compiler = struct {
             const seq_len = utf8SeqLenAt(self.pattern, self.pos, self.pattern.len);
             if (seq_len > 1) {
                 const raw = self.pattern[self.pos .. self.pos + seq_len];
-                const cp = std.unicode.utf8Decode(raw) catch {
+                const cp = inst_mod.decodeUtf8(raw) catch {
                     return self.fail(error.RegexSyntax, .invalid_utf8, item_pos, "invalid UTF-8 in character class");
                 };
                 self.pos += seq_len;
@@ -1589,7 +1602,7 @@ pub const Compiler = struct {
             const seq_len = utf8SeqLenAt(self.pattern, self.pos, self.pattern.len);
             if (seq_len > 1) {
                 const raw = self.pattern[self.pos .. self.pos + seq_len];
-                const cp = std.unicode.utf8Decode(raw) catch {
+                const cp = inst_mod.decodeUtf8(raw) catch {
                     return self.fail(error.RegexSyntax, .invalid_utf8, self.pos, "invalid UTF-8 in character class");
                 };
                 self.pos += seq_len;

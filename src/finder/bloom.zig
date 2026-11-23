@@ -172,8 +172,7 @@ pub const NgramBloom = struct {
         var h: u64 = 0x9E3779B97F4A7C15 ^ (@as(u64, gram.len) *% 0xBF58476D1CE4E5B9);
         if (ascii_lower) {
             for (gram) |raw_b| {
-                const is_upper: u8 = @intFromBool(raw_b >= 'A' and raw_b <= 'Z');
-                const b: u8 = raw_b + (is_upper << 5);
+                const b: u8 = std.ascii.toLower(raw_b);
                 h = (h ^ b) *% 0xBF58476D1CE4E5B9;
                 h ^= h >> 27;
             }
@@ -320,7 +319,7 @@ pub const NgramBloom = struct {
         var alpha_pos: [max_ngram_len]u8 = undefined;
         var alpha_count: usize = 0;
         for (gram, 0..) |b, idx| {
-            if ((b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z')) {
+            if (std.ascii.isAlphabetic(b)) {
                 alpha_pos[alpha_count] = @intCast(idx);
                 alpha_count += 1;
                 if (alpha_count > 4) return true;
@@ -337,9 +336,9 @@ pub const NgramBloom = struct {
         while (mask_bits < combos) : (mask_bits += 1) {
             for (0..alpha_count) |j| {
                 const pos = alpha_pos[j];
-                const lower = ascii.fold(gram[pos]);
+                const b = gram[pos];
                 const bit = (mask_bits >> @as(u3, @intCast(j))) & 1;
-                cand[pos] = if (bit != 0) lower - ('a' - 'A') else lower;
+                cand[pos] = if (bit != 0) std.ascii.toUpper(b) else std.ascii.toLower(b);
             }
             if (self.containsExactNgram(cand[0..gram.len])) return true;
         }
@@ -395,7 +394,13 @@ pub const NgramBloom = struct {
         }
         const seq_len = std.unicode.utf8ByteSequenceLength(sub[pos]) catch return true;
         if (pos + seq_len > sub.len) return true;
-        const cp = std.unicode.utf8Decode(sub[pos .. pos + seq_len]) catch return true;
+        const cp: u21 = switch (seq_len) {
+            1 => sub[pos],
+            2 => std.unicode.utf8Decode2(sub[pos..][0..2].*) catch return true,
+            3 => std.unicode.utf8Decode3(sub[pos..][0..3].*) catch return true,
+            4 => std.unicode.utf8Decode4(sub[pos..][0..4].*) catch return true,
+            else => unreachable,
+        };
 
         var alts: [4]u21 = undefined;
         const info = codepointFoldBranches(cp, &alts);
@@ -432,7 +437,13 @@ pub const NgramBloom = struct {
 
             while (cp_end < lit.len and min_bytes < n) {
                 const seq_len = std.unicode.utf8ByteSequenceLength(lit[cp_end]) catch return true;
-                const cp = std.unicode.utf8Decode(lit[cp_end .. cp_end + seq_len]) catch return true;
+                const cp: u21 = switch (seq_len) {
+                    1 => lit[cp_end],
+                    2 => std.unicode.utf8Decode2(lit[cp_end..][0..2].*) catch return true,
+                    3 => std.unicode.utf8Decode3(lit[cp_end..][0..3].*) catch return true,
+                    4 => std.unicode.utf8Decode4(lit[cp_end..][0..4].*) catch return true,
+                    else => unreachable,
+                };
                 var dummy: [4]u21 = undefined;
                 const info = codepointFoldBranches(cp, &dummy);
                 min_bytes += info.min_utf8_len;

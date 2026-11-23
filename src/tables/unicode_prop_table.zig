@@ -1051,7 +1051,7 @@ pub fn lookupProperty(raw_name: []const u8) ?PropertySpec {
     var value_part = raw_name;
     var prefix_kind: enum { any, gc, sc } = .any;
 
-    if (std.mem.indexOfAny(u8, raw_name, "=:")) |sep_idx| {
+    if (std.mem.findAny(u8, raw_name, "=:")) |sep_idx| {
         var key_buf: [64]u8 = undefined;
         const key_norm = normalizeName(raw_name[0..sep_idx], &key_buf) orelse return null;
         if (std.mem.eql(u8, key_norm, "gc") or std.mem.eql(u8, key_norm, "generalcategory")) {
@@ -1075,129 +1075,155 @@ pub fn lookupProperty(raw_name: []const u8) ?PropertySpec {
     return null;
 }
 
+const gc_prop_map = std.StaticStringMap(PropertySpec).initComptime(.{
+    // Letters
+    .{ "l", PropertySpec{ .ranges = &gc_L } },
+    .{ "letter", PropertySpec{ .ranges = &gc_L } },
+    .{ "alpha", PropertySpec{ .ranges = &gc_L } },
+    .{ "alphabetic", PropertySpec{ .ranges = &gc_L } },
+    .{ "lu", PropertySpec{ .ranges = &gc_Lu, .is_cased_subcat = true } },
+    .{ "uppercaseletter", PropertySpec{ .ranges = &gc_Lu, .is_cased_subcat = true } },
+    .{ "upper", PropertySpec{ .ranges = &gc_Lu, .is_cased_subcat = true } },
+    .{ "uppercase", PropertySpec{ .ranges = &gc_Lu, .is_cased_subcat = true } },
+    .{ "ll", PropertySpec{ .ranges = &gc_Ll, .is_cased_subcat = true } },
+    .{ "lowercaseletter", PropertySpec{ .ranges = &gc_Ll, .is_cased_subcat = true } },
+    .{ "lower", PropertySpec{ .ranges = &gc_Ll, .is_cased_subcat = true } },
+    .{ "lowercase", PropertySpec{ .ranges = &gc_Ll, .is_cased_subcat = true } },
+    .{ "lt", PropertySpec{ .ranges = &gc_Lt, .is_cased_subcat = true } },
+    .{ "titlecaseletter", PropertySpec{ .ranges = &gc_Lt, .is_cased_subcat = true } },
+    .{ "lc", PropertySpec{ .ranges = &gc_LC } },
+    .{ "casedletter", PropertySpec{ .ranges = &gc_LC } },
+    .{ "lm", PropertySpec{ .ranges = &gc_Lm } },
+    .{ "modifierletter", PropertySpec{ .ranges = &gc_Lm } },
+    .{ "lo", PropertySpec{ .ranges = &gc_Lo } },
+    .{ "otherletter", PropertySpec{ .ranges = &gc_Lo } },
+
+    // Marks
+    .{ "m", PropertySpec{ .ranges = &gc_M } },
+    .{ "mark", PropertySpec{ .ranges = &gc_M } },
+    .{ "combiningmark", PropertySpec{ .ranges = &gc_M } },
+    .{ "mn", PropertySpec{ .ranges = &gc_Mn } },
+    .{ "nonspacingmark", PropertySpec{ .ranges = &gc_Mn } },
+    .{ "mc", PropertySpec{ .ranges = &gc_Mc } },
+    .{ "spacingmark", PropertySpec{ .ranges = &gc_Mc } },
+    .{ "me", PropertySpec{ .ranges = &gc_Me } },
+    .{ "enclosingmark", PropertySpec{ .ranges = &gc_Me } },
+
+    // Numbers
+    .{ "n", PropertySpec{ .ranges = &gc_N } },
+    .{ "number", PropertySpec{ .ranges = &gc_N } },
+    .{ "nd", PropertySpec{ .ranges = &gc_Nd } },
+    .{ "decimalnumber", PropertySpec{ .ranges = &gc_Nd } },
+    .{ "digit", PropertySpec{ .ranges = &gc_Nd } },
+    .{ "nl", PropertySpec{ .ranges = &gc_Nl } },
+    .{ "letternumber", PropertySpec{ .ranges = &gc_Nl } },
+    .{ "no", PropertySpec{ .ranges = &gc_No } },
+    .{ "othernumber", PropertySpec{ .ranges = &gc_No } },
+
+    // Punctuation
+    .{ "p", PropertySpec{ .ranges = &gc_P } },
+    .{ "punctuation", PropertySpec{ .ranges = &gc_P } },
+    .{ "punct", PropertySpec{ .ranges = &gc_P } },
+    .{ "pc", PropertySpec{ .ranges = &gc_Pc } },
+    .{ "connectorpunctuation", PropertySpec{ .ranges = &gc_Pc } },
+    .{ "pd", PropertySpec{ .ranges = &gc_Pd } },
+    .{ "dashpunctuation", PropertySpec{ .ranges = &gc_Pd } },
+    .{ "ps", PropertySpec{ .ranges = &gc_Ps } },
+    .{ "openpunctuation", PropertySpec{ .ranges = &gc_Ps } },
+    .{ "pe", PropertySpec{ .ranges = &gc_Pe } },
+    .{ "closepunctuation", PropertySpec{ .ranges = &gc_Pe } },
+    .{ "pi", PropertySpec{ .ranges = &gc_Pi } },
+    .{ "initialpunctuation", PropertySpec{ .ranges = &gc_Pi } },
+    .{ "pf", PropertySpec{ .ranges = &gc_Pf } },
+    .{ "finalpunctuation", PropertySpec{ .ranges = &gc_Pf } },
+    .{ "po", PropertySpec{ .ranges = &gc_Po } },
+    .{ "otherpunctuation", PropertySpec{ .ranges = &gc_Po } },
+
+    // Symbols
+    .{ "s", PropertySpec{ .ranges = &gc_S } },
+    .{ "symbol", PropertySpec{ .ranges = &gc_S } },
+    .{ "sm", PropertySpec{ .ranges = &gc_Sm } },
+    .{ "mathsymbol", PropertySpec{ .ranges = &gc_Sm } },
+    .{ "sc", PropertySpec{ .ranges = &gc_Sc } },
+    .{ "currencysymbol", PropertySpec{ .ranges = &gc_Sc } },
+    .{ "sk", PropertySpec{ .ranges = &gc_Sk } },
+    .{ "modifiersymbol", PropertySpec{ .ranges = &gc_Sk } },
+    .{ "so", PropertySpec{ .ranges = &gc_So } },
+    .{ "othersymbol", PropertySpec{ .ranges = &gc_So } },
+
+    // Separators
+    .{ "z", PropertySpec{ .ranges = &gc_Z } },
+    .{ "separator", PropertySpec{ .ranges = &gc_Z } },
+    .{ "space", PropertySpec{ .ranges = &gc_Z } },
+    .{ "whitespace", PropertySpec{ .ranges = &gc_Z } },
+    .{ "zs", PropertySpec{ .ranges = &gc_Zs } },
+    .{ "spaceseparator", PropertySpec{ .ranges = &gc_Zs } },
+    .{ "zl", PropertySpec{ .ranges = &gc_Zl } },
+    .{ "lineseparator", PropertySpec{ .ranges = &gc_Zl } },
+    .{ "zp", PropertySpec{ .ranges = &gc_Zp } },
+    .{ "paragraphseparator", PropertySpec{ .ranges = &gc_Zp } },
+
+    // Other / Control
+    .{ "c", PropertySpec{ .ranges = &gc_C } },
+    .{ "other", PropertySpec{ .ranges = &gc_C } },
+    .{ "cc", PropertySpec{ .ranges = &gc_Cc } },
+    .{ "control", PropertySpec{ .ranges = &gc_Cc } },
+    .{ "cntrl", PropertySpec{ .ranges = &gc_Cc } },
+    .{ "cf", PropertySpec{ .ranges = &gc_Cf } },
+    .{ "format", PropertySpec{ .ranges = &gc_Cf } },
+    .{ "co", PropertySpec{ .ranges = &gc_Co } },
+    .{ "privateuse", PropertySpec{ .ranges = &gc_Co } },
+    .{ "cn", PropertySpec{ .ranges = &gc_Cn } },
+    .{ "unassigned", PropertySpec{ .ranges = &gc_Cn } },
+});
+
+const any_prop_map = std.StaticStringMap(PropertySpec).initComptime(.{
+    .{ "ascii", PropertySpec{ .ranges = &prop_ASCII } },
+    .{ "any", PropertySpec{ .ranges = &prop_Any } },
+    .{ "assigned", PropertySpec{ .ranges = &prop_Any } },
+    .{ "emoji", PropertySpec{ .ranges = &prop_Emoji } },
+    .{ "emojipresentation", PropertySpec{ .ranges = &prop_Emoji } },
+    .{ "extendedpictographic", PropertySpec{ .ranges = &prop_Emoji } },
+    .{ "whitespace", PropertySpec{ .ranges = &prop_Whitespace } },
+    .{ "wspace", PropertySpec{ .ranges = &prop_Whitespace } },
+    .{ "space", PropertySpec{ .ranges = &prop_Whitespace } },
+});
+
+const sc_prop_map = std.StaticStringMap(PropertySpec).initComptime(.{
+    .{ "han", PropertySpec{ .ranges = &sc_Han } },
+    .{ "hani", PropertySpec{ .ranges = &sc_Han } },
+    .{ "hiragana", PropertySpec{ .ranges = &sc_Hiragana } },
+    .{ "hira", PropertySpec{ .ranges = &sc_Hiragana } },
+    .{ "katakana", PropertySpec{ .ranges = &sc_Katakana } },
+    .{ "kana", PropertySpec{ .ranges = &sc_Katakana } },
+    .{ "hangul", PropertySpec{ .ranges = &sc_Hangul } },
+    .{ "hang", PropertySpec{ .ranges = &sc_Hangul } },
+    .{ "cyrillic", PropertySpec{ .ranges = &sc_Cyrillic } },
+    .{ "cyrl", PropertySpec{ .ranges = &sc_Cyrillic } },
+    .{ "greek", PropertySpec{ .ranges = &sc_Greek } },
+    .{ "grek", PropertySpec{ .ranges = &sc_Greek } },
+    .{ "latin", PropertySpec{ .ranges = &sc_Latin } },
+    .{ "latn", PropertySpec{ .ranges = &sc_Latin } },
+    .{ "arabic", PropertySpec{ .ranges = &sc_Arabic } },
+    .{ "arab", PropertySpec{ .ranges = &sc_Arabic } },
+    .{ "hebrew", PropertySpec{ .ranges = &sc_Hebrew } },
+    .{ "hebr", PropertySpec{ .ranges = &sc_Hebrew } },
+    .{ "devanagari", PropertySpec{ .ranges = &sc_Devanagari } },
+    .{ "deva", PropertySpec{ .ranges = &sc_Devanagari } },
+    .{ "thai", PropertySpec{ .ranges = &sc_Thai } },
+});
+
 fn lookupNormalized(norm: []const u8, prefix_kind: anytype) ?PropertySpec {
     if (prefix_kind == .any or prefix_kind == .gc) {
-        // Letters
-        if (std.mem.eql(u8, norm, "l") or std.mem.eql(u8, norm, "letter") or std.mem.eql(u8, norm, "alpha") or std.mem.eql(u8, norm, "alphabetic"))
-            return .{ .ranges = &gc_L };
-        if (std.mem.eql(u8, norm, "lu") or std.mem.eql(u8, norm, "uppercaseletter") or std.mem.eql(u8, norm, "upper") or std.mem.eql(u8, norm, "uppercase"))
-            return .{ .ranges = &gc_Lu, .is_cased_subcat = true };
-        if (std.mem.eql(u8, norm, "ll") or std.mem.eql(u8, norm, "lowercaseletter") or std.mem.eql(u8, norm, "lower") or std.mem.eql(u8, norm, "lowercase"))
-            return .{ .ranges = &gc_Ll, .is_cased_subcat = true };
-        if (std.mem.eql(u8, norm, "lt") or std.mem.eql(u8, norm, "titlecaseletter"))
-            return .{ .ranges = &gc_Lt, .is_cased_subcat = true };
-        if (std.mem.eql(u8, norm, "lc") or std.mem.eql(u8, norm, "casedletter"))
-            return .{ .ranges = &gc_LC };
-        if (std.mem.eql(u8, norm, "lm") or std.mem.eql(u8, norm, "modifierletter"))
-            return .{ .ranges = &gc_Lm };
-        if (std.mem.eql(u8, norm, "lo") or std.mem.eql(u8, norm, "otherletter"))
-            return .{ .ranges = &gc_Lo };
-
-        // Marks
-        if (std.mem.eql(u8, norm, "m") or std.mem.eql(u8, norm, "mark") or std.mem.eql(u8, norm, "combiningmark"))
-            return .{ .ranges = &gc_M };
-        if (std.mem.eql(u8, norm, "mn") or std.mem.eql(u8, norm, "nonspacingmark"))
-            return .{ .ranges = &gc_Mn };
-        if (std.mem.eql(u8, norm, "mc") or std.mem.eql(u8, norm, "spacingmark"))
-            return .{ .ranges = &gc_Mc };
-        if (std.mem.eql(u8, norm, "me") or std.mem.eql(u8, norm, "enclosingmark"))
-            return .{ .ranges = &gc_Me };
-
-        // Numbers
-        if (std.mem.eql(u8, norm, "n") or std.mem.eql(u8, norm, "number"))
-            return .{ .ranges = &gc_N };
-        if (std.mem.eql(u8, norm, "nd") or std.mem.eql(u8, norm, "decimalnumber") or std.mem.eql(u8, norm, "digit"))
-            return .{ .ranges = &gc_Nd };
-        if (std.mem.eql(u8, norm, "nl") or std.mem.eql(u8, norm, "letternumber"))
-            return .{ .ranges = &gc_Nl };
-        if (std.mem.eql(u8, norm, "no") or std.mem.eql(u8, norm, "othernumber"))
-            return .{ .ranges = &gc_No };
-
-        // Punctuation
-        if (std.mem.eql(u8, norm, "p") or std.mem.eql(u8, norm, "punctuation") or std.mem.eql(u8, norm, "punct"))
-            return .{ .ranges = &gc_P };
-        if (std.mem.eql(u8, norm, "pc") or std.mem.eql(u8, norm, "connectorpunctuation"))
-            return .{ .ranges = &gc_Pc };
-        if (std.mem.eql(u8, norm, "pd") or std.mem.eql(u8, norm, "dashpunctuation"))
-            return .{ .ranges = &gc_Pd };
-        if (std.mem.eql(u8, norm, "ps") or std.mem.eql(u8, norm, "openpunctuation"))
-            return .{ .ranges = &gc_Ps };
-        if (std.mem.eql(u8, norm, "pe") or std.mem.eql(u8, norm, "closepunctuation"))
-            return .{ .ranges = &gc_Pe };
-        if (std.mem.eql(u8, norm, "pi") or std.mem.eql(u8, norm, "initialpunctuation"))
-            return .{ .ranges = &gc_Pi };
-        if (std.mem.eql(u8, norm, "pf") or std.mem.eql(u8, norm, "finalpunctuation"))
-            return .{ .ranges = &gc_Pf };
-        if (std.mem.eql(u8, norm, "po") or std.mem.eql(u8, norm, "otherpunctuation"))
-            return .{ .ranges = &gc_Po };
-
-        // Symbols
-        if (std.mem.eql(u8, norm, "s") or std.mem.eql(u8, norm, "symbol"))
-            return .{ .ranges = &gc_S };
-        if (std.mem.eql(u8, norm, "sm") or std.mem.eql(u8, norm, "mathsymbol"))
-            return .{ .ranges = &gc_Sm };
-        if (std.mem.eql(u8, norm, "sc") or std.mem.eql(u8, norm, "currencysymbol"))
-            return .{ .ranges = &gc_Sc };
-        if (std.mem.eql(u8, norm, "sk") or std.mem.eql(u8, norm, "modifiersymbol"))
-            return .{ .ranges = &gc_Sk };
-        if (std.mem.eql(u8, norm, "so") or std.mem.eql(u8, norm, "othersymbol"))
-            return .{ .ranges = &gc_So };
-
-        // Separators
-        if (std.mem.eql(u8, norm, "z") or std.mem.eql(u8, norm, "separator") or std.mem.eql(u8, norm, "space") or std.mem.eql(u8, norm, "whitespace"))
-            return .{ .ranges = &gc_Z };
-        if (std.mem.eql(u8, norm, "zs") or std.mem.eql(u8, norm, "spaceseparator"))
-            return .{ .ranges = &gc_Zs };
-        if (std.mem.eql(u8, norm, "zl") or std.mem.eql(u8, norm, "lineseparator"))
-            return .{ .ranges = &gc_Zl };
-        if (std.mem.eql(u8, norm, "zp") or std.mem.eql(u8, norm, "paragraphseparator"))
-            return .{ .ranges = &gc_Zp };
-
-        // Other / Control
-        if (std.mem.eql(u8, norm, "c") or std.mem.eql(u8, norm, "other"))
-            return .{ .ranges = &gc_C };
-        if (std.mem.eql(u8, norm, "cc") or std.mem.eql(u8, norm, "control") or std.mem.eql(u8, norm, "cntrl"))
-            return .{ .ranges = &gc_Cc };
-        if (std.mem.eql(u8, norm, "cf") or std.mem.eql(u8, norm, "format"))
-            return .{ .ranges = &gc_Cf };
-        if (std.mem.eql(u8, norm, "co") or std.mem.eql(u8, norm, "privateuse"))
-            return .{ .ranges = &gc_Co };
-        if (std.mem.eql(u8, norm, "cn") or std.mem.eql(u8, norm, "unassigned"))
-            return .{ .ranges = &gc_Cn };
+        if (gc_prop_map.get(norm)) |spec| return spec;
     }
 
     if (prefix_kind == .any) {
-        if (std.mem.eql(u8, norm, "ascii")) return .{ .ranges = &prop_ASCII };
-        if (std.mem.eql(u8, norm, "any") or std.mem.eql(u8, norm, "assigned")) return .{ .ranges = &prop_Any };
-        if (std.mem.eql(u8, norm, "emoji") or std.mem.eql(u8, norm, "emojipresentation") or std.mem.eql(u8, norm, "extendedpictographic"))
-            return .{ .ranges = &prop_Emoji };
-        if (std.mem.eql(u8, norm, "whitespace") or std.mem.eql(u8, norm, "wspace") or std.mem.eql(u8, norm, "space"))
-            return .{ .ranges = &prop_Whitespace };
+        if (any_prop_map.get(norm)) |spec| return spec;
     }
 
     if (prefix_kind == .any or prefix_kind == .sc) {
-        if (std.mem.eql(u8, norm, "han") or std.mem.eql(u8, norm, "hani"))
-            return .{ .ranges = &sc_Han };
-        if (std.mem.eql(u8, norm, "hiragana") or std.mem.eql(u8, norm, "hira"))
-            return .{ .ranges = &sc_Hiragana };
-        if (std.mem.eql(u8, norm, "katakana") or std.mem.eql(u8, norm, "kana"))
-            return .{ .ranges = &sc_Katakana };
-        if (std.mem.eql(u8, norm, "hangul") or std.mem.eql(u8, norm, "hang"))
-            return .{ .ranges = &sc_Hangul };
-        if (std.mem.eql(u8, norm, "cyrillic") or std.mem.eql(u8, norm, "cyrl"))
-            return .{ .ranges = &sc_Cyrillic };
-        if (std.mem.eql(u8, norm, "greek") or std.mem.eql(u8, norm, "grek"))
-            return .{ .ranges = &sc_Greek };
-        if (std.mem.eql(u8, norm, "latin") or std.mem.eql(u8, norm, "latn"))
-            return .{ .ranges = &sc_Latin };
-        if (std.mem.eql(u8, norm, "arabic") or std.mem.eql(u8, norm, "arab"))
-            return .{ .ranges = &sc_Arabic };
-        if (std.mem.eql(u8, norm, "hebrew") or std.mem.eql(u8, norm, "hebr"))
-            return .{ .ranges = &sc_Hebrew };
-        if (std.mem.eql(u8, norm, "devanagari") or std.mem.eql(u8, norm, "deva"))
-            return .{ .ranges = &sc_Devanagari };
-        if (std.mem.eql(u8, norm, "thai"))
-            return .{ .ranges = &sc_Thai };
+        if (sc_prop_map.get(norm)) |spec| return spec;
     }
 
     return null;
@@ -1220,7 +1246,7 @@ pub const prop_Whitespace = [_]CodepointRange{
 /// UAX #29 / UTS #18 Unicode Word character classification (`Alphabetic | M | N | Pc | Join_Control`).
 pub fn isWordCodepoint(cp: u21) bool {
     if (cp < 0x80) {
-        return (cp >= '0' and cp <= '9') or (cp >= 'A' and cp <= 'Z') or (cp >= 'a' and cp <= 'z') or cp == '_';
+        return std.ascii.isAlphanumeric(@intCast(cp)) or cp == '_';
     }
     if (cp > 0x10FFFF) return false;
     // ZWNJ / ZWJ (Join_Control)

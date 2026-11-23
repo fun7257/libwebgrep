@@ -25,6 +25,16 @@ const Step = struct {
     len: usize,
 };
 
+inline fn decodeUtf8(bytes: []const u8) !u21 {
+    return switch (bytes.len) {
+        1 => bytes[0],
+        2 => std.unicode.utf8Decode2(bytes[0..2].*),
+        3 => std.unicode.utf8Decode3(bytes[0..3].*),
+        4 => std.unicode.utf8Decode4(bytes[0..4].*),
+        else => unreachable,
+    };
+}
+
 fn nextCodepoint(bytes: []const u8, pos: usize) ?Step {
     if (pos >= bytes.len) return null;
     const b = bytes[pos];
@@ -37,7 +47,7 @@ fn nextCodepoint(bytes: []const u8, pos: usize) ?Step {
         @branchHint(.cold);
         return .{ .cp = 0x110000 + @as(u21, b), .len = 1 };
     }
-    const cp = std.unicode.utf8Decode(bytes[pos .. pos + seq_len]) catch {
+    const cp = decodeUtf8(bytes[pos .. pos + seq_len]) catch {
         @branchHint(.cold);
         return .{ .cp = 0x110000 + @as(u21, b), .len = 1 };
     };
@@ -50,7 +60,7 @@ pub fn patternHasUnicodeUpper(pattern: []const u8) bool {
     while (i < pattern.len) {
         const b = pattern[i];
         if (b < 0x80) {
-            if (b >= 'A' and b <= 'Z') return true;
+            if (std.ascii.isUpper(b)) return true;
             i += 1;
             continue;
         }
@@ -59,7 +69,7 @@ pub fn patternHasUnicodeUpper(pattern: []const u8) bool {
             continue;
         };
         if (i + len > pattern.len) break;
-        const cp = std.unicode.utf8Decode(pattern[i .. i + len]) catch {
+        const cp = decodeUtf8(pattern[i .. i + len]) catch {
             i += 1;
             continue;
         };
@@ -107,14 +117,7 @@ fn leadBytesForCodepoint(cp: u21, leads: *[4]u8) usize {
         const enc_len = std.unicode.utf8Encode(alt_cp, &utf8_buf) catch return 5;
         if (enc_len == 0) continue;
         const lb = utf8_buf[0];
-        var dup = false;
-        for (leads[0..n_leads]) |existing| {
-            if (existing == lb) {
-                dup = true;
-                break;
-            }
-        }
-        if (!dup) {
+        if (std.mem.findScalar(u8, leads[0..n_leads], lb) == null) {
             if (n_leads >= 4) return 5;
             leads[n_leads] = lb;
             n_leads += 1;
@@ -233,7 +236,7 @@ pub fn isWordBefore(haystack: []const u8, pos: usize) bool {
     }
     const seq_len = std.unicode.utf8ByteSequenceLength(haystack[start]) catch return false;
     if (start + seq_len != pos) return false;
-    const cp = std.unicode.utf8Decode(haystack[start..pos]) catch return false;
+    const cp = decodeUtf8(haystack[start..pos]) catch return false;
     return isUnicodeWordCodepoint(cp);
 }
 
@@ -244,7 +247,7 @@ pub fn isWordAt(haystack: []const u8, pos: usize) bool {
     if (b < 0x80) return isUnicodeWordCodepoint(b);
     const seq_len = std.unicode.utf8ByteSequenceLength(b) catch return false;
     if (pos + seq_len > haystack.len) return false;
-    const cp = std.unicode.utf8Decode(haystack[pos .. pos + seq_len]) catch return false;
+    const cp = decodeUtf8(haystack[pos .. pos + seq_len]) catch return false;
     return isUnicodeWordCodepoint(cp);
 }
 
@@ -263,7 +266,7 @@ pub fn needsUnicodeExpansion(pattern: []const u8) bool {
             continue;
         };
         if (i + len > pattern.len) break;
-        const cp = std.unicode.utf8Decode(pattern[i .. i + len]) catch {
+        const cp = decodeUtf8(pattern[i .. i + len]) catch {
             i += 1;
             continue;
         };
@@ -306,7 +309,7 @@ pub fn countBranches(pattern: []const u8, include_cross_ascii: bool) usize {
             continue;
         };
         if (i + len > pattern.len) break;
-        const cp = std.unicode.utf8Decode(pattern[i .. i + len]) catch {
+        const cp = decodeUtf8(pattern[i .. i + len]) catch {
             i += 1;
             continue;
         };
@@ -383,7 +386,7 @@ fn expandRecursive(
         prefix.shrinkRetainingCapacity(saved_len);
         return;
     }
-    const cp = std.unicode.utf8Decode(pattern[pos .. pos + len]) catch {
+    const cp = decodeUtf8(pattern[pos .. pos + len]) catch {
         try prefix.appendSlice(allocator, pattern[pos .. pos + len]);
         try expandRecursive(allocator, pattern, pos + len, include_cross_ascii, prefix, out_list, limit);
         prefix.shrinkRetainingCapacity(saved_len);

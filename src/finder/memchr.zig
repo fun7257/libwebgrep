@@ -4,12 +4,10 @@
 //! custom SIMD measured 55.8 GB/s vs. std's 54.6 GB/s (~2% difference); later microbenchmarks
 //! are recorded in `BENCHMARKS.md`.
 //! `findEither` (two distinct bytes), reverse search, and byte counting still use custom `@Vector`
-//! loops because std's `findScalarLast` is scalar and std has no vectorized count.
+//! loops because std's `findScalarLast` is scalar and std's `countScalar` regresses 21-36% in-cache
+//! due to per-vector horizontal reductions vs. our 63-batch `u8` accumulator.
 //!
-//! A 16-byte comparison is packed into a 64-bit nibble mask: reinterpret the comparison result
-//! as 8x 16-bit lanes, shift right by 4 bits, and narrow to 8 bits. Each matching byte produces
-//! four 1-bits, so its index is `ctz / 4` and the match count is `popcount / 4`.
-//! 32-byte vectors are split into two 16-byte halves processed the same way.
+//! `nibbleMask` compresses 16-byte `0xFF`/`0x00` flags into a 64-bit nibble mask for Teddy on NEON.
 
 const builtin = @import("builtin");
 const std = @import("std");
@@ -244,79 +242,13 @@ fn scalarEither(haystack: []const u8, start: usize, end: usize, a: u8, b: u8) ?u
     return null;
 }
 
-fn firstIn(comptime width: comptime_int, block: @Vector(width, u8), a: u8, b: u8) ?usize {
-    if (width == 64) {
-        const quarters: [4]@Vector(16, u8) = @bitCast(block);
-        inline for (0..4) |q| {
-            if (indexFromMask(mask16(quarters[q], a, b))) |rel| return q * 16 + rel;
-        }
-        return null;
-    }
-    if (width == 32) {
-        const halves: [2]@Vector(16, u8) = @bitCast(block);
-        if (indexFromMask(mask16(halves[0], a, b))) |rel| return rel;
-        if (indexFromMask(mask16(halves[1], a, b))) |rel| return 16 + rel;
-        return null;
-    }
-    return indexFromMask(mask16(block, a, b));
-}
-
 fn lastIn(comptime width: comptime_int, block: @Vector(width, u8), needle: u8) ?usize {
-    if (width == 64) {
-        const quarters: [4]@Vector(16, u8) = @bitCast(block);
-        if (lastFromMask(mask16(quarters[3], needle, needle))) |rel| return 48 + rel;
-        if (lastFromMask(mask16(quarters[2], needle, needle))) |rel| return 32 + rel;
-        if (lastFromMask(mask16(quarters[1], needle, needle))) |rel| return 16 + rel;
-        if (lastFromMask(mask16(quarters[0], needle, needle))) |rel| return rel;
-        return null;
+    const cmp = block == @as(@Vector(width, u8), @splat(needle));
+    if (@reduce(.Or, cmp)) {
+        @branchHint(.unlikely);
+        return @as(usize, std.simd.lastTrue(cmp).?);
     }
-    if (width == 32) {
-        const halves: [2]@Vector(16, u8) = @bitCast(block);
-        if (lastFromMask(mask16(halves[1], needle, needle))) |rel| return 16 + rel;
-        if (lastFromMask(mask16(halves[0], needle, needle))) |rel| return rel;
-        return null;
-    }
-    return lastFromMask(mask16(block, needle, needle));
-}
-
-fn countIn(comptime width: comptime_int, block: @Vector(width, u8), needle: u8) usize {
-    if (width == 64) {
-        const quarters: [4]@Vector(16, u8) = @bitCast(block);
-        return countMask(mask16(quarters[0], needle, needle)) +
-            countMask(mask16(quarters[1], needle, needle)) +
-            countMask(mask16(quarters[2], needle, needle)) +
-            countMask(mask16(quarters[3], needle, needle));
-    }
-    if (width == 32) {
-        const halves: [2]@Vector(16, u8) = @bitCast(block);
-        return countMask(mask16(halves[0], needle, needle)) + countMask(mask16(halves[1], needle, needle));
-    }
-    return countMask(mask16(block, needle, needle));
-}
-
-/// Each matching byte occupies 4 consecutive 1-bits in the mask. Returns null if no match.
-fn indexFromMask(mask: u64) ?usize {
-    if (mask == 0) return null;
-    return @as(usize, @ctz(mask)) / 4;
-}
-
-fn lastFromMask(mask: u64) ?usize {
-    if (mask == 0) return null;
-    return @as(usize, 63 - @clz(mask)) / 4;
-}
-
-fn countMask(mask: u64) usize {
-    return @as(usize, @popCount(mask)) / 4;
-}
-
-/// Packs a 16-byte comparison into a 64-bit nibble mask.
-fn mask16(block: @Vector(16, u8), a: u8, b: u8) u64 {
-    const cmp = if (a == b)
-        block == @as(@Vector(16, u8), @splat(a))
-    else
-        (block == @as(@Vector(16, u8), @splat(a))) | (block == @as(@Vector(16, u8), @splat(b)));
-    const bytes: @Vector(16, u8) = @select(u8, cmp, @as(@Vector(16, u8), @splat(@as(u8, 0xFF))), @as(@Vector(16, u8), @splat(@as(u8, 0))));
-    return nibbleMask(bytes);
+    return null;
 }
 
 /// Compresses each `0xFF` hit byte into four 1-bits. Used in place of movemask on NEON.
@@ -333,24 +265,6 @@ pub inline fn nibbleMask(flags: @Vector(16, u8)) u64 {
         }
         return mask;
     }
-}
-
-/// Returns the byte index of the first hit in a nibble mask, or null if none.
-pub inline fn index16(flags: @Vector(16, u8)) ?usize {
-    const mask = nibbleMask(flags);
-    if (mask == 0) return null;
-    return @as(usize, @ctz(mask)) / 4;
-}
-
-/// Returns the first byte index among `native_width` `0xFF` flags, splitting 32-byte vectors into two 16-byte halves.
-pub inline fn indexWidth(flags: @Vector(native_width, u8)) ?usize {
-    if (comptime native_width == 32) {
-        const halves: [2]@Vector(16, u8) = @bitCast(flags);
-        if (index16(halves[0])) |rel| return rel;
-        if (index16(halves[1])) |rel| return 16 + rel;
-        return null;
-    }
-    return index16(flags);
 }
 
 fn scalarFind(haystack: []const u8, start: usize, needle: u8) ?usize {

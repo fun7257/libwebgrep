@@ -438,7 +438,7 @@ pub fn build(
         for (0..256) |b| {
             const dest: u32 = if (node.next[b] >= 0) @intCast(node.next[b]) else 0;
             const key = (@as(u64, class_of[b]) << 32) | dest;
-            const slot = findKey(keys[0..nkeys], key);
+            const slot = std.mem.findScalar(u64, keys[0..nkeys], key);
             if (slot) |at| {
                 new_of[b] = vals[at];
             } else {
@@ -556,19 +556,7 @@ fn appendOuts(
     from: u32,
 ) !void {
     if (dest == from) return;
-    const n = nodes.items[from].out.items.len;
-    var k: usize = 0;
-    while (k < n) : (k += 1) {
-        const item = nodes.items[from].out.items[k];
-        try nodes.items[dest].out.append(allocator, item);
-    }
-}
-
-fn findKey(keys: []const u64, key: u64) ?usize {
-    for (keys, 0..) |have, i| {
-        if (have == key) return i;
-    }
-    return null;
+    try nodes.items[dest].out.appendSlice(allocator, nodes.items[from].out.items);
 }
 
 fn consider(best: *?Cand, start: usize, end: usize, id: u32, mode: matcher.MatchMode) void {
@@ -598,10 +586,7 @@ fn toMatch(best: ?Cand) ?matcher.Match {
 }
 
 fn equalAt(pat: []const u8, hay: []const u8, ignore: bool) bool {
-    for (pat, hay) |p, h| {
-        if (!ascii.eq(p, h, ignore)) return false;
-    }
-    return true;
+    return if (ignore) std.ascii.eqlIgnoreCase(pat, hay) else std.mem.eql(u8, pat, hay);
 }
 
 fn buildAnchor(allocator: std.mem.Allocator, patterns: []const []const u8, ignore: bool) !AnchorSet {
@@ -634,11 +619,7 @@ fn buildAnchor(allocator: std.mem.Allocator, patterns: []const []const u8, ignor
         if (count == 0) continue;
         const forms = if (ignore) ascii.caseVariants(@intCast(byte)) else [2]u8{ @intCast(byte), @intCast(byte) };
         for (forms) |form| {
-            var seen = false;
-            for (member_buf[0..member_n]) |have| {
-                if (have == form) seen = true;
-            }
-            if (seen) continue;
+            if (std.mem.findScalar(u8, member_buf[0..member_n], form) != null) continue;
             if (member_n == member_buf.len) return .{};
             member_buf[member_n] = form;
             member_n += 1;

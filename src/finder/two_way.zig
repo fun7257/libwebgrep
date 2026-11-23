@@ -187,11 +187,7 @@ fn cmpByte(a: u8, b: u8, fold: Fold) std.math.Order {
 }
 
 fn bytesEqual(a: []const u8, b: []const u8, fold: Fold) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |x, y| {
-        if (cmpByte(x, y, fold) != .eq) return false;
-    }
-    return true;
+    return if (fold == .ascii) std.ascii.eqlIgnoreCase(a, b) else std.mem.eql(u8, a, b);
 }
 
 fn scalarFind(haystack: []const u8, needle: []const u8, start: usize, fold: Fold) ?usize {

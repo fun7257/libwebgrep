@@ -306,16 +306,11 @@ pub const Regex = struct {
             var shift: usize = lit.len;
             var k: usize = 1;
             while (k < lit.len) : (k += 1) {
-                var ok_overlap = true;
-                var j: usize = 0;
-                while (k + j < lit.len) : (j += 1) {
-                    const a = if (self.ignore_case) std.ascii.toLower(lit[j]) else lit[j];
-                    const b = if (self.ignore_case) std.ascii.toLower(lit[k + j]) else lit[k + j];
-                    if (a != b) {
-                        ok_overlap = false;
-                        break;
-                    }
-                }
+                const rem = lit.len - k;
+                const ok_overlap = if (self.ignore_case)
+                    std.ascii.eqlIgnoreCase(lit[0..rem], lit[k..])
+                else
+                    std.mem.eql(u8, lit[0..rem], lit[k..]);
                 if (ok_overlap) {
                     shift = k;
                     break;
@@ -2407,10 +2402,7 @@ inline fn matchPrefixUclassReverse(
         }
         if ((b_last & 0xC0) != 0x80) break;
         if (cur >= min_start + 3 and (haystack[cur - 3] & 0xF0) == 0xE0 and (haystack[cur - 2] & 0xC0) == 0x80) {
-            const cp: u21 = (@as(u21, haystack[cur - 3] & 0x0F) << 12) |
-                (@as(u21, haystack[cur - 2] & 0x3F) << 6) |
-                @as(u21, b_last & 0x3F);
-            if (cp < 0x800 or (cp >= 0xD800 and cp <= 0xDFFF)) break;
+            const cp = std.unicode.utf8Decode3(haystack[cur - 3 ..][0..3].*) catch break;
             const in_set = inRanges(cp, ranges);
             if (if (uc.negated) in_set else !in_set) break;
             cur -= 3;
@@ -2418,8 +2410,7 @@ inline fn matchPrefixUclassReverse(
             continue;
         }
         if (cur >= min_start + 2 and (haystack[cur - 2] & 0xE0) == 0xC0) {
-            const cp: u21 = (@as(u21, haystack[cur - 2] & 0x1F) << 6) | @as(u21, b_last & 0x3F);
-            if (cp < 0x80) break;
+            const cp = std.unicode.utf8Decode2(haystack[cur - 2 ..][0..2].*) catch break;
             const in_set = inRanges(cp, ranges);
             if (if (uc.negated) in_set else !in_set) break;
             cur -= 2;
@@ -2429,11 +2420,7 @@ inline fn matchPrefixUclassReverse(
         if (cur >= min_start + 4 and (haystack[cur - 4] & 0xF8) == 0xF0 and
             (haystack[cur - 3] & 0xC0) == 0x80 and (haystack[cur - 2] & 0xC0) == 0x80)
         {
-            const cp: u21 = (@as(u21, haystack[cur - 4] & 0x07) << 18) |
-                (@as(u21, haystack[cur - 3] & 0x3F) << 12) |
-                (@as(u21, haystack[cur - 2] & 0x3F) << 6) |
-                @as(u21, b_last & 0x3F);
-            if (cp < 0x10000 or cp > 0x10FFFF) break;
+            const cp = std.unicode.utf8Decode4(haystack[cur - 4 ..][0..4].*) catch break;
             const in_set = inRanges(cp, ranges);
             if (if (uc.negated) in_set else !in_set) break;
             cur -= 4;

@@ -831,18 +831,11 @@ inline fn windowHits(
 }
 
 inline fn firstTrue(hits: @Vector(width, bool)) ?usize {
-    const V = @Vector(width, u8);
-    const flags: V = @select(u8, hits, @as(V, @splat(@as(u8, 0xFF))), @as(V, @splat(@as(u8, 0))));
-    return memchr.indexWidth(flags);
+    return if (std.simd.firstTrue(hits)) |idx| @as(usize, idx) else null;
 }
 
 fn equalAt(pat: []const u8, hay: []const u8, comptime ignore: bool) bool {
-    for (pat, hay) |p, h| {
-        if (ignore) {
-            if (ascii.fold(p) != ascii.fold(h)) return false;
-        } else if (p != h) return false;
-    }
-    return true;
+    return if (ignore) std.ascii.eqlIgnoreCase(pat, hay) else std.mem.eql(u8, pat, hay);
 }
 
 fn consider(best: *?Cand, start: usize, end: usize, id: u32, mode: matcher.MatchMode) void {

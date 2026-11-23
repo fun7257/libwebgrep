@@ -3,6 +3,8 @@
 //! [Role] Compact O(1) lookup tables for Windows-1252, Windows-1251, GB18030 4-byte ranges,
 //!        Shift_JIS (CP932), EUC-JP (JIS X 0208), Big5, and EUC-KR (CP949).
 
+const std = @import("std");
+
 pub const windows1252_80_9f = [32]u16{
     0x20ac, 0xfffd, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020, 0x2021, 0x02c6, 0x2030, 0x0160, 0x2039, 0x0152, 0xfffd, 0x017d, 0xfffd,
     0xfffd, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013, 0x2014, 0x02dc, 0x2122, 0x0161, 0x203a, 0x0153, 0xfffd, 0x017e, 0x0178,
@@ -234,13 +236,12 @@ pub fn lookupGb18030FourByte(b0: u8, b1: u8, b2: u8, b3: u8) ?u21 {
     const ptr: u32 = ((@as(u32, b0 - 0x81) * 10 + @as(u32, b1 - 0x30)) * 126 + @as(u32, b2 - 0x81)) * 10 + @as(u32, b3 - 0x30);
     if (ptr >= 189000 and ptr <= 1237575) return @intCast(0x10000 + (ptr - 189000));
     if (ptr >= 39420) return null;
-    var lo: usize = 0;
-    var hi: usize = gb18030_ranges.len;
-    while (lo + 1 < hi) {
-        const mid = lo + (hi - lo) / 2;
-        if (gb18030_ranges[mid].ptr <= ptr) lo = mid else hi = mid;
-    }
-    const base = gb18030_ranges[lo];
+    const idx = std.sort.upperBound(Gb18030Range, &gb18030_ranges, ptr, struct {
+        fn cmp(context: u32, item: Gb18030Range) std.math.Order {
+            return std.math.order(context, item.ptr);
+        }
+    }.cmp);
+    const base = gb18030_ranges[idx - 1];
     return @intCast(@as(u32, base.cp) + (ptr - base.ptr));
 }
 
@@ -4311,17 +4312,11 @@ const gb18030_two_byte_extra = [_]Gb18030ExtraEntry{
 
 pub fn lookupGb18030TwoByteExtra(b0: u8, b1: u8) ?u21 {
     const key: u16 = (@as(u16, b0) << 8) | b1;
-    var lo: usize = 0;
-    var hi: usize = gb18030_two_byte_extra.len;
-    while (lo < hi) {
-        const mid = lo + (hi - lo) / 2;
-        if (gb18030_two_byte_extra[mid].key < key) {
-            lo = mid + 1;
-        } else if (gb18030_two_byte_extra[mid].key > key) {
-            hi = mid;
-        } else {
-            return gb18030_two_byte_extra[mid].cp;
+    const Entry = @TypeOf(gb18030_two_byte_extra[0]);
+    const idx = std.sort.binarySearch(Entry, &gb18030_two_byte_extra, key, struct {
+        fn cmp(context: u16, item: Entry) std.math.Order {
+            return std.math.order(context, item.key);
         }
-    }
-    return null;
+    }.cmp) orelse return null;
+    return gb18030_two_byte_extra[idx].cp;
 }

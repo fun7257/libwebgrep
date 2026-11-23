@@ -519,11 +519,7 @@ fn toMatch(best: ?Cand) ?matcher.Match {
 }
 
 fn expandTable(comptime lanes: usize, comptime Vec: type, table: *const [16]u8) Vec {
-    if (comptime lanes == 16) return table.*;
-    var wide: [32]u8 = undefined;
-    wide[0..16].* = table.*;
-    wide[16..32].* = table.*;
-    return wide;
+    return std.simd.repeat(lanes, @as(@Vector(16, u8), table.*));
 }
 
 fn nonzero16(block: @Vector(16, u8)) u64 {
@@ -553,10 +549,8 @@ fn loadAt(comptime lanes: usize, comptime Vec: type, haystack: []const u8, at: u
 
 fn matchesAt(pat: []const u8, haystack: []const u8, at: usize, ignore: bool) bool {
     if (at > haystack.len or pat.len > haystack.len - at) return false;
-    for (pat, haystack[at..][0..pat.len]) |p, h| {
-        if (!ascii.eq(p, h, ignore)) return false;
-    }
-    return true;
+    const slice = haystack[at..][0..pat.len];
+    return if (ignore) std.ascii.eqlIgnoreCase(pat, slice) else std.mem.eql(u8, pat, slice);
 }
 
 fn preferLeftmost(a: Cand, b: Cand) bool {

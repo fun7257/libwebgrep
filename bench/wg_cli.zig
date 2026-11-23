@@ -1,6 +1,7 @@
 //! Standalone search CLI built on top of `libwebgrep` (`src/root.zig`) and `libwebgrep_internal` (`src/internal_root.zig`).
-//! Supports `-c`, `-n`, `-F`, `-i`, `-a`/`--text`, `--binary`, `--no-binary`, `-g <glob>`, `-e <pat>`, `-j <threads>`,
-//! `--no-config`, `--no-unicode`, `--no-ignore`, `--mmap`, and `--no-mmap`, emitting output format & exit codes identical to `rg`.
+//! Supports `-c`, `-n`, `-F`, `-i`, `-v`, `-w`, `-C <n>`, `-f <file>`, `-a`/`--text`, `--binary`, `--no-binary`,
+//! `-g <glob>`, `-e <pat>`, `-j <threads>`, `--no-config`, `--no-unicode`, `--no-ignore`, `--mmap`, and `--no-mmap`,
+//! emitting output format & exit codes identical to `rg`.
 
 const std = @import("std");
 const libwebgrep = @import("libwebgrep_internal");
@@ -13,6 +14,9 @@ const CliArgs = struct {
     line_numbers: bool = false,
     fixed_strings: bool = false,
     ignore_case: bool = false,
+    invert: bool = false,
+    whole_word: bool = false,
+    context: u32 = 0,
     multiline: bool = false,
     multiline_dotall: bool = false,
     no_unicode: bool = false,
@@ -22,11 +26,15 @@ const CliArgs = struct {
     io_mode: IoMode = .no_mmap,
     globs: std.ArrayList([]const u8) = .empty,
     patterns: std.ArrayList([]const u8) = .empty,
+    pattern_file_bufs: std.ArrayList([]u8) = .empty,
+    saw_pattern_flag: bool = false,
     target_path: []const u8 = "",
 
     pub fn deinit(self: *CliArgs, allocator: std.mem.Allocator) void {
         self.globs.deinit(allocator);
         self.patterns.deinit(allocator);
+        for (self.pattern_file_bufs.items) |buf| allocator.free(buf);
+        self.pattern_file_bufs.deinit(allocator);
     }
 };
 
@@ -40,7 +48,7 @@ const PrintSink = struct {
     prefix_path: ?[]const u8 = null,
     line_numbers: bool = false,
 
-    pub fn matched(self: *PrintSink, line: libwebgrep.Line) bool {
+    fn writeLine(self: *PrintSink, line: libwebgrep.Line, sep: u8) bool {
         if (line.binary_status == .detected) return false;
         if ((self.prefix_path != null or self.line_numbers) and std.mem.findScalar(u8, line.bytes, '\n') != null) {
             var it = std.mem.splitScalar(u8, line.bytes, '\n');
@@ -48,11 +56,11 @@ const PrintSink = struct {
             while (it.next()) |sub| : (idx += 1) {
                 if (self.prefix_path) |p| {
                     self.out.writeAll(p) catch return false;
-                    self.out.writeByte(':') catch return false;
+                    self.out.writeByte(sep) catch return false;
                 }
                 if (self.line_numbers) {
                     if (line.number) |num| {
-                        self.out.print("{d}:", .{num + idx}) catch return false;
+                        self.out.print("{d}{c}", .{ num + idx, sep }) catch return false;
                     }
                 }
                 self.out.writeAll(sub) catch return false;
@@ -62,15 +70,28 @@ const PrintSink = struct {
         }
         if (self.prefix_path) |p| {
             self.out.writeAll(p) catch return false;
-            self.out.writeByte(':') catch return false;
+            self.out.writeByte(sep) catch return false;
         }
         if (self.line_numbers) {
             if (line.number) |num| {
-                self.out.print("{d}:", .{num}) catch return false;
+                self.out.print("{d}{c}", .{ num, sep }) catch return false;
             }
         }
         self.out.writeAll(line.bytes) catch return false;
         self.out.writeByte('\n') catch return false;
+        return true;
+    }
+
+    pub fn matched(self: *PrintSink, line: libwebgrep.Line) bool {
+        return self.writeLine(line, ':');
+    }
+
+    pub fn context(self: *PrintSink, line: libwebgrep.Line) bool {
+        return self.writeLine(line, '-');
+    }
+
+    pub fn contextBreak(self: *PrintSink) bool {
+        self.out.writeAll("--\n") catch return false;
         return true;
     }
 
@@ -172,6 +193,22 @@ fn searchSingleFileWithSink(
     };
 }
 
+fn loadPatternFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, cli: *CliArgs) !void {
+    const data = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024 * 1024));
+    errdefer gpa.free(data);
+    try cli.pattern_file_bufs.append(gpa, data);
+    if (data.len == 0) return;
+    const body = if (data[data.len - 1] == '\n') data[0 .. data.len - 1] else data;
+    var it = std.mem.splitScalar(u8, body, '\n');
+    while (it.next()) |raw_line| {
+        const pat = if (raw_line.len > 0 and raw_line[raw_line.len - 1] == '\r')
+            raw_line[0 .. raw_line.len - 1]
+        else
+            raw_line;
+        try cli.patterns.append(gpa, pat);
+    }
+}
+
 fn searchOneFile(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -190,8 +227,13 @@ fn searchOneFile(
     };
     defer file.close(io);
 
+    const ctx_lines: u32 = if (args.count_only) 0 else args.context;
     const cfg = libwebgrep.SearchConfig{
         .line_numbers = args.line_numbers,
+        .invert = args.invert,
+        .whole_word = args.whole_word,
+        .context = ctx_lines,
+        .max_context_lines = if (ctx_lines > libwebgrep.SearchConfig.context_lines_hard_cap) ctx_lines else null,
         .multiline = args.multiline,
         .match_mode = if (args.multiline) .leftmost_first else .earliest,
         .binary = args.binary_policy,
@@ -248,6 +290,28 @@ pub fn main(init: std.process.Init) !u8 {
             } else if (std.mem.eql(u8, arg, "-i") or std.mem.eql(u8, arg, "--ignore-case")) {
                 cli.ignore_case = true;
                 continue;
+            } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--invert-match")) {
+                cli.invert = true;
+                continue;
+            } else if (std.mem.eql(u8, arg, "-w") or std.mem.eql(u8, arg, "--word-regexp")) {
+                cli.whole_word = true;
+                continue;
+            } else if (std.mem.eql(u8, arg, "-C") or std.mem.eql(u8, arg, "--context")) {
+                const c_str = argv_it.next() orelse return 2;
+                cli.context = std.fmt.parseInt(u32, c_str, 10) catch return 2;
+                continue;
+            } else if (std.mem.startsWith(u8, arg, "--context=")) {
+                cli.context = std.fmt.parseInt(u32, arg["--context=".len..], 10) catch return 2;
+                continue;
+            } else if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--file")) {
+                const f_path = argv_it.next() orelse return 2;
+                cli.saw_pattern_flag = true;
+                loadPatternFile(gpa, io, f_path, &cli) catch return 2;
+                continue;
+            } else if (std.mem.startsWith(u8, arg, "--file=")) {
+                cli.saw_pattern_flag = true;
+                loadPatternFile(gpa, io, arg["--file=".len..], &cli) catch return 2;
+                continue;
             } else if (std.mem.eql(u8, arg, "-U") or std.mem.eql(u8, arg, "--multiline")) {
                 cli.multiline = true;
                 continue;
@@ -289,6 +353,7 @@ pub fn main(init: std.process.Init) !u8 {
                 continue;
             } else if (std.mem.eql(u8, arg, "-e") or std.mem.eql(u8, arg, "--regexp")) {
                 const p = argv_it.next() orelse return 2;
+                cli.saw_pattern_flag = true;
                 try cli.patterns.append(gpa, p);
                 continue;
             } else if (std.mem.eql(u8, arg, "-j") or std.mem.eql(u8, arg, "--threads")) {
@@ -297,14 +362,45 @@ pub fn main(init: std.process.Init) !u8 {
                 if (cli.threads == 0) cli.threads = 1;
                 continue;
             } else if (arg.len > 2 and arg[0] == '-' and arg[1] != '-') {
-                for (arg[1..]) |ch| {
-                    switch (ch) {
+                var i: usize = 1;
+                while (i < arg.len) : (i += 1) {
+                    switch (arg[i]) {
                         'c' => cli.count_only = true,
                         'n' => cli.line_numbers = true,
                         'F' => cli.fixed_strings = true,
                         'i' => cli.ignore_case = true,
+                        'v' => cli.invert = true,
+                        'w' => cli.whole_word = true,
                         'a' => cli.binary_policy = .none,
                         'U' => cli.multiline = true,
+                        'C' => {
+                            const val = if (i + 1 < arg.len) arg[i + 1 ..] else (argv_it.next() orelse return 2);
+                            cli.context = std.fmt.parseInt(u32, val, 10) catch return 2;
+                            break;
+                        },
+                        'f' => {
+                            const val = if (i + 1 < arg.len) arg[i + 1 ..] else (argv_it.next() orelse return 2);
+                            cli.saw_pattern_flag = true;
+                            loadPatternFile(gpa, io, val, &cli) catch return 2;
+                            break;
+                        },
+                        'e' => {
+                            const val = if (i + 1 < arg.len) arg[i + 1 ..] else (argv_it.next() orelse return 2);
+                            cli.saw_pattern_flag = true;
+                            try cli.patterns.append(gpa, val);
+                            break;
+                        },
+                        'g' => {
+                            const val = if (i + 1 < arg.len) arg[i + 1 ..] else (argv_it.next() orelse return 2);
+                            try cli.globs.append(gpa, val);
+                            break;
+                        },
+                        'j' => {
+                            const val = if (i + 1 < arg.len) arg[i + 1 ..] else (argv_it.next() orelse return 2);
+                            cli.threads = std.fmt.parseInt(u32, val, 10) catch return 2;
+                            if (cli.threads == 0) cli.threads = 1;
+                            break;
+                        },
                         else => return 2,
                     }
                 }
@@ -313,34 +409,52 @@ pub fn main(init: std.process.Init) !u8 {
                 return 2;
             }
         }
-        if (cli.patterns.items.len == 0 and positional_pat == null) {
+        if (!cli.saw_pattern_flag and positional_pat == null) {
             positional_pat = arg;
         } else {
             cli.target_path = arg;
         }
     }
 
-    if (cli.patterns.items.len == 0) {
+    if (cli.saw_pattern_flag) {
+        if (cli.target_path.len == 0) {
+            if (positional_pat) |p| {
+                cli.target_path = p;
+                positional_pat = null;
+            }
+        }
+    } else if (cli.patterns.items.len == 0) {
         if (positional_pat) |p| {
             try cli.patterns.append(gpa, p);
         } else return 2;
     }
     if (cli.target_path.len == 0) return 2;
+    if (cli.patterns.items.len == 0) {
+        if (!cli.invert) return 1;
+        // With -v and an empty pattern file, no line matches any pattern, so every line is an inverted match.
+        // Use a never-matching regex ([^\s\S]) so all lines are emitted identically to `rg -v -f /dev/null`.
+        cli.fixed_strings = false;
+        try cli.patterns.append(gpa, "a^");
+    }
+
+    var total_pattern_bytes: usize = 0;
+    for (cli.patterns.items) |pat| total_pattern_bytes += pat.len;
 
     const case_mode: libwebgrep.CaseMode = if (cli.ignore_case) .insensitive else .sensitive;
+    const max_pat_count: usize = @max(@as(usize, 1024), cli.patterns.items.len);
+    const max_pat_bytes: usize = @max(@as(usize, 256 * 1024), total_pattern_bytes);
+    const find_opts = libwebgrep.FindOptions{
+        .case = case_mode,
+        .unicode_case = !cli.no_unicode,
+        .multiline = cli.multiline,
+        .max_pattern_count = max_pat_count,
+        .max_pattern_bytes = max_pat_bytes,
+    };
     var cm: CompiledMatcher = if (cli.fixed_strings) blk: {
         if (cli.patterns.items.len == 1) {
-            break :blk .{ .finder = libwebgrep.Finder.init(cli.patterns.items[0], .{
-                .case = case_mode,
-                .unicode_case = !cli.no_unicode,
-                .multiline = cli.multiline,
-            }) catch return 2 };
+            break :blk .{ .finder = libwebgrep.Finder.init(cli.patterns.items[0], find_opts) catch return 2 };
         } else {
-            break :blk .{ .multi = libwebgrep.Multi.init(gpa, cli.patterns.items, .{
-                .case = case_mode,
-                .unicode_case = !cli.no_unicode,
-                .multiline = cli.multiline,
-            }) catch return 2 };
+            break :blk .{ .multi = libwebgrep.Multi.init(gpa, cli.patterns.items, find_opts) catch return 2 };
         }
     } else blk: {
         if (cli.patterns.items.len == 1) {
@@ -378,6 +492,9 @@ pub fn main(init: std.process.Init) !u8 {
                 .unicode_classes = !cli.no_unicode,
                 .multiline = cli.multiline,
                 .dot_all = cli.multiline_dotall,
+                .max_inst = @max(@as(usize, 8192), joined.len * 4),
+                .max_pattern_count = max_pat_count,
+                .max_pattern_bytes = max_pat_bytes,
             }) catch return 2 };
         }
     };
@@ -402,6 +519,7 @@ pub fn main(init: std.process.Init) !u8 {
     } else {
         var saw_output = false;
         const roots = [_][]const u8{cli.target_path};
+        const ctx_lines: u32 = if (cli.count_only) 0 else cli.context;
         const stats = try internal.parallel.run(gpa, io, .{
             .pattern = if (cli.fixed_strings and cli.patterns.items.len == 1) cli.patterns.items[0] else "",
             .patterns = if (cli.fixed_strings and cli.patterns.items.len > 1) cli.patterns.items else &.{},
@@ -409,14 +527,14 @@ pub fn main(init: std.process.Init) !u8 {
                 .regex => |*r| r,
                 else => null,
             },
-            .find = .{
-                .case = case_mode,
-                .unicode_case = !cli.no_unicode,
-                .multiline = cli.multiline,
-            },
+            .find = find_opts,
             .roots = &roots,
             .search = .{
                 .line_numbers = cli.line_numbers,
+                .invert = cli.invert,
+                .whole_word = cli.whole_word,
+                .context = ctx_lines,
+                .max_context_lines = if (ctx_lines > libwebgrep.SearchConfig.context_lines_hard_cap) ctx_lines else null,
                 .multiline = cli.multiline,
                 .match_mode = if (cli.multiline) .leftmost_first else .earliest,
                 .binary = cli.binary_policy,

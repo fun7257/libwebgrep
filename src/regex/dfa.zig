@@ -44,6 +44,25 @@ pub fn isExactInsts(insts: []const Inst) bool {
     return true;
 }
 
+/// Returns true when every NFA transition is exact on pure ASCII slices (`b < 0x80`).
+/// Allows `.unicode_class` (whose `< 0x80` transitions are exact in `BoundedDfa`) and its
+/// `.any_cont` helpers, while excluding assertions, wildcards, and case-folded unicode classes.
+pub fn isExactOnAsciiInsts(insts: []const Inst) bool {
+    for (insts) |inst| {
+        switch (inst) {
+            .byte, .split, .jmp, .save, .match, .match_id, .any_cont => {},
+            .class => |cl| {
+                if (cl.utf8_negated) return false;
+            },
+            .unicode_class => |uc| {
+                if (uc.ignore_case) return false;
+            },
+            .assert, .any => return false,
+        }
+    }
+    return true;
+}
+
 pub fn BoundedDfa(comptime max_states_cap: u16) type {
     return struct {
         const Self = @This();

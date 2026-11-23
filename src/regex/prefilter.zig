@@ -538,8 +538,9 @@ pub fn tryExtractAltLiterals(self: anytype, pattern: []const u8, find_opts: matc
         }
     }
 
-    var branches: [16][]const u8 = undefined;
-    var n_branches: usize = 0;
+    const max_alt_branches: usize = 256;
+    var branches = std.ArrayList([]const u8).empty;
+    defer branches.deinit(self.allocator);
     var branch_start: usize = 0;
     var depth: usize = 0;
     var in_class = false;
@@ -575,15 +576,13 @@ pub fn tryExtractAltLiterals(self: anytype, pattern: []const u8, find_opts: matc
         } else if (ch == ')') {
             if (depth > 0) depth -= 1;
         } else if (ch == '|' and depth == 0) {
-            if (n_branches >= 15) return;
-            branches[n_branches] = inner[branch_start..i];
-            n_branches += 1;
+            if (branches.items.len + 1 >= max_alt_branches) return;
+            try branches.append(self.allocator, inner[branch_start..i]);
             branch_start = i + 1;
         }
     }
-    branches[n_branches] = inner[branch_start..];
-    n_branches += 1;
-    if (n_branches < 2) return;
+    try branches.append(self.allocator, inner[branch_start..]);
+    if (branches.items.len < 2) return;
 
     var prefixes = std.ArrayList([]const u8).empty;
     errdefer {
@@ -595,7 +594,7 @@ pub fn tryExtractAltLiterals(self: anytype, pattern: []const u8, find_opts: matc
     defer prefix_buf.deinit(self.allocator);
 
     var all_exact = true;
-    for (branches[0..n_branches]) |br| {
+    for (branches.items) |br| {
         prefix_buf.clearRetainingCapacity();
         var k: usize = 0;
         var br_exact = true;
@@ -676,6 +675,36 @@ pub fn tryExtractAltLiterals(self: anytype, pattern: []const u8, find_opts: matc
         }
         const max_alt_exact = if (self.ignore_case and self.unicode_case) max_br_len *| 3 else max_br_len;
         self.alt_is_exact = all_exact and (!self.multiline or max_alt_exact <= self.max_multiline_window);
+
+        // When >= 4 alternation branches share a long common prefix (e.g., `ALT_TOKEN_00|...|ALT_TOKEN_31`),
+        // attach a single-literal `PackedPair` Finder on the LCP so rare-hit scans run at 23 GB/s instead of Teddy/AC.
+        if (owned_slices.len >= 4 and (!self.ignore_case or !self.unicode_case)) {
+            var lcp_len = owned_slices[0].len;
+            for (owned_slices[1..]) |s| {
+                const lim = @min(lcp_len, s.len);
+                var k: usize = 0;
+                while (k < lim) : (k += 1) {
+                    const a = if (self.ignore_case) std.ascii.toLower(owned_slices[0][k]) else owned_slices[0][k];
+                    const b = if (self.ignore_case) std.ascii.toLower(s[k]) else s[k];
+                    if (a != b) break;
+                }
+                lcp_len = k;
+                if (lcp_len < 3) break;
+            }
+            // Trim trailing UTF-8 continuation bytes so LCP ends on a valid codepoint boundary.
+            while (lcp_len > 0 and (owned_slices[0][lcp_len - 1] & 0xC0) == 0x80) : (lcp_len -= 1) {}
+            if (lcp_len >= 3) {
+                if (self.allocator.dupe(u8, owned_slices[0][0..lcp_len])) |lcp_owned| {
+                    if (Finder.init(lcp_owned, find_opts)) |lcp_f| {
+                        self.alt_lcp_bytes = lcp_owned;
+                        self.alt_lcp_finder = lcp_f;
+                        self.alt_max_branch_len = max_br_len;
+                    } else |_| {
+                        self.allocator.free(lcp_owned);
+                    }
+                } else |_| {}
+            }
+        }
     } else |_| {
         for (owned_slices) |s| self.allocator.free(s);
         self.allocator.free(owned_slices);

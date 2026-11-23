@@ -577,3 +577,67 @@ test "regex v0.8: unicode_classes option and (?u)/(?-u) inline flags for \\d \\w
         try std.testing.expect(re_toggle.find("中文-٠١", 0, .leftmost_first) == null);
     }
 }
+
+test "Regex SIMD ByteContextPrefilter, 4-byte suffix Teddy promotion, and Unicode prefix fast path" {
+    const alloc = std.testing.allocator;
+
+    // 1. \p{Han}+_[0-9]{4}: uses ByteContextPrefilter + direct reverse Unicode class verification
+    {
+        var re = try Regex.init(alloc, "\\p{Han}+_[0-9]{4}", .{ .unicode_classes = true });
+        defer re.deinit();
+        try std.testing.expect(re.byte_ctx_prefilter != null);
+        try std.testing.expect(re.req_prefix_uclass_pc != std.math.maxInt(u32));
+        try std.testing.expect(re.dfa_suffix_is_exact);
+
+        var buf: [260]u8 = @splat(' ');
+        const noise = "user_session_9012 Café_LATTE ";
+        @memcpy(buf[10..][0..noise.len], noise);
+        const target = "异常订单超时_2026";
+        @memcpy(buf[160..][0..target.len], target);
+
+        const m = re.find(&buf, 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(target, buf[m.start..m.end]);
+
+        const m_e = re.find(&buf, 0, .earliest) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(target, buf[m_e.start..m_e.end]);
+
+        var nul: ?usize = null;
+        buf[100] = 0;
+        try std.testing.expect(re.findWatched(&buf, 0, &nul) == null);
+        try std.testing.expectEqual(@as(?usize, 100), nul);
+
+        buf[100] = ' ';
+        buf[160 + target.len + 2] = 0;
+        nul = null;
+        const mw = re.findWatched(&buf, 0, &nul) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(nul == null);
+        try std.testing.expectEqualStrings(target, buf[mw.start..mw.end]);
+    }
+
+    // 2. (a|b){15}c: promotes 3 preceding bytes into 8 4-byte patterns (aaac..bbbc)
+    {
+        var re = try Regex.init(alloc, "(a|b){15}c", .{});
+        defer re.deinit();
+        try std.testing.expect(re.pair_prefilter != null);
+        try std.testing.expectEqual(@as(u8, 3), re.pair_prefilter_prefix_len);
+
+        const hay = "service=cache compaction_cycle ababababaabbabac_sentinel";
+        const m = re.find(hay, 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("ababababaabbabac", hay[m.start..m.end]);
+
+        var nul: ?usize = null;
+        const mw = re.findWatched(hay, 0, &nul) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(nul == null);
+        try std.testing.expectEqualStrings("ababababaabbabac", hay[mw.start..mw.end]);
+    }
+
+    // 3. Disjointness guard: \p{L}+a[0-9]* must NOT take uclass fast path because 'a' is in \p{L}
+    {
+        var re = try Regex.init(alloc, "\\p{L}+a[0-9]*", .{ .unicode_classes = true });
+        defer re.deinit();
+        try std.testing.expectEqual(std.math.maxInt(u32), re.req_prefix_uclass_pc);
+        const hay = "baa1";
+        const m = re.find(hay, 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("baa1", hay[m.start..m.end]);
+    }
+}

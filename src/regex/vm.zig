@@ -134,6 +134,34 @@ pub const Regex = struct {
     req_prefix_shift: usize = 1,
     req_is_prefix: bool = false,
     req_is_exact: bool = false,
+    /// True when the entire pattern is strictly `\b<req_literal_bytes>\b` (verified via O(1) boundary checks).
+    req_word_bounded: bool = false,
+    /// Minimum bytes required before `req_literal_bytes` (derived from compiled NFA graph).
+    req_min_before: usize = 0,
+    /// Bounded maximum bytes before `req_literal_bytes`, or `null` when a prefix cycle exists.
+    req_max_before: ?usize = null,
+    /// When true, `haystack[hit.start - 1]` (and up to 3 bytes before `hit.start`) must match `req_prev_masks`.
+    req_has_prev_mask: bool = false,
+    req_prev_mask: ByteSet = .{},
+    req_prev_mask_len: u8 = 0,
+    req_prev_masks: [3]ByteSet = .{ .{}, .{}, .{} },
+    /// Optional k-byte suffix prefilter (`[prev_bytes..., req_literal_bytes[0]]`, k = 1..3)
+    /// when a 1-byte interior/trailing literal has a small Cartesian product of predecessor bytes
+    /// (e.g., `(a|b){15}c` -> 8 4-byte patterns `aaac..bbbc` dispatched to AVX2 Teddy).
+    pair_prefilter_slices: [][]const u8 = &.{},
+    pair_prefilter: ?Multi = null,
+    pair_prefilter_prefix_len: u8 = 0,
+    /// Optional SIMD single-byte literal + contiguous predecessor/successor byte-range prefilter
+    /// (e.g. `\p{Han}+_[0-9]{4}` -> `[0x80..0xBF]_[0-9]`, `[a-z]{4,7}=[0-9]{3,4}ms` -> `[a-z]=[0-9]`).
+    byte_ctx_prefilter: ?ByteContextPrefilter = null,
+    /// When non-sentinel, the prefix before `req_literal_bytes` is strictly a repeated single `.unicode_class`
+    /// (`+` if `req_prefix_uclass_min == 1`, `*` if `0`), disjoint from `req_literal_bytes[0]`, with an exact suffix DFA.
+    req_prefix_uclass_pc: u32 = std.math.maxInt(u32),
+    req_prefix_uclass_min: u8 = 0,
+    dfa_suffix_is_exact: bool = false,
+    /// When true, every byte in `[match.start .. hit.start)` must belong to `req_prefix_bytes_mask`.
+    req_has_prefix_bytes_mask: bool = false,
+    req_prefix_bytes_mask: ByteSet = .{},
     prefilter: ?Finder = null,
     /// Trailing required literal (such as `"timeout"` in `ERROR.*timeout`), used for a fast secondary check after a prefilter hit.
     tail_literal_bytes: []u8 = &.{},
@@ -142,12 +170,18 @@ pub const Regex = struct {
     alt_literal_slices: [][]const u8 = &.{},
     alt_prefilter: ?Multi = null,
     alt_is_exact: bool = false,
+    /// Optional longest-common-prefix `Finder` across all alternation branches (e.g., `ALT_TOKEN_` for 32 branches).
+    alt_lcp_bytes: []u8 = &.{},
+    alt_lcp_finder: ?Finder = null,
+    alt_max_branch_len: usize = 0,
     /// Pre-determinized DFA if full ahead-of-time determinization succeeded.
     precomputed_dfa: ?*HeapDfa = null,
     has_lazy: bool = false,
     has_alt: bool = false,
     saw_extended: bool = false,
     dfa_is_exact: bool = false,
+    /// True when `precomputed_dfa` produces exact match spans whenever the matched slice is pure ASCII.
+    dfa_exact_on_ascii: bool = false,
     dfa_prefix_state: u16 = dfa_mod.start_state,
     dfa_prefix_len: usize = 0,
     dfa_suffix_state: u16 = 0,
@@ -295,6 +329,7 @@ pub const Regex = struct {
                 if (heap_dfa.determinize(self.insts, self.unicode_ranges, self.start_pc, self.multiline)) {
                     self.precomputed_dfa = heap_dfa;
                     self.dfa_is_exact = !self.has_lazy and dfa_mod.isExactInsts(self.insts);
+                    self.dfa_exact_on_ascii = !self.has_lazy and dfa_mod.isExactOnAsciiInsts(self.insts);
                     if (self.req_is_prefix and self.req_literal_bytes.len > 0) {
                         var s: u16 = dfa_mod.start_state;
                         var ok = true;
@@ -314,9 +349,9 @@ pub const Regex = struct {
                             self.dfa_prefix_state = s;
                             self.dfa_prefix_len = self.req_literal_bytes.len;
                         }
-                    } else if (!self.req_is_prefix and self.req_literal_bytes.len >= 2 and (!self.ignore_case or !self.unicode_case)) {
-                        if (findUniqueLiteralSuffixPc(self.insts, self.req_literal_bytes)) |suffix_pc| {
-                            if (heap_dfa.determinizeSuffix(self.insts, self.unicode_ranges, suffix_pc, self.multiline)) |s_id| {
+                    } else if (!self.req_is_prefix and self.req_literal_bytes.len >= 1 and (!self.ignore_case or !self.unicode_case)) {
+                        if (findUniqueLiteralSpanPc(self.insts, self.req_literal_bytes)) |span_pc| {
+                            if (heap_dfa.determinizeSuffix(self.insts, self.unicode_ranges, span_pc.end_pc, self.multiline)) |s_id| {
                                 self.dfa_suffix_state = s_id;
                             }
                         }
@@ -325,6 +360,9 @@ pub const Regex = struct {
                     allocator.destroy(heap_dfa);
                 }
             } else |_| {}
+        }
+        if (!self.req_is_exact and !self.req_is_prefix and self.req_literal_bytes.len >= 1 and (!self.ignore_case or !self.unicode_case)) {
+            analyzeRequiredLiteralContext(&self);
         }
         return self;
     }
@@ -336,6 +374,12 @@ pub const Regex = struct {
         if (self.precomputed_dfa) |d| self.allocator.destroy(d);
         if (self.req_literal_bytes.len != 0) self.allocator.free(self.req_literal_bytes);
         if (self.tail_literal_bytes.len != 0) self.allocator.free(self.tail_literal_bytes);
+        if (self.pair_prefilter) |*pp| pp.deinit();
+        if (self.pair_prefilter_slices.len != 0) {
+            for (self.pair_prefilter_slices) |s| self.allocator.free(s);
+            self.allocator.free(self.pair_prefilter_slices);
+        }
+        if (self.alt_lcp_bytes.len != 0) self.allocator.free(self.alt_lcp_bytes);
         if (self.alt_prefilter) |*ap| ap.deinit();
         if (self.alt_literal_slices.len != 0) {
             for (self.alt_literal_slices) |s| self.allocator.free(s);
@@ -412,14 +456,14 @@ pub const Regex = struct {
 
     pub inline fn watchedIsExact(self: *const Regex) bool {
         if (self.anchored_start) return false;
-        if (self.req_is_exact) return true;
+        if (self.req_is_exact or self.req_word_bounded) return true;
         if (self.req_is_prefix and self.precomputed_dfa != null and self.dfa_is_exact and !self.has_alt) return true;
         return false;
     }
 
     pub inline fn watchedHasExactStart(self: *const Regex) bool {
         if (self.anchored_start) return false;
-        return self.req_is_exact or self.req_is_prefix;
+        return self.req_is_exact or self.req_word_bounded or self.req_is_prefix;
     }
 
     /// Thread-safe, lock-free search over `haystack`. Accepts `*const Regex` (and `*Regex` via auto-coercion).
@@ -489,6 +533,21 @@ pub const Regex = struct {
         if (self.req_is_exact) {
             if (self.prefilter) |*pf| {
                 return pf.findReadOnly(haystack, start, mode);
+            }
+        }
+
+        // Fast path 1b: the entire regex is strictly `\b<literal>\b`
+        if (self.req_word_bounded) {
+            if (self.prefilter) |*pf| {
+                var pos = start;
+                while (pos <= haystack.len) {
+                    const hit = pf.findReadOnly(haystack, pos, .earliest) orelse return null;
+                    if (checkAssert(.word_boundary, haystack, hit.start) and checkAssert(.word_boundary, haystack, hit.end)) {
+                        return hit;
+                    }
+                    pos = hit.start + self.req_prefix_shift;
+                }
+                return null;
             }
         }
 
@@ -575,12 +634,53 @@ pub const Regex = struct {
             var min_start = start;
             var cached_win_end: usize = std.math.maxInt(usize);
             const exact_for_mode = self.dfa_is_exact and !self.has_alt;
+            const ascii_exact_for_mode = self.dfa_exact_on_ascii and !self.has_alt;
             while (pos <= haystack.len) {
-                const hit = pf.findReadOnly(haystack, pos, .earliest) orelse return null;
+                const hit = if (self.pair_prefilter) |*pp| blk: {
+                    const pf_pre: usize = self.pair_prefilter_prefix_len;
+                    const pair_search_from = @max(pos, min_start + self.req_min_before) -| pf_pre;
+                    if (pair_search_from > haystack.len) return null;
+                    const ph = pp.find(haystack, pair_search_from, .earliest) orelse return null;
+                    break :blk Match{ .start = ph.start + pf_pre, .end = ph.end, .pattern_id = null };
+                } else if (self.byte_ctx_prefilter) |bcp| blk: {
+                    const at = bcp.find(haystack, pos, min_start + self.req_min_before) orelse return null;
+                    break :blk Match{ .start = at, .end = at + 1, .pattern_id = null };
+                } else (pf.findReadOnly(haystack, pos, .earliest) orelse return null);
                 if (self.multiline and hit.end - hit.start > self.max_multiline_window) {
                     pos = hit.start + 1;
                     min_start = pos;
                     continue;
+                }
+                if (hit.start < min_start + self.req_min_before) {
+                    pos = hit.start + self.req_prefix_shift;
+                    continue;
+                }
+                if (self.req_has_prev_mask) {
+                    if (!self.req_prev_masks[0].contains(haystack[hit.start - 1])) {
+                        pos = hit.start + self.req_prefix_shift;
+                        continue;
+                    }
+                    if (self.req_prev_mask_len >= 2 and !self.req_prev_masks[1].contains(haystack[hit.start - 2])) {
+                        pos = hit.start + self.req_prefix_shift;
+                        continue;
+                    }
+                    if (self.req_prev_mask_len >= 3 and !self.req_prev_masks[2].contains(haystack[hit.start - 3])) {
+                        pos = hit.start + self.req_prefix_shift;
+                        continue;
+                    }
+                }
+                if (self.req_prefix_uclass_pc != std.math.maxInt(u32) and self.dfa_suffix_is_exact) {
+                    if (self.precomputed_dfa) |dfa| {
+                        if (dfa.matchPrefixDeterminized(haystack[hit.end..], self.dfa_suffix_state, 0, false)) |suf_len| {
+                            const uc = self.insts[self.req_prefix_uclass_pc].unicode_class;
+                            const ranges = self.unicode_ranges[uc.range_idx].ranges;
+                            if (matchPrefixUclassReverse(haystack, min_start, hit.start, uc, ranges, self.req_prefix_uclass_min)) |run_start| {
+                                return Match{ .start = run_start, .end = hit.end + suf_len, .pattern_id = null };
+                            }
+                        }
+                        pos = hit.start + self.req_prefix_shift;
+                        continue;
+                    }
                 }
                 if (self.dfa_suffix_state != 0 and !self.multiline) {
                     if (self.precomputed_dfa) |dfa| {
@@ -609,18 +709,46 @@ pub const Regex = struct {
                         continue;
                     }
                 }
-                const search_from = if (!self.multiline)
-                    @max(min_start, lineStartAt(haystack, hit.start))
+                const narrowed_local = !self.multiline and (self.req_max_before != null or self.req_has_prefix_bytes_mask);
+                const search_from = blk: {
+                    if (self.multiline) {
+                        break :blk @max(min_start, hit.end -| self.max_multiline_window);
+                    }
+                    var lo = min_start;
+                    if (self.req_max_before) |max_b| {
+                        lo = @max(lo, hit.start -| max_b);
+                    }
+                    if (self.req_has_prefix_bytes_mask) {
+                        var cur = hit.start;
+                        while (cur > lo and self.req_prefix_bytes_mask.contains(haystack[cur - 1])) {
+                            cur -= 1;
+                        }
+                        lo = cur;
+                    }
+                    if (self.req_max_before != null or self.req_has_prefix_bytes_mask) {
+                        if (lo < hit.start and (!self.req_has_prefix_bytes_mask or self.req_prefix_bytes_mask.contains('\n'))) {
+                            if (memchr.findLast(memchr.native_width, haystack, lo, hit.start, '\n')) |nl| {
+                                lo = nl + 1;
+                            }
+                        }
+                        break :blk lo;
+                    }
+                    break :blk @max(min_start, lineStartAt(haystack, hit.start));
+                };
+                const p_hi = if (self.multiline)
+                    hit.start -| self.req_min_before
+                else if (narrowed_local)
+                    hit.start -| self.req_min_before
                 else
-                    @max(min_start, hit.end -| self.max_multiline_window);
-                const p_hi = if (self.multiline) hit.start else win_end;
+                    win_end;
                 if (self.precomputed_dfa) |dfa| {
                     if (!self.anchored_start) {
                         var p = search_from;
                         while (p <= p_hi) : (p += 1) {
+                            if (p < win_end and dfa.trans[dfa_mod.start_state][haystack[p]] == dfa_mod.dead_state) continue;
                             const p_win = if (self.multiline) self.windowLimit(haystack, p) else win_end;
-                            if (dfa.matchPrefixDeterminized(haystack[p..p_win], dfa_mod.start_state, 0, !exact_for_mode)) |match_len| {
-                                if (exact_for_mode) {
+                            if (dfa.matchPrefixDeterminized(haystack[p..p_win], dfa_mod.start_state, 0, !exact_for_mode and !ascii_exact_for_mode)) |match_len| {
+                                if (exact_for_mode or (ascii_exact_for_mode and isAsciiBytes(haystack[p .. p + match_len]))) {
                                     return Match{ .start = p, .end = p + match_len, .pattern_id = null };
                                 }
                                 if (self.runRangeAllowed(haystack, p, p, p_win, mode, AllowAny{}, steps, scratch)) |m| {
@@ -628,7 +756,9 @@ pub const Regex = struct {
                                 }
                             }
                         }
-                        if (!self.multiline) {
+                        if (narrowed_local) {
+                            pos = hit.start + self.req_prefix_shift;
+                        } else if (!self.multiline) {
                             pos = @min(haystack.len + 1, win_end + 1);
                             min_start = pos;
                         } else {
@@ -643,7 +773,9 @@ pub const Regex = struct {
                         return m;
                     }
                 }
-                if (!self.multiline) {
+                if (narrowed_local) {
+                    pos = hit.start + self.req_prefix_shift;
+                } else if (!self.multiline) {
                     pos = @min(haystack.len + 1, win_end + 1);
                     min_start = pos;
                 } else {
@@ -657,6 +789,20 @@ pub const Regex = struct {
         // Fast path 4: top-level alternation where every branch starts with a literal prefix
         if (self.alt_prefilter) |*ap| {
             if (self.alt_is_exact) {
+                if (self.alt_lcp_finder) |*lcp_f| {
+                    var pos = start;
+                    while (pos <= haystack.len) {
+                        const hit = lcp_f.findReadOnly(haystack, pos, .earliest) orelse return null;
+                        const slice_end = @min(haystack.len, hit.start +| self.alt_max_branch_len);
+                        if (ap.find(haystack[hit.start..slice_end], 0, mode)) |m| {
+                            if (m.start == 0) {
+                                return Match{ .start = hit.start, .end = hit.start + m.end, .pattern_id = null };
+                            }
+                        }
+                        pos = hit.start + 1;
+                    }
+                    return null;
+                }
                 if (ap.find(haystack, start, mode)) |m| {
                     return Match{ .start = m.start, .end = m.end, .pattern_id = null };
                 }
@@ -840,7 +986,48 @@ pub const Regex = struct {
                     return pf.findWatched(haystack, start, nul);
                 }
             }
+            if (self.req_word_bounded) {
+                if (self.prefilter) |*pf| {
+                    var pos = start;
+                    while (pos <= haystack.len) {
+                        const hit = pf.findWatched(haystack, pos, nul) orelse return null;
+                        if (checkAssert(.word_boundary, haystack, hit.start) and checkAssert(.word_boundary, haystack, hit.end)) {
+                            return hit;
+                        }
+                        const next_pos = hit.start + self.req_prefix_shift;
+                        const check_to = @min(next_pos, haystack.len);
+                        if (check_to > hit.end) {
+                            if (memchr.find(memchr.native_width, haystack[0..check_to], hit.end, 0)) |at| {
+                                nul.* = at;
+                                return null;
+                            }
+                        }
+                        pos = next_pos;
+                    }
+                    return null;
+                }
+            }
             if (self.alt_is_exact) {
+                if (self.alt_lcp_finder) |*lcp_f| {
+                    if (self.alt_prefilter) |*ap| {
+                        var pos = start;
+                        while (pos <= haystack.len) {
+                            const hit = lcp_f.findWatched(haystack, pos, nul) orelse return null;
+                            const slice_end = @min(haystack.len, hit.start +| self.alt_max_branch_len);
+                            if (ap.find(haystack[hit.start..slice_end], 0, .leftmost_first)) |m| {
+                                if (m.start == 0) {
+                                    return checkWatchedMatch(haystack, hit.end, Match{
+                                        .start = hit.start,
+                                        .end = hit.start + m.end,
+                                        .pattern_id = null,
+                                    }, nul);
+                                }
+                            }
+                            pos = hit.start + 1;
+                        }
+                        return null;
+                    }
+                }
                 if (self.alt_prefilter) |*ap| {
                     if (ap.findWatched(haystack, start, nul)) |m| {
                         return Match{ .start = m.start, .end = m.end, .pattern_id = null };
@@ -945,12 +1132,69 @@ pub const Regex = struct {
                 var min_start = start;
                 var cached_win_end: usize = std.math.maxInt(usize);
                 const exact_for_mode = self.dfa_is_exact and !self.has_alt;
+                const ascii_exact_for_mode = self.dfa_exact_on_ascii and !self.has_alt;
                 while (pos <= haystack.len) {
-                    const hit = pf.findWatched(haystack, pos, nul) orelse return null;
+                    const hit = if (self.pair_prefilter) |*pp| blk: {
+                        const pf_pre: usize = self.pair_prefilter_prefix_len;
+                        const pair_search_from = @max(pos, min_start + self.req_min_before) -| pf_pre;
+                        if (pair_search_from > haystack.len) return null;
+                        if (pair_search_from > pos) {
+                            if (memchr.find(memchr.native_width, haystack[0..pair_search_from], pos, 0)) |at| {
+                                nul.* = at;
+                                return null;
+                            }
+                        }
+                        const ph = pp.findWatched(haystack, pair_search_from, nul) orelse return null;
+                        break :blk Match{ .start = ph.start + pf_pre, .end = ph.end, .pattern_id = null };
+                    } else if (self.byte_ctx_prefilter) |bcp| blk: {
+                        const at = bcp.findWatched(haystack, pos, min_start + self.req_min_before, nul) orelse return null;
+                        break :blk Match{ .start = at, .end = at + 1, .pattern_id = null };
+                    } else (pf.findWatched(haystack, pos, nul) orelse return null);
                     if (self.multiline and hit.end - hit.start > self.max_multiline_window) {
                         pos = hit.start + 1;
                         min_start = pos;
                         continue;
+                    }
+                    const prev_fail = hit.start < min_start + self.req_min_before or
+                        (self.req_has_prev_mask and (!self.req_prev_masks[0].contains(haystack[hit.start - 1]) or
+                            (self.req_prev_mask_len >= 2 and !self.req_prev_masks[1].contains(haystack[hit.start - 2])) or
+                            (self.req_prev_mask_len >= 3 and !self.req_prev_masks[2].contains(haystack[hit.start - 3]))));
+                    if (prev_fail) {
+                        const next_pos = hit.start + self.req_prefix_shift;
+                        const check_to = @min(next_pos, haystack.len);
+                        if (check_to > hit.end) {
+                            if (memchr.find(memchr.native_width, haystack[0..check_to], hit.end, 0)) |at| {
+                                nul.* = at;
+                                return null;
+                            }
+                        }
+                        pos = next_pos;
+                        continue;
+                    }
+                    if (self.req_prefix_uclass_pc != std.math.maxInt(u32) and self.dfa_suffix_is_exact) {
+                        if (self.precomputed_dfa) |dfa| {
+                            if (dfa.matchPrefixDeterminized(haystack[hit.end..], self.dfa_suffix_state, 0, false)) |suf_len| {
+                                const uc = self.insts[self.req_prefix_uclass_pc].unicode_class;
+                                const ranges = self.unicode_ranges[uc.range_idx].ranges;
+                                if (matchPrefixUclassReverse(haystack, min_start, hit.start, uc, ranges, self.req_prefix_uclass_min)) |run_start| {
+                                    return checkWatchedMatch(haystack, hit.end, Match{
+                                        .start = run_start,
+                                        .end = hit.end + suf_len,
+                                        .pattern_id = null,
+                                    }, nul);
+                                }
+                            }
+                            const next_pos = hit.start + self.req_prefix_shift;
+                            const check_to = @min(next_pos, haystack.len);
+                            if (check_to > hit.end) {
+                                if (memchr.find(memchr.native_width, haystack[0..check_to], hit.end, 0)) |at| {
+                                    nul.* = at;
+                                    return null;
+                                }
+                            }
+                            pos = next_pos;
+                            continue;
+                        }
                     }
                     if (self.dfa_suffix_state != 0 and !self.multiline) {
                         if (self.precomputed_dfa) |dfa| {
@@ -990,17 +1234,45 @@ pub const Regex = struct {
                             continue;
                         }
                     }
-                    const search_from = if (!self.multiline)
-                        @max(min_start, lineStartAt(haystack, hit.start))
+                    const narrowed_local = !self.multiline and (self.req_max_before != null or self.req_has_prefix_bytes_mask);
+                    const search_from = blk: {
+                        if (self.multiline) {
+                            break :blk @max(min_start, hit.end -| self.max_multiline_window);
+                        }
+                        var lo = min_start;
+                        if (self.req_max_before) |max_b| {
+                            lo = @max(lo, hit.start -| max_b);
+                        }
+                        if (self.req_has_prefix_bytes_mask) {
+                            var cur = hit.start;
+                            while (cur > lo and self.req_prefix_bytes_mask.contains(haystack[cur - 1])) {
+                                cur -= 1;
+                            }
+                            lo = cur;
+                        }
+                        if (self.req_max_before != null or self.req_has_prefix_bytes_mask) {
+                            if (lo < hit.start and (!self.req_has_prefix_bytes_mask or self.req_prefix_bytes_mask.contains('\n'))) {
+                                if (memchr.findLast(memchr.native_width, haystack, lo, hit.start, '\n')) |nl| {
+                                    lo = nl + 1;
+                                }
+                            }
+                            break :blk lo;
+                        }
+                        break :blk @max(min_start, lineStartAt(haystack, hit.start));
+                    };
+                    const p_hi = if (self.multiline)
+                        hit.start -| self.req_min_before
+                    else if (narrowed_local)
+                        hit.start -| self.req_min_before
                     else
-                        @max(min_start, hit.end -| self.max_multiline_window);
-                    const p_hi = if (self.multiline) hit.start else win_end;
+                        win_end;
                     if (self.precomputed_dfa) |dfa| {
                         var p = search_from;
                         while (p <= p_hi) : (p += 1) {
+                            if (p < win_end and dfa.trans[dfa_mod.start_state][haystack[p]] == dfa_mod.dead_state) continue;
                             const p_win = if (self.multiline) self.windowLimit(haystack, p) else win_end;
-                            if (dfa.matchPrefixDeterminized(haystack[p..p_win], dfa_mod.start_state, 0, !exact_for_mode)) |match_len| {
-                                const m = if (exact_for_mode)
+                            if (dfa.matchPrefixDeterminized(haystack[p..p_win], dfa_mod.start_state, 0, !exact_for_mode and !ascii_exact_for_mode)) |match_len| {
+                                const m = if (exact_for_mode or (ascii_exact_for_mode and isAsciiBytes(haystack[p .. p + match_len])))
                                     Match{ .start = p, .end = p + match_len, .pattern_id = null }
                                 else
                                     self.runRangeAllowed(haystack, p, p, p_win, .earliest, AllowAny{}, null, null);
@@ -1014,7 +1286,12 @@ pub const Regex = struct {
                             return checkWatchedMatch(haystack, hit.end, m, nul);
                         }
                     }
-                    const next_pos = if (!self.multiline) @min(haystack.len + 1, win_end + 1) else hit.start + 1;
+                    const next_pos = if (narrowed_local)
+                        hit.start + self.req_prefix_shift
+                    else if (!self.multiline)
+                        @min(haystack.len + 1, win_end + 1)
+                    else
+                        hit.start + 1;
                     const check_to = @min(next_pos, haystack.len);
                     if (check_to > hit.end) {
                         if (memchr.find(memchr.native_width, haystack[0..check_to], hit.end, 0)) |at| {
@@ -1023,7 +1300,7 @@ pub const Regex = struct {
                         }
                     }
                     pos = next_pos;
-                    min_start = pos;
+                    if (!narrowed_local) min_start = pos;
                 }
                 return null;
             }
@@ -1908,9 +2185,415 @@ pub const Regex = struct {
     }
 };
 
-fn findUniqueLiteralSuffixPc(insts: []const Inst, lit: []const u8) ?u32 {
+/// Vectorized single-byte literal prefilter fused with contiguous predecessor/successor byte-range checks.
+/// Eliminates high-frequency single-byte false hits (e.g., `[0x80..0xBF]_[0-9]` or `[a-z]=[0-9]`) directly in SIMD.
+const ByteContextPrefilter = struct {
+    lit: u8,
+    has_prev: bool,
+    prev_lo: u8,
+    prev_span: u8,
+    has_next: bool,
+    next_lo: u8,
+    next_span: u8,
+
+    pub fn find(self: ByteContextPrefilter, haystack: []const u8, pos: usize, min_lit_pos: usize) ?usize {
+        var unused: ?usize = null;
+        return self.findInner(haystack, pos, min_lit_pos, false, &unused);
+    }
+
+    pub fn findWatched(self: ByteContextPrefilter, haystack: []const u8, pos: usize, min_lit_pos: usize, nul: *?usize) ?usize {
+        return self.findInner(haystack, pos, min_lit_pos, true, nul);
+    }
+
+    fn findInner(
+        self: ByteContextPrefilter,
+        haystack: []const u8,
+        pos: usize,
+        min_lit_pos: usize,
+        comptime watch_nul: bool,
+        nul: *?usize,
+    ) ?usize {
+        var start_i = @max(pos, min_lit_pos);
+        if (self.has_prev and start_i < 1) start_i = 1;
+        const end_excl = if (self.has_next) haystack.len -| 1 else haystack.len;
+        if (watch_nul and start_i > pos) {
+            const pre_lim = @min(start_i, haystack.len);
+            if (pos < pre_lim) {
+                if (memchr.find(memchr.native_width, haystack[0..pre_lim], pos, 0)) |z| {
+                    nul.* = z;
+                    return null;
+                }
+            }
+        }
+        if (start_i >= end_excl) {
+            if (watch_nul and start_i < haystack.len) {
+                if (memchr.find(memchr.native_width, haystack, start_i, 0)) |z| nul.* = z;
+            }
+            return null;
+        }
+        if (self.has_prev) {
+            if (self.has_next) {
+                return self.scanLoop(haystack, start_i, end_excl, true, true, watch_nul, nul);
+            }
+            return self.scanLoop(haystack, start_i, end_excl, true, false, watch_nul, nul);
+        }
+        return self.scanLoop(haystack, start_i, end_excl, false, true, watch_nul, nul);
+    }
+
+    inline fn vecHitMask(
+        self: ByteContextPrefilter,
+        comptime width: comptime_int,
+        haystack: []const u8,
+        at: usize,
+        comptime has_p: bool,
+        comptime has_n: bool,
+    ) @Vector(width, bool) {
+        const V = @Vector(width, u8);
+        const v_cur: V = haystack[at..][0..width].*;
+        var m = v_cur == @as(V, @splat(self.lit));
+        if (has_p) {
+            const v_prev: V = haystack[at - 1 ..][0..width].*;
+            m = m & ((v_prev -% @as(V, @splat(self.prev_lo))) <= @as(V, @splat(self.prev_span)));
+        }
+        if (has_n) {
+            const v_next: V = haystack[at + 1 ..][0..width].*;
+            m = m & ((v_next -% @as(V, @splat(self.next_lo))) <= @as(V, @splat(self.next_span)));
+        }
+        return m;
+    }
+
+    fn scanLoop(
+        self: ByteContextPrefilter,
+        haystack: []const u8,
+        start_i: usize,
+        end_excl: usize,
+        comptime has_p: bool,
+        comptime has_n: bool,
+        comptime watch_nul: bool,
+        nul: *?usize,
+    ) ?usize {
+        const width = memchr.native_width;
+        const V = @Vector(width, u8);
+        const zero_v: V = @splat(0);
+        const stride = width * 4;
+        var i = start_i;
+
+        while (i + stride <= end_excl) {
+            var masks: [4]@Vector(width, bool) = undefined;
+            inline for (0..4) |k| {
+                const at = i + k * width;
+                var m = self.vecHitMask(width, haystack, at, has_p, has_n);
+                if (watch_nul) {
+                    const v_cur: V = haystack[at..][0..width].*;
+                    m = m | (v_cur == zero_v);
+                }
+                masks[k] = m;
+            }
+            if (@reduce(.Or, (masks[0] | masks[1]) | (masks[2] | masks[3]))) {
+                @branchHint(.unlikely);
+                inline for (0..4) |k| {
+                    if (@reduce(.Or, masks[k])) {
+                        const at = i + k * width;
+                        const h_mask = self.vecHitMask(width, haystack, at, has_p, has_n);
+                        if (comptime builtin.cpu.arch.endian() == .little) {
+                            const MaskInt = @Int(.unsigned, width);
+                            const hbits: MaskInt = @bitCast(h_mask);
+                            if (watch_nul) {
+                                const v_cur: V = haystack[at..][0..width].*;
+                                const zbits: MaskInt = @bitCast(v_cur == zero_v);
+                                if (zbits != 0) {
+                                    const zrel: usize = @ctz(zbits);
+                                    if (hbits == 0 or zrel < @as(usize, @ctz(hbits))) {
+                                        nul.* = at + zrel;
+                                        return null;
+                                    }
+                                }
+                            }
+                            if (hbits != 0) return at + @as(usize, @ctz(hbits));
+                        } else {
+                            if (watch_nul) {
+                                const v_cur: V = haystack[at..][0..width].*;
+                                if (std.simd.firstTrue(v_cur == zero_v)) |zrel| {
+                                    if (std.simd.firstTrue(h_mask)) |hrel| {
+                                        if (hrel < zrel) return at + @as(usize, hrel);
+                                    }
+                                    nul.* = at + @as(usize, zrel);
+                                    return null;
+                                }
+                            }
+                            if (std.simd.firstTrue(h_mask)) |hrel| return at + @as(usize, hrel);
+                        }
+                    }
+                }
+            }
+            i += stride;
+        }
+
+        while (i + width <= end_excl) {
+            const h_mask = self.vecHitMask(width, haystack, i, has_p, has_n);
+            const v_cur: V = haystack[i..][0..width].*;
+            const comb = if (watch_nul) h_mask | (v_cur == zero_v) else h_mask;
+            if (@reduce(.Or, comb)) {
+                @branchHint(.unlikely);
+                if (comptime builtin.cpu.arch.endian() == .little) {
+                    const MaskInt = @Int(.unsigned, width);
+                    const hbits: MaskInt = @bitCast(h_mask);
+                    if (watch_nul) {
+                        const zbits: MaskInt = @bitCast(v_cur == zero_v);
+                        if (zbits != 0) {
+                            const zrel: usize = @ctz(zbits);
+                            if (hbits == 0 or zrel < @as(usize, @ctz(hbits))) {
+                                nul.* = i + zrel;
+                                return null;
+                            }
+                        }
+                    }
+                    if (hbits != 0) return i + @as(usize, @ctz(hbits));
+                } else {
+                    if (watch_nul) {
+                        if (std.simd.firstTrue(v_cur == zero_v)) |zrel| {
+                            if (std.simd.firstTrue(h_mask)) |hrel| {
+                                if (hrel < zrel) return i + @as(usize, hrel);
+                            }
+                            nul.* = i + @as(usize, zrel);
+                            return null;
+                        }
+                    }
+                    if (std.simd.firstTrue(h_mask)) |hrel| return i + @as(usize, hrel);
+                }
+            }
+            i += width;
+        }
+
+        while (i < end_excl) : (i += 1) {
+            const b = haystack[i];
+            if (watch_nul and b == 0) {
+                nul.* = i;
+                return null;
+            }
+            if (b == self.lit and
+                (!has_p or (haystack[i - 1] -% self.prev_lo) <= self.prev_span) and
+                (!has_n or (haystack[i + 1] -% self.next_lo) <= self.next_span))
+            {
+                return i;
+            }
+        }
+        if (watch_nul and end_excl < haystack.len) {
+            if (memchr.find(width, haystack, end_excl, 0)) |z| nul.* = z;
+        }
+        return null;
+    }
+};
+
+inline fn matchPrefixUclassReverse(
+    haystack: []const u8,
+    min_start: usize,
+    hit_start: usize,
+    uc: anytype,
+    ranges: []const inst_mod.CodepointRange,
+    min_reps: u8,
+) ?usize {
+    var cur = hit_start;
+    var reps: usize = 0;
+    while (cur > min_start) {
+        const b_last = haystack[cur - 1];
+        if (b_last < 0x80) {
+            if (!uc.allow_nl and b_last == '\n') break;
+            const in_set = (uc.has_ascii_set and uc.ascii_set.contains(b_last)) or inRanges(b_last, ranges);
+            if (if (uc.negated) in_set else !in_set) break;
+            cur -= 1;
+            reps += 1;
+            continue;
+        }
+        if ((b_last & 0xC0) != 0x80) break;
+        if (cur >= min_start + 3 and (haystack[cur - 3] & 0xF0) == 0xE0 and (haystack[cur - 2] & 0xC0) == 0x80) {
+            const cp: u21 = (@as(u21, haystack[cur - 3] & 0x0F) << 12) |
+                (@as(u21, haystack[cur - 2] & 0x3F) << 6) |
+                @as(u21, b_last & 0x3F);
+            if (cp < 0x800 or (cp >= 0xD800 and cp <= 0xDFFF)) break;
+            const in_set = inRanges(cp, ranges);
+            if (if (uc.negated) in_set else !in_set) break;
+            cur -= 3;
+            reps += 1;
+            continue;
+        }
+        if (cur >= min_start + 2 and (haystack[cur - 2] & 0xE0) == 0xC0) {
+            const cp: u21 = (@as(u21, haystack[cur - 2] & 0x1F) << 6) | @as(u21, b_last & 0x3F);
+            if (cp < 0x80) break;
+            const in_set = inRanges(cp, ranges);
+            if (if (uc.negated) in_set else !in_set) break;
+            cur -= 2;
+            reps += 1;
+            continue;
+        }
+        if (cur >= min_start + 4 and (haystack[cur - 4] & 0xF8) == 0xF0 and
+            (haystack[cur - 3] & 0xC0) == 0x80 and (haystack[cur - 2] & 0xC0) == 0x80)
+        {
+            const cp: u21 = (@as(u21, haystack[cur - 4] & 0x07) << 18) |
+                (@as(u21, haystack[cur - 3] & 0x3F) << 12) |
+                (@as(u21, haystack[cur - 2] & 0x3F) << 6) |
+                @as(u21, b_last & 0x3F);
+            if (cp < 0x10000 or cp > 0x10FFFF) break;
+            const in_set = inRanges(cp, ranges);
+            if (if (uc.negated) in_set else !in_set) break;
+            cur -= 4;
+            reps += 1;
+            continue;
+        }
+        break;
+    }
+    if (reps >= min_reps) return cur;
+    return null;
+}
+
+const ContiguousByteRange = struct { lo: u8, span: u8 };
+
+fn extractContiguousByteRange(set: ByteSet) ?ContiguousByteRange {
+    var lo: ?u8 = null;
+    var hi: u8 = 0;
+    var count: usize = 0;
+    var b: u16 = 0;
+    while (b < 256) : (b += 1) {
+        const byte: u8 = @truncate(b);
+        if (set.contains(byte)) {
+            if (lo == null) lo = byte;
+            hi = byte;
+            count += 1;
+        }
+    }
+    const start_b = lo orelse return null;
+    const span: usize = @as(usize, hi) - @as(usize, start_b);
+    if (span + 1 != count or span >= 128) return null;
+    return .{ .lo = start_b, .span = @intCast(span) };
+}
+
+fn isSuffixSubgraphExact(insts: []const Inst, start_pc: u32) bool {
+    const n = insts.len;
+    if (n == 0 or n > 256 or start_pc >= n) return false;
+    var vis: [256]bool = @splat(false);
+    var q: [256]u32 = undefined;
+    var head: usize = 0;
+    var tail: usize = 0;
+    vis[start_pc] = true;
+    q[tail] = start_pc;
+    tail += 1;
+    while (head < tail) {
+        const pc = q[head];
+        head += 1;
+        switch (insts[pc]) {
+            .byte => |by| {
+                if (by.out < n and !vis[by.out]) {
+                    vis[by.out] = true;
+                    q[tail] = by.out;
+                    tail += 1;
+                }
+            },
+            .class => |cl| {
+                if (cl.utf8_negated) return false;
+                if (cl.out < n and !vis[cl.out]) {
+                    vis[cl.out] = true;
+                    q[tail] = cl.out;
+                    tail += 1;
+                }
+            },
+            .jmp => |t| {
+                if (t < n and !vis[t]) {
+                    vis[t] = true;
+                    q[tail] = t;
+                    tail += 1;
+                }
+            },
+            .split => |s| {
+                if (s.out1 < n and !vis[s.out1]) {
+                    vis[s.out1] = true;
+                    q[tail] = s.out1;
+                    tail += 1;
+                }
+                if (s.out2 < n and !vis[s.out2]) {
+                    vis[s.out2] = true;
+                    q[tail] = s.out2;
+                    tail += 1;
+                }
+            },
+            .save => |sv| {
+                if (sv.out < n and !vis[sv.out]) {
+                    vis[sv.out] = true;
+                    q[tail] = sv.out;
+                    tail += 1;
+                }
+            },
+            .match, .match_id => {},
+            .assert, .unicode_class, .any, .any_cont => return false,
+        }
+    }
+    return true;
+}
+
+fn zeroWidthReaches(insts: []const Inst, from_pc: u32, target_pc: u32) bool {
+    const n = insts.len;
+    if (n == 0 or n > 256 or from_pc >= n) return false;
+    var vis: [256]bool = @splat(false);
+    var q: [256]u32 = undefined;
+    var head: usize = 0;
+    var tail: usize = 0;
+    vis[from_pc] = true;
+    q[tail] = from_pc;
+    tail += 1;
+    while (head < tail) {
+        const pc = q[head];
+        head += 1;
+        if (pc == target_pc) return true;
+        switch (insts[pc]) {
+            .jmp => |t| if (t < n and !vis[t]) {
+                vis[t] = true;
+                q[tail] = t;
+                tail += 1;
+            },
+            .split => |s| {
+                if (s.out1 < n and !vis[s.out1]) {
+                    vis[s.out1] = true;
+                    q[tail] = s.out1;
+                    tail += 1;
+                }
+                if (s.out2 < n and !vis[s.out2]) {
+                    vis[s.out2] = true;
+                    q[tail] = s.out2;
+                    tail += 1;
+                }
+            },
+            .save => |sv| if (sv.out < n and !vis[sv.out]) {
+                vis[sv.out] = true;
+                q[tail] = sv.out;
+                tail += 1;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+inline fn isAsciiBytes(bytes: []const u8) bool {
+    const V = @Vector(memchr.native_width, u8);
+    const msb: V = @splat(0x80);
+    var i: usize = 0;
+    while (i + memchr.native_width <= bytes.len) : (i += memchr.native_width) {
+        const v: V = bytes[i..][0..memchr.native_width].*;
+        if (@reduce(.Or, (v & msb) != @as(V, @splat(0)))) return false;
+    }
+    while (i < bytes.len) : (i += 1) {
+        if (bytes[i] >= 0x80) return false;
+    }
+    return true;
+}
+
+const LiteralSpanPc = struct {
+    start_pc: u32,
+    end_pc: u32,
+};
+
+fn findUniqueLiteralSpanPc(insts: []const Inst, lit: []const u8) ?LiteralSpanPc {
     if (lit.len == 0 or insts.len < lit.len) return null;
-    var found_out: ?u32 = null;
+    var found: ?LiteralSpanPc = null;
     var start_idx: usize = 0;
     while (start_idx < insts.len) : (start_idx += 1) {
         var cur: u32 = @intCast(start_idx);
@@ -1940,11 +2623,800 @@ fn findUniqueLiteralSuffixPc(insts: []const Inst, lit: []const u8) ?u32 {
             }
         }
         if (matched) {
-            if (found_out != null and found_out.? != cur) return null;
-            found_out = cur;
+            const cand = LiteralSpanPc{ .start_pc = @intCast(start_idx), .end_pc = cur };
+            if (found) |prev| {
+                if (prev.start_pc != cand.start_pc or prev.end_pc != cand.end_pc) return null;
+            }
+            found = cand;
         }
     }
-    return found_out;
+    return found;
+}
+
+fn isLinearWordBoundaryChain(insts: []const Inst, from_pc: u32, target_pc: ?u32, want_match: bool) bool {
+    var cur = from_pc;
+    var saw_wb = false;
+    var steps: usize = 0;
+    while (steps < insts.len + 1) : (steps += 1) {
+        if (target_pc) |tp| {
+            if (cur == tp) return saw_wb;
+        }
+        if (cur >= insts.len) return false;
+        switch (insts[cur]) {
+            .jmp => |t| cur = t,
+            .save => |sv| cur = sv.out,
+            .assert => |as| {
+                if (as.kind != .word_boundary) return false;
+                saw_wb = true;
+                cur = as.out;
+            },
+            .match => return want_match and saw_wb,
+            else => return false,
+        }
+    }
+    return false;
+}
+
+fn unionByteSet(dst: *ByteSet, src: ByteSet) void {
+    for (0..4) |i| dst.bits[i] |= src.bits[i];
+}
+
+fn byteSetIsAll(s: ByteSet) bool {
+    return (s.bits[0] & s.bits[1] & s.bits[2] & s.bits[3]) == std.math.maxInt(u64);
+}
+
+fn byteSetForInst(inst: Inst, unicode_ranges: []const UnicodeRangeList, multiline: bool) struct {
+    out_set: ByteSet,
+    has_out: bool,
+    cont1_set: ByteSet,
+    cont2_set: ByteSet,
+    cont3_set: ByteSet,
+} {
+    var out_set = ByteSet{};
+    var has_out = false;
+    var cont1_set = ByteSet{};
+    var cont2_set = ByteSet{};
+    var cont3_set = ByteSet{};
+    switch (inst) {
+        .byte => |by| {
+            out_set.setWithCase(by.b, by.ignore_case);
+            has_out = true;
+        },
+        .class => |cl| {
+            out_set = cl.set;
+            has_out = true;
+            if (cl.utf8_negated) {
+                cont1_set.setRange(0xC2, 0xDF, false);
+                cont2_set.setRange(0xE0, 0xEF, false);
+                cont3_set.setRange(0xF0, 0xF4, false);
+            }
+        },
+        .any_cont => {
+            out_set.setRange(0x80, 0xBF, false);
+            has_out = true;
+        },
+        .any => |an| {
+            out_set.setRange(0x00, 0x7F, false);
+            if (!an.allow_nl or !multiline) out_set.clear('\n');
+            has_out = true;
+            cont1_set.setRange(0xC2, 0xDF, false);
+            cont2_set.setRange(0xE0, 0xEF, false);
+            cont3_set.setRange(0xF0, 0xF4, false);
+        },
+        .unicode_class => |uc| {
+            if (uc.ignore_case) {
+                out_set.setRange(0x00, 0x7F, false);
+                if (!uc.allow_nl or !multiline) out_set.clear('\n');
+                has_out = true;
+            } else {
+                const ranges = unicode_ranges[uc.range_idx].ranges;
+                var b: u8 = 0;
+                while (b < 0x80) : (b += 1) {
+                    if ((!uc.allow_nl or !multiline) and b == '\n') continue;
+                    const in_set = (uc.has_ascii_set and uc.ascii_set.contains(b)) or inRanges(b, ranges);
+                    if (if (uc.negated) !in_set else in_set) {
+                        out_set.set(b);
+                        has_out = true;
+                    }
+                }
+            }
+            cont1_set.setRange(0xC2, 0xDF, false);
+            cont2_set.setRange(0xE0, 0xEF, false);
+            cont3_set.setRange(0xF0, 0xF4, false);
+        },
+        else => {},
+    }
+    return .{
+        .out_set = out_set,
+        .has_out = has_out,
+        .cont1_set = cont1_set,
+        .cont2_set = cont2_set,
+        .cont3_set = cont3_set,
+    };
+}
+
+/// Analyzes the compiled NFA subgraph preceding a unique required literal (`lit_start_pc..lit_end_pc`)
+/// to derive exact `\b<lit>\b` recognition, bounded `[req_min_before, req_max_before]` windows,
+/// 1-byte predecessor rejection (`req_prev_mask`), and backward-scan byte closure (`req_prefix_bytes_mask`).
+fn analyzeRequiredLiteralContext(self: *Regex) void {
+    const insts = self.insts;
+    if (insts.len == 0 or insts.len > 256) return;
+    const span_pc = findUniqueLiteralSpanPc(insts, self.req_literal_bytes) orelse return;
+    const lit_start = span_pc.start_pc;
+    const lit_end = span_pc.end_pc;
+
+    // 1. Exact `\b<literal>\b` detection (zero consuming instructions before/after the unique literal chain).
+    if (!self.anchored_start and
+        isLinearWordBoundaryChain(insts, self.start_pc, lit_start, false) and
+        isLinearWordBoundaryChain(insts, lit_end, null, true))
+    {
+        const max_len = if (self.ignore_case and self.unicode_case) self.req_literal_bytes.len *| 3 else self.req_literal_bytes.len;
+        if (!self.multiline or max_len <= self.max_multiline_window) {
+            self.req_word_bounded = true;
+            return;
+        }
+    }
+
+    const n = insts.len;
+    // 2. Compute nodes reachable from `start_pc` without crossing `lit_start`, and nodes that can reach `lit_start`.
+    var fwd: [256]bool = @splat(false);
+    var queue: [256]u32 = undefined;
+    var q_head: usize = 0;
+    var q_tail: usize = 0;
+    fwd[self.start_pc] = true;
+    queue[q_tail] = self.start_pc;
+    q_tail += 1;
+
+    while (q_head < q_tail) {
+        const pc = queue[q_head];
+        q_head += 1;
+        if (pc == lit_start) continue;
+        const add = struct {
+            fn push(target: u32, lim: usize, vis: *[256]bool, q: *[256]u32, tail: *usize) void {
+                if (target < lim and !vis[target]) {
+                    vis[target] = true;
+                    q[tail.*] = target;
+                    tail.* += 1;
+                }
+            }
+        }.push;
+        switch (insts[pc]) {
+            .jmp => |t| add(t, n, &fwd, &queue, &q_tail),
+            .split => |s| {
+                add(s.out1, n, &fwd, &queue, &q_tail);
+                add(s.out2, n, &fwd, &queue, &q_tail);
+            },
+            .save => |sv| add(sv.out, n, &fwd, &queue, &q_tail),
+            .assert => |as| add(as.out, n, &fwd, &queue, &q_tail),
+            .byte => |by| add(by.out, n, &fwd, &queue, &q_tail),
+            .any_cont => |ac| add(ac.out, n, &fwd, &queue, &q_tail),
+            .class => |cl| {
+                add(cl.out, n, &fwd, &queue, &q_tail);
+                if (cl.utf8_negated) {
+                    if (cl.cont1 != 0) add(cl.cont1, n, &fwd, &queue, &q_tail);
+                    if (cl.cont2 != 0) add(cl.cont2, n, &fwd, &queue, &q_tail);
+                    if (cl.cont3 != 0) add(cl.cont3, n, &fwd, &queue, &q_tail);
+                }
+            },
+            .any => |an| {
+                add(an.out, n, &fwd, &queue, &q_tail);
+                if (an.cont1 != 0) add(an.cont1, n, &fwd, &queue, &q_tail);
+                if (an.cont2 != 0) add(an.cont2, n, &fwd, &queue, &q_tail);
+                if (an.cont3 != 0) add(an.cont3, n, &fwd, &queue, &q_tail);
+            },
+            .unicode_class => |uc| {
+                const bs = byteSetForInst(insts[pc], self.unicode_ranges, self.multiline);
+                if (bs.has_out) add(uc.out, n, &fwd, &queue, &q_tail);
+                if (uc.cont1 != 0) add(uc.cont1, n, &fwd, &queue, &q_tail);
+                if (uc.cont2 != 0) add(uc.cont2, n, &fwd, &queue, &q_tail);
+                if (uc.cont3 != 0) add(uc.cont3, n, &fwd, &queue, &q_tail);
+            },
+            .match, .match_id => {},
+        }
+    }
+    if (!fwd[lit_start]) return;
+
+    // Reverse reachability to `lit_start` (all nodes that can reach `lit_start` without crossing `lit_start` first),
+    // plus zero-width reverse reachability to `lit_start` (to identify immediate predecessor consuming instructions).
+    var can_reach: [256]bool = @splat(false);
+    var zero_to_lit: [256]bool = @splat(false);
+    can_reach[lit_start] = true;
+    zero_to_lit[lit_start] = true;
+
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (0..n) |idx| {
+            if (!fwd[idx] or idx == lit_start) continue;
+            switch (insts[idx]) {
+                .jmp => |t| {
+                    if (t < n and can_reach[t] and !can_reach[idx]) {
+                        can_reach[idx] = true;
+                        changed = true;
+                    }
+                    if (t < n and zero_to_lit[t] and !zero_to_lit[idx]) {
+                        zero_to_lit[idx] = true;
+                        changed = true;
+                    }
+                },
+                .split => |s| {
+                    if (((s.out1 < n and can_reach[s.out1]) or (s.out2 < n and can_reach[s.out2])) and !can_reach[idx]) {
+                        can_reach[idx] = true;
+                        changed = true;
+                    }
+                    if (((s.out1 < n and zero_to_lit[s.out1]) or (s.out2 < n and zero_to_lit[s.out2])) and !zero_to_lit[idx]) {
+                        zero_to_lit[idx] = true;
+                        changed = true;
+                    }
+                },
+                .save => |sv| {
+                    if (sv.out < n and can_reach[sv.out] and !can_reach[idx]) {
+                        can_reach[idx] = true;
+                        changed = true;
+                    }
+                    if (sv.out < n and zero_to_lit[sv.out] and !zero_to_lit[idx]) {
+                        zero_to_lit[idx] = true;
+                        changed = true;
+                    }
+                },
+                .assert => |as| {
+                    if (as.out < n and can_reach[as.out] and !can_reach[idx]) {
+                        can_reach[idx] = true;
+                        changed = true;
+                    }
+                    if (as.out < n and zero_to_lit[as.out] and !zero_to_lit[idx]) {
+                        zero_to_lit[idx] = true;
+                        changed = true;
+                    }
+                },
+                .byte => |by| {
+                    if (by.out < n and can_reach[by.out] and !can_reach[idx]) {
+                        can_reach[idx] = true;
+                        changed = true;
+                    }
+                },
+                .any_cont => |ac| {
+                    if (ac.out < n and can_reach[ac.out] and !can_reach[idx]) {
+                        can_reach[idx] = true;
+                        changed = true;
+                    }
+                },
+                .class => |cl| {
+                    const hit_out = (cl.out < n and can_reach[cl.out]) or
+                        (cl.utf8_negated and ((cl.cont1 != 0 and cl.cont1 < n and can_reach[cl.cont1]) or
+                            (cl.cont2 != 0 and cl.cont2 < n and can_reach[cl.cont2]) or
+                            (cl.cont3 != 0 and cl.cont3 < n and can_reach[cl.cont3])));
+                    if (hit_out and !can_reach[idx]) {
+                        can_reach[idx] = true;
+                        changed = true;
+                    }
+                },
+                .any => |an| {
+                    const hit_out = (an.out < n and can_reach[an.out]) or
+                        (an.cont1 != 0 and an.cont1 < n and can_reach[an.cont1]) or
+                        (an.cont2 != 0 and an.cont2 < n and can_reach[an.cont2]) or
+                        (an.cont3 != 0 and an.cont3 < n and can_reach[an.cont3]);
+                    if (hit_out and !can_reach[idx]) {
+                        can_reach[idx] = true;
+                        changed = true;
+                    }
+                },
+                .unicode_class => |uc| {
+                    const bs = byteSetForInst(insts[idx], self.unicode_ranges, self.multiline);
+                    const hit_out = (bs.has_out and uc.out < n and can_reach[uc.out]) or
+                        (uc.cont1 != 0 and uc.cont1 < n and can_reach[uc.cont1]) or
+                        (uc.cont2 != 0 and uc.cont2 < n and can_reach[uc.cont2]) or
+                        (uc.cont3 != 0 and uc.cont3 < n and can_reach[uc.cont3]);
+                    if (hit_out and !can_reach[idx]) {
+                        can_reach[idx] = true;
+                        changed = true;
+                    }
+                },
+                .match, .match_id => {},
+            }
+        }
+    }
+
+    // 3. Bellman-Ford for exact shortest (`min_dist`) and longest (`max_dist`) byte length from `start_pc` to `lit_start`.
+    const inf: u32 = std.math.maxInt(u32);
+    var min_dist: [256]u32 = @splat(inf);
+    var max_dist: [256]i32 = @splat(-1);
+    min_dist[self.start_pc] = 0;
+    max_dist[self.start_pc] = 0;
+
+    var max_unbounded = false;
+    var iter: usize = 0;
+    while (iter < n + 1) : (iter += 1) {
+        var any_update = false;
+        for (0..n) |idx| {
+            if (!can_reach[idx] or idx == lit_start) continue;
+            const d_min = min_dist[idx];
+            const d_max = max_dist[idx];
+            if (d_min == inf and d_max < 0) continue;
+
+            const relax = struct {
+                fn edge(target: u32, cost: u32, lim: usize, reach: *const [256]bool, dm: u32, dx: i32, mins: *[256]u32, maxs: *[256]i32, is_last: bool, unb: *bool, upd: *bool) void {
+                    if (target >= lim or !reach[target]) return;
+                    if (dm != std.math.maxInt(u32)) {
+                        const cand = dm +| cost;
+                        if (cand < mins[target]) {
+                            mins[target] = cand;
+                            upd.* = true;
+                        }
+                    }
+                    if (dx >= 0) {
+                        const cand_max = dx + @as(i32, @intCast(cost));
+                        if (cand_max > maxs[target]) {
+                            if (is_last and cost > 0) {
+                                unb.* = true;
+                            } else {
+                                maxs[target] = cand_max;
+                                upd.* = true;
+                            }
+                        }
+                    }
+                }
+            }.edge;
+
+            const is_last = (iter == n);
+            switch (insts[idx]) {
+                .jmp => |t| relax(t, 0, n, &can_reach, d_min, d_max, &min_dist, &max_dist, is_last, &max_unbounded, &any_update),
+                .split => |s| {
+                    relax(s.out1, 0, n, &can_reach, d_min, d_max, &min_dist, &max_dist, is_last, &max_unbounded, &any_update);
+                    relax(s.out2, 0, n, &can_reach, d_min, d_max, &min_dist, &max_dist, is_last, &max_unbounded, &any_update);
+                },
+                .save => |sv| relax(sv.out, 0, n, &can_reach, d_min, d_max, &min_dist, &max_dist, is_last, &max_unbounded, &any_update),
+                .assert => |as| relax(as.out, 0, n, &can_reach, d_min, d_max, &min_dist, &max_dist, is_last, &max_unbounded, &any_update),
+                .byte => |by| relax(by.out, 1, n, &can_reach, d_min, d_max, &min_dist, &max_dist, is_last, &max_unbounded, &any_update),
+                .any_cont => |ac| relax(ac.out, 1, n, &can_reach, d_min, d_max, &min_dist, &max_dist, is_last, &max_unbounded, &any_update),
+                .class => |cl| {
+                    relax(cl.out, 1, n, &can_reach, d_min, d_max, &min_dist, &max_dist, is_last, &max_unbounded, &any_update);
+                    if (cl.utf8_negated) {
+                        if (cl.cont1 != 0) relax(cl.cont1, 1, n, &can_reach, d_min, d_max, &min_dist, &max_dist, is_last, &max_unbounded, &any_update);
+                        if (cl.cont2 != 0) relax(cl.cont2, 1, n, &can_reach, d_min, d_max, &min_dist, &max_dist, is_last, &max_unbounded, &any_update);
+                        if (cl.cont3 != 0) relax(cl.cont3, 1, n, &can_reach, d_min, d_max, &min_dist, &max_dist, is_last, &max_unbounded, &any_update);
+                    }
+                },
+                .any => |an| {
+                    relax(an.out, 1, n, &can_reach, d_min, d_max, &min_dist, &max_dist, is_last, &max_unbounded, &any_update);
+                    if (an.cont1 != 0) relax(an.cont1, 1, n, &can_reach, d_min, d_max, &min_dist, &max_dist, is_last, &max_unbounded, &any_update);
+                    if (an.cont2 != 0) relax(an.cont2, 1, n, &can_reach, d_min, d_max, &min_dist, &max_dist, is_last, &max_unbounded, &any_update);
+                    if (an.cont3 != 0) relax(an.cont3, 1, n, &can_reach, d_min, d_max, &min_dist, &max_dist, is_last, &max_unbounded, &any_update);
+                },
+                .unicode_class => |uc| {
+                    const bs = byteSetForInst(insts[idx], self.unicode_ranges, self.multiline);
+                    if (bs.has_out) relax(uc.out, 1, n, &can_reach, d_min, d_max, &min_dist, &max_dist, is_last, &max_unbounded, &any_update);
+                    if (uc.cont1 != 0) relax(uc.cont1, 1, n, &can_reach, d_min, d_max, &min_dist, &max_dist, is_last, &max_unbounded, &any_update);
+                    if (uc.cont2 != 0) relax(uc.cont2, 1, n, &can_reach, d_min, d_max, &min_dist, &max_dist, is_last, &max_unbounded, &any_update);
+                    if (uc.cont3 != 0) relax(uc.cont3, 1, n, &can_reach, d_min, d_max, &min_dist, &max_dist, is_last, &max_unbounded, &any_update);
+                },
+                .match, .match_id => {},
+            }
+        }
+        if (!any_update) break;
+    }
+
+    if (min_dist[lit_start] != inf) {
+        self.req_min_before = min_dist[lit_start];
+    }
+    if (!max_unbounded and max_dist[lit_start] >= 0) {
+        self.req_max_before = @intCast(max_dist[lit_start]);
+    }
+
+    // 4. Collect `req_prev_mask` (immediate predecessor bytes when empty prefix is impossible) and
+    //    `req_prefix_bytes_mask` (union of all bytes consumable on paths from `start_pc` to `lit_start`).
+    var prev_mask = ByteSet{};
+    var prefix_bytes = ByteSet{};
+    var any_prev = false;
+    var any_prefix_bytes = false;
+
+    for (0..n) |idx| {
+        if (!can_reach[idx] or idx == lit_start) continue;
+        const bs = byteSetForInst(insts[idx], self.unicode_ranges, self.multiline);
+        switch (insts[idx]) {
+            .byte => |by| {
+                if (by.out < n and can_reach[by.out]) {
+                    unionByteSet(&prefix_bytes, bs.out_set);
+                    any_prefix_bytes = true;
+                    if (zero_to_lit[by.out]) {
+                        unionByteSet(&prev_mask, bs.out_set);
+                        any_prev = true;
+                    }
+                }
+            },
+            .any_cont => |ac| {
+                if (ac.out < n and can_reach[ac.out]) {
+                    unionByteSet(&prefix_bytes, bs.out_set);
+                    any_prefix_bytes = true;
+                    if (zero_to_lit[ac.out]) {
+                        unionByteSet(&prev_mask, bs.out_set);
+                        any_prev = true;
+                    }
+                }
+            },
+            .class => |cl| {
+                if (cl.out < n and can_reach[cl.out]) {
+                    unionByteSet(&prefix_bytes, bs.out_set);
+                    any_prefix_bytes = true;
+                    if (zero_to_lit[cl.out]) {
+                        unionByteSet(&prev_mask, bs.out_set);
+                        any_prev = true;
+                    }
+                }
+                if (cl.utf8_negated) {
+                    if (cl.cont1 != 0 and cl.cont1 < n and can_reach[cl.cont1]) {
+                        unionByteSet(&prefix_bytes, bs.cont1_set);
+                        any_prefix_bytes = true;
+                    }
+                    if (cl.cont2 != 0 and cl.cont2 < n and can_reach[cl.cont2]) {
+                        unionByteSet(&prefix_bytes, bs.cont2_set);
+                        any_prefix_bytes = true;
+                    }
+                    if (cl.cont3 != 0 and cl.cont3 < n and can_reach[cl.cont3]) {
+                        unionByteSet(&prefix_bytes, bs.cont3_set);
+                        any_prefix_bytes = true;
+                    }
+                }
+            },
+            .any => |an| {
+                if (an.out < n and can_reach[an.out]) {
+                    unionByteSet(&prefix_bytes, bs.out_set);
+                    any_prefix_bytes = true;
+                    if (zero_to_lit[an.out]) {
+                        unionByteSet(&prev_mask, bs.out_set);
+                        any_prev = true;
+                    }
+                }
+                if (an.cont1 != 0 and an.cont1 < n and can_reach[an.cont1]) {
+                    unionByteSet(&prefix_bytes, bs.cont1_set);
+                    any_prefix_bytes = true;
+                }
+                if (an.cont2 != 0 and an.cont2 < n and can_reach[an.cont2]) {
+                    unionByteSet(&prefix_bytes, bs.cont2_set);
+                    any_prefix_bytes = true;
+                }
+                if (an.cont3 != 0 and an.cont3 < n and can_reach[an.cont3]) {
+                    unionByteSet(&prefix_bytes, bs.cont3_set);
+                    any_prefix_bytes = true;
+                }
+            },
+            .unicode_class => |uc| {
+                if (bs.has_out and uc.out < n and can_reach[uc.out]) {
+                    unionByteSet(&prefix_bytes, bs.out_set);
+                    any_prefix_bytes = true;
+                    if (zero_to_lit[uc.out]) {
+                        unionByteSet(&prev_mask, bs.out_set);
+                        any_prev = true;
+                    }
+                }
+                if (uc.cont1 != 0 and uc.cont1 < n and can_reach[uc.cont1]) {
+                    unionByteSet(&prefix_bytes, bs.cont1_set);
+                    any_prefix_bytes = true;
+                }
+                if (uc.cont2 != 0 and uc.cont2 < n and can_reach[uc.cont2]) {
+                    unionByteSet(&prefix_bytes, bs.cont2_set);
+                    any_prefix_bytes = true;
+                }
+                if (uc.cont3 != 0 and uc.cont3 < n and can_reach[uc.cont3]) {
+                    unionByteSet(&prefix_bytes, bs.cont3_set);
+                    any_prefix_bytes = true;
+                }
+            },
+            else => {},
+        }
+    }
+
+    if (!zero_to_lit[self.start_pc] and any_prev and !byteSetIsAll(prev_mask) and self.req_min_before >= 1) {
+        self.req_has_prev_mask = true;
+        self.req_prev_mask = prev_mask;
+        self.req_prev_masks[0] = prev_mask;
+        self.req_prev_mask_len = 1;
+
+        // Extend reverse predecessor masks to distances d=2 and d=3 (strictly within `req_min_before`).
+        var reach_d: [256]bool = zero_to_lit;
+        var d: usize = 1;
+        while (d < 3 and d + 1 <= self.req_min_before) : (d += 1) {
+            var next_reach: [256]bool = @splat(false);
+            // Step backward across 1 consuming edge from `reach_d`
+            for (0..n) |idx| {
+                if (!can_reach[idx] or idx == lit_start) continue;
+                switch (insts[idx]) {
+                    .byte => |by| if (by.out < n and reach_d[by.out]) {
+                        next_reach[idx] = true;
+                    },
+                    .any_cont => |ac| if (ac.out < n and reach_d[ac.out]) {
+                        next_reach[idx] = true;
+                    },
+                    .class => |cl| {
+                        const hit_c = (cl.out < n and reach_d[cl.out]) or
+                            (cl.utf8_negated and ((cl.cont1 != 0 and cl.cont1 < n and reach_d[cl.cont1]) or
+                                (cl.cont2 != 0 and cl.cont2 < n and reach_d[cl.cont2]) or
+                                (cl.cont3 != 0 and cl.cont3 < n and reach_d[cl.cont3])));
+                        if (hit_c) next_reach[idx] = true;
+                    },
+                    .any => |an| {
+                        const hit_a = (an.out < n and reach_d[an.out]) or
+                            (an.cont1 != 0 and an.cont1 < n and reach_d[an.cont1]) or
+                            (an.cont2 != 0 and an.cont2 < n and reach_d[an.cont2]) or
+                            (an.cont3 != 0 and an.cont3 < n and reach_d[an.cont3]);
+                        if (hit_a) next_reach[idx] = true;
+                    },
+                    .unicode_class => |uc| {
+                        const bs = byteSetForInst(insts[idx], self.unicode_ranges, self.multiline);
+                        const hit_u = (bs.has_out and uc.out < n and reach_d[uc.out]) or
+                            (uc.cont1 != 0 and uc.cont1 < n and reach_d[uc.cont1]) or
+                            (uc.cont2 != 0 and uc.cont2 < n and reach_d[uc.cont2]) or
+                            (uc.cont3 != 0 and uc.cont3 < n and reach_d[uc.cont3]);
+                        if (hit_u) next_reach[idx] = true;
+                    },
+                    else => {},
+                }
+            }
+            // Propagate backward across zero-width edges
+            var z_changed = true;
+            while (z_changed) {
+                z_changed = false;
+                for (0..n) |idx| {
+                    if (!can_reach[idx] or idx == lit_start or next_reach[idx]) continue;
+                    switch (insts[idx]) {
+                        .jmp => |t| if (t < n and next_reach[t]) {
+                            next_reach[idx] = true;
+                            z_changed = true;
+                        },
+                        .split => |s| if ((s.out1 < n and next_reach[s.out1]) or (s.out2 < n and next_reach[s.out2])) {
+                            next_reach[idx] = true;
+                            z_changed = true;
+                        },
+                        .save => |sv| if (sv.out < n and next_reach[sv.out]) {
+                            next_reach[idx] = true;
+                            z_changed = true;
+                        },
+                        .assert => |as| if (as.out < n and next_reach[as.out]) {
+                            next_reach[idx] = true;
+                            z_changed = true;
+                        },
+                        else => {},
+                    }
+                }
+            }
+            if (next_reach[self.start_pc]) break;
+            var mask_d = ByteSet{};
+            var any_d = false;
+            for (0..n) |idx| {
+                if (!can_reach[idx] or idx == lit_start) continue;
+                const bs = byteSetForInst(insts[idx], self.unicode_ranges, self.multiline);
+                switch (insts[idx]) {
+                    .byte => |by| if (by.out < n and next_reach[by.out]) {
+                        unionByteSet(&mask_d, bs.out_set);
+                        any_d = true;
+                    },
+                    .any_cont => |ac| if (ac.out < n and next_reach[ac.out]) {
+                        unionByteSet(&mask_d, bs.out_set);
+                        any_d = true;
+                    },
+                    .class => |cl| {
+                        if (cl.out < n and next_reach[cl.out]) {
+                            unionByteSet(&mask_d, bs.out_set);
+                            any_d = true;
+                        }
+                        if (cl.utf8_negated) {
+                            if (cl.cont1 != 0 and cl.cont1 < n and next_reach[cl.cont1]) {
+                                unionByteSet(&mask_d, bs.cont1_set);
+                                any_d = true;
+                            }
+                            if (cl.cont2 != 0 and cl.cont2 < n and next_reach[cl.cont2]) {
+                                unionByteSet(&mask_d, bs.cont2_set);
+                                any_d = true;
+                            }
+                            if (cl.cont3 != 0 and cl.cont3 < n and next_reach[cl.cont3]) {
+                                unionByteSet(&mask_d, bs.cont3_set);
+                                any_d = true;
+                            }
+                        }
+                    },
+                    .any => |an| {
+                        if (an.out < n and next_reach[an.out]) {
+                            unionByteSet(&mask_d, bs.out_set);
+                            any_d = true;
+                        }
+                        if (an.cont1 != 0 and an.cont1 < n and next_reach[an.cont1]) {
+                            unionByteSet(&mask_d, bs.cont1_set);
+                            any_d = true;
+                        }
+                        if (an.cont2 != 0 and an.cont2 < n and next_reach[an.cont2]) {
+                            unionByteSet(&mask_d, bs.cont2_set);
+                            any_d = true;
+                        }
+                        if (an.cont3 != 0 and an.cont3 < n and next_reach[an.cont3]) {
+                            unionByteSet(&mask_d, bs.cont3_set);
+                            any_d = true;
+                        }
+                    },
+                    .unicode_class => |uc| {
+                        if (bs.has_out and uc.out < n and next_reach[uc.out]) {
+                            unionByteSet(&mask_d, bs.out_set);
+                            any_d = true;
+                        }
+                        if (uc.cont1 != 0 and uc.cont1 < n and next_reach[uc.cont1]) {
+                            unionByteSet(&mask_d, bs.cont1_set);
+                            any_d = true;
+                        }
+                        if (uc.cont2 != 0 and uc.cont2 < n and next_reach[uc.cont2]) {
+                            unionByteSet(&mask_d, bs.cont2_set);
+                            any_d = true;
+                        }
+                        if (uc.cont3 != 0 and uc.cont3 < n and next_reach[uc.cont3]) {
+                            unionByteSet(&mask_d, bs.cont3_set);
+                            any_d = true;
+                        }
+                    },
+                    else => {},
+                }
+            }
+            if (!any_d or byteSetIsAll(mask_d)) break;
+            self.req_prev_masks[d] = mask_d;
+            self.req_prev_mask_len = @intCast(d + 1);
+            reach_d = next_reach;
+        }
+
+        // If `req_literal_bytes` is a single byte and preceding byte masks have small cardinality (e.g. `(a|b){15}c`),
+        // promote up to 3 preceding bytes into a 2..4-byte `Multi` prefilter (up to 16 patterns -> AVX2 Teddy for >4).
+        if (self.req_literal_bytes.len == 1 and !self.ignore_case and !self.multiline) {
+            var prev_lists: [3][8]u8 = undefined;
+            var prev_counts: [3]usize = .{ 0, 0, 0 };
+            var prefix_len: usize = 0;
+            var product: usize = 1;
+            const max_d: usize = @min(@as(usize, self.req_prev_mask_len), 3);
+            var d_idx: usize = 0;
+            while (d_idx < max_d) : (d_idx += 1) {
+                var cnt: usize = 0;
+                var ok_d = true;
+                var b: u16 = 0;
+                while (b < 256) : (b += 1) {
+                    const byte: u8 = @truncate(b);
+                    if (self.req_prev_masks[d_idx].contains(byte)) {
+                        if (byte == '\n' or cnt >= 8) {
+                            ok_d = false;
+                            break;
+                        }
+                        prev_lists[d_idx][cnt] = byte;
+                        cnt += 1;
+                    }
+                }
+                if (!ok_d or cnt == 0) break;
+                const next_prod = product * cnt;
+                if (next_prod > 16) break;
+                prev_counts[d_idx] = cnt;
+                product = next_prod;
+                prefix_len = d_idx + 1;
+            }
+            if (prefix_len >= 1) {
+                if (self.allocator.alloc([]const u8, product)) |slices| {
+                    var built: usize = 0;
+                    var alloc_ok = true;
+                    const pat_len = prefix_len + 1;
+                    for (0..product) |idx| {
+                        if (self.allocator.alloc(u8, pat_len)) |pat_buf| {
+                            var rem = idx;
+                            for (0..prefix_len) |di| {
+                                const c = prev_counts[di];
+                                pat_buf[prefix_len - 1 - di] = prev_lists[di][rem % c];
+                                rem /= c;
+                            }
+                            pat_buf[prefix_len] = self.req_literal_bytes[0];
+                            slices[idx] = pat_buf;
+                            built += 1;
+                        } else |_| {
+                            alloc_ok = false;
+                            break;
+                        }
+                    }
+                    if (alloc_ok) {
+                        if (Multi.init(self.allocator, slices, .{ .case = .sensitive, .multiline = false })) |m| {
+                            self.pair_prefilter_slices = slices;
+                            self.pair_prefilter = m;
+                            self.pair_prefilter_prefix_len = @intCast(prefix_len);
+                        } else |_| {
+                            for (slices) |s| self.allocator.free(s);
+                            self.allocator.free(slices);
+                        }
+                    } else {
+                        for (slices[0..built]) |s| self.allocator.free(s);
+                        self.allocator.free(slices);
+                    }
+                } else |_| {}
+            }
+        }
+    }
+    if (any_prefix_bytes and !byteSetIsAll(prefix_bytes)) {
+        self.req_has_prefix_bytes_mask = true;
+        self.req_prefix_bytes_mask = prefix_bytes;
+    }
+
+    // 5. Check whether the suffix DFA after `lit_end` is byte-exact, and whether the prefix before `lit_start`
+    //    is strictly a repeated single `.unicode_class` (`+` or `*`) disjoint from `req_literal_bytes[0]`.
+    if (self.dfa_suffix_state != 0 and !self.has_lazy and !self.has_alt and !self.anchored_start and !self.multiline) {
+        self.dfa_suffix_is_exact = isSuffixSubgraphExact(insts, lit_end);
+        if (self.dfa_suffix_is_exact and self.precomputed_dfa != null and self.req_literal_bytes[0] < 0x80) {
+            var uc_pc: u32 = std.math.maxInt(u32);
+            var uc_count: usize = 0;
+            var pure_uclass = true;
+            for (0..n) |idx| {
+                if (!can_reach[idx] or idx == lit_start) continue;
+                switch (insts[idx]) {
+                    .jmp, .split, .save, .any_cont => {},
+                    .unicode_class => {
+                        uc_pc = @intCast(idx);
+                        uc_count += 1;
+                    },
+                    else => {
+                        pure_uclass = false;
+                        break;
+                    },
+                }
+            }
+            if (pure_uclass and uc_count == 1) {
+                const uc = insts[uc_pc].unicode_class;
+                // Ensure every reachable `.any_cont` belongs exclusively to this `uc_pc`.
+                for (0..n) |idx| {
+                    if (!can_reach[idx] or idx == lit_start) continue;
+                    if (insts[idx] == .any_cont) {
+                        const ipc: u32 = @intCast(idx);
+                        if (ipc != uc.cont1 and ipc != uc.cont2 and ipc != uc.cont3) {
+                            pure_uclass = false;
+                            break;
+                        }
+                    }
+                }
+                if (pure_uclass and !uc.ignore_case and
+                    zeroWidthReaches(insts, self.start_pc, uc_pc) and
+                    zeroWidthReaches(insts, uc.out, uc_pc) and
+                    zeroWidthReaches(insts, uc.out, lit_start))
+                {
+                    const lit0 = self.req_literal_bytes[0];
+                    const ranges = self.unicode_ranges[uc.range_idx].ranges;
+                    const in_set = (uc.has_ascii_set and uc.ascii_set.contains(lit0)) or inRanges(lit0, ranges);
+                    const uc_matches_lit0 = if (uc.negated) !in_set else in_set;
+                    if (!uc_matches_lit0) {
+                        self.req_prefix_uclass_pc = uc_pc;
+                        self.req_prefix_uclass_min = if (zero_to_lit[self.start_pc]) 0 else 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // 6. Build SIMD single-byte + contiguous prev/next byte-range prefilter when `pair_prefilter` was not built.
+    if (self.pair_prefilter == null and self.req_literal_bytes.len == 1 and !self.ignore_case and !self.multiline) {
+        const prev_rng = if (self.req_has_prev_mask) extractContiguousByteRange(self.req_prev_masks[0]) else null;
+        var next_rng: ?ContiguousByteRange = null;
+        if (self.dfa_suffix_state != 0) {
+            if (self.precomputed_dfa) |dfa| {
+                if (!dfa.is_match[self.dfa_suffix_state]) {
+                    var next_set = ByteSet{};
+                    var b: u16 = 0;
+                    while (b < 256) : (b += 1) {
+                        const byte: u8 = @truncate(b);
+                        if (dfa.trans[self.dfa_suffix_state][byte] != dfa_mod.dead_state) {
+                            next_set.set(byte);
+                        }
+                    }
+                    next_rng = extractContiguousByteRange(next_set);
+                }
+            }
+        }
+        if (prev_rng != null or next_rng != null) {
+            self.byte_ctx_prefilter = .{
+                .lit = self.req_literal_bytes[0],
+                .has_prev = prev_rng != null,
+                .prev_lo = if (prev_rng) |r| r.lo else 0,
+                .prev_span = if (prev_rng) |r| r.span else 0,
+                .has_next = next_rng != null,
+                .next_lo = if (next_rng) |r| r.lo else 0,
+                .next_span = if (next_rng) |r| r.span else 0,
+            };
+        }
+    }
 }
 
 fn instCanMatchNewline(inst: Inst, unicode_ranges: []const UnicodeRangeList, multiline: bool) bool {

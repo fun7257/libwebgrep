@@ -55,4 +55,6 @@ pub const archive = @import("codec/archive.zig");
 pub const tree = @import("search/tree.zig");
 pub const searchArchiveSlice = tree.searchArchiveSlice;
 pub const searchTarStream = tree.searchTarStream;
+pub const types = @import("walk/types.zig");
+pub const walker = @import("walk/walker.zig");
 

@@ -261,7 +261,16 @@ pub fn build(
         }
         switch (item.class) {
             .exact => try appendIndex(gpa, &exact_lists, item.key, id),
-            .ext => try appendIndex(gpa, &ext_lists, item.key, id),
+            .ext => {
+                // `extensionOf` extracts only the final `.ext` segment. Compound extensions
+                // such as `*.gen.c` or `*.local.log` (key `.gen.c` / `.local.log`) contain
+                // an additional dot and would never match `exts.get(".c")` / `exts.get(".log")`.
+                if (item.key.len > 1 and std.mem.findScalar(u8, item.key[1..], '.') != null) {
+                    try suffixes.append(gpa, .{ .text = item.key, .index = id });
+                } else {
+                    try appendIndex(gpa, &ext_lists, item.key, id);
+                }
+            },
             .prefix => try prefixes.append(gpa, .{ .text = item.key, .index = id }),
             .suffix => try suffixes.append(gpa, .{ .text = item.key, .index = id }),
             .general => try general.append(gpa, id),
@@ -338,8 +347,7 @@ fn view(set: *const Set, rel: []const u8, scratch: []u8) ?[]const u8 {
         if (rel.len == 0) path = scratch[0..set.repo_prefix.len];
     }
     if (set.prefix == 0) return path;
-    if (path.len < set.prefix) return null;
-    if (path.len == set.prefix) return path[path.len..];
+    if (path.len <= set.prefix) return null;
     if (path[set.prefix] != '/') return null;
     return path[set.prefix + 1 ..];
 }
@@ -377,7 +385,6 @@ fn considerOne(set: *const Set, index: u32, is_dir: bool, best: *?u32) void {
 
 fn extensionOf(base: []const u8) ?[]const u8 {
     const dot = std.mem.findScalarLast(u8, base, '.') orelse return null;
-    if (dot == 0) return null;
     return base[dot..];
 }
 
@@ -492,4 +499,46 @@ test "plain-text ignore rules and per-layer switches" {
     try std.testing.expect(!isIgnored(&dot_set, "debug.log", false, &scratch));
     try std.testing.expect(isIgnored(&dot_set, "temp.out", false, &scratch));
     try std.testing.expect(!isIgnored(&dot_set, "final.out", false, &scratch));
+}
+
+test "compound extensions (*.gen.c, *.local.log), nested negation, dotfiles, and subdir wildcard" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var scratch: [256]u8 = undefined;
+
+    // 1. Compound extensions in .git/info/exclude + .gitignore, overridden by nested !.gitignore
+    var root_globs: std.ArrayList(glob.Glob) = .empty;
+    try parseLayerInto(arena, .{
+        .git_exclude = "*.local.log\n",
+        .gitignore = "build/\ngenerated/\n*.o\n*.gen.c\n*.tmp\n",
+    }, .{}, &root_globs);
+    const root_set = try build(arena, std.testing.allocator, null, 0, &.{}, root_globs.items);
+
+    const sub_globs = try parseAll(arena, "!important.tmp\n!keep_me.gen.c\n");
+    const sub_set = try build(arena, std.testing.allocator, &root_set, 3, &.{}, sub_globs);
+
+    try std.testing.expect(isIgnored(&root_set, "app.local.log", false, &scratch));
+    try std.testing.expect(isIgnored(&root_set, "sub/app.local.log", false, &scratch));
+    try std.testing.expect(!isIgnored(&root_set, "app.log", false, &scratch));
+    try std.testing.expect(isIgnored(&root_set, "foo.gen.c", false, &scratch));
+    try std.testing.expect(!isIgnored(&root_set, "foo.c", false, &scratch));
+    try std.testing.expect(isIgnored(&sub_set, "sub/drop.gen.c", false, &scratch));
+    try std.testing.expect(!isIgnored(&sub_set, "sub/keep_me.gen.c", false, &scratch));
+    try std.testing.expect(isIgnored(&sub_set, "sub/drop.tmp", false, &scratch));
+    try std.testing.expect(!isIgnored(&sub_set, "sub/important.tmp", false, &scratch));
+    try std.testing.expect(isIgnored(&root_set, ".tmp", false, &scratch));
+
+    // 2. Wildcard `*` with `!keep.txt` inside a subdirectory must not ignore the directory itself
+    const wild_globs = try parseAll(arena, "*\n!keep.txt\n");
+    const wild_set = try build(arena, std.testing.allocator, &root_set, 3, &.{}, wild_globs);
+    try std.testing.expect(!isIgnored(&wild_set, "sub/keep.txt", false, &scratch));
+    try std.testing.expect(isIgnored(&wild_set, "sub/drop.txt", false, &scratch));
+
+    // 3. Ancestor set with repo_prefix evaluates anchored and compound rules relative to repo root
+    const anc_globs = try parseAll(arena, "/src/mod_000/generated/\n*.gen.c\n");
+    const anc_set = try build(arena, std.testing.allocator, null, 0, "src/mod_000", anc_globs);
+    try std.testing.expect(isIgnored(&anc_set, "generated", true, &scratch));
+    try std.testing.expect(isIgnored(&anc_set, "foo.gen.c", false, &scratch));
+    try std.testing.expect(!isIgnored(&anc_set, "foo.c", false, &scratch));
 }

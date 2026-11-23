@@ -42,7 +42,7 @@ const PrintSink = struct {
 
     pub fn matched(self: *PrintSink, line: libwebgrep.Line) bool {
         if (line.binary_status == .detected) return false;
-        if ((self.prefix_path != null or self.line_numbers) and std.mem.indexOfScalar(u8, line.bytes, '\n') != null) {
+        if ((self.prefix_path != null or self.line_numbers) and std.mem.findScalar(u8, line.bytes, '\n') != null) {
             var it = std.mem.splitScalar(u8, line.bytes, '\n');
             var idx: u64 = 0;
             while (it.next()) |sub| : (idx += 1) {
@@ -129,7 +129,7 @@ fn searchSingleFileWithSink(
             }) catch null;
             if (mm) |*mapped| {
                 defer mapped.destroy(io);
-                if (cfg.binary != .quit or std.mem.indexOfScalar(u8, mapped.memory[0..@min(mapped.memory.len, 4096)], 0) == null) {
+                if (cfg.binary != .quit or std.mem.findScalar(u8, mapped.memory[0..@min(mapped.memory.len, 4096)], 0) == null) {
                     internal.platform.adviseMappedSequential(mapped.memory);
                 }
                 if (threads > 1 and mapped.memory.len >= 512 * 1024) {

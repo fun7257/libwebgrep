@@ -525,7 +525,7 @@ pub fn acceptsWholeLine(matcher: anytype, buf: []const u8, start: usize, end: us
 
 pub inline fn hasFilterUpper(s: []const u8) bool {
     for (s) |c| {
-        if (c >= 'A' and c <= 'Z') return true;
+        if (std.ascii.isUpper(c)) return true;
     }
     return unicode_fold.patternHasUnicodeUpper(s);
 }
@@ -544,7 +544,7 @@ pub inline fn sliceContainsFilter(haystack: []const u8, needle: []const u8, case
         const b0_hi = std.ascii.toUpper(needle[0]);
         if (needle.len == 1) {
             return if (b0_lo == b0_hi)
-                memchr.find(memchr.native_width, haystack, 0, b0_lo) != null
+                std.mem.findScalar(u8, haystack, b0_lo) != null
             else
                 memchr.findEither(memchr.native_width, haystack, 0, b0_lo, b0_hi) != null;
         }
@@ -553,7 +553,7 @@ pub inline fn sliceContainsFilter(haystack: []const u8, needle: []const u8, case
         var pos: usize = 0;
         while (pos <= limit) {
             const at = (if (b0_lo == b0_hi)
-                memchr.find(memchr.native_width, head_haystack, pos, b0_lo)
+                std.mem.findScalarPos(u8, head_haystack, pos, b0_lo)
             else
                 memchr.findEither(memchr.native_width, head_haystack, pos, b0_lo, b0_hi)) orelse return false;
             if (std.ascii.toLower(haystack[at + needle.len - 1]) == blast_lo and
@@ -567,13 +567,13 @@ pub inline fn sliceContainsFilter(haystack: []const u8, needle: []const u8, case
     }
     const b0 = needle[0];
     if (needle.len == 1) {
-        return memchr.find(memchr.native_width, haystack, 0, b0) != null;
+        return std.mem.findScalar(u8, haystack, b0) != null;
     }
     const blast = needle[needle.len - 1];
     const mid_needle = needle[1 .. needle.len - 1];
     var pos: usize = 0;
     while (pos <= limit) {
-        const at = memchr.find(memchr.native_width, head_haystack, pos, b0) orelse return false;
+        const at = std.mem.findScalarPos(u8, head_haystack, pos, b0) orelse return false;
         if (haystack[at + needle.len - 1] == blast and
             std.mem.eql(u8, haystack[at + 1 .. at + needle.len - 1], mid_needle))
         {

@@ -301,7 +301,6 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, req: Run) !Stats {
     }
     try session.prepareConfig(io, req.walk);
 
-    const started = std.Io.Timestamp.now(io, .awake);
     var many: ?multi_mod.Multi = null;
     defer if (many) |*engine| engine.deinit();
     if (req.patterns.len > 1) {
@@ -369,7 +368,6 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, req: Run) !Stats {
     }
     if (shared.write_failed.load(.acquire)) return error.WriteFailed;
 
-    _ = started;
     _ = req.write_summary;
     return snapshot(&shared);
 }
@@ -681,7 +679,7 @@ fn runFileOrMmap(
                 }) catch null;
                 if (mm) |*mapped| {
                     defer mapped.destroy(shared.io);
-                    if (cfg.binary != .quit or std.mem.indexOfScalar(u8, mapped.memory[0..@min(mapped.memory.len, 4096)], 0) == null) {
+                    if (cfg.binary != .quit or std.mem.findScalar(u8, mapped.memory[0..@min(mapped.memory.len, 4096)], 0) == null) {
                         platform.adviseMappedSequential(mapped.memory);
                     }
                     return searcher.searchSlice(S, sink, mapped.memory, path, engine, cfg);
@@ -760,16 +758,8 @@ fn runFileOrMmap(
 }
 
 inline fn appendU64(buf: *std.ArrayList(u8), val: u64) void {
-    var digits: [20]u8 = undefined;
-    var n = val;
-    var i: usize = digits.len;
-    while (true) {
-        i -= 1;
-        digits[i] = @as(u8, @intCast(n % 10)) + '0';
-        n /= 10;
-        if (n == 0) break;
-    }
-    buf.appendSliceAssumeCapacity(digits[i..]);
+    const len = std.fmt.printInt(buf.unusedCapacitySlice(), val, 10, .lower, .{});
+    buf.items.len += len;
 }
 
 inline fn appendFormattedLine(
@@ -804,7 +794,7 @@ const FastTextSink = struct {
         if (line.binary_status == .detected) return false;
         const alloc = self.worker.shared.allocator;
         const buf = &self.worker.out_buf;
-        if (self.multiline and std.mem.indexOfScalar(u8, line.bytes, '\n') != null) {
+        if (self.multiline and std.mem.findScalar(u8, line.bytes, '\n') != null) {
             var it = std.mem.splitScalar(u8, line.bytes, '\n');
             var idx: u64 = 0;
             while (it.next()) |sub| : (idx += 1) {
@@ -1012,8 +1002,8 @@ test "single-threaded traversal skips gitignore and counts matches" {
     try testing.expectEqual(@as(u64, 2), stats.searches_with_match);
     try testing.expectEqual(@as(u64, 3), stats.searches);
     try testing.expectEqual(@as(u32, 0), stats.errors);
-    try testing.expect(std.mem.indexOf(u8, out.written(), "skip.log") == null);
-    try testing.expect(std.mem.indexOf(u8, out.written(), ".git") == null);
+    try testing.expect(std.mem.find(u8, out.written(), "skip.log") == null);
+    try testing.expect(std.mem.find(u8, out.written(), ".git") == null);
 }
 
 test "two workers do not lose matches" {

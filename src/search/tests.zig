@@ -410,7 +410,7 @@ test "chunked file reading matches slice search" {
     });
     try testing.expectEqual(Outcome.complete, result.outcome);
     try testing.expectEqual(@as(u64, 2), rec.matches);
-    try testing.expect(std.mem.indexOf(u8, rec.text.items, "MATCH") != null);
+    try testing.expect(std.mem.find(u8, rec.text.items, "MATCH") != null);
 }
 
 test "stops when Sink returns false" {
@@ -632,7 +632,7 @@ test "CRLF line content excludes CR, and whole-line matching does not include CR
     var plain = try run("a\r\nMATCH\r\nb\r\n", "MATCH", .{ .line_numbers = true, .binary = .none });
     defer plain.deinit(testing.allocator);
     try testing.expectEqualStrings("2:MATCH\n", plain.text.items);
-    try testing.expect(std.mem.indexOfScalar(u8, plain.text.items, '\r') == null);
+    try testing.expect(std.mem.findScalar(u8, plain.text.items, '\r') == null);
 
     var whole = try run("a\r\nMATCH\r\nb\r\n", "MATCH", .{
         .line_numbers = true,
@@ -942,7 +942,7 @@ test "overlong line retains only the match window with exact offsets" {
     try testing.expect(slice_win.bytes.len <= max_line);
     try testing.expect(slice_win.bytes.len > 0);
     try testing.expectEqualStrings(hay[slice_win.window_start..][0..slice_win.bytes.len], slice_win.bytes);
-    try testing.expect(std.mem.indexOf(u8, slice_win.bytes, "MATCH") != null);
+    try testing.expect(std.mem.find(u8, slice_win.bytes, "MATCH") != null);
     try testing.expectEqual(@as(u64, match_at), slice_win.window_start + slice_win.mstart);
 
     var reader = std.Io.Reader.fixed(hay);
@@ -961,7 +961,7 @@ test "overlong line retains only the match window with exact offsets" {
     try testing.expectEqual(@as(u64, 0), read_win.offset);
     try testing.expect(read_win.bytes.len <= max_line);
     try testing.expectEqualStrings(hay[read_win.window_start..][0..read_win.bytes.len], read_win.bytes);
-    try testing.expect(std.mem.indexOf(u8, read_win.bytes, "MATCH") != null);
+    try testing.expect(std.mem.find(u8, read_win.bytes, "MATCH") != null);
     try testing.expectEqual(@as(u64, match_at), read_win.window_start + read_win.mstart);
 }
 
@@ -1054,7 +1054,7 @@ test "binary input treated as text still uses the overlong line window" {
     try testing.expectEqual(Outcome.complete, result.outcome);
     try testing.expect(win.truncated);
     try testing.expectEqual(@as(u64, 63), win.line_len);
-    try testing.expect(std.mem.indexOf(u8, win.bytes, "MATCH") != null);
+    try testing.expect(std.mem.find(u8, win.bytes, "MATCH") != null);
     try testing.expect(win.bytes.len <= 8);
 }
 
@@ -1215,7 +1215,7 @@ test "context break is an event marker rather than two hyphens" {
     });
     defer rec.deinit(testing.allocator);
     try testing.expectEqual(@as(u32, 1), rec.breaks);
-    try testing.expect(std.mem.indexOf(u8, rec.text.items, "--") == null);
+    try testing.expect(std.mem.find(u8, rec.text.items, "--") == null);
     try testing.expectEqualStrings("2-b\n3:MATCH\n4-c\n6-e\n7:MATCH2\n8-f\n", rec.text.items);
 }
 
@@ -1780,7 +1780,7 @@ test "multiple match spans on a single line are sorted by start offset" {
     try testing.expectEqualStrings("ab", line.bytes[line.matches[0].start..line.matches[0].end]);
     try testing.expectEqualStrings("ab", line.bytes[line.matches[2].start..line.matches[2].end]);
     try testing.expectEqual(@as(?u64, 1), line.column);
-    try testing.expect(std.mem.indexOfScalar(u8, line.bytes, 0x1b) == null);
+    try testing.expect(std.mem.findScalar(u8, line.bytes, 0x1b) == null);
 }
 
 test "each event carries only the source ID" {
@@ -1808,7 +1808,7 @@ test "three binary status values" {
     bag.reset();
     _ = try searchId(&bag, "text", "xxMATCH\x00yy\n", "MATCH", .{ .binary = .none });
     try testing.expectEqual(BinaryStatus.none, bag.find(.end).status);
-    try testing.expect(std.mem.indexOfScalar(u8, bag.matchAt(0).bytes, 0) != null);
+    try testing.expect(std.mem.findScalar(u8, bag.matchAt(0).bytes, 0) != null);
 
     bag.reset();
     _ = try searchId(&bag, "seen", "xxMATCH\x00yy\n", "MATCH", .{ .binary = .report });
@@ -1865,8 +1865,8 @@ test "leading whitespace on a line is returned verbatim" {
     try testing.expectEqual(@as(usize, 2), line.matches[0].start);
     try testing.expectEqual(@as(usize, 7), line.matches[0].end);
     try testing.expectEqual(@as(?u64, 3), line.column);
-    try testing.expect(std.mem.indexOfScalar(u8, line.bytes, 0x1b) == null);
-    try testing.expect(std.mem.indexOf(u8, line.bytes, "<") == null);
+    try testing.expect(std.mem.findScalar(u8, line.bytes, 0x1b) == null);
+    try testing.expect(std.mem.find(u8, line.bytes, "<") == null);
 }
 
 test "events are delivered one by one via callback" {
@@ -2389,8 +2389,8 @@ test "returned errors do not contain file paths" {
         .log = CapLog.write,
         .log_ctx = &log,
     }));
-    try testing.expect(std.mem.indexOf(u8, log.buf[0..log.len], secret) != null);
-    try testing.expect(std.mem.indexOf(u8, @errorName(error.BufferLimit), secret) == null);
+    try testing.expect(std.mem.find(u8, log.buf[0..log.len], secret) != null);
+    try testing.expect(std.mem.find(u8, @errorName(error.BufferLimit), secret) == null);
 
     log.len = 0;
     var raw: u8 = 0;
@@ -2402,8 +2402,8 @@ test "returned errors do not contain file paths" {
         .log_ctx = &log,
     }, secret, badRead, &raw);
     try testing.expectEqual(sink_mod.SoftError.read_failed, soft.soft_error.?);
-    try testing.expect(std.mem.indexOf(u8, log.buf[0..log.len], secret) != null);
-    try testing.expect(std.mem.indexOf(u8, @tagName(soft.soft_error.?), "/") == null);
+    try testing.expect(std.mem.find(u8, log.buf[0..log.len], secret) != null);
+    try testing.expect(std.mem.find(u8, @tagName(soft.soft_error.?), "/") == null);
 }
 
 test "core does not read environment variables" {
@@ -4337,7 +4337,7 @@ test "policy limits: default limits apply when omitted and unconstrained custom 
             var it = std.mem.splitScalar(u8, rec_slice.text.items, '\n');
             while (it.next()) |ln| {
                 if (ln.len == 0) continue;
-                if (std.mem.indexOfScalar(u8, ln, '-') != null) ctx_lines += 1;
+                if (std.mem.findScalar(u8, ln, '-') != null) ctx_lines += 1;
             }
             try testing.expectEqual(@as(usize, 20), ctx_lines);
             try testing.expect(std.mem.startsWith(u8, rec_slice.text.items, "6-ctx_06\n"));
@@ -4376,7 +4376,7 @@ test "policy limits: default limits apply when omitted and unconstrained custom 
             var it = std.mem.splitScalar(u8, rec_stream.text.items, '\n');
             while (it.next()) |ln| {
                 if (ln.len == 0) continue;
-                if (std.mem.indexOfScalar(u8, ln, '-') != null) ctx_lines += 1;
+                if (std.mem.findScalar(u8, ln, '-') != null) ctx_lines += 1;
             }
             try testing.expectEqual(@as(usize, 20), ctx_lines);
             try testing.expect(std.mem.startsWith(u8, rec_stream.text.items, "6-ctx_06\n"));
@@ -5781,9 +5781,9 @@ test "fuzz: multiline differential oracle (Regex DFA/prefilter/watched vs pure N
             try testing.expectEqual(exp_n > 0, rs_ora.find(hay, 0, .leftmost_first) != null);
 
             const m_hit = m_ora.find(hay, 0, .leftmost_first);
-            const has_lit = (std.mem.indexOf(u8, hay, "ab\nc") != null) or
-                (std.mem.indexOf(u8, hay, "cd\n0") != null) or
-                (std.mem.indexOf(u8, hay, "a\r\nb") != null);
+            const has_lit = (std.mem.find(u8, hay, "ab\nc") != null) or
+                (std.mem.find(u8, hay, "cd\n0") != null) or
+                (std.mem.find(u8, hay, "a\r\nb") != null);
             try testing.expectEqual(has_lit, m_hit != null);
         }
     }
@@ -6126,7 +6126,7 @@ test "primitives: end-to-end P0-1, P0-2, P1-1, P1-2, P2-2a and cross-primitive s
             fn acceptKeep(ctx: ?*anyopaque, cand: searcher.LineFilterCandidate) bool {
                 const self: *@This() = @ptrCast(@alignCast(ctx.?));
                 self.seen += 1;
-                return std.mem.indexOf(u8, cand.bytes, "ALLOW") != null;
+                return std.mem.find(u8, cand.bytes, "ALLOW") != null;
             }
         };
 

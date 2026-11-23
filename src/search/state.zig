@@ -408,7 +408,7 @@ pub fn budgetView(haystack: []const u8, prepared_base: u64, state: *State, confi
             if (br.start > prepared_base) {
                 start_idx = @intCast(@min(br.start - prepared_base, @as(u64, haystack.len)));
                 if (config.range_align_lines and start_idx > 0 and start_idx < haystack.len and haystack[start_idx - 1] != sep) {
-                    start_idx = if (memchr.find(width, haystack, start_idx, sep)) |d| d + 1 else haystack.len;
+                    start_idx = if (std.mem.findScalarPos(u8, haystack, start_idx, sep)) |d| d + 1 else haystack.len;
                 }
             }
             if (br.end) |be| {
@@ -416,7 +416,7 @@ pub fn budgetView(haystack: []const u8, prepared_base: u64, state: *State, confi
                 if (raw_end <= start_idx) {
                     end_idx = start_idx;
                 } else if (config.range_align_lines and raw_end < haystack.len and haystack[raw_end - 1] != sep) {
-                    end_idx = if (memchr.find(width, haystack, raw_end, sep)) |d| d + 1 else haystack.len;
+                    end_idx = if (std.mem.findScalarPos(u8, haystack, raw_end, sep)) |d| d + 1 else haystack.len;
                 } else {
                     end_idx = raw_end;
                 }
@@ -432,7 +432,7 @@ pub fn budgetView(haystack: []const u8, prepared_base: u64, state: *State, confi
         var start_idx: usize = @intCast(@min(eff_start, @as(u64, haystack.len)));
         if (config.range_align_lines and eff_start > 0 and start_idx > 0 and start_idx < haystack.len) {
             if (haystack[start_idx - 1] != sep) {
-                start_idx = if (memchr.find(width, haystack, start_idx, sep)) |d| d + 1 else haystack.len;
+                start_idx = if (std.mem.findScalarPos(u8, haystack, start_idx, sep)) |d| d + 1 else haystack.len;
             }
         }
         var end_idx: usize = haystack.len;
@@ -443,7 +443,7 @@ pub fn budgetView(haystack: []const u8, prepared_base: u64, state: *State, confi
                 if (raw_end <= start_idx) {
                     end_idx = start_idx;
                 } else if (config.range_align_lines and raw_end < haystack.len and haystack[raw_end - 1] != sep) {
-                    end_idx = if (memchr.find(width, haystack, raw_end, sep)) |d| d + 1 else haystack.len;
+                    end_idx = if (std.mem.findScalarPos(u8, haystack, raw_end, sep)) |d| d + 1 else haystack.len;
                 } else {
                     end_idx = raw_end;
                 }
@@ -569,7 +569,7 @@ pub fn effectiveMaxNewlines(matcher: anytype, config: SearchConfig) ?u32 {
     if (!effectiveMultiline(matcher, config)) return 0;
     const T = MatcherType(@TypeOf(matcher));
     if (@hasDecl(T, "maxNewlines")) return matcher.maxNewlines();
-    if (@hasField(T, "needle")) return @intCast(std.mem.count(u8, matcher.needle, "\n"));
+    if (@hasField(T, "needle")) return @intCast(std.mem.countScalar(u8, matcher.needle, '\n'));
     return null;
 }
 
@@ -708,14 +708,14 @@ pub fn lineStart(buf: []const u8, pos: usize, config: SearchConfig) usize {
 
 pub fn lineEnd(buf: []const u8, from: usize, config: SearchConfig) usize {
     if (from >= buf.len) return buf.len;
-    if (memchr.find(width, buf, from, recordSep(config))) |i| return i + 1;
+    if (std.mem.findScalarPos(u8, buf, from, recordSep(config))) |i| return i + 1;
     return buf.len;
 }
 
 pub fn nextLine(buf: []const u8, pos: usize, end: usize, config: SearchConfig) ?Range {
     if (pos >= end or pos >= buf.len) return null;
     const limit = @min(end, buf.len);
-    if (memchr.find(width, buf, pos, recordSep(config))) |i| {
+    if (std.mem.findScalarPos(u8, buf, pos, recordSep(config))) |i| {
         if (i >= limit) return .{ .start = pos, .end = limit };
         return .{ .start = pos, .end = i + 1 };
     }

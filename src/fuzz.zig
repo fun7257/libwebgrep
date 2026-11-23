@@ -231,7 +231,7 @@ test "fuzz: Finder differential oracle across sensitive/insensitive/smart/unicod
                     var nul_at: ?usize = null;
                     const watched = finder.findWatched(haystack, start, &nul_at);
                     const ref_nul = if (start < haystack.len)
-                        if (std.mem.indexOfScalarPos(u8, haystack, start, 0)) |idx| idx else null
+                        if (std.mem.findScalarPos(u8, haystack, start, 0)) |idx| idx else null
                     else
                         null;
 

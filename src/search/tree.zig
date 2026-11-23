@@ -1526,7 +1526,7 @@ fn shouldSkipArchivePath(
     var scratch: [4096]u8 = undefined;
 
     while (start < clean.len) {
-        const maybe_slash = std.mem.indexOfScalarPos(u8, clean, start, '/');
+        const maybe_slash = std.mem.findScalarPos(u8, clean, start, '/');
         const end = maybe_slash orelse clean.len;
         const is_component_dir = (maybe_slash != null) or is_leaf_dir;
         const seg = clean[start..end];
@@ -1904,51 +1904,6 @@ pub fn searchTarStream(
 // Unit Tests
 // ============================================================================
 
-fn writeTarOctal(field: []u8, val: u64) void {
-    @memset(field, '0');
-    if (field.len > 0) field[field.len - 1] = 0;
-    var v = val;
-    var idx: usize = if (field.len >= 2) field.len - 2 else 0;
-    while (v > 0) {
-        field[idx] = @intCast('0' + (v & 7));
-        v >>= 3;
-        if (idx == 0) break;
-        idx -= 1;
-    }
-}
-
-fn finalizeTarHeader(header: *[512]u8) void {
-    @memcpy(header[257..263], "ustar\x00");
-    @memcpy(header[263..265], "00");
-    @memset(header[148..156], ' ');
-    var sum: u64 = 0;
-    for (header) |b| sum += b;
-    writeTarOctal(header[148..155], sum);
-    header[155] = ' ';
-}
-
-fn appendTarEntry(out: *std.ArrayList(u8), allocator: std.mem.Allocator, path: []const u8, typeflag: u8, data: []const u8) !void {
-    var header: [512]u8 = @splat(0);
-    const name_len = @min(path.len, 100);
-    @memcpy(header[0..name_len], path[0..name_len]);
-    writeTarOctal(header[100..108], 0o644);
-    writeTarOctal(header[108..116], 0);
-    writeTarOctal(header[116..124], 0);
-    writeTarOctal(header[124..136], if (typeflag == '0') data.len else 0);
-    writeTarOctal(header[136..148], 0);
-    header[156] = typeflag;
-    finalizeTarHeader(&header);
-    try out.appendSlice(allocator, &header);
-    if (typeflag == '0' and data.len > 0) {
-        try out.appendSlice(allocator, data);
-        const rem = data.len % 512;
-        if (rem != 0) {
-            const pad = 512 - rem;
-            try out.appendNTimes(allocator, 0, pad);
-        }
-    }
-}
-
 test "searchTree over virtual Memory respects .gitignore and globs" {
     const f_gitignore = source_mod.Node{ .name = ".gitignore", .kind = .file, .bytes = "ignored.txt\nbuild/\n" };
     const f_ignored = source_mod.Node{ .name = "ignored.txt", .kind = .file, .bytes = "needle in ignored\n" };
@@ -2027,12 +1982,13 @@ test "searchTree over virtual Memory respects .gitignore and globs" {
 }
 
 test "searchArchiveSlice on .tar with file types" {
-    var tar_bytes: std.ArrayList(u8) = .empty;
-    defer tar_bytes.deinit(std.testing.allocator);
+    var tar_out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer tar_out.deinit();
 
-    try appendTarEntry(&tar_bytes, std.testing.allocator, "src/lib.zig", '0', "const target = 42;\n");
-    try appendTarEntry(&tar_bytes, std.testing.allocator, "README.md", '0', "target in readme\n");
-    try tar_bytes.appendNTimes(std.testing.allocator, 0, 1024);
+    var tw: std.tar.Writer = .{ .underlying_writer = &tar_out.writer };
+    try tw.writeFileBytes("src/lib.zig", "const target = 42;\n", .{ .mode = 0o644 });
+    try tw.writeFileBytes("README.md", "target in readme\n", .{ .mode = 0o644 });
+    try tw.finishPedantically();
 
     const finder = try @import("../finder/finder.zig").Finder.init("target", .{});
 
@@ -2049,7 +2005,7 @@ test "searchArchiveSlice on .tar with file types" {
         std.testing.allocator,
         std.testing.io,
         &sink,
-        tar_bytes.items,
+        tar_out.written(),
         &finder,
         .{
             .types = &.{"zig"},
@@ -2059,7 +2015,7 @@ test "searchArchiveSlice on .tar with file types" {
     try std.testing.expectEqual(@as(u64, 1), summary.matched_lines);
     try std.testing.expectEqual(@as(u64, 1), sink.matched_lines);
 
-    var reader = std.Io.Reader.fixed(tar_bytes.items);
+    var reader = std.Io.Reader.fixed(tar_out.written());
     var stream_sink = CountSink{};
     const stream_summary = try searchArchive(
         CountSink,
@@ -2074,14 +2030,10 @@ test "searchArchiveSlice on .tar with file types" {
 }
 
 fn appendLeb128(out: *std.ArrayList(u8), allocator: std.mem.Allocator, val: u64) !void {
-    var v = val;
-    while (true) {
-        var b: u8 = @intCast(v & 0x7F);
-        v >>= 7;
-        if (v != 0) b |= 0x80;
-        try out.append(allocator, b);
-        if (v == 0) break;
-    }
+    var buf: [10]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    w.writeUleb128(val) catch unreachable;
+    try out.appendSlice(allocator, w.buffered());
 }
 
 fn compressXzStoredAlloc(allocator: std.mem.Allocator, payload: []const u8) ![]u8 {

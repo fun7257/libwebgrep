@@ -352,9 +352,9 @@ pub fn advanceUtf16Span(
 
 fn isReplacementIdent(s: []const u8) bool {
     if (s.len == 0) return false;
-    if (!((s[0] >= 'a' and s[0] <= 'z') or (s[0] >= 'A' and s[0] <= 'Z') or s[0] == '_')) return false;
+    if (!(std.ascii.isAlphabetic(s[0]) or s[0] == '_')) return false;
     for (s[1..]) |ch| {
-        if (!((ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '_')) return false;
+        if (!(std.ascii.isAlphanumeric(ch) or ch == '_')) return false;
     }
     return true;
 }
@@ -401,12 +401,12 @@ pub fn expandReplacementTemplate(
             }
             i += 2;
         } else if (next == '{') {
-            if (std.mem.indexOfScalarPos(u8, repl, i + 2, '}')) |close_brace| {
+            if (std.mem.findScalarPos(u8, repl, i + 2, '}')) |close_brace| {
                 const inner = repl[i + 2 .. close_brace];
                 if (inner.len > 0) {
                     var all_digits = true;
                     for (inner) |b| {
-                        if (b < '0' or b > '9') {
+                        if (!std.ascii.isDigit(b)) {
                             all_digits = false;
                             break;
                         }
@@ -515,7 +515,7 @@ pub fn buildReplaced(
     match_out: *?Span,
     repl: []const u8,
 ) ?[]const u8 {
-    if (std.mem.indexOfScalar(u8, repl, '$') == null) {
+    if (std.mem.findScalar(u8, repl, '$') == null) {
         var need: usize = 0;
         var cursor: usize = 0;
         for (matches) |item| {
@@ -618,11 +618,7 @@ pub fn replaceDest(state: *State, scratch: []u8, need: usize) ?[]u8 {
     if (need <= scratch.len) return scratch[0..need];
     const alloc = state.text_alloc orelse return null;
     if (state.replace_buf.len < need) {
-        if (state.replace_buf.len == 0) {
-            state.replace_buf = alloc.alloc(u8, need) catch return null;
-        } else {
-            state.replace_buf = alloc.realloc(state.replace_buf, need) catch return null;
-        }
+        state.replace_buf = alloc.realloc(state.replace_buf, need) catch return null;
     }
     if (state.replace_buf.len < need) return null;
     return state.replace_buf[0..need];
@@ -639,11 +635,7 @@ pub fn lossyDest(state: *State, scratch: []u8, need: usize) ?[]u8 {
     if (need <= scratch.len) return scratch[0..need];
     const alloc = state.text_alloc orelse return null;
     if (state.text_buf.len < need) {
-        if (state.text_buf.len == 0) {
-            state.text_buf = alloc.alloc(u8, need) catch return null;
-        } else {
-            state.text_buf = alloc.realloc(state.text_buf, need) catch return null;
-        }
+        state.text_buf = alloc.realloc(state.text_buf, need) catch return null;
     }
     if (state.text_buf.len < need) return null;
     return state.text_buf[0..need];

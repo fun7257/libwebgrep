@@ -523,7 +523,7 @@ const root = struct {
                         continue;
                     };
                     if (rel.len == 0) continue;
-                    const slash = std.mem.indexOfScalar(u8, rel, '/');
+                    const slash = std.mem.findScalar(u8, rel, '/');
                     const child_name = if (slash) |si| rel[0..si] else rel;
                     const child_kind: source_mod.Kind = if (slash != null) .directory else .file;
 
@@ -538,7 +538,7 @@ const root = struct {
                             continue;
                         };
                         if (prev_rel.len == 0) continue;
-                        const prev_slash = std.mem.indexOfScalar(u8, prev_rel, '/');
+                        const prev_slash = std.mem.findScalar(u8, prev_rel, '/');
                         const prev_name = if (prev_slash) |si| prev_rel[0..si] else prev_rel;
                         if (std.mem.eql(u8, prev_name, child_name)) {
                             dup = true;
@@ -1993,7 +1993,7 @@ test "E2E T1_F04_03: C ABI webgrep_search_slice with C callback, webgrep_scratch
                 self.matched_lines += 1;
                 if (ev.*.replaced_ptr) |rp| {
                     const rslice = rp[0..ev.*.replaced_len];
-                    if (std.mem.indexOf(u8, rslice, "id:42") != null) {
+                    if (std.mem.find(u8, rslice, "id:42") != null) {
                         self.saw_replacement = true;
                     }
                 }
@@ -2442,7 +2442,7 @@ test "E2E T1_F08_04: openReaderPull with streaming BOM & charset transcoding (UT
         while (try pull.next()) |ev| {
             if (ev.kind == .match) {
                 found = true;
-                try testing.expect(std.mem.indexOf(u8, ev.line.?.text, "UTF_STREAM_HIT café") != null);
+                try testing.expect(std.mem.find(u8, ev.line.?.text, "UTF_STREAM_HIT café") != null);
             }
         }
         try testing.expect(found);
@@ -2460,7 +2460,7 @@ test "E2E T1_F08_04: openReaderPull with streaming BOM & charset transcoding (UT
     while (try pull_lat.next()) |ev| {
         if (ev.kind == .match) {
             saw_lat = true;
-            try testing.expect(std.mem.indexOf(u8, ev.line.?.text, "café UTF_STREAM_HIT") != null);
+            try testing.expect(std.mem.find(u8, ev.line.?.text, "café UTF_STREAM_HIT") != null);
         }
     }
     try testing.expect(saw_lat);
@@ -5215,7 +5215,7 @@ test "E2E T4_07: Cross-Language FFI Service Simulation via C ABI" {
             self.events += 1;
             if (ev.*.replaced_ptr) |rp| {
                 const s = rp[0..ev.*.replaced_len];
-                if (std.mem.indexOf(u8, s, "[REDACTED]") != null) self.saw_redacted = true;
+                if (std.mem.find(u8, s, "[REDACTED]") != null) self.saw_redacted = true;
             }
             for (0..ev.*.matches_len) |i| {
                 if (ev.*.matches_ptr[i].pattern_id == 0) self.saw_pid_0 = true;

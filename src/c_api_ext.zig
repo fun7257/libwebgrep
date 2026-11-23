@@ -697,8 +697,8 @@ pub export fn webgrep_search_archive_reader(
     const stream_reader: *std.Io.Reader = if (z_tcfg.archive.format == .auto) &prefixed.reader else &c_reader.reader;
 
     const is_zip = z_tcfg.archive.format == .zip or (z_tcfg.archive.format == .auto and prefix_len >= 4 and
-        prefix_buf[0] == 'P' and prefix_buf[1] == 'K' and
-        ((prefix_buf[2] == 3 and prefix_buf[3] == 4) or (prefix_buf[2] == 5 and prefix_buf[3] == 6)));
+        (std.mem.eql(u8, prefix_buf[0..4], "PK\x03\x04") or
+            std.mem.eql(u8, prefix_buf[0..4], "PK\x05\x06")));
 
     const box: *const api.MatcherBox = @ptrCast(@alignCast(m_ptr));
     var sink = api.CLineEventSink{

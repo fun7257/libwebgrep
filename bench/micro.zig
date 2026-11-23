@@ -39,7 +39,7 @@ const BenchTracker = struct {
 
     fn wants(self: *const BenchTracker, name: []const u8) bool {
         const f = self.filter orelse return true;
-        return std.mem.indexOf(u8, name, f) != null;
+        return std.mem.find(u8, name, f) != null;
     }
 
     fn wantsAny(self: *const BenchTracker, names: []const []const u8) bool {

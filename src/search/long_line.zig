@@ -63,17 +63,13 @@ pub fn containsDone(seen: []const bool, config: SearchConfig) bool {
 
 pub fn ensureHold(allocator: std.mem.Allocator, hold: *[]u8, n: usize) error{OutOfMemory}!void {
     if (n == 0 or hold.len >= n) return;
-    if (hold.len == 0) {
-        hold.* = try allocator.alloc(u8, n);
-    } else {
-        hold.* = try allocator.realloc(hold.*, n);
-    }
+    hold.* = try allocator.realloc(hold.*, n);
 }
 
 pub fn compactBuf(buf: []u8, filled: *usize, drop: usize, state: *State) void {
     if (drop == 0 or drop > filled.*) return;
     const remain = filled.* - drop;
-    if (remain > 0) std.mem.copyForwards(u8, buf[0..remain], buf[drop..filled.*]);
+    if (remain > 0) @memmove(buf[0..remain], buf[drop..filled.*]);
     filled.* = remain;
     state.pos = if (state.pos >= drop) state.pos - drop else 0;
     state.last_line_visited = if (state.last_line_visited >= drop) state.last_line_visited - drop else 0;
@@ -193,7 +189,7 @@ pub fn slideLong(buf: *[]u8, filled: *usize, matcher: anytype, state: *State, co
         const nls = memchr.count(width, buf.*[0..drop], 0, drop, recordSep(config));
         state.line_number = ln + nls;
     }
-    std.mem.copyForwards(u8, buf.*[0..keep], buf.*[drop..filled.*]);
+    @memmove(buf.*[0..keep], buf.*[drop..filled.*]);
     filled.* = keep;
     state.long_dropped += drop;
     state.abs_base += drop;
@@ -384,11 +380,7 @@ pub fn beginLongWithMatch(
     state.long_number = state.line_number;
     const total_contains = config.contains.len + config.contains_regexes.len;
     if (total_contains > seen.len) {
-        if (seen.len == 0) {
-            seen.* = try allocator.alloc(bool, total_contains);
-        } else {
-            seen.* = try allocator.realloc(seen.*, total_contains);
-        }
+        seen.* = try allocator.realloc(seen.*, total_contains);
     }
     if (seen.len > 0) @memset(seen.*, false);
     const bytes = buf.*[0..filled.*];
@@ -603,12 +595,12 @@ pub fn pumpLong(
 ) ReadError!bool {
     if (stopInMatch(state, config)) return false;
     if (watchesBinary(config) and state.nul_offset == null and new_at < filled.*) {
-        if (memchr.find(width, buf.*[new_at..filled.*], 0, 0)) |rel| {
+        if (std.mem.findScalar(u8, buf.*[new_at..filled.*], 0)) |rel| {
             const nul_idx = new_at + rel;
             const abs_nul = state.abs_base + nul_idx;
             if (config.binary == .quit) {
                 if (state.long_active) {
-                    if (memchr.find(width, buf.*[0..nul_idx], 0, recordSep(config))) |nl| {
+                    if (std.mem.findScalar(u8, buf.*[0..nul_idx], recordSep(config))) |nl| {
                         var content_len = nl;
                         if (!config.null_data and nl > 0 and buf.*[nl - 1] == '\r') content_len = nl - 1;
                         try noteLong(allocator, matcher, buf.*[0..content_len], hold, seen, state, config, true);
@@ -641,7 +633,7 @@ pub fn pumpLong(
         return transitionToLong(S, allocator, sink, matcher, buf, filled, search_end, hold, seen, state, config);
     }
     const sep = recordSep(config);
-    if (memchr.find(width, buf.*[0..filled.*], 0, sep)) |nl| {
+    if (std.mem.findScalar(u8, buf.*[0..filled.*], sep)) |nl| {
         var content_len = nl;
         if (!config.null_data and nl > 0 and buf.*[nl - 1] == '\r') content_len = nl - 1;
         try noteLong(allocator, matcher, buf.*[0..content_len], hold, seen, state, config, true);

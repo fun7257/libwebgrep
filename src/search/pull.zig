@@ -738,11 +738,7 @@ pub fn ReaderPull(comptime M: type) type {
             var buf: []u8 = undefined;
             if (stream_slot) |slot| {
                 if (slot.len < cap0) {
-                    if (slot.len == 0) {
-                        slot.* = try stream_alloc.alloc(u8, cap0);
-                    } else {
-                        slot.* = try stream_alloc.realloc(slot.*, cap0);
-                    }
+                    slot.* = try stream_alloc.realloc(slot.*, cap0);
                 }
                 buf = slot.*;
             } else {
@@ -789,11 +785,7 @@ pub fn ReaderPull(comptime M: type) type {
                 const needed_slots: usize = state.ring.cap;
                 if (config.scratch_pool) |sp| {
                     if (sp.ring_slots.len < needed_slots) {
-                        if (sp.ring_slots.len == 0) {
-                            sp.ring_slots = try sp.allocator.alloc(cfg_mod.RingSlot, needed_slots);
-                        } else {
-                            sp.ring_slots = try sp.allocator.realloc(sp.ring_slots, needed_slots);
-                        }
+                        sp.ring_slots = try sp.allocator.realloc(sp.ring_slots, needed_slots);
                     }
                     state.ring.heap_slots = sp.ring_slots[0..needed_slots];
                 } else {
@@ -806,11 +798,7 @@ pub fn ReaderPull(comptime M: type) type {
                 if (bytes > 0) {
                     if (config.scratch_pool) |sp| {
                         if (sp.ring_storage.len < bytes) {
-                            if (sp.ring_storage.len == 0) {
-                                sp.ring_storage = try sp.allocator.alloc(u8, bytes);
-                            } else {
-                                sp.ring_storage = try sp.allocator.realloc(sp.ring_storage, bytes);
-                            }
+                            sp.ring_storage = try sp.allocator.realloc(sp.ring_storage, bytes);
                         }
                         state.ring.storage = sp.ring_storage[0..bytes];
                     } else {
@@ -963,11 +951,11 @@ pub fn ReaderPull(comptime M: type) type {
                                     self.range_eof = true;
                                     break;
                                 }
-                                if (memchr.find(cfg_mod.width, self.buf[0..rn], 0, sep)) |nl_rel| {
+                                if (std.mem.findScalar(u8, self.buf[0..rn], sep)) |nl_rel| {
                                     const drop = nl_rel + 1;
                                     self.state.abs_base += drop;
                                     const rem = rn - drop;
-                                    if (rem > 0) std.mem.copyForwards(u8, self.buf[0..rem], self.buf[drop..rn]);
+                                    if (rem > 0) @memmove(self.buf[0..rem], self.buf[drop..rn]);
                                     self.filled = rem;
                                     break;
                                 }
@@ -1011,11 +999,11 @@ pub fn ReaderPull(comptime M: type) type {
                                 self.range_eof = true;
                                 break;
                             }
-                            if (memchr.find(cfg_mod.width, self.buf[0..rn], 0, sep)) |nl_rel| {
+                            if (std.mem.findScalar(u8, self.buf[0..rn], sep)) |nl_rel| {
                                 const drop = nl_rel + 1;
                                 self.state.abs_base += drop;
                                 const rem = rn - drop;
-                                if (rem > 0) std.mem.copyForwards(u8, self.buf[0..rem], self.buf[drop..rn]);
+                                if (rem > 0) @memmove(self.buf[0..rem], self.buf[drop..rn]);
                                 self.filled = rem;
                                 break;
                             }
@@ -1055,7 +1043,7 @@ pub fn ReaderPull(comptime M: type) type {
                         const cut: usize = @intCast(eff_start - cur_decoded);
                         if (cut > 0) prev_b = self.buf[cut - 1];
                         const rem = p_sk.n - cut;
-                        if (rem > 0) std.mem.copyForwards(u8, self.buf[0..rem], self.buf[cut..p_sk.n]);
+                        if (rem > 0) @memmove(self.buf[0..rem], self.buf[cut..p_sk.n]);
                         self.filled = rem;
                         if (self.state.is_range_search) self.state.bytes_read += rem;
                         cur_decoded = eff_start;
@@ -1077,10 +1065,10 @@ pub fn ReaderPull(comptime M: type) type {
                             @intCast(@min(@as(u64, self.filled), re_end -| self.state.abs_base))
                         else
                             self.filled;
-                        if (memchr.find(cfg_mod.width, self.buf[0..check_len], 0, sep)) |nl_rel| {
+                        if (std.mem.findScalar(u8, self.buf[0..check_len], sep)) |nl_rel| {
                             const drop = nl_rel + 1;
                             const rem = self.filled - drop;
-                            if (rem > 0) std.mem.copyForwards(u8, self.buf[0..rem], self.buf[drop..self.filled]);
+                            if (rem > 0) @memmove(self.buf[0..rem], self.buf[drop..self.filled]);
                             self.filled = rem;
                             self.state.abs_base += drop;
                             break;
@@ -1243,13 +1231,13 @@ pub fn ReaderPull(comptime M: type) type {
                         if (self.buf[rel_re - 1] == sep) {
                             self.filled = rel_re;
                             self.range_eof = true;
-                        } else if (memchr.find(cfg_mod.width, self.buf[0..self.filled], rel_re, sep)) |nl_idx| {
+                        } else if (std.mem.findScalarPos(u8, self.buf[0..self.filled], rel_re, sep)) |nl_idx| {
                             self.filled = nl_idx + 1;
                             self.range_eof = true;
                         } else {
                             self.extending_past_range_end = true;
                         }
-                    } else if (memchr.find(cfg_mod.width, self.buf[0..self.filled], 0, sep)) |nl_idx| {
+                    } else if (std.mem.findScalar(u8, self.buf[0..self.filled], sep)) |nl_idx| {
                         self.filled = nl_idx + 1;
                         self.range_eof = true;
                     }
@@ -1355,14 +1343,14 @@ pub fn ReaderPull(comptime M: type) type {
                                     self.filled = rel_re;
                                     self.range_eof = true;
                                     eof = true;
-                                } else if (memchr.find(cfg_mod.width, self.buf[0..self.filled], rel_re, sep)) |nl_idx| {
+                                } else if (std.mem.findScalarPos(u8, self.buf[0..self.filled], rel_re, sep)) |nl_idx| {
                                     self.filled = nl_idx + 1;
                                     self.range_eof = true;
                                     eof = true;
                                 } else {
                                     self.extending_past_range_end = true;
                                 }
-                            } else if (memchr.find(cfg_mod.width, self.buf[chunk_at..self.filled], 0, sep)) |rel_nl| {
+                            } else if (std.mem.findScalar(u8, self.buf[chunk_at..self.filled], sep)) |rel_nl| {
                                 self.filled = chunk_at + rel_nl + 1;
                                 self.range_eof = true;
                                 eof = true;
@@ -1425,11 +1413,11 @@ pub fn ReaderPull(comptime M: type) type {
                 var nul_rel: ?usize = null;
                 const found = if (comptime @hasDecl(state_mod.MatcherType(@TypeOf(self.matcher)), "findWatched")) self.matcher.findWatched(self.buf[0..search_end], self.state.pos, &nul_rel) else unreachable;
                 if (nul_rel == null and search_end < self.filled) {
-                    if (memchr.find(cfg_mod.width, self.buf[search_end..self.filled], 0, 0)) |rel| nul_rel = search_end + rel;
+                    if (std.mem.findScalar(u8, self.buf[search_end..self.filled], 0)) |rel| nul_rel = search_end + rel;
                 }
                 if (nul_rel == null) {
                     if (found) |hit| {
-                        if (memchr.find(cfg_mod.width, self.buf[hit.start..self.filled], 0, 0)) |rel| {
+                        if (std.mem.findScalar(u8, self.buf[hit.start..self.filled], 0)) |rel| {
                             nul_rel = hit.start + rel;
                         } else {
                             if (hit.start < self.state.pos + 4096) {
@@ -1482,7 +1470,7 @@ pub fn ReaderPull(comptime M: type) type {
                     skip_match = false;
                 }
             } else if (chunk_at < self.filled and cfg_mod.watchesBinary(self.config) and self.state.nul_offset == null) {
-                if (memchr.find(cfg_mod.width, self.buf[chunk_at..self.filled], 0, 0)) |rel| {
+                if (std.mem.findScalar(u8, self.buf[chunk_at..self.filled], 0)) |rel| {
                     const nul_idx = chunk_at + rel;
                     if (self.config.binary == .quit) {
                         const safe_end = state_mod.lineStart(self.buf[0..nul_idx], nul_idx, self.config);
@@ -1634,7 +1622,7 @@ pub fn ReaderPull(comptime M: type) type {
             state_mod.countLines(self.buf, consumed, &self.state, self.config);
             const remain = self.filled - consumed;
             if (consumed > 0 and remain > 0) {
-                std.mem.copyForwards(u8, self.buf[0..remain], self.buf[consumed..self.filled]);
+                @memmove(self.buf[0..remain], self.buf[consumed..self.filled]);
             }
             self.filled = remain;
             self.state.pos = if (self.state.pos >= consumed) self.state.pos - consumed else 0;

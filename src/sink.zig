@@ -561,9 +561,8 @@ fn lineStart(haystack: []const u8, pos: usize) usize {
 }
 
 fn lineEnd(haystack: []const u8, from: usize) usize {
-    const memchr = @import("finder/memchr.zig");
     if (from >= haystack.len) return haystack.len;
-    if (memchr.find(memchr.native_width, haystack, from, '\n')) |i| return i + 1;
+    if (std.mem.findScalarPos(u8, haystack, from, '\n')) |i| return i + 1;
     return haystack.len;
 }
 

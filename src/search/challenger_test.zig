@@ -100,27 +100,14 @@ test "vector 1.1: fragmented 1-byte stream reading UTF-8 identical to slice pull
 }
 
 fn encodeUtf16LeWithBom(allocator: std.mem.Allocator, utf8: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, &[_]u8{ 0xFF, 0xFE });
-    var view = try std.unicode.Utf8View.init(utf8);
-    var it = view.iterator();
-    while (it.nextCodepoint()) |cp| {
-        if (cp <= 0xFFFF) {
-            var buf: [2]u8 = undefined;
-            std.mem.writeInt(u16, &buf, @intCast(cp), .little);
-            try out.appendSlice(allocator, &buf);
-        } else {
-            const adj = cp - 0x10000;
-            const high: u16 = @intCast(0xD800 + (adj >> 10));
-            const low: u16 = @intCast(0xDC00 + (adj & 0x3FF));
-            var buf: [4]u8 = undefined;
-            std.mem.writeInt(u16, buf[0..2], high, .little);
-            std.mem.writeInt(u16, buf[2..4], low, .little);
-            try out.appendSlice(allocator, &buf);
-        }
-    }
-    return out.toOwnedSlice(allocator);
+    const units = try std.unicode.utf8ToUtf16LeAlloc(allocator, utf8);
+    defer allocator.free(units);
+    const payload = std.mem.sliceAsBytes(units);
+    const out = try allocator.alloc(u8, 2 + payload.len);
+    out[0] = 0xFF;
+    out[1] = 0xFE;
+    @memcpy(out[2..], payload);
+    return out;
 }
 
 test "vector 1.2: fragmented 1-byte stream reading UTF-16LE identical to slice search" {

@@ -1540,7 +1540,7 @@ test "c_api: search_slice with callback and scratch" {
             if (ev.is_context == 0) {
                 self.lines += 1;
                 if (ev.replaced_ptr) |rp| {
-                    if (std.mem.indexOf(u8, rp[0..ev.replaced_len], "num:99") != null) {
+                    if (std.mem.find(u8, rp[0..ev.replaced_len], "num:99") != null) {
                         self.saw_rep = true;
                     }
                 }
@@ -1594,35 +1594,22 @@ test "c_api: search_reader streaming" {
     try std.testing.expectEqual(@as(u64, 2), sum.matched_lines);
 }
 
-fn writeTestTarHeader(block: *[512]u8, name: []const u8, size: usize, typeflag: u8) void {
-    @memset(block, 0);
-    @memcpy(block[0..name.len], name);
-    _ = std.fmt.bufPrint(block[100..107], "{o:0>7}", .{@as(u32, 0o644)}) catch unreachable;
-    _ = std.fmt.bufPrint(block[124..135], "{o:0>11}", .{size}) catch unreachable;
-    @memset(block[148..156], ' ');
-    block[156] = typeflag;
-    @memcpy(block[257..263], "ustar\x00");
-    @memcpy(block[263..265], "00");
-    var chksum: u32 = 0;
-    for (block) |b| chksum += b;
-    _ = std.fmt.bufPrint(block[148..154], "{o:0>6}", .{chksum}) catch unreachable;
-    block[154] = 0;
-    block[155] = ' ';
-}
-
 test "c_api: search_archive_slice on in-memory tar" {
     var m: ?*webgrep_matcher_t = null;
     try std.testing.expectEqual(WEBGREP_OK, webgrep_matcher_compile_literal("TAR_MATCH", 9, null, &m));
     defer webgrep_matcher_free(m);
 
     const content = "hello TAR_MATCH world\n";
-    var tar_buf: [2048]u8 = @splat(0);
-    writeTestTarHeader(tar_buf[0..512], "dir/test.txt", content.len, '0');
-    @memcpy(tar_buf[512 .. 512 + content.len], content);
+    var tar_buf: [2048]u8 = undefined;
+    var fixed_w: std.Io.Writer = .fixed(&tar_buf);
+    var tw: std.tar.Writer = .{ .underlying_writer = &fixed_w };
+    try tw.writeFileBytes("dir/test.txt", content, .{ .mode = 0o644 });
+    try tw.finishPedantically();
 
     const tcfg = webgrep_tree_config_default();
     var tsum: webgrep_tree_summary_t = .{};
-    try std.testing.expectEqual(WEBGREP_OK, webgrep_search_archive_slice(m, &tar_buf, tar_buf.len, &tcfg, null, null, &tsum));
+    const written = fixed_w.buffered();
+    try std.testing.expectEqual(WEBGREP_OK, webgrep_search_archive_slice(m, written.ptr, written.len, &tcfg, null, null, &tsum));
     try std.testing.expectEqual(@as(u64, 1), tsum.matched_files);
     try std.testing.expectEqual(@as(u64, 1), tsum.matched_lines);
 }
@@ -1694,7 +1681,7 @@ test "c_api: null options parity, byte_range, line_number_mode, line_filter, rev
         }
         fn filterKeep(_: ?*anyopaque, cand: *const webgrep_line_filter_candidate_t) callconv(.c) bool {
             const line = cand.bytes_ptr.?[0..cand.bytes_len];
-            return std.mem.indexOf(u8, line, "keep") != null;
+            return std.mem.find(u8, line, "keep") != null;
         }
     };
 

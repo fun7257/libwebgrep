@@ -592,7 +592,7 @@ fn Run(comptime B: type, comptime MT: type) type {
             const n: usize = @intCast(nom);
             if (hay[n - 1] == self.sep) return nom;
             const end: usize = @intCast(self.ve);
-            const i = memchr.find(width, hay[0..end], n, self.sep) orelse return self.ve;
+            const i = std.mem.findScalarPos(u8, hay[0..end], n, self.sep) orelse return self.ve;
             return @as(u64, i) + 1;
         }
 
@@ -629,7 +629,7 @@ fn Run(comptime B: type, comptime MT: type) type {
                 const got = try ra.readAtFull(cur, probe[0..want]);
                 _ = self.total_read.fetchAdd(got, .monotonic);
                 if (got == 0) return self.ve;
-                if (memchr.find(width, probe[0..got], 0, self.sep)) |i| return cur + i + 1;
+                if (std.mem.findScalar(u8, probe[0..got], self.sep)) |i| return cur + i + 1;
                 cur += got;
             }
             return self.ve;
@@ -713,7 +713,7 @@ fn Run(comptime B: type, comptime MT: type) type {
                 a = self.vs;
             } else if (buf[0] == self.sep) {
                 a = nom_s;
-            } else if (memchr.find(width, buf[0..got], 1, self.sep)) |i| {
+            } else if (std.mem.findScalarPos(u8, buf[0..got], 1, self.sep)) |i| {
                 a = read_lo + @as(u64, i) + 1;
             } else if (read_hi >= self.ve) {
                 a = self.ve;
@@ -733,7 +733,7 @@ fn Run(comptime B: type, comptime MT: type) type {
                 const rel_e: usize = @intCast(nom_e - read_lo);
                 if (buf[rel_e - 1] == self.sep) {
                     b = nom_e;
-                } else if (memchr.find(width, buf[0..got], rel_e, self.sep)) |i| {
+                } else if (std.mem.findScalarPos(u8, buf[0..got], rel_e, self.sep)) |i| {
                     b = read_lo + @as(u64, i) + 1;
                 } else if (read_hi >= self.ve) {
                     b = self.ve;
@@ -1282,7 +1282,7 @@ fn raAlign(ra: RandomAccess, pos: u64, size: u64, sep: u8) anyerror!u64 {
         const want: usize = @intCast(@min(@as(u64, probe.len), size - cur));
         const got = try ra.readAtFull(cur, probe[0..want]);
         if (got == 0) return size;
-        if (memchr.find(width, probe[0..got], 0, sep)) |i| return cur + i + 1;
+        if (std.mem.findScalar(u8, probe[0..got], sep)) |i| return cur + i + 1;
         cur += got;
     }
     return size;
@@ -1329,7 +1329,7 @@ fn tryParallel(
     if (view_len < min_bytes or view_len <= chunk) return null;
     try cfg_mod.validateBudgets(config);
 
-    const n_chunks: usize = @intCast((view_len + chunk - 1) / chunk);
+    const n_chunks: usize = @intCast(std.math.divCeil(u64, view_len, chunk) catch unreachable);
     const window: usize = @max(2, @min(n_chunks, @as(usize, opts.max_inflight orelse 2 * workers)));
     const R = Run(B, @TypeOf(matcher));
 

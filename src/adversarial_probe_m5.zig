@@ -108,7 +108,7 @@ fn naiveMultiFind(
             }
             continue;
         }
-        if ( std.mem.indexOfPos(u8, haystack, start, pat)) |pos| {
+        if (std.mem.findPos(u8, haystack, start, pat)) |pos| {
             const cand = matcher_mod.Match{ .start = pos, .end = pos + pat.len, .pattern_id = pid };
             best = pickBetterMatch(best, cand, mode);
         }

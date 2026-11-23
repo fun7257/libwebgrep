@@ -117,11 +117,7 @@ fn stashDecompressedInScratch(prep: *Prepared, config: SearchConfig) error{OutOf
         if (prep.owned.len != 0) {
             const dec = prep.owned;
             if (sp.decode_buf.len < dec.len) {
-                if (sp.decode_buf.len == 0) {
-                    sp.decode_buf = try sp.allocator.alloc(u8, dec.len);
-                } else {
-                    sp.decode_buf = try sp.allocator.realloc(sp.decode_buf, dec.len);
-                }
+                sp.decode_buf = try sp.allocator.realloc(sp.decode_buf, dec.len);
             }
             @memcpy(sp.decode_buf[0..dec.len], dec);
             if (prep.alloc) |alloc| alloc.free(dec);
@@ -397,11 +393,7 @@ pub fn searchPrepared(
         const needed_slots: usize = state.ring.cap;
         if (config.scratch_pool) |sp| {
             if (sp.ring_slots.len < needed_slots) {
-                if (sp.ring_slots.len == 0) {
-                    sp.ring_slots = try sp.allocator.alloc(cfg_mod.RingSlot, needed_slots);
-                } else {
-                    sp.ring_slots = try sp.allocator.realloc(sp.ring_slots, needed_slots);
-                }
+                sp.ring_slots = try sp.allocator.realloc(sp.ring_slots, needed_slots);
             }
             state.ring.heap_slots = sp.ring_slots[0..needed_slots];
         } else {
@@ -522,7 +514,7 @@ pub fn searchPrepared(
                     }
                 }
                 if (try line_matcher_mod.findLineLimitOpts(matcher, view, &state, hit.start + 1, config, need_ls)) |line| {
-                    if (memchr.find(width, view[hit.start..line.end], 0, 0)) |rel| {
+                    if (std.mem.findScalar(u8, view[hit.start..line.end], 0)) |rel| {
                         const nul = hit.start + rel;
                         const safe_end = lineStart(view, nul, config);
                         state.pos = saved_pos;
@@ -585,7 +577,7 @@ pub fn searchPrepared(
                     const first_le = lineEnd(view, safe_from, config);
                     const nul_check_end = @max(hit.start, first_le);
                     if (nul_check_end > hit.start) {
-                        if (memchr.find(width, view[hit.start..nul_check_end], 0, 0)) |rel| {
+                        if (std.mem.findScalar(u8, view[hit.start..nul_check_end], 0)) |rel| {
                             const nul = hit.start + rel;
                             const safe_end = lineStart(view, nul, config);
                             state.pos = saved_pos;
@@ -619,7 +611,7 @@ pub fn searchPrepared(
                 }
             }
             const hit_line_end = lineEnd(view, @max(hit.end, hit.start), config);
-            if (memchr.find(width, view[hit.start..hit_line_end], 0, 0)) |rel| {
+            if (std.mem.findScalar(u8, view[hit.start..hit_line_end], 0)) |rel| {
                 const nul = hit.start + rel;
                 const safe_end = lineStart(view, nul, config);
                 if (safe_end > state.pos) {
@@ -711,14 +703,14 @@ pub fn searchPrepared(
     if (watchesBinary(config)) {
         var nul_at: ?usize = null;
         if (switched_to_prepass) {
-            nul_at = memchr.find(width, view, state.pos, 0);
+            nul_at = std.mem.findScalarPos(u8, view, state.pos, 0);
         } else if (view.len > 0 and canFuse(matcher, config, &state)) {
             const is_ml = state_mod.effectiveMultiline(matcher, config);
             const ml_win = if (is_ml) state_mod.effectiveMultilineWindow(matcher, config) else 0;
             const found = if (comptime @hasDecl(state_mod.MatcherType(@TypeOf(matcher)), "findWatched")) matcher.findWatched(view, state.pos, &nul_at) else unreachable;
             if (nul_at == null) {
                 if (found) |hit| {
-                    if (memchr.find(width, view[hit.start..], 0, 0)) |rel| {
+                    if (std.mem.findScalar(u8, view[hit.start..], 0)) |rel| {
                         nul_at = hit.start + rel;
                     } else {
                         if (state_mod.watchedMatchIsExact(matcher, config)) {
@@ -738,7 +730,7 @@ pub fn searchPrepared(
                 }
             }
         } else {
-            nul_at = memchr.find(width, view, 0, 0);
+            nul_at = std.mem.findScalar(u8, view, 0);
         }
         if (nul_at) |initial_nul| {
             if (config.binary == .quit) {
@@ -761,7 +753,7 @@ pub fn searchPrepared(
                         state.pending_skip_to = null;
                     }
                     if (state.pos > nul) {
-                        cur_nul = if (state.pos < view.len) memchr.find(width, view, state.pos, 0) else null;
+                        cur_nul = if (state.pos < view.len) std.mem.findScalarPos(u8, view, state.pos, 0) else null;
                         continue;
                     }
                     noteBinary(&state, config, state.abs_base + nul);
@@ -859,11 +851,7 @@ pub fn drive(
         const needed_slots: usize = state.ring.cap;
         if (config.scratch_pool) |sp| {
             if (sp.ring_slots.len < needed_slots) {
-                if (sp.ring_slots.len == 0) {
-                    sp.ring_slots = try sp.allocator.alloc(cfg_mod.RingSlot, needed_slots);
-                } else {
-                    sp.ring_slots = try sp.allocator.realloc(sp.ring_slots, needed_slots);
-                }
+                sp.ring_slots = try sp.allocator.realloc(sp.ring_slots, needed_slots);
             }
             state.ring.heap_slots = sp.ring_slots[0..needed_slots];
         } else {
@@ -876,11 +864,7 @@ pub fn drive(
         if (bytes > 0) {
             if (config.scratch_pool) |sp| {
                 if (sp.ring_storage.len < bytes) {
-                    if (sp.ring_storage.len == 0) {
-                        sp.ring_storage = try sp.allocator.alloc(u8, bytes);
-                    } else {
-                        sp.ring_storage = try sp.allocator.realloc(sp.ring_storage, bytes);
-                    }
+                    sp.ring_storage = try sp.allocator.realloc(sp.ring_storage, bytes);
                 }
                 state.ring.storage = sp.ring_storage[0..bytes];
             } else {
@@ -950,11 +934,7 @@ pub fn drive(
     var buf: []u8 = undefined;
     if (stream_slot) |slot| {
         if (slot.len < cap0) {
-            if (slot.len == 0) {
-                slot.* = try stream_alloc.alloc(u8, cap0);
-            } else {
-                slot.* = try stream_alloc.realloc(slot.*, cap0);
-            }
+            slot.* = try stream_alloc.realloc(slot.*, cap0);
         }
         buf = slot.*;
     } else {
@@ -1111,7 +1091,7 @@ pub fn drive(
         if (eff_start > 0 or range_end != null) {
             var s_idx: usize = @intCast(@min(eff_start, @as(u64, ds.len)));
             if (config.range_align_lines and config.continuation == null and eff_start > 0 and s_idx > 0 and s_idx < ds.len and ds[s_idx - 1] != sep) {
-                s_idx = if (memchr.find(width, ds, s_idx, sep)) |d| d + 1 else ds.len;
+                s_idx = if (std.mem.findScalarPos(u8, ds, s_idx, sep)) |d| d + 1 else ds.len;
             }
             var e_idx: usize = ds.len;
             if (range_end) |re_end| {
@@ -1119,7 +1099,7 @@ pub fn drive(
                 if (raw_e <= s_idx) {
                     e_idx = s_idx;
                 } else if (config.range_align_lines and raw_e < ds.len and ds[raw_e - 1] != sep) {
-                    e_idx = if (memchr.find(width, ds, raw_e, sep)) |d| d + 1 else ds.len;
+                    e_idx = if (std.mem.findScalarPos(u8, ds, raw_e, sep)) |d| d + 1 else ds.len;
                 } else {
                     e_idx = raw_e;
                 }
@@ -1190,11 +1170,11 @@ pub fn drive(
                             range_eof = true;
                             break;
                         }
-                        if (memchr.find(width, buf[0..rn], 0, sep)) |nl_rel| {
+                        if (std.mem.findScalar(u8, buf[0..rn], sep)) |nl_rel| {
                             const drop = nl_rel + 1;
                             state.abs_base += drop;
                             const rem = rn - drop;
-                            if (rem > 0) std.mem.copyForwards(u8, buf[0..rem], buf[drop..rn]);
+                            if (rem > 0) @memmove(buf[0..rem], buf[drop..rn]);
                             filled = rem;
                             break;
                         }
@@ -1237,11 +1217,11 @@ pub fn drive(
                         range_eof = true;
                         break;
                     }
-                    if (memchr.find(width, buf[0..rn], 0, sep)) |nl_rel| {
+                    if (std.mem.findScalar(u8, buf[0..rn], sep)) |nl_rel| {
                         const drop = nl_rel + 1;
                         state.abs_base += drop;
                         const rem = rn - drop;
-                        if (rem > 0) std.mem.copyForwards(u8, buf[0..rem], buf[drop..rn]);
+                        if (rem > 0) @memmove(buf[0..rem], buf[drop..rn]);
                         filled = rem;
                         break;
                     }
@@ -1282,7 +1262,7 @@ pub fn drive(
                     const cut: usize = @intCast(eff_start - cur_decoded);
                     if (cut > 0) prev_b = buf[cut - 1];
                     const rem = pulled_skip.n - cut;
-                    if (rem > 0) std.mem.copyForwards(u8, buf[0..rem], buf[cut..pulled_skip.n]);
+                    if (rem > 0) @memmove(buf[0..rem], buf[cut..pulled_skip.n]);
                     filled = rem;
                     if (state.is_range_search) state.bytes_read += rem;
                     cur_decoded = eff_start;
@@ -1304,10 +1284,10 @@ pub fn drive(
                         @intCast(@min(@as(u64, filled), re_end -| state.abs_base))
                     else
                         filled;
-                    if (memchr.find(width, buf[0..check_len], 0, sep)) |nl_rel| {
+                    if (std.mem.findScalar(u8, buf[0..check_len], sep)) |nl_rel| {
                         const drop = nl_rel + 1;
                         const rem = filled - drop;
-                        if (rem > 0) std.mem.copyForwards(u8, buf[0..rem], buf[drop..filled]);
+                        if (rem > 0) @memmove(buf[0..rem], buf[drop..filled]);
                         filled = rem;
                         state.abs_base += drop;
                         break;
@@ -1377,7 +1357,7 @@ pub fn drive(
                     const drop: usize = @intCast(skip_target - state.abs_base);
                     countLines(buf[0..filled], drop, &state, config);
                     const rem = filled - drop;
-                    if (drop > 0 and rem > 0) std.mem.copyForwards(u8, buf[0..rem], buf[drop..filled]);
+                    if (drop > 0 and rem > 0) @memmove(buf[0..rem], buf[drop..filled]);
                     filled = rem;
                     state.pos = 0;
                     state.last_line_visited = 0;
@@ -1444,7 +1424,7 @@ pub fn drive(
                                     state.line_number = ln + memchr.count(width, buf, 0, cut, sep);
                                 }
                                 const rem = p_sk.n - cut;
-                                if (rem > 0) std.mem.copyForwards(u8, buf[0..rem], buf[cut..p_sk.n]);
+                                if (rem > 0) @memmove(buf[0..rem], buf[cut..p_sk.n]);
                                 filled = rem;
                                 if (state.is_range_search) state.bytes_read += rem;
                                 cur_off = skip_target;
@@ -1490,13 +1470,13 @@ pub fn drive(
                     if (buf[rel_re - 1] == sep) {
                         filled = rel_re;
                         range_eof = true;
-                    } else if (memchr.find(width, buf[0..filled], rel_re, sep)) |nl_idx| {
+                    } else if (std.mem.findScalarPos(u8, buf[0..filled], rel_re, sep)) |nl_idx| {
                         filled = nl_idx + 1;
                         range_eof = true;
                     } else {
                         extending_past_range_end = true;
                     }
-                } else if (memchr.find(width, buf[0..filled], 0, sep)) |nl_idx| {
+                } else if (std.mem.findScalar(u8, buf[0..filled], sep)) |nl_idx| {
                     filled = nl_idx + 1;
                     range_eof = true;
                 }
@@ -1588,14 +1568,14 @@ pub fn drive(
                                 filled = rel_re;
                                 range_eof = true;
                                 eof = true;
-                            } else if (memchr.find(width, buf[0..filled], rel_re, sep)) |nl_idx| {
+                            } else if (std.mem.findScalarPos(u8, buf[0..filled], rel_re, sep)) |nl_idx| {
                                 filled = nl_idx + 1;
                                 range_eof = true;
                                 eof = true;
                             } else {
                                 extending_past_range_end = true;
                             }
-                        } else if (memchr.find(width, buf[chunk_at..filled], 0, sep)) |rel_nl| {
+                        } else if (std.mem.findScalar(u8, buf[chunk_at..filled], sep)) |rel_nl| {
                             filled = chunk_at + rel_nl + 1;
                             range_eof = true;
                             eof = true;
@@ -1659,7 +1639,7 @@ pub fn drive(
                 unreachable;
             if (nul_rel == null) {
                 if (found) |hit| {
-                    if (memchr.find(width, buf[hit.start..filled], 0, 0)) |rel| {
+                    if (std.mem.findScalar(u8, buf[hit.start..filled], 0)) |rel| {
                         nul_rel = hit.start + rel;
                     } else {
                         search_end = if (eof) filled else lastComplete(buf[0..filled], config);
@@ -1738,7 +1718,7 @@ pub fn drive(
                 const found = if (comptime @hasDecl(state_mod.MatcherType(@TypeOf(matcher)), "findWatched")) matcher.findWatched(buf[0..search_end], state.pos, &nul_rel) else unreachable;
                 if (nul_rel == null) {
                     if (found) |hit| {
-                        if (memchr.find(width, buf[hit.start..filled], 0, 0)) |rel| {
+                        if (std.mem.findScalar(u8, buf[hit.start..filled], 0)) |rel| {
                             nul_rel = hit.start + rel;
                         } else {
                             if (hit.start < state.pos + 4096) {
@@ -1757,7 +1737,7 @@ pub fn drive(
                         }
                     } else {
                         if (search_end < filled) {
-                            if (memchr.find(width, buf[search_end..filled], 0, 0)) |rel| nul_rel = search_end + rel;
+                            if (std.mem.findScalar(u8, buf[search_end..filled], 0)) |rel| nul_rel = search_end + rel;
                         }
                         if (nul_rel == null) {
                             skip_match = true;
@@ -1790,7 +1770,7 @@ pub fn drive(
                     skip_match = false;
                 }
             } else if (chunk_at < filled and watchesBinary(config) and state.nul_offset == null) {
-                if (memchr.find(width, buf[chunk_at..filled], 0, 0)) |rel| {
+                if (std.mem.findScalar(u8, buf[chunk_at..filled], 0)) |rel| {
                     const nul_idx = chunk_at + rel;
                     if (config.binary == .quit) {
                         const safe_end = lineStart(buf[0..nul_idx], nul_idx, config);
@@ -1935,7 +1915,7 @@ pub fn drive(
         countLines(buf, consumed, &state, config);
         const remain = filled - consumed;
         if (consumed > 0 and remain > 0) {
-            std.mem.copyForwards(u8, buf[0..remain], buf[consumed..filled]);
+            @memmove(buf[0..remain], buf[consumed..filled]);
         }
         filled = remain;
         state.pos = if (fast_next_pos) |fnp| fnp else if (state.pos >= consumed) state.pos - consumed else 0;

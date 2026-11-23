@@ -345,11 +345,7 @@ const ReverseContext = struct {
         if (self.io_buf.len >= want) return self.io_buf;
         const a = self.alloc orelse return error.OutOfMemory;
         const cap = @max(want, @max(self.io_buf.len * 2, 4096));
-        if (self.io_buf.len == 0) {
-            self.io_buf = try a.alloc(u8, cap);
-        } else {
-            self.io_buf = try a.realloc(self.io_buf, cap);
-        }
+        self.io_buf = try a.realloc(self.io_buf, cap);
         return self.io_buf;
     }
 
@@ -378,7 +374,7 @@ const ReverseContext = struct {
                 const s_i: usize = @intCast(@min(off, @as(u64, s.len)));
                 const u_i: usize = @intCast(@min(upper, @as(u64, s.len)));
                 if (s_i >= u_i) return null;
-                const end_i = if (memchr.find(width, s[0..u_i], s_i, self.sep)) |nl| nl + 1 else u_i;
+                const end_i = if (std.mem.findScalarPos(u8, s[0..u_i], s_i, self.sep)) |nl| nl + 1 else u_i;
                 return .{ .start = s_i, .end = end_i };
             },
             .random_access => |ra| {
@@ -389,7 +385,7 @@ const ReverseContext = struct {
                     const got = ra.readAtFull(cur, tmp[0..want]) catch return null;
                     self.bytes_read.* += got;
                     if (got == 0) break;
-                    if (memchr.find(width, tmp[0..got], 0, self.sep)) |nl| {
+                    if (std.mem.findScalar(u8, tmp[0..got], self.sep)) |nl| {
                         return .{ .start = off, .end = cur + nl + 1 };
                     }
                     cur += got;
@@ -500,11 +496,7 @@ const ReverseContext = struct {
         if (self.after_n > inline_after.len) {
             if (self.after_heap.len < self.after_n) {
                 const a = self.alloc orelse return error.OutOfMemory;
-                if (self.after_heap.len == 0) {
-                    self.after_heap = try a.alloc(AbsRange, self.after_n);
-                } else {
-                    self.after_heap = try a.realloc(self.after_heap, self.after_n);
-                }
+                self.after_heap = try a.realloc(self.after_heap, self.after_n);
             }
             after_buf = self.after_heap;
         }
@@ -883,12 +875,12 @@ pub fn searchReverseSlice(
 
     if (config.range_align_lines) {
         if (start_idx > 0 and start_idx < data.len and data[start_idx - 1] != sep) {
-            start_idx = if (memchr.find(width, data, start_idx, sep)) |d| d + 1 else data.len;
+            start_idx = if (std.mem.findScalarPos(u8, data, start_idx, sep)) |d| d + 1 else data.len;
         }
         if (end_idx <= start_idx) {
             end_idx = start_idx;
         } else if (end_idx < data.len and data[end_idx - 1] != sep) {
-            end_idx = if (memchr.find(width, data, end_idx, sep)) |d| d + 1 else data.len;
+            end_idx = if (std.mem.findScalarPos(u8, data, end_idx, sep)) |d| d + 1 else data.len;
         }
     } else if (end_idx < start_idx) {
         end_idx = start_idx;
@@ -962,7 +954,7 @@ pub fn searchReverseSlice(
     while (cursor_end > start_idx and !state.stopped) {
         var commit_lo_idx: usize = if (cursor_end - start_idx <= step_sz) start_idx else cursor_end - step_sz;
         if (commit_lo_idx > start_idx and data[commit_lo_idx - 1] != sep) {
-            if (memchr.find(width, data[0..cursor_end], commit_lo_idx, sep)) |nl_at| {
+            if (std.mem.findScalarPos(u8, data[0..cursor_end], commit_lo_idx, sep)) |nl_at| {
                 if (nl_at + 1 < cursor_end) {
                     commit_lo_idx = nl_at + 1;
                 } else if (memchr.findLast(width, data, start_idx, commit_lo_idx, sep)) |prev_nl| {
@@ -1178,11 +1170,7 @@ pub fn searchReverseAt(
     var buf: []u8 = undefined;
     if (stream_slot) |slot| {
         if (slot.len < buf_cap0) {
-            if (slot.len == 0) {
-                slot.* = try stream_alloc.alloc(u8, buf_cap0);
-            } else {
-                slot.* = try stream_alloc.realloc(slot.*, buf_cap0);
-            }
+            slot.* = try stream_alloc.realloc(slot.*, buf_cap0);
         }
         buf = slot.*;
     } else {
@@ -1245,7 +1233,7 @@ pub fn searchReverseAt(
                         end_off = cur;
                         break;
                     }
-                    if (memchr.find(width, buf[0..rn], 0, sep)) |nl_rel| {
+                    if (std.mem.findScalar(u8, buf[0..rn], sep)) |nl_rel| {
                         start_off = cur + nl_rel + 1;
                         break;
                     }
@@ -1277,7 +1265,7 @@ pub fn searchReverseAt(
                         end_off = cur;
                         break;
                     }
-                    if (memchr.find(width, buf[0..rn], 0, sep)) |nl_rel| {
+                    if (std.mem.findScalar(u8, buf[0..rn], sep)) |nl_rel| {
                         end_off = cur + nl_rel + 1;
                         break;
                     }
@@ -1419,7 +1407,7 @@ pub fn searchReverseAt(
         // Align `overlap_lo` and `commit_lo` inside `raw_window`
         var rel_overlap: usize = 0;
         if (read_lo > start_off) {
-            if (memchr.find(width, raw_window, 0, sep)) |first_nl| {
+            if (std.mem.findScalar(u8, raw_window, sep)) |first_nl| {
                 if (first_nl + 1 < raw_window.len) {
                     rel_overlap = first_nl + 1;
                 }
@@ -1433,7 +1421,7 @@ pub fn searchReverseAt(
             @intCast(@min(@as(u64, raw_window.len), target_lo - read_lo));
 
         if (read_lo + @as(u64, rel_commit) > start_off and rel_commit > 0 and rel_commit < raw_window.len and raw_window[rel_commit - 1] != sep) {
-            if (memchr.find(width, raw_window, rel_commit, sep)) |nl_at| {
+            if (std.mem.findScalarPos(u8, raw_window, rel_commit, sep)) |nl_at| {
                 if (nl_at + 1 < raw_window.len) {
                     rel_commit = nl_at + 1;
                 } else if (memchr.findLast(width, raw_window, rel_overlap, rel_commit, sep)) |prev_nl| {
@@ -1450,7 +1438,7 @@ pub fn searchReverseAt(
 
         // If the entire window has no newline and read_lo > start_off (a single line exceeding step_sz),
         // expand left up to `max_line_len` so normal lines <= max_line_len are never split!
-        if (rel_commit == rel_overlap and read_lo > start_off and memchr.find(width, raw_window, 0, sep) == null) {
+        if (rel_commit == rel_overlap and read_lo > start_off and std.mem.findScalar(u8, raw_window, sep) == null) {
             const line_span_so_far = cursor_end - read_lo;
             if (line_span_so_far <= @as(u64, config.max_line_len) and buf.len < hold_limit) {
                 if (try state_mod.growWithLimit(stream_alloc, buf, hold_limit)) |grown| {

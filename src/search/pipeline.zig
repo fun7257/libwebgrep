@@ -450,6 +450,7 @@ pub fn searchPrepared(
         state.pending_skip_to = null;
     }
 
+    var switched_to_prepass = false;
     if (watchesBinary(config) and config.binary == .quit and canFuse(matcher, config, &state)) {
         const is_ml = state_mod.effectiveMultiline(matcher, config);
         const ml_win = if (is_ml) state_mod.effectiveMultilineWindow(matcher, config) else 0;
@@ -458,6 +459,8 @@ pub fn searchPrepared(
         const need_ls = line_matcher_mod.needLineStart(S, &state, config);
         const direct_sink = !is_ml and ((comptime !@hasDecl(S, "matched")) or config.match_mode == .earliest) and
             config.resume_from == 0 and !config.files_without_match and config.line_filter == null;
+        const initial_pos = state.pos;
+        var fused_hits: usize = 0;
         while (state.pos < view.len and !state.stopped) {
             if (state.exceeded(config) or flagIsSet(config) or stopInMatch(&state, config) or !maybeProgress(S, sink, &state, config)) {
                 if (state.exceeded(config)) state.need_close = true;
@@ -662,6 +665,11 @@ pub fn searchPrepared(
                     state.need_close = true;
                     break;
                 }
+                fused_hits += 1;
+                if (fused_hits >= 4 and state.pos <= initial_pos + 32 * 1024 and view.len > state.pos + 64 * 1024) {
+                    switched_to_prepass = true;
+                    break;
+                }
                 continue;
             }
             if (config.progress_interval == null or config.progress_interval.? == 0) {
@@ -683,18 +691,28 @@ pub fn searchPrepared(
             if (state.pending_skip_to != null) {
                 _ = line_matcher_mod.applyInBufferSkip(view, view.len, &state, config);
                 state.pending_skip_to = null;
+            } else if (!state.stopped and !state.exceeded(config) and state.pos == hit_line_end) {
+                fused_hits += 1;
+                if (fused_hits >= 4 and state.pos <= initial_pos + 32 * 1024 and view.len > state.pos + 64 * 1024) {
+                    switched_to_prepass = true;
+                    break;
+                }
             }
         }
-        const consumed_w = (!state.stopped or state.pos >= view.len) and !state.output_blocked;
-        if (consumed_w and !state.hit_byte_cap and state.soft_error == null) state.scanned_all = true;
-        if (state.hit_byte_cap) noteLimit(&state, .max_bytes);
-        return finishSink(S, sink, &state, config);
+        if (!switched_to_prepass) {
+            const consumed_w = (!state.stopped or state.pos >= view.len) and !state.output_blocked;
+            if (consumed_w and !state.hit_byte_cap and state.soft_error == null) state.scanned_all = true;
+            if (state.hit_byte_cap) noteLimit(&state, .max_bytes);
+            return finishSink(S, sink, &state, config);
+        }
     }
 
     var skip_match = false;
     if (watchesBinary(config)) {
         var nul_at: ?usize = null;
-        if (view.len > 0 and canFuse(matcher, config, &state)) {
+        if (switched_to_prepass) {
+            nul_at = memchr.find(width, view, state.pos, 0);
+        } else if (view.len > 0 and canFuse(matcher, config, &state)) {
             const is_ml = state_mod.effectiveMultiline(matcher, config);
             const ml_win = if (is_ml) state_mod.effectiveMultilineWindow(matcher, config) else 0;
             const found = if (comptime @hasDecl(state_mod.MatcherType(@TypeOf(matcher)), "findWatched")) matcher.findWatched(view, state.pos, &nul_at) else unreachable;

@@ -57,8 +57,38 @@ const payload_mask: u32 = 0x3FFF_FFFF;
 /// all depth-1 states remain 100% dense even for a full 256-byte alphabet.
 const dense_budget_cells: usize = 65_792;
 
+/// Extended L2 dense cell budget (~524 KiB max) reserved exclusively for depth <= 2 states,
+/// keeping 2,000+ pattern sets 100% dense through depth 2 without bloating depth >= 3.
+const dense_depth2_budget_cells: usize = 131_072;
+
+/// Adaptive 4-stream ILP lane sizing and maximum pattern length for interleaved dense scanning.
+const ilp_min_lane: usize = 256;
+const ilp_max_lane: usize = 2048;
+const ilp_max_pat_len: u32 = 128;
+
 /// Chunk size for cache-hot periodic NUL detection in `findWatchingNul` when not using SIMD skip.
 const nul_chunk_bytes: usize = 32 * 1024;
+
+/// All 256 byte values pre-sorted by `frequency.default_rank` descending (tie-broken by byte ascending)
+/// so BFS assigns dense slots to hot text prefixes first.
+const bytes_by_freq_desc: [256]u8 = blk: {
+    @setEvalBranchQuota(100_000);
+    var order: [256]u8 = undefined;
+    for (0..256) |i| order[i] = @intCast(i);
+    for (1..256) |i| {
+        const key = order[i];
+        const key_rank = frequency.default_rank[key];
+        var j = i;
+        while (j > 0) : (j -= 1) {
+            const prev = order[j - 1];
+            const prev_rank = frequency.default_rank[prev];
+            if (prev_rank > key_rank or (prev_rank == key_rank and prev < key)) break;
+            order[j] = prev;
+        }
+        order[j] = key;
+    }
+    break :blk order;
+};
 
 const Out = struct {
     len: u32,
@@ -191,7 +221,8 @@ pub const Ac = struct {
             step_limit: usize = 0,
             nul_checked: usize,
             skip_cooldown: usize,
-            skip_backoff: usize = 64,
+            skip_backoff: usize = 1024,
+            ilp_lane: usize = ilp_min_lane,
         };
         var ls = LoopState{
             .i = start,
@@ -237,11 +268,11 @@ pub const Ac = struct {
                     ls.i = skip_res.pos;
                     if (ls.i >= ls.scan_end) break :outer;
                     if (ls.i > before) {
-                        ls.skip_backoff = 64;
+                        ls.skip_backoff = 1024;
                         ls.skip_cooldown = ls.i + 16;
                     } else {
                         ls.skip_cooldown = ls.i + ls.skip_backoff;
-                        if (ls.skip_backoff < 4096) ls.skip_backoff *= 2;
+                        if (ls.skip_backoff < 65536) ls.skip_backoff *= 2;
                     }
                 }
             }
@@ -255,6 +286,28 @@ pub const Ac = struct {
             if (watch_nul and best == null) {
                 const nul_limit = ls.i +| nul_chunk_bytes;
                 if (nul_limit < ls.step_limit) ls.step_limit = nul_limit;
+            }
+
+            if (ls.state == 0 and best == null and self.max_len <= ilp_max_pat_len) {
+                const ov: usize = self.max_len - 1;
+                if (ls.step_limit - ls.i >= 4 * ilp_min_lane and ls.scan_end - ls.i >= 4 * ilp_min_lane + ov) {
+                    const res = self.scan4Stream(haystack, ls.i, ls.step_limit, ls.scan_end, ls.ilp_lane);
+                    if (res.hit) {
+                        self.resolve4StreamMatch(
+                            haystack,
+                            res.pos,
+                            res.lane,
+                            res.hit_k,
+                            res.hit_n,
+                            mode,
+                            &best,
+                            &ls.scan_end,
+                        );
+                        break :outer;
+                    }
+                    ls.i = res.pos;
+                    ls.ilp_lane = res.lane;
+                }
             }
 
             var i = ls.i;
@@ -355,13 +408,193 @@ pub const Ac = struct {
             }
             return null;
         };
-        if (watch_nul and ls.nul_checked < chosen.start) {
-            if (memchr.find(memchr.native_width, haystack[0..chosen.start], ls.nul_checked, 0)) |nul_at| {
+        if (watch_nul and ls.nul_checked < chosen.end) {
+            if (memchr.find(memchr.native_width, haystack[0..chosen.end], ls.nul_checked, 0)) |nul_at| {
                 nul_out.* = nul_at;
                 return null;
             }
         }
         return .{ .start = chosen.start, .end = chosen.end, .pattern_id = chosen.id };
+    }
+
+    const Scan4Result = struct {
+        pos: usize,
+        lane: usize,
+        hit: bool,
+        hit_k: usize = 0,
+        hit_n: [4]u32 = .{ 0, 0, 0, 0 },
+    };
+
+    noinline fn scan4Stream(
+        self: *const Ac,
+        haystack: []const u8,
+        start_pos: usize,
+        step_limit: usize,
+        scan_end: usize,
+        start_lane: usize,
+    ) Scan4Result {
+        const dense = self.dense.ptr;
+        const class_of = &self.class_of;
+        const ov: usize = self.max_len - 1;
+        var pos = start_pos;
+        var cur_lane = start_lane;
+
+        while (step_limit - pos >= 4 * ilp_min_lane and scan_end - pos >= 4 * ilp_min_lane + ov) {
+            const avail_step = step_limit - pos;
+            const avail_scan = scan_end - pos;
+            var lane = cur_lane;
+            while (lane > ilp_min_lane and (4 * lane > avail_step or 4 * lane + ov > avail_scan)) {
+                lane >>= 1;
+            }
+            const limit = lane + ov;
+            const p0 = haystack.ptr + pos;
+            const p1 = p0 + lane;
+            const p2 = p1 + lane;
+            const p3 = p2 + lane;
+
+            var s0: u32 = 0;
+            var s1: u32 = 0;
+            var s2: u32 = 0;
+            var s3: u32 = 0;
+            var k: usize = 0;
+
+            while (k < limit) {
+                const n0 = dense[s0 + class_of[p0[k]]];
+                const n1 = dense[s1 + class_of[p1[k]]];
+                const n2 = dense[s2 + class_of[p2[k]]];
+                const n3 = dense[s3 + class_of[p3[k]]];
+                const comb = (n0 | n1) | (n2 | n3);
+                if (comb >= sparse_bit) {
+                    @branchHint(.unlikely);
+                    if ((comb & match_bit) != 0) {
+                        return .{
+                            .pos = pos,
+                            .lane = lane,
+                            .hit = true,
+                            .hit_k = k,
+                            .hit_n = .{ n0, n1, n2, n3 },
+                        };
+                    }
+                    // At least one lane entered a sparse state without matching; step all 4 lanes
+                    // in lockstep until all return to dense or a match fires.
+                    s0 = n0;
+                    s1 = n1;
+                    s2 = n2;
+                    s3 = n3;
+                    k += 1;
+                    while (k < limit and ((s0 | s1) | (s2 | s3)) >= sparse_bit) {
+                        const sn0 = if (s0 < sparse_bit) dense[s0 + class_of[p0[k]]] else self.stepSparse(s0 & payload_mask, p0[k]);
+                        const sn1 = if (s1 < sparse_bit) dense[s1 + class_of[p1[k]]] else self.stepSparse(s1 & payload_mask, p1[k]);
+                        const sn2 = if (s2 < sparse_bit) dense[s2 + class_of[p2[k]]] else self.stepSparse(s2 & payload_mask, p2[k]);
+                        const sn3 = if (s3 < sparse_bit) dense[s3 + class_of[p3[k]]] else self.stepSparse(s3 & payload_mask, p3[k]);
+                        if ((((sn0 | sn1) | (sn2 | sn3)) & match_bit) != 0) {
+                            return .{
+                                .pos = pos,
+                                .lane = lane,
+                                .hit = true,
+                                .hit_k = k,
+                                .hit_n = .{ sn0, sn1, sn2, sn3 },
+                            };
+                        }
+                        s0 = sn0;
+                        s1 = sn1;
+                        s2 = sn2;
+                        s3 = sn3;
+                        k += 1;
+                    }
+                    continue;
+                }
+                s0 = n0;
+                s1 = n1;
+                s2 = n2;
+                s3 = n3;
+                k += 1;
+            }
+
+            pos += 4 * lane;
+            if (lane == cur_lane and cur_lane < ilp_max_lane) {
+                cur_lane *= 2;
+            }
+        }
+
+        return .{ .pos = pos, .lane = cur_lane, .hit = false };
+    }
+
+    noinline fn resolve4StreamMatch(
+        self: *const Ac,
+        haystack: []const u8,
+        pos: usize,
+        lane: usize,
+        hit_k: usize,
+        hit_n: [4]u32,
+        comptime mode: matcher.MatchMode,
+        best: *?Cand,
+        scan_end: *usize,
+    ) void {
+        const dense = self.dense.ptr;
+        const class_of = &self.class_of;
+        const limit = lane + @as(usize, self.max_len - 1);
+
+        var h: usize = 0;
+        while (h < 4) : (h += 1) {
+            if ((hit_n[h] & match_bit) != 0) break;
+        }
+        std.debug.assert(h < 4);
+
+        // Finish any earlier lanes 0..h-1 from (hit_k + 1, hit_n[l]) up to `limit` without
+        // rescanning [0..hit_k]. If an earlier lane matches, it strictly determines the winner.
+        for (0..h) |l| {
+            const lane_base = pos + l * lane;
+            const lane_limit = lane_base + limit;
+            var abs_i = lane_base + hit_k + 1;
+            var state = hit_n[l];
+            std.debug.assert((state & match_bit) == 0);
+            while (abs_i < lane_limit) {
+                const next = if (state < sparse_bit)
+                    dense[state + class_of[haystack[abs_i]]]
+                else
+                    self.stepSparse(state & payload_mask, haystack[abs_i]);
+                abs_i += 1;
+                if ((next & match_bit) != 0) {
+                    self.recordMatches(next, abs_i, mode, best, scan_end);
+                    if (comptime mode == .earliest) return;
+                    self.finishLeftmostLane(haystack, abs_i, next & ~match_bit, best, scan_end);
+                    return;
+                }
+                state = next;
+            }
+        }
+
+        const h_end = pos + h * lane + hit_k + 1;
+        self.recordMatches(hit_n[h], h_end, mode, best, scan_end);
+        if (comptime mode == .leftmost_first) {
+            self.finishLeftmostLane(haystack, h_end, hit_n[h] & ~match_bit, best, scan_end);
+        }
+    }
+
+    inline fn finishLeftmostLane(
+        self: *const Ac,
+        haystack: []const u8,
+        start_i: usize,
+        start_state: u32,
+        best: *?Cand,
+        scan_end: *usize,
+    ) void {
+        const dense = self.dense.ptr;
+        const class_of = &self.class_of;
+        var abs_i = start_i;
+        var state = start_state;
+        while (abs_i < scan_end.*) {
+            const next = if (state < sparse_bit)
+                dense[state + class_of[haystack[abs_i]]]
+            else
+                self.stepSparse(state & payload_mask, haystack[abs_i]);
+            abs_i += 1;
+            if ((next & match_bit) != 0) {
+                self.recordMatches(next, abs_i, .leftmost_first, best, scan_end);
+            }
+            state = next & ~match_bit;
+        }
     }
 
     inline fn stepSparse(self: *const Ac, start_sparse_idx: u32, raw: u8) u32 {
@@ -732,7 +965,8 @@ pub fn build(
     bfs_order[0] = 0;
     old_to_new[0] = 0;
     var q_len: usize = 1;
-    for (0..256) |b| {
+    // Enqueue depth-1 states ordered by byte frequency descending so hot text prefixes claim dense slots first.
+    for (bytes_by_freq_desc) |b| {
         const cid = root_children[b];
         if (cid != 0) {
             nodes.items[cid].fail = 0;
@@ -741,8 +975,47 @@ pub fn build(
             q_len += 1;
         }
     }
+    const depth1_end: usize = q_len;
 
+    // Expand depth-1 states with their children also sorted by byte frequency descending.
     var q_at: usize = 1;
+    var d1_children: [256]u32 = undefined;
+    while (q_at < depth1_end) : (q_at += 1) {
+        const u = bfs_order[q_at];
+        var cnt: usize = 0;
+        var v = nodes.items[u].first_child;
+        while (v != 0) : (v = nodes.items[v].next_sibling) {
+            d1_children[cnt] = v;
+            cnt += 1;
+        }
+        if (cnt > 1) {
+            var a: usize = 1;
+            while (a < cnt) : (a += 1) {
+                const kv = d1_children[a];
+                const kb = nodes.items[kv].edge_byte;
+                const kr = frequency.default_rank[kb];
+                var j = a;
+                while (j > 0) : (j -= 1) {
+                    const pv = d1_children[j - 1];
+                    const pb = nodes.items[pv].edge_byte;
+                    const pr = frequency.default_rank[pb];
+                    if (pr > kr or (pr == kr and pb < kb)) break;
+                    d1_children[j] = pv;
+                }
+                d1_children[j] = kv;
+            }
+        }
+        for (d1_children[0..cnt]) |child| {
+            const b = nodes.items[child].edge_byte;
+            // Depth-1 nodes always have fail == 0, so a depth-2 child's failure link is root_children[b].
+            nodes.items[child].fail = root_children[b];
+            old_to_new[child] = @intCast(q_len);
+            bfs_order[q_len] = child;
+            q_len += 1;
+        }
+    }
+    const depth2_end: usize = q_len;
+
     while (q_at < q_len) : (q_at += 1) {
         const u = bfs_order[q_at];
         var v = nodes.items[u].first_child;
@@ -831,7 +1104,9 @@ pub fn build(
     std.debug.assert(out_cursor == build_outs.items.len);
 
     // 5. Build cache-resident dense prefix (BFS states 0..dense_count-1) + compact sparse NFA tail.
-    const dense_count_usize: usize = @max(@as(usize, 1), @min(nstates, dense_budget_cells / @as(usize, nclasses)));
+    const base_dense_cap = dense_budget_cells / @as(usize, nclasses);
+    const depth2_dense_cap = @min(depth2_end, dense_depth2_budget_cells / @as(usize, nclasses));
+    const dense_count_usize: usize = @max(@as(usize, 1), @min(nstates, @max(base_dense_cap, depth2_dense_cap)));
     const dense_count: u32 = @intCast(dense_count_usize);
     const dense_cells = dense_count_usize * @as(usize, nclasses);
     const dense = try allocator.alloc(u32, dense_cells);
@@ -1306,8 +1581,14 @@ test "large 2000-pattern hybrid automaton: deep sparse matches, chunk-boundary N
     defer ac.deinit();
     try std.testing.expect(!ac.use_anchor);
     try std.testing.expect(ac.sparse_states.len > 10_000);
-    // Dense prefix must stay bounded within L2 budget (~263 KiB).
-    try std.testing.expect(ac.dense.len <= dense_budget_cells);
+    // Dense prefix stays bounded within the depth-2 L2 budget (~524 KiB) while covering hot depth-2 states.
+    try std.testing.expect(ac.dense.len <= dense_depth2_budget_cells);
+    try std.testing.expect(ac.dense_count > dense_budget_cells / ac.nclasses);
+    // Frequency-ordered BFS keeps high-frequency lowercase depth-2 prefixes (e.g. "et") dense.
+    const d1_e = ac.dense[ac.class_of['e']];
+    try std.testing.expect(d1_e < sparse_bit);
+    const d2_et = ac.dense[d1_e + ac.class_of['t']];
+    try std.testing.expect(d2_et < sparse_bit);
 
     // Build a >64 KiB haystack spanning multiple nul_chunk_bytes boundaries
     const hay_len = nul_chunk_bytes * 2 + 1024;
@@ -1358,7 +1639,7 @@ test "divNclasses exactness across all nclasses 1..256 and OOM safety" {
     for (1..257) |d_usize| {
         const d: u32 = @intCast(d_usize);
         const inv: u64 = ((@as(u64, 1) << 32) + @as(u64, d) - 1) / @as(u64, d);
-        const max_q: u32 = @intCast(dense_budget_cells / d_usize);
+        const max_q: u32 = @intCast(dense_depth2_budget_cells / d_usize);
         var q: u32 = 0;
         while (q <= max_q) : (q += 1) {
             try std.testing.expectEqual(@as(usize, q), divNclasses(q * d, inv));
@@ -1383,5 +1664,241 @@ test "divNclasses exactness across all nclasses 1..256 and OOM safety" {
             mut.deinit();
             break;
         } else |_| {}
+    }
+}
+
+test "4-stream ILP parity: lane boundaries, cross-lane overlaps, and sparse transitions" {
+    const alloc = std.testing.allocator;
+    // Build >1,000 patterns with deep shared prefixes so sparse_states is non-empty and
+    // max_len <= ilp_max_pat_len, exercising both dense and sparse transitions inside 4-stream ILP.
+    const base_pats = 1000;
+    const extra_pats = 6;
+    const n_pats = base_pats + extra_pats;
+    var storage = try alloc.alloc([40]u8, base_pats);
+    defer alloc.free(storage);
+    var pats = try alloc.alloc([]const u8, n_pats);
+    defer alloc.free(pats);
+
+    const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_-";
+    for (0..base_pats) |i| {
+        const c0 = alphabet[i % alphabet.len];
+        const c1 = alphabet[(i * 7 + 3) % alphabet.len];
+        const c2 = alphabet[(i * 13 + 5) % alphabet.len];
+        const c3 = alphabet[(i * 19 + 11) % alphabet.len];
+        pats[i] = try std.fmt.bufPrint(&storage[i], "{c}{c}{c}{c}_tok_{d:0>4}_tail", .{ c0, c1, c2, c3, i });
+    }
+    // Overlapping patterns (note lower id for longer pattern to stress leftmost_first tie-breaking)
+    pats[base_pats + 0] = "zzzz_alpha_beta_gamma";
+    pats[base_pats + 1] = "alpha_beta";
+    pats[base_pats + 2] = "beta_ga";
+    pats[base_pats + 3] = "short_hit";
+    // Deep sparse chain (depth > 25, guaranteed to live in sparse_states)
+    pats[base_pats + 4] = "deep_sparse_chain_0123456789_alpha_end";
+    pats[base_pats + 5] = "deep_sparse_chain_0123456789_beta_end";
+
+    inline for (.{ false, true }) |ignore_case| {
+        var ac = try build(alloc, pats, ignore_case);
+        defer ac.deinit();
+        try std.testing.expect(!ac.use_anchor);
+        try std.testing.expect(ac.sparse_states.len > 0);
+        try std.testing.expect(ac.max_len <= ilp_max_pat_len);
+
+        const ov: usize = ac.max_len - 1;
+        const lane: usize = ilp_min_lane;
+        const hay_len = 16 * 1024 + 512;
+        const hay = try alloc.alloc(u8, hay_len);
+        defer alloc.free(hay);
+
+        const extra_slice = pats[base_pats..];
+
+        // 1. Matches straddling every lane boundary (lane-1, lane, 2*lane, 3*lane, 4*lane-1)
+        //    plus a boundary after adaptive lane doubling (at 7168 -> lane = 2048).
+        const boundary_offsets = [_]usize{
+            lane - 1,
+            lane,
+            lane - 5,
+            2 * lane - 3,
+            2 * lane,
+            3 * lane - 2,
+            3 * lane,
+            4 * lane - 1,
+            4 * lane,
+            // After 1024 + 2048 + 4096 = 7168 bytes, adaptive lane reaches 2048:
+            7168 + ilp_max_lane - 1,
+            7168 + 2 * ilp_max_lane - 4,
+            7168 + 3 * ilp_max_lane,
+            7168 + 4 * ilp_max_lane - 1,
+        };
+        for (boundary_offsets) |off| {
+            @memset(hay, 'a'); // 'a' is a start byte, forcing immediate 4-stream entry
+            const pat = if (ignore_case) "ZZZZ_ALPHA_BETA_GAMMA" else "zzzz_alpha_beta_gamma";
+            @memcpy(hay[off..][0..pat.len], pat);
+            inline for (.{ .earliest, .leftmost_first }) |mode| {
+                const got = ac.find(hay, 0, mode).?;
+                const want = scalarAcCase(hay, 0, extra_slice, ignore_case, mode).?;
+                try std.testing.expectEqual(want.start, got.start);
+                try std.testing.expectEqual(want.end, got.end);
+                try std.testing.expectEqual(@as(?u32, base_pats + want.pattern_id.?), got.pattern_id);
+            }
+        }
+
+        // 2. Lane 1 matches at small k while lane 0 matches at k' > k (both before and in overlap zone)
+        {
+            @memset(hay, 'a');
+            // Lane 1 fires early at k = 10 + 9 - 1 = 18; lane 0 matches later at k' = 200 + 10 - 1 = 209
+            @memcpy(hay[lane + 10 ..][0.."short_hit".len], "short_hit");
+            @memcpy(hay[200..][0.."alpha_beta".len], "alpha_beta");
+            inline for (.{ .earliest, .leftmost_first }) |mode| {
+                const got = ac.find(hay, 0, mode).?;
+                const want = scalarAcCase(hay, 0, extra_slice, ignore_case, mode).?;
+                try std.testing.expectEqual(want.start, got.start);
+                try std.testing.expectEqual(want.end, got.end);
+                try std.testing.expectEqual(@as(?u32, base_pats + want.pattern_id.?), got.pattern_id);
+            }
+
+            // Lane 0 starts at lane - 4 ("zzzz_alpha_beta_gamma", ends at lane + 17);
+            // lane 1 sees "alpha_beta" (ends at lane + 11) and "beta_ga" earlier at k < lane!
+            @memset(hay, 'a');
+            @memcpy(hay[lane - 4 ..][0.."zzzz_alpha_beta_gamma".len], "zzzz_alpha_beta_gamma");
+            inline for (.{ .earliest, .leftmost_first }) |mode| {
+                const got = ac.find(hay, 0, mode).?;
+                const want = scalarAcCase(hay, 0, extra_slice, ignore_case, mode).?;
+                try std.testing.expectEqual(want.start, got.start);
+                try std.testing.expectEqual(want.end, got.end);
+                try std.testing.expectEqual(@as(?u32, base_pats + want.pattern_id.?), got.pattern_id);
+            }
+
+            // Lane 3 match near limit = 4*lane + ov where "alpha_beta" ends inside chunk 1 while
+            // the longer leftmost_first winner "zzzz_alpha_beta_gamma" extends PAST 4*lane + ov.
+            @memset(hay, 'a');
+            const edge_off = 4 * lane + ov - 16;
+            @memcpy(hay[edge_off..][0.."zzzz_alpha_beta_gamma".len], "zzzz_alpha_beta_gamma");
+            inline for (.{ .earliest, .leftmost_first }) |mode| {
+                const got = ac.find(hay, 0, mode).?;
+                const want = scalarAcCase(hay, 0, extra_slice, ignore_case, mode).?;
+                try std.testing.expectEqual(want.start, got.start);
+                try std.testing.expectEqual(want.end, got.end);
+                try std.testing.expectEqual(@as(?u32, base_pats + want.pattern_id.?), got.pattern_id);
+            }
+        }
+
+        // 3. Sparse transitions inside 4-stream ILP (both non-matching deep sparse decoys and real deep sparse matches)
+        {
+            @memset(hay, 'a');
+            const decoy = "deep_sparse_chain_0123456789_XXXXX";
+            // Plant decoys in every lane at staggered offsets so sparse lockstep triggers repeatedly
+            @memcpy(hay[15..][0..decoy.len], decoy);
+            @memcpy(hay[lane + 15 ..][0..decoy.len], decoy);
+            @memcpy(hay[2 * lane + 35 ..][0..decoy.len], decoy);
+            @memcpy(hay[3 * lane + 55 ..][0..decoy.len], decoy);
+            // Plant a real deep sparse match in lane 2 after the decoys, plus a lane 3 hit
+            const sparse_hit = "deep_sparse_chain_0123456789_beta_end";
+            @memcpy(hay[2 * lane + 110 ..][0..sparse_hit.len], sparse_hit);
+            @memcpy(hay[3 * lane + 120 ..][0.."short_hit".len], "short_hit");
+            inline for (.{ .earliest, .leftmost_first }) |mode| {
+                const got = ac.find(hay, 0, mode).?;
+                const want = scalarAcCase(hay, 0, extra_slice, ignore_case, mode).?;
+                try std.testing.expectEqual(want.start, got.start);
+                try std.testing.expectEqual(want.end, got.end);
+                try std.testing.expectEqual(@as(?u32, base_pats + want.pattern_id.?), got.pattern_id);
+            }
+        }
+    }
+}
+
+test "4-stream ILP findWatchingNul: before lane 0, between lanes, inside match, and 32 KiB chunks" {
+    const alloc = std.testing.allocator;
+    const base_pats = 120;
+    const n_pats = base_pats + 2;
+    var storage = try alloc.alloc([20]u8, base_pats);
+    defer alloc.free(storage);
+    var pats = try alloc.alloc([]const u8, n_pats);
+    defer alloc.free(pats);
+
+    const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_-";
+    for (0..base_pats) |i| {
+        const c0 = alphabet[i % alphabet.len];
+        const c1 = alphabet[(i * 7 + 1) % alphabet.len];
+        pats[i] = try std.fmt.bufPrint(&storage[i], "{c}{c}_watch_{d:0>3}_end", .{ c0, c1, i });
+    }
+    const nul_pat = "nul_pat_\x00_mid";
+    const ascii_pat = "target_watch_hit";
+    pats[base_pats] = nul_pat;
+    pats[base_pats + 1] = ascii_pat;
+
+    var ac = try build(alloc, pats, false);
+    defer ac.deinit();
+    try std.testing.expect(!ac.use_anchor);
+    try std.testing.expect(ac.max_len <= ilp_max_pat_len);
+
+    const lane: usize = ilp_min_lane;
+    const hay_len = nul_chunk_bytes * 2 + 4096;
+    const hay = try alloc.alloc(u8, hay_len);
+    defer alloc.free(hay);
+
+    inline for (.{ .earliest, .leftmost_first }) |mode| {
+        // 1. NUL placed before lane 0 match suppresses match
+        @memset(hay, 'a');
+        hay[42] = 0;
+        @memcpy(hay[100..][0..ascii_pat.len], ascii_pat);
+        var nul_at: ?usize = null;
+        try std.testing.expect(ac.findWatchingNul(hay, 0, mode, &nul_at) == null);
+        try std.testing.expectEqual(@as(?usize, 42), nul_at);
+
+        // 2. NUL placed between lane 0 and lane 2 when only lane 2 matches -> NUL wins
+        @memset(hay, 'a');
+        hay[lane + 77] = 0;
+        @memcpy(hay[2 * lane + 20 ..][0..ascii_pat.len], ascii_pat);
+        nul_at = null;
+        try std.testing.expect(ac.findWatchingNul(hay, 0, mode, &nul_at) == null);
+        try std.testing.expectEqual(@as(?usize, lane + 77), nul_at);
+
+        // 3. Match in lane 0, NUL between lane 0 and lane 2, match in lane 2 -> lane 0 match wins
+        @memset(hay, 'a');
+        @memcpy(hay[80..][0..ascii_pat.len], ascii_pat);
+        hay[lane + 77] = 0;
+        @memcpy(hay[2 * lane + 20 ..][0..ascii_pat.len], ascii_pat);
+        nul_at = null;
+        const l0_hit = ac.findWatchingNul(hay, 0, mode, &nul_at).?;
+        try std.testing.expectEqual(@as(usize, 80), l0_hit.start);
+        try std.testing.expectEqual(@as(?usize, null), nul_at);
+
+        // 4. NUL inside a matching pattern (in lane 1) -> NUL wins
+        @memset(hay, 'a');
+        const nul_pat_pos = lane + 30;
+        @memcpy(hay[nul_pat_pos..][0..nul_pat.len], nul_pat);
+        nul_at = null;
+        try std.testing.expect(ac.findWatchingNul(hay, 0, mode, &nul_at) == null);
+        try std.testing.expectEqual(@as(?usize, nul_pat_pos + 8), nul_at);
+
+        // 5. NUL immediately AFTER match end in lane 2 does NOT suppress the match
+        @memset(hay, 'a');
+        const l2_pos = 2 * lane + 20;
+        @memcpy(hay[l2_pos..][0..ascii_pat.len], ascii_pat);
+        hay[l2_pos + ascii_pat.len] = 0;
+        nul_at = null;
+        const l2_hit = ac.findWatchingNul(hay, 0, mode, &nul_at).?;
+        try std.testing.expectEqual(l2_pos, l2_hit.start);
+        try std.testing.expectEqual(@as(?usize, null), nul_at);
+
+        // 6. Across 32 KiB chunk boundaries: NUL in second chunk before match
+        @memset(hay, 'a');
+        const chunk2_nul = nul_chunk_bytes + 500;
+        const chunk2_match = nul_chunk_bytes + 5000;
+        hay[chunk2_nul] = 0;
+        @memcpy(hay[chunk2_match..][0..ascii_pat.len], ascii_pat);
+        nul_at = null;
+        try std.testing.expect(ac.findWatchingNul(hay, 0, mode, &nul_at) == null);
+        try std.testing.expectEqual(@as(?usize, chunk2_nul), nul_at);
+
+        // 7. Across 32 KiB chunk boundary: match straddling 32 KiB before NUL in second chunk
+        @memset(hay, 'a');
+        const straddle_pos = nul_chunk_bytes - 5;
+        @memcpy(hay[straddle_pos..][0..ascii_pat.len], ascii_pat);
+        hay[nul_chunk_bytes + 500] = 0;
+        nul_at = null;
+        const straddle_hit = ac.findWatchingNul(hay, 0, mode, &nul_at).?;
+        try std.testing.expectEqual(straddle_pos, straddle_hit.start);
+        try std.testing.expectEqual(@as(?usize, null), nul_at);
     }
 }

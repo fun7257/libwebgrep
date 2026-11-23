@@ -58,6 +58,10 @@ pub const WEBGREP_ENTRY_FILE: i32 = 0;
 pub const WEBGREP_ENTRY_DIRECTORY: i32 = 1;
 pub const WEBGREP_ENTRY_OTHER: i32 = 2;
 
+pub const WEBGREP_WHOLE_WORD_OFF: u8 = 0;
+pub const WEBGREP_WHOLE_WORD_UNICODE: u8 = 1;
+pub const WEBGREP_WHOLE_WORD_ASCII: u8 = 2;
+
 // ============================================================================
 // Opaque Handles & Extern Structs
 // ============================================================================
@@ -615,6 +619,7 @@ pub fn buildSearchConfig(
     z_cfg.passthru = c.passthru != 0;
     z_cfg.line_numbers = z_cfg.line_number_mode != .unknown;
     z_cfg.whole_word = c.whole_word != 0;
+    z_cfg.whole_word_unicode = (c.whole_word != WEBGREP_WHOLE_WORD_ASCII);
     z_cfg.whole_line = c.line_regexp != 0;
     z_cfg.multiline = c.multiline != 0;
     if (c.max_multiline_window > 0) z_cfg.max_multiline_window = c.max_multiline_window;

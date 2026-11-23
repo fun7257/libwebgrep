@@ -118,18 +118,29 @@ pub fn noteLong(
     }
     if (state.long_has_match or config.whole_line) return;
     const keep = if (commit) 0 else overlapKeep(matcher, config);
-    const stable = if (bytes.len > keep) bytes.len - keep else 0;
+    const left_ctx: usize = if (!commit and config.whole_word) (if (config.whole_word_unicode) @as(usize, 4) else @as(usize, 1)) else 0;
+    const stable = if (bytes.len > keep) @min(bytes.len, (bytes.len - keep) + left_ctx) else 0;
     var pos: usize = 0;
     while (pos < stable) {
         const hit = nextMatch(matcher, bytes, pos, config) orelse break;
         if (hit.start >= stable) break;
-        if (config.whole_word and hit.end >= bytes.len and !commit) {
-            pos = @min(bytes.len, hit.start + 1);
-            continue;
+        if (config.whole_word and !commit) {
+            var right_truncated = hit.end >= bytes.len;
+            if (!right_truncated and config.whole_word_unicode and bytes[hit.end] >= 0x80) {
+                if (std.unicode.utf8ByteSequenceLength(bytes[hit.end])) |seq_len| {
+                    if (hit.end + seq_len > bytes.len) right_truncated = true;
+                } else |_| {}
+            }
+            if (right_truncated) {
+                pos = @min(bytes.len, hit.start + 1);
+                continue;
+            }
         }
-        if (config.whole_word and state.long_dropped > 0 and hit.start == 0 and !commit) {
-            pos = @min(bytes.len, hit.start + 1);
-            continue;
+        if (config.whole_word and state.long_dropped > 0) {
+            if (hit.start == 0 or (config.whole_word_unicode and hit.start < 4 and bytes.len > 0 and (bytes[0] & 0xC0) == 0x80)) {
+                pos = @min(bytes.len, hit.start + 1);
+                continue;
+            }
         }
         try saveMatchWindow(allocator, bytes, hit, hold, state, config);
         state.long_has_match = true;
@@ -184,13 +195,21 @@ pub fn savePrefix(
 pub fn slideLong(buf: *[]u8, filled: *usize, matcher: anytype, state: *State, config: SearchConfig) void {
     const keep = overlapKeep(matcher, config);
     if (filled.* <= keep) return;
-    const drop = filled.* - keep;
+    var drop = filled.* - keep;
+    if (config.whole_word and config.whole_word_unicode) {
+        var back: usize = 0;
+        while (drop > 0 and back < 3 and (buf.*[drop] & 0xC0) == 0x80) : (back += 1) {
+            drop -= 1;
+        }
+        if (drop == 0) return;
+    }
+    const actual_keep = filled.* - drop;
     if (state.line_number) |ln| {
         const nls = memchr.count(width, buf.*[0..drop], 0, drop, recordSep(config));
         state.line_number = ln + nls;
     }
-    @memmove(buf.*[0..keep], buf.*[drop..filled.*]);
-    filled.* = keep;
+    @memmove(buf.*[0..actual_keep], buf.*[drop..filled.*]);
+    filled.* = actual_keep;
     state.long_dropped += drop;
     state.abs_base += drop;
 }

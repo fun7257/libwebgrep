@@ -445,6 +445,24 @@ pub const FoundLine = struct {
     }
 };
 
+inline fn matcherCannotStartOnLineBreak(matcher: anytype, config: SearchConfig) bool {
+    if (config.null_data) return false;
+    const T = state_mod.MatcherType(@TypeOf(matcher));
+    if (@hasField(T, "req_is_prefix") and @hasField(T, "req_literal_bytes")) {
+        if (matcher.req_is_prefix and matcher.req_literal_bytes.len > 0) {
+            const b0 = matcher.req_literal_bytes[0];
+            return b0 != '\n' and b0 != '\r';
+        }
+    }
+    if (@hasField(T, "pattern")) {
+        if (matcher.pattern.len > 0) {
+            const b0 = matcher.pattern[0];
+            return b0 != '\n' and b0 != '\r';
+        }
+    }
+    return false;
+}
+
 pub inline fn bridgingProbeLimit(matcher: anytype, buf: []const u8, end: usize, config: SearchConfig) usize {
     if (end >= buf.len) return buf.len;
     if (!config.null_data) {
@@ -566,12 +584,19 @@ fn findLineLimitInternal(matcher: anytype, buf: []const u8, state: *State, limit
             var single_match = false;
             if (is_ml and !config.whole_line) {
                 single_match = true;
+                const unconstrained = config.max_count == null and !config.exists and config.max_results == null and !config.files_without_match and !config.stop_on_nonmatch and (limit >= buf.len or state.from_reader);
+                const no_lb_start = matcherCannotStartOnLineBreak(matcher, config);
                 var cur = hit;
                 while (true) {
                     const next_from = if (cur.end == cur.start) cur.end + 1 else cur.end;
                     if (next_from >= end or next_from > buf.len) break;
-                    const probe_lim = bridgingProbeLimit(matcher, buf, end, config);
-                    const m2 = nextMatch(matcher, buf[0..probe_lim], next_from, config) orelse break;
+                    if (no_lb_start and next_from >= contentEnd(buf, .{ .start = cur.start, .end = end }, config)) break;
+                    const m2 = if (unconstrained)
+                        (nextMatchCached(matcher, buf, next_from, state, config) orelse break)
+                    else blk: {
+                        const probe_lim = bridgingProbeLimit(matcher, buf, end, config);
+                        break :blk nextMatch(matcher, buf[0..probe_lim], next_from, config) orelse break;
+                    };
                     if (m2.start >= end) break;
                     single_match = false;
                     const end2 = matchLineEnd(buf, pos, m2, config);
@@ -641,12 +666,19 @@ fn findLineLimitInternal(matcher: anytype, buf: []const u8, state: *State, limit
         var single_match = false;
         if (is_ml and !config.whole_line) {
             single_match = true;
+            const unconstrained = config.max_count == null and !config.exists and config.max_results == null and !config.files_without_match and !config.stop_on_nonmatch and (limit >= buf.len or state.from_reader);
+            const no_lb_start = matcherCannotStartOnLineBreak(matcher, config);
             var cur = hit;
             while (true) {
                 const next_from = if (cur.end == cur.start) cur.end + 1 else cur.end;
                 if (next_from >= end or next_from > buf.len) break;
-                const probe_lim = bridgingProbeLimit(matcher, buf, end, config);
-                const m2 = nextMatch(matcher, buf[0..probe_lim], next_from, config) orelse break;
+                if (no_lb_start and next_from >= contentEnd(buf, .{ .start = start, .end = end }, config)) break;
+                const m2 = if (unconstrained)
+                    (nextMatchCached(matcher, buf, next_from, state, config) orelse break)
+                else blk: {
+                    const probe_lim = bridgingProbeLimit(matcher, buf, end, config);
+                    break :blk nextMatch(matcher, buf[0..probe_lim], next_from, config) orelse break;
+                };
                 if (m2.start >= end) break;
                 single_match = false;
                 const end2 = matchLineEnd(buf, start, m2, config);
@@ -700,6 +732,12 @@ const WordBoundedCtx = struct {
     }
 };
 
+const WordBoundedAsciiCtx = struct {
+    pub inline fn allow(_: WordBoundedAsciiCtx, haystack: []const u8, start: usize, end: usize) bool {
+        return wordBoundedAscii(haystack, start, end);
+    }
+};
+
 pub inline fn nextMatchCached(matcher: anytype, buf: []const u8, pos: usize, state: *State, config: SearchConfig) ?matcher_mod.Match {
     if (state.getCachedMatch(buf, pos)) |cached| {
         return cached;
@@ -712,16 +750,27 @@ pub inline fn nextMatchCached(matcher: anytype, buf: []const u8, pos: usize, sta
 pub fn nextMatch(matcher: anytype, buf: []const u8, pos: usize, config: SearchConfig) ?matcher_mod.Match {
     const T = state_mod.MatcherType(@TypeOf(matcher));
     if (config.whole_word and @hasDecl(T, "findAllowed")) {
-        if (T == matcher_mod.AnyMatcher) {
-            return matcher.findAllowed(buf, pos, config.match_mode, WordBoundedCtx{});
+        if (config.whole_word_unicode) {
+            if (T == matcher_mod.AnyMatcher) {
+                return matcher.findAllowed(buf, pos, config.match_mode, WordBoundedCtx{});
+            }
+            return matcher.findAllowed(buf, pos, config.match_mode, wordBounded);
+        } else {
+            if (T == matcher_mod.AnyMatcher) {
+                return matcher.findAllowed(buf, pos, config.match_mode, WordBoundedAsciiCtx{});
+            }
+            return matcher.findAllowed(buf, pos, config.match_mode, wordBoundedAscii);
         }
-        return matcher.findAllowed(buf, pos, config.match_mode, wordBounded);
     }
     if (config.whole_word) {
         var cur = pos;
         while (cur <= buf.len) {
             const m = matcher.find(buf, cur, config.match_mode) orelse return null;
-            if (wordBounded(buf, m.start, m.end)) return m;
+            const ok = if (config.whole_word_unicode)
+                wordBounded(buf, m.start, m.end)
+            else
+                wordBoundedAscii(buf, m.start, m.end);
+            if (ok) return m;
             if (m.start >= buf.len) return null;
             cur = m.start + 1;
         }
@@ -877,10 +926,18 @@ pub fn linePassesUserFilter(
 }
 
 /// Half-boundary check: inspects only the codepoints immediately outside the match, without requiring the match endpoints themselves to be word characters.
-pub fn wordBounded(haystack: []const u8, start: usize, end: usize) bool {
+pub inline fn wordBounded(haystack: []const u8, start: usize, end: usize) bool {
     if (start > haystack.len or end > haystack.len or start > end) return false;
     if (unicode_fold.isWordBefore(haystack, start)) return false;
     if (unicode_fold.isWordAt(haystack, end)) return false;
+    return true;
+}
+
+/// ASCII-only half-boundary check (`whole_word_unicode = false` / `--no-unicode`).
+pub inline fn wordBoundedAscii(haystack: []const u8, start: usize, end: usize) bool {
+    if (start > haystack.len or end > haystack.len or start > end) return false;
+    if (start > 0 and unicode_fold.isAsciiWordByte(haystack[start - 1])) return false;
+    if (end < haystack.len and unicode_fold.isAsciiWordByte(haystack[end])) return false;
     return true;
 }
 

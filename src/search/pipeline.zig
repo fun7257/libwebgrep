@@ -216,19 +216,20 @@ pub fn materialize(haystack: []const u8, config: SearchConfig) SliceError!Prepar
             };
             const src_slice = if (resume_raw) |rr| current[rr..] else current;
             const init_raw: u64 = if (resume_raw) |rr| @intCast(rr) else 0;
-            if (encoding.decodedSize(target, src_slice) > cap) return error.DecodeLimit;
+            const decoded_len = encoding.decodedSize(target, src_slice);
+            if (decoded_len > cap) return error.DecodeLimit;
             const alloc = effectiveAllocator(config) orelse return error.OutOfMemory;
             prep.alloc = alloc;
             prep.transformed = true;
             if (config.scratch_pool) |sp| {
-                const decoded = try encoding.convertScratchWithMap(sp.allocator, &sp.decode_buf, alloc, target, src_slice, init_raw, &prep.offset_map);
+                const decoded = try encoding.convertScratchWithMapKnownLen(sp.allocator, &sp.decode_buf, alloc, target, src_slice, init_raw, &prep.offset_map, decoded_len);
                 if (prep.owned.len != 0) {
                     alloc.free(prep.owned);
                     prep.owned = &.{};
                 }
                 prep.bytes = decoded;
             } else {
-                const owned = try encoding.convertAllocWithMap(alloc, target, src_slice, init_raw, &prep.offset_map);
+                const owned = try encoding.convertAllocWithMapKnownLen(alloc, target, src_slice, init_raw, &prep.offset_map, decoded_len);
                 if (prep.owned.len != 0) alloc.free(prep.owned);
                 prep.owned = owned;
                 prep.bytes = owned;
@@ -250,19 +251,20 @@ pub fn materialize(haystack: []const u8, config: SearchConfig) SliceError!Prepar
             }
             const src_slice = if (resume_raw) |rr| (if (rr >= 3) current[rr..] else rest) else rest;
             const init_raw: u64 = if (resume_raw) |rr| (if (rr >= 3) @intCast(rr) else 3) else 3;
-            if (encoding.decodedSize(.utf8, src_slice) > cap) return error.DecodeLimit;
+            const decoded_len = encoding.decodedSize(.utf8, src_slice);
+            if (decoded_len > cap) return error.DecodeLimit;
             const alloc = effectiveAllocator(config) orelse return error.OutOfMemory;
             prep.alloc = alloc;
             prep.transformed = true;
             if (config.scratch_pool) |sp| {
-                const decoded = try encoding.convertScratchWithMap(sp.allocator, &sp.decode_buf, alloc, .utf8, src_slice, init_raw, &prep.offset_map);
+                const decoded = try encoding.convertScratchWithMapKnownLen(sp.allocator, &sp.decode_buf, alloc, .utf8, src_slice, init_raw, &prep.offset_map, decoded_len);
                 if (prep.owned.len != 0) {
                     alloc.free(prep.owned);
                     prep.owned = &.{};
                 }
                 prep.bytes = decoded;
             } else {
-                const owned = try encoding.convertAllocWithMap(alloc, .utf8, src_slice, init_raw, &prep.offset_map);
+                const owned = try encoding.convertAllocWithMapKnownLen(alloc, .utf8, src_slice, init_raw, &prep.offset_map, decoded_len);
                 if (prep.owned.len != 0) alloc.free(prep.owned);
                 prep.owned = owned;
                 prep.bytes = owned;
@@ -274,21 +276,22 @@ pub fn materialize(haystack: []const u8, config: SearchConfig) SliceError!Prepar
             const payload = if (current.len >= 2) current[2..] else current[0..0];
             const src_slice = if (resume_raw) |rr| (if (rr >= 2) current[rr..] else payload) else payload;
             const init_raw: u64 = if (resume_raw) |rr| (if (rr >= 2) @intCast(rr) else 2) else 2;
-            if (encoding.decodedSize(kind, src_slice) > cap) {
+            const decoded_len = encoding.decodedSize(kind, src_slice);
+            if (decoded_len > cap) {
                 return error.DecodeLimit;
             }
             const alloc = effectiveAllocator(config) orelse return error.OutOfMemory;
             prep.alloc = alloc;
             prep.transformed = true;
             if (config.scratch_pool) |sp| {
-                const decoded = try encoding.convertScratchWithMap(sp.allocator, &sp.decode_buf, alloc, kind, src_slice, init_raw, &prep.offset_map);
+                const decoded = try encoding.convertScratchWithMapKnownLen(sp.allocator, &sp.decode_buf, alloc, kind, src_slice, init_raw, &prep.offset_map, decoded_len);
                 if (prep.owned.len != 0) {
                     alloc.free(prep.owned);
                     prep.owned = &.{};
                 }
                 prep.bytes = decoded;
             } else {
-                const owned = try encoding.convertAllocWithMap(alloc, kind, src_slice, init_raw, &prep.offset_map);
+                const owned = try encoding.convertAllocWithMapKnownLen(alloc, kind, src_slice, init_raw, &prep.offset_map, decoded_len);
                 if (prep.owned.len != 0) alloc.free(prep.owned);
                 prep.owned = owned;
                 prep.bytes = owned;
@@ -300,20 +303,21 @@ pub fn materialize(haystack: []const u8, config: SearchConfig) SliceError!Prepar
             const payload = current[4..];
             const src_slice = if (resume_raw) |rr| (if (rr > 4) current[rr..] else payload) else payload;
             const init_raw: u64 = if (resume_raw) |rr| @intCast(@max(rr, 4)) else 4;
-            if (encoding.decodedSize(kind, src_slice) > cap) return error.DecodeLimit;
+            const decoded_len = encoding.decodedSize(kind, src_slice);
+            if (decoded_len > cap) return error.DecodeLimit;
             const alloc = effectiveAllocator(config) orelse return error.OutOfMemory;
             prep.alloc = alloc;
             prep.transformed = true;
             prep.offset_map.base_raw_offset = 4;
             if (config.scratch_pool) |sp| {
-                const decoded = try encoding.convertScratchWithMap(sp.allocator, &sp.decode_buf, alloc, kind, src_slice, init_raw, &prep.offset_map);
+                const decoded = try encoding.convertScratchWithMapKnownLen(sp.allocator, &sp.decode_buf, alloc, kind, src_slice, init_raw, &prep.offset_map, decoded_len);
                 if (prep.owned.len != 0) {
                     alloc.free(prep.owned);
                     prep.owned = &.{};
                 }
                 prep.bytes = decoded;
             } else {
-                const owned = try encoding.convertAllocWithMap(alloc, kind, src_slice, init_raw, &prep.offset_map);
+                const owned = try encoding.convertAllocWithMapKnownLen(alloc, kind, src_slice, init_raw, &prep.offset_map, decoded_len);
                 if (prep.owned.len != 0) alloc.free(prep.owned);
                 prep.owned = owned;
                 prep.bytes = owned;
@@ -376,6 +380,8 @@ pub fn searchPrepared(
             state.capture_regex = @ptrCast(@alignCast(any_m.ctx));
         }
     }
+    state.is_pure_empty = format_mod.isPureEmptyPattern(matcher);
+    state.compiled_repl = format_mod.compileReplacement(config.replacement, matcher);
     state.label = name;
     state.decompressed_bytes = prepared.decompressed_bytes;
     state.offset_map = &prepared.offset_map;
@@ -583,6 +589,11 @@ pub fn searchPrepared(
                     if (state.exceeded(config)) {
                         state.stopped = true;
                         state.need_close = true;
+                        break;
+                    }
+                    fused_hits += 1;
+                    if (shouldSwitchToPrepass(config, fused_hits, initial_pos, state.pos, view.len)) {
+                        switched_to_prepass = true;
                         break;
                     }
                     continue;
@@ -837,6 +848,8 @@ pub fn drive(
             state.capture_regex = @ptrCast(@alignCast(any_m.ctx));
         }
     }
+    state.is_pure_empty = format_mod.isPureEmptyPattern(matcher);
+    state.compiled_repl = format_mod.compileReplacement(config.replacement, matcher);
     state.label = name;
     state.decompressed_bytes = config.decompressed_bytes;
     armClock(&state, config);
@@ -969,7 +982,13 @@ pub fn drive(
     state.decompress_map = &decompress_map;
     var decoder = encoding.Decoder.initWithHint(config.encoding, config.charset);
     decoder.max_in = decodeCap(config);
-    decoder.offset_map = &offset_map;
+    const sink_skips_offset_map = (comptime (!@hasDecl(S, "matched") and !@hasDecl(S, "context")) or
+        (@hasDecl(S, "matched_fast_line") and S.matched_fast_line) or
+        (@hasDecl(S, "matched_raw_spans") and S.matched_raw_spans)) and
+        config.max_results == null and
+        config.binary != .report and
+        config.continuation == null;
+    decoder.offset_map = if (sink_skips_offset_map) null else &offset_map;
     if (config.scratch_pool) |sp| {
         decoder.raw_buf = sp.decode_buf;
     }

@@ -82,13 +82,157 @@ fn instsHaveNonEmptyConstraint(insts: []const regex_mod.Inst) bool {
     return false;
 }
 
-fn isPureEmptyPattern(matcher: anytype) bool {
+pub fn isPureEmptyPattern(matcher: anytype) bool {
     const T = state_mod.MatcherType(@TypeOf(matcher));
     if (@hasField(T, "pattern")) return matcher.pattern.len == 0;
     if (@hasField(T, "empty_only")) return matcher.empty_only;
     if (T == regex_mod.Regex) return !instsHaveNonEmptyConstraint(matcher.insts);
     if (T == regex_mod.RegexSet) return matcher.pattern_count > 0 and !instsHaveNonEmptyConstraint(matcher.insts);
     return false;
+}
+
+fn isAnyMatcherRegex(any_m: matcher_mod.AnyMatcher) bool {
+    if (any_m.vtable.is_capture_regex) return true;
+    var dummy: regex_mod.Regex = undefined;
+    const ptr_mut: *regex_mod.Regex = &dummy;
+    const ptr_const: *const regex_mod.Regex = &dummy;
+    return any_m.vtable == matcher_mod.AnyMatcher.init(regex_mod.Regex, ptr_mut).vtable or
+        any_m.vtable == matcher_mod.AnyMatcher.init(regex_mod.Regex, ptr_const).vtable or
+        any_m.vtable == matcher_mod.AnyMatcher.init(*regex_mod.Regex, ptr_mut).vtable or
+        any_m.vtable == matcher_mod.AnyMatcher.init(*const regex_mod.Regex, ptr_const).vtable;
+}
+
+fn extractCaptureRegex(matcher: anytype) ?*const regex_mod.Regex {
+    const T = @TypeOf(matcher);
+    if (T == ?*const regex_mod.Regex or T == ?*regex_mod.Regex) {
+        return matcher;
+    }
+    const MChild = state_mod.MatcherType(T);
+    if (MChild == regex_mod.Regex) {
+        return if (@typeInfo(T) == .pointer) matcher else &matcher;
+    }
+    if (MChild == matcher_mod.AnyMatcher) {
+        const any_m: matcher_mod.AnyMatcher = if (@typeInfo(T) == .pointer) matcher.* else matcher;
+        if (isAnyMatcherRegex(any_m)) {
+            return @ptrCast(@alignCast(any_m.ctx));
+        }
+    }
+    return null;
+}
+
+const max_capture_groups_cap: usize = @typeInfo(@FieldType(regex_mod.Captures, "groups")).array.len;
+
+/// Compiles a replacement template once per search, resolving `$0`/`$&`/`$$`/`$1`..`$32`/`${name}`
+/// into an inline sequence of `ReplOp` instructions and classifying whether capture extraction is needed.
+pub fn compileReplacement(template: ?[]const u8, matcher: anytype) state_mod.CompiledReplacement {
+    const repl = template orelse return .{};
+    var out = state_mod.CompiledReplacement{ .mode = .literal_only };
+    if (std.mem.findScalar(u8, repl, '$') == null) {
+        if (repl.len > 0) {
+            out.ops[0] = .{ .literal = repl };
+            out.len = 1;
+        }
+        return out;
+    }
+
+    const re = extractCaptureRegex(matcher);
+    var saw_whole = false;
+    var saw_group = false;
+
+    const pushOp = struct {
+        fn push(dst: *state_mod.CompiledReplacement, op: state_mod.ReplOp) void {
+            if (dst.overflow) return;
+            if (dst.len >= dst.ops.len) {
+                dst.overflow = true;
+                return;
+            }
+            dst.ops[dst.len] = op;
+            dst.len += 1;
+        }
+    }.push;
+
+    var lit_start: usize = 0;
+    var i: usize = 0;
+    while (i < repl.len) {
+        if (repl[i] != '$' or i + 1 >= repl.len) {
+            i += 1;
+            continue;
+        }
+        const next = repl[i + 1];
+        if (next == '$') {
+            if (i > lit_start) pushOp(&out, .{ .literal = repl[lit_start..i] });
+            pushOp(&out, .{ .literal = repl[i .. i + 1] });
+            i += 2;
+            lit_start = i;
+        } else if (next == '&' or next == '0') {
+            if (i > lit_start) pushOp(&out, .{ .literal = repl[lit_start..i] });
+            pushOp(&out, .whole_match);
+            saw_whole = true;
+            i += 2;
+            lit_start = i;
+        } else if (next >= '1' and next <= '9') {
+            if (i > lit_start) pushOp(&out, .{ .literal = repl[lit_start..i] });
+            const g: u8 = next - '0';
+            pushOp(&out, .{ .group = g });
+            saw_group = true;
+            i += 2;
+            lit_start = i;
+        } else if (next == '{') {
+            if (std.mem.findScalarPos(u8, repl, i + 2, '}')) |close_brace| {
+                const inner = repl[i + 2 .. close_brace];
+                if (inner.len > 0) {
+                    var all_digits = true;
+                    for (inner) |b| {
+                        if (!std.ascii.isDigit(b)) {
+                            all_digits = false;
+                            break;
+                        }
+                    }
+                    if (all_digits) {
+                        if (std.fmt.parseInt(usize, inner, 10)) |g| {
+                            if (i > lit_start) pushOp(&out, .{ .literal = repl[lit_start..i] });
+                            if (g == 0) {
+                                pushOp(&out, .whole_match);
+                                saw_whole = true;
+                            } else if (g <= max_capture_groups_cap) {
+                                pushOp(&out, .{ .group = @intCast(g) });
+                                saw_group = true;
+                            }
+                            i = close_brace + 1;
+                            lit_start = i;
+                            continue;
+                        } else |_| {}
+                    } else if (isReplacementIdent(inner)) {
+                        if (i > lit_start) pushOp(&out, .{ .literal = repl[lit_start..i] });
+                        if (re) |r| {
+                            if (r.groupIndexByName(inner)) |g| {
+                                if (g >= 1 and g <= max_capture_groups_cap) {
+                                    pushOp(&out, .{ .group = @intCast(g) });
+                                    saw_group = true;
+                                }
+                            }
+                        }
+                        i = close_brace + 1;
+                        lit_start = i;
+                        continue;
+                    }
+                }
+            }
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    if (i > lit_start) pushOp(&out, .{ .literal = repl[lit_start..i] });
+
+    if (saw_group) {
+        out.mode = .needs_captures;
+    } else if (saw_whole) {
+        out.mode = .whole_match_only;
+    } else {
+        out.mode = .literal_only;
+    }
+    return out;
 }
 
 /// Non-overlapping matches on this line, relative to the preview window and sorted by start offset.
@@ -117,7 +261,13 @@ pub fn gatherSpans(
     }
     const is_ml = state_mod.effectiveMultiline(matcher, config);
     const content_end = contentEnd(buf, line, config);
-    const line_buf = if (is_ml) buf else buf[0..@min(content_end, buf.len)];
+    const use_full_cached = is_ml or (
+        !config.null_data and
+        config.max_count == null and !config.exists and config.max_results == null and
+        !config.files_without_match and !config.stop_on_nonmatch and
+        (content_end == buf.len or buf[content_end] == '\n')
+    );
+    const line_buf = if (use_full_cached) buf else buf[0..@min(content_end, buf.len)];
     const scan_end = if (is_ml) @min(line.end, line_buf.len) else @min(content_end, line_buf.len);
     const win_lo = preview.start;
     const win_hi = preview.end;
@@ -142,10 +292,11 @@ pub fn gatherSpans(
         }
         pos = if (k.end > k.start) k.end else k.start + 1;
     }
-    const skip_rest = (if (known) |k| k.single_match else false) or isPureEmptyPattern(matcher);
+    const skip_rest = (if (known) |k| k.single_match else false) or state.is_pure_empty;
+    var sorted = true;
     while (!skip_rest and pos <= scan_end) {
         if (stopInMatch(state, config)) break;
-        const found = (if (is_ml) line_matcher_mod.nextMatchCached(matcher, line_buf, pos, state, config) else nextMatch(matcher, line_buf, pos, config)) orelse break;
+        const found = (if (use_full_cached) line_matcher_mod.nextMatchCached(matcher, line_buf, pos, state, config) else nextMatch(matcher, line_buf, pos, config)) orelse break;
         if (found.start < pos or found.start > scan_end) break;
         if (found.start >= content_end) break;
         if (is_ml and found.end > line.end) break;
@@ -156,15 +307,18 @@ pub fn gatherSpans(
         const empty_at_point = raw_empty and fstart == win_lo and win_lo == win_hi;
         if (in_window or empty_at_point) {
             if (n == store.len) store = try growSpans(alloc, store, heap, n);
-            if (empty_at_point) {
-                store[n] = .{ .start = 0, .end = 0, .pattern_id = found.pattern_id };
-            } else {
-                store[n] = .{
+            const new_span: Span = if (empty_at_point)
+                .{ .start = 0, .end = 0, .pattern_id = found.pattern_id }
+            else
+                .{
                     .start = fstart - win_lo,
                     .end = @min(fend, win_hi) - win_lo,
                     .pattern_id = found.pattern_id,
                 };
+            if (n > 0 and sorted and spanBefore({}, new_span, store[n - 1])) {
+                sorted = false;
             }
+            store[n] = new_span;
             n += 1;
         }
         if (raw_empty) {
@@ -182,7 +336,7 @@ pub fn gatherSpans(
             n = 1;
         }
     }
-    if (n > 1) std.mem.sort(Span, store[0..n], {}, spanBefore);
+    if (n > 1 and !sorted) std.mem.sort(Span, store[0..n], {}, spanBefore);
     return store[0..n];
 }
 
@@ -474,7 +628,7 @@ fn extractMatchCaptures(
     if (buf_offset + to <= raw_slice.len) {
         const abs_from = buf_offset + from;
         var abs_to = buf_offset + to;
-        if (to == bytes.len and abs_to < raw_slice.len) {
+        if (re.multiline and to == bytes.len and abs_to < raw_slice.len) {
             if (re.findReadOnly(raw_slice, abs_from, match_mode)) |full_m| {
                 if (full_m.start == abs_from and full_m.end >= abs_to) {
                     abs_to = @min(full_m.end, raw_slice.len);
@@ -503,6 +657,43 @@ fn extractMatchCaptures(
     return re.extractCaptures(bytes, .{ .start = from, .end = to });
 }
 
+inline fn expandCompiledOps(
+    ops: []const state_mod.ReplOp,
+    bytes: []const u8,
+    cap_source: []const u8,
+    from: usize,
+    to: usize,
+    caps: ?regex_mod.Captures,
+    dest: ?[]u8,
+) usize {
+    var written: usize = 0;
+    for (ops) |op| {
+        switch (op) {
+            .literal => |lit| {
+                if (dest) |d| if (lit.len > 0) @memcpy(d[written .. written + lit.len], lit);
+                written += lit.len;
+            },
+            .whole_match => {
+                const seg = bytes[from..to];
+                if (dest) |d| if (seg.len > 0) @memcpy(d[written .. written + seg.len], seg);
+                written += seg.len;
+            },
+            .group => |g| {
+                if (caps) |c| {
+                    if (c.group(g)) |sp| {
+                        const gfrom = @min(sp.start, cap_source.len);
+                        const gto = @min(@max(sp.end, gfrom), cap_source.len);
+                        const seg = cap_source[gfrom..gto];
+                        if (dest) |d| if (seg.len > 0) @memcpy(d[written .. written + seg.len], seg);
+                        written += seg.len;
+                    }
+                }
+            },
+        }
+    }
+    return written;
+}
+
 pub fn buildReplaced(
     state: *State,
     scratch: []u8,
@@ -515,21 +706,31 @@ pub fn buildReplaced(
     match_out: *?Span,
     repl: []const u8,
 ) ?[]const u8 {
-    if (std.mem.findScalar(u8, repl, '$') == null) {
+    const compiled = if (state.compiled_repl.mode != .none)
+        state.compiled_repl
+    else
+        compileReplacement(repl, state.capture_regex);
+
+    if (!compiled.overflow and compiled.mode == .literal_only) {
+        const ops = compiled.ops[0..compiled.len];
+        var lit_len: usize = 0;
+        for (ops) |op| {
+            lit_len += op.literal.len;
+        }
         var need: usize = 0;
         var cursor: usize = 0;
         for (matches) |item| {
             const from = @min(item.start, bytes.len);
             const to = @min(@max(item.end, from), bytes.len);
             if (from > cursor) need += from - cursor;
-            need += repl.len;
+            need += lit_len;
             cursor = @max(cursor, to);
         }
         if (cursor < bytes.len) need += bytes.len - cursor;
         const dest = replaceDest(state, scratch, need) orelse return null;
         cursor = 0;
         var out: usize = 0;
-        for (matches) |item| {
+        for (matches) |*item| {
             const from = @min(item.start, bytes.len);
             const to = @min(@max(item.end, from), bytes.len);
             if (from > cursor) {
@@ -537,11 +738,21 @@ pub fn buildReplaced(
                 @memcpy(dest[out .. out + seg.len], seg);
                 out += seg.len;
             }
-            if (repl.len > 0) {
-                @memcpy(dest[out .. out + repl.len], repl);
-                out += repl.len;
+            const exp_start = out;
+            for (ops) |op| {
+                const lit = op.literal;
+                if (lit.len > 0) {
+                    @memcpy(dest[out .. out + lit.len], lit);
+                    out += lit.len;
+                }
             }
+            item.replacement = dest[exp_start..out];
             cursor = @max(cursor, to);
+        }
+        if (match_out.*) |*m| {
+            if (matches.len > 0 and m.start == matches[0].start and m.end == matches[0].end) {
+                m.replacement = matches[0].replacement;
+            }
         }
         if (cursor < bytes.len) {
             const tail = bytes[cursor..];
@@ -551,8 +762,88 @@ pub fn buildReplaced(
         return dest[0..out];
     }
 
+    if (!compiled.overflow and compiled.mode == .whole_match_only) {
+        const ops = compiled.ops[0..compiled.len];
+        var lit_len: usize = 0;
+        var whole_count: usize = 0;
+        for (ops) |op| {
+            switch (op) {
+                .literal => |lit| lit_len += lit.len,
+                .whole_match => whole_count += 1,
+                .group => {},
+            }
+        }
+        var need: usize = 0;
+        var cursor: usize = 0;
+        for (matches) |item| {
+            const from = @min(item.start, bytes.len);
+            const to = @min(@max(item.end, from), bytes.len);
+            if (from > cursor) need += from - cursor;
+            need += lit_len + whole_count * (to - from);
+            cursor = @max(cursor, to);
+        }
+        if (cursor < bytes.len) need += bytes.len - cursor;
+        const dest = replaceDest(state, scratch, need) orelse return null;
+        cursor = 0;
+        var out: usize = 0;
+        for (matches) |*item| {
+            const from = @min(item.start, bytes.len);
+            const to = @min(@max(item.end, from), bytes.len);
+            if (from > cursor) {
+                const seg = bytes[cursor..from];
+                @memcpy(dest[out .. out + seg.len], seg);
+                out += seg.len;
+            }
+            const exp_start = out;
+            out += expandCompiledOps(ops, bytes, bytes, from, to, null, dest[exp_start..]);
+            item.replacement = dest[exp_start..out];
+            cursor = @max(cursor, to);
+        }
+        if (match_out.*) |*m| {
+            if (matches.len > 0 and m.start == matches[0].start and m.end == matches[0].end) {
+                m.replacement = matches[0].replacement;
+            }
+        }
+        if (cursor < bytes.len) {
+            const tail = bytes[cursor..];
+            @memcpy(dest[out .. out + tail.len], tail);
+            out += tail.len;
+        }
+        return dest[0..out];
+    }
+
+    const need_caps = compiled.mode == .needs_captures;
     const raw_end = @min(@max(line_end, buf_offset +| bytes.len), raw_buf.len);
     const raw_slice = raw_buf[0..raw_end];
+
+    if (matches.len == 1 and !compiled.overflow and need_caps) {
+        const ops = compiled.ops[0..compiled.len];
+        const from = @min(matches[0].start, bytes.len);
+        const to = @min(@max(matches[0].end, from), bytes.len);
+        var used_fb = false;
+        const caps: ?regex_mod.Captures = if (state.capture_regex) |re|
+            extractMatchCaptures(re, bytes, raw_slice, buf_offset, from, to, match_mode, &used_fb)
+        else
+            null;
+        const cap_src = if (used_fb) bytes else raw_slice;
+        const exp_len = expandCompiledOps(ops, bytes, cap_src, from, to, caps, null);
+        const need = from + exp_len + (bytes.len - to);
+        const dest = replaceDest(state, scratch, need) orelse return null;
+        if (from > 0) @memcpy(dest[0..from], bytes[0..from]);
+        const written = expandCompiledOps(ops, bytes, cap_src, from, to, caps, dest[from..]);
+        const exp_end = from + written;
+        matches[0].replacement = dest[from..exp_end];
+        if (match_out.*) |*m| {
+            if (m.start == matches[0].start and m.end == matches[0].end) {
+                m.replacement = matches[0].replacement;
+            }
+        }
+        if (to < bytes.len) {
+            const tail = bytes[to..];
+            @memcpy(dest[exp_end .. exp_end + tail.len], tail);
+        }
+        return dest[0..need];
+    }
 
     var caps_cache: [32]?regex_mod.Captures = undefined;
     var fallback_cache: [32]bool = undefined;
@@ -563,16 +854,22 @@ pub fn buildReplaced(
         const to = @min(@max(item.end, from), bytes.len);
         if (from > cursor) need += from - cursor;
         var used_fb = false;
-        const caps: ?regex_mod.Captures = if (state.capture_regex) |re|
-            extractMatchCaptures(re, bytes, raw_slice, buf_offset, from, to, match_mode, &used_fb)
-        else
-            null;
+        const caps: ?regex_mod.Captures = if (need_caps) blk: {
+            break :blk if (state.capture_regex) |re|
+                extractMatchCaptures(re, bytes, raw_slice, buf_offset, from, to, match_mode, &used_fb)
+            else
+                null;
+        } else null;
         if (idx < caps_cache.len) {
             caps_cache[idx] = caps;
             fallback_cache[idx] = used_fb;
         }
         const cap_src = if (used_fb) bytes else raw_slice;
-        need += expandReplacementTemplate(repl, bytes, cap_src, from, to, state.capture_regex, caps, null);
+        if (!compiled.overflow) {
+            need += expandCompiledOps(compiled.ops[0..compiled.len], bytes, cap_src, from, to, caps, null);
+        } else {
+            need += expandReplacementTemplate(repl, bytes, cap_src, from, to, state.capture_regex, caps, null);
+        }
         cursor = @max(cursor, to);
     }
     if (cursor < bytes.len) need += bytes.len - cursor;
@@ -588,7 +885,9 @@ pub fn buildReplaced(
             out += seg.len;
         }
         var used_fb = false;
-        const caps: ?regex_mod.Captures = if (idx < caps_cache.len) blk: {
+        const caps: ?regex_mod.Captures = if (!need_caps)
+            null
+        else if (idx < caps_cache.len) blk: {
             used_fb = fallback_cache[idx];
             break :blk caps_cache[idx];
         } else if (state.capture_regex) |re|
@@ -597,7 +896,11 @@ pub fn buildReplaced(
             null;
         const cap_src = if (used_fb) bytes else raw_slice;
         const exp_start = out;
-        out += expandReplacementTemplate(repl, bytes, cap_src, from, to, state.capture_regex, caps, dest[exp_start..]);
+        if (!compiled.overflow) {
+            out += expandCompiledOps(compiled.ops[0..compiled.len], bytes, cap_src, from, to, caps, dest[exp_start..]);
+        } else {
+            out += expandReplacementTemplate(repl, bytes, cap_src, from, to, state.capture_regex, caps, dest[exp_start..]);
+        }
         item.replacement = dest[exp_start..out];
         cursor = @max(cursor, to);
     }
@@ -614,11 +917,175 @@ pub fn buildReplaced(
     return dest[0..out];
 }
 
+fn buildOnlyMatchingReplacements(
+    state: *State,
+    scratch: []u8,
+    bytes: []const u8,
+    raw_buf: []const u8,
+    buf_offset: usize,
+    line_end: usize,
+    match_mode: matcher_mod.MatchMode,
+    matches: []Span,
+    match_out: *?Span,
+    repl: []const u8,
+) void {
+    if (matches.len == 0) return;
+    const compiled = if (state.compiled_repl.mode != .none)
+        state.compiled_repl
+    else
+        compileReplacement(repl, state.capture_regex);
+
+    if (!compiled.overflow and compiled.mode == .literal_only) {
+        const ops = compiled.ops[0..compiled.len];
+        if (ops.len == 0) {
+            for (matches) |*item| item.replacement = "";
+            if (match_out.*) |*m| m.replacement = "";
+            return;
+        }
+        if (ops.len == 1) {
+            const lit = ops[0].literal;
+            for (matches) |*item| item.replacement = lit;
+            if (match_out.*) |*m| m.replacement = lit;
+            return;
+        }
+        var lit_len: usize = 0;
+        for (ops) |op| lit_len += op.literal.len;
+        const dest = replaceDest(state, scratch, lit_len) orelse return;
+        var out: usize = 0;
+        for (ops) |op| {
+            const lit = op.literal;
+            if (lit.len > 0) {
+                @memcpy(dest[out .. out + lit.len], lit);
+                out += lit.len;
+            }
+        }
+        const slice = dest[0..out];
+        for (matches) |*item| item.replacement = slice;
+        if (match_out.*) |*m| m.replacement = slice;
+        return;
+    }
+
+    if (!compiled.overflow and compiled.mode == .whole_match_only) {
+        const ops = compiled.ops[0..compiled.len];
+        var lit_len: usize = 0;
+        var whole_count: usize = 0;
+        for (ops) |op| {
+            switch (op) {
+                .literal => |lit| lit_len += lit.len,
+                .whole_match => whole_count += 1,
+                .group => {},
+            }
+        }
+        var need: usize = 0;
+        for (matches) |item| {
+            const from = @min(item.start, bytes.len);
+            const to = @min(@max(item.end, from), bytes.len);
+            need += lit_len + whole_count * (to - from);
+        }
+        const dest = replaceDest(state, scratch, need) orelse return;
+        var out: usize = 0;
+        for (matches) |*item| {
+            const from = @min(item.start, bytes.len);
+            const to = @min(@max(item.end, from), bytes.len);
+            const exp_start = out;
+            out += expandCompiledOps(ops, bytes, bytes, from, to, null, dest[exp_start..]);
+            item.replacement = dest[exp_start..out];
+        }
+        if (match_out.*) |*m| {
+            if (m.start == matches[0].start and m.end == matches[0].end) {
+                m.replacement = matches[0].replacement;
+            }
+        }
+        return;
+    }
+
+    const need_caps = compiled.mode == .needs_captures;
+    const raw_end = @min(@max(line_end, buf_offset +| bytes.len), raw_buf.len);
+    const raw_slice = raw_buf[0..raw_end];
+
+    if (matches.len == 1 and !compiled.overflow and need_caps) {
+        const ops = compiled.ops[0..compiled.len];
+        const from = @min(matches[0].start, bytes.len);
+        const to = @min(@max(matches[0].end, from), bytes.len);
+        var used_fb = false;
+        const caps: ?regex_mod.Captures = if (state.capture_regex) |re|
+            extractMatchCaptures(re, bytes, raw_slice, buf_offset, from, to, match_mode, &used_fb)
+        else
+            null;
+        const cap_src = if (used_fb) bytes else raw_slice;
+        const exp_len = expandCompiledOps(ops, bytes, cap_src, from, to, caps, null);
+        const dest = replaceDest(state, scratch, exp_len) orelse return;
+        const written = expandCompiledOps(ops, bytes, cap_src, from, to, caps, dest);
+        matches[0].replacement = dest[0..written];
+        if (match_out.*) |*m| {
+            if (m.start == matches[0].start and m.end == matches[0].end) {
+                m.replacement = matches[0].replacement;
+            }
+        }
+        return;
+    }
+
+    var caps_cache: [32]?regex_mod.Captures = undefined;
+    var fallback_cache: [32]bool = undefined;
+    var need: usize = 0;
+    for (matches, 0..) |item, idx| {
+        const from = @min(item.start, bytes.len);
+        const to = @min(@max(item.end, from), bytes.len);
+        var used_fb = false;
+        const caps: ?regex_mod.Captures = if (need_caps) blk: {
+            break :blk if (state.capture_regex) |re|
+                extractMatchCaptures(re, bytes, raw_slice, buf_offset, from, to, match_mode, &used_fb)
+            else
+                null;
+        } else null;
+        if (idx < caps_cache.len) {
+            caps_cache[idx] = caps;
+            fallback_cache[idx] = used_fb;
+        }
+        const cap_src = if (used_fb) bytes else raw_slice;
+        if (!compiled.overflow) {
+            need += expandCompiledOps(compiled.ops[0..compiled.len], bytes, cap_src, from, to, caps, null);
+        } else {
+            need += expandReplacementTemplate(repl, bytes, cap_src, from, to, state.capture_regex, caps, null);
+        }
+    }
+    const dest = replaceDest(state, scratch, need) orelse return;
+    var out: usize = 0;
+    for (matches, 0..) |*item, idx| {
+        const from = @min(item.start, bytes.len);
+        const to = @min(@max(item.end, from), bytes.len);
+        var used_fb = false;
+        const caps: ?regex_mod.Captures = if (!need_caps)
+            null
+        else if (idx < caps_cache.len) blk: {
+            used_fb = fallback_cache[idx];
+            break :blk caps_cache[idx];
+        } else if (state.capture_regex) |re|
+            extractMatchCaptures(re, bytes, raw_slice, buf_offset, from, to, match_mode, &used_fb)
+        else
+            null;
+        const cap_src = if (used_fb) bytes else raw_slice;
+        const exp_start = out;
+        if (!compiled.overflow) {
+            out += expandCompiledOps(compiled.ops[0..compiled.len], bytes, cap_src, from, to, caps, dest[exp_start..]);
+        } else {
+            out += expandReplacementTemplate(repl, bytes, cap_src, from, to, state.capture_regex, caps, dest[exp_start..]);
+        }
+        item.replacement = dest[exp_start..out];
+    }
+    if (match_out.*) |*m| {
+        if (m.start == matches[0].start and m.end == matches[0].end) {
+            m.replacement = matches[0].replacement;
+        }
+    }
+}
+
 pub fn replaceDest(state: *State, scratch: []u8, need: usize) ?[]u8 {
     if (need <= scratch.len) return scratch[0..need];
     const alloc = state.text_alloc orelse return null;
     if (state.replace_buf.len < need) {
-        state.replace_buf = alloc.realloc(state.replace_buf, need) catch return null;
+        const new_cap = @max(need, state.replace_buf.len *| 2);
+        state.replace_buf = alloc.realloc(state.replace_buf, new_cap) catch return null;
     }
     if (state.replace_buf.len < need) return null;
     return state.replace_buf[0..need];
@@ -712,6 +1179,102 @@ pub fn sinkMatched(
             state.has_sunk = true;
             state.matched_lines += 1;
             state.matches += 1;
+            state.results_out += 1;
+            var keep = true;
+            switch (action) {
+                .cont => {},
+                .skip_to => |target| {
+                    if (target > line_end_abs) {
+                        state.after_left = 0;
+                        state.ring.clear();
+                        state.pending_skip_to = target;
+                    }
+                },
+                .pause => {
+                    state.paused = true;
+                    state.resume_at = line_end_abs;
+                    state.resume_line = if (state.line_number != null) nextLineNumber(state, buf, line, config) else 0;
+                    state.stopped = true;
+                    keep = false;
+                },
+                .stop => {
+                    state.stopped = true;
+                    keep = false;
+                },
+            }
+            advanceLineCount(buf, line, state_mod.effectiveMultiline(matcher, config), state, config);
+            if (state.paused) return false;
+            if (keep and !maybeProgress(S, sink, state, config)) return false;
+            if (!noteHitLimit(state, config, line_end_abs)) return false;
+            return keep and !state.paused;
+        }
+    }
+    if (comptime @hasDecl(S, "matched_raw_spans") and S.matched_raw_spans) {
+        if (config.binary != .report) {
+            const preview = previewLine(buf, line, known, config);
+            const line_abs = state.abs_base + line.start;
+            if (!try sinkBreakAt(S, sink, line_abs, state, config)) return false;
+            countLines(buf, line.start, state, config);
+            const bytes = buf[preview.start..preview.end];
+            var inline_spans: [32]Span = undefined;
+            const matches = try gatherSpans(
+                state.text_alloc,
+                &inline_spans,
+                &state.span_buf,
+                matcher,
+                buf,
+                line,
+                preview,
+                known,
+                state,
+                config,
+            );
+            if (!try guardLine(state, config, bytes.len)) return false;
+            var one: [1]Span = undefined;
+            var multi = matches;
+            if (multi.len == 0) {
+                if (preview.span) |found| {
+                    one[0] = .{ .start = found.start, .end = found.end, .pattern_id = found.pattern_id };
+                    multi = &one;
+                }
+            }
+            var match_span = preview.span;
+            var replaced: ?[]const u8 = null;
+            if (config.replacement) |repl| {
+                var replace_scratch: [4096]u8 = undefined;
+                if (comptime @hasDecl(S, "only_matching_replace") and S.only_matching_replace) {
+                    buildOnlyMatchingReplacements(state, &replace_scratch, bytes, buf, preview.start, line.end, config.match_mode, multi, &match_span, repl);
+                } else if (multi.len > 0) {
+                    replaced = buildReplaced(state, &replace_scratch, bytes, buf, preview.start, line.end, config.match_mode, multi, &match_span, repl);
+                }
+            }
+            const raw_line = Line{
+                .bytes = bytes,
+                .text = bytes,
+                .raw = bytes,
+                .replaced = replaced,
+                .offset = line_abs,
+                .raw_offset = line_abs,
+                .number = state.line_number,
+                .match = match_span,
+                .matches = multi,
+                .column = if (multi.len > 0) @as(u64, multi[0].start) + 1 else null,
+                .u16_column = null,
+                .binary_status = state.binary_status,
+                .truncated = preview.truncated,
+                .line_len = preview.line_len,
+                .window_start = preview.window_start,
+            };
+            const action = callSinkAction(S, "matched", sink, .{raw_line});
+            releaseQueue(state);
+            const line_end_abs = state.abs_base + @as(u64, line.end);
+            state.last_line_visited = line.end;
+            state.last_abs_end = line_end_abs;
+            state.remembered_until = @max(state.remembered_until, line.end);
+            state.after_left = afterCount(config);
+            state.has_sunk = true;
+            state.matched_lines += 1;
+            state.matches += if (matches.len > 0) @as(u64, @intCast(matches.len)) else 1;
             state.results_out += 1;
             var keep = true;
             switch (action) {

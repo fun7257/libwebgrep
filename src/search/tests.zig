@@ -6939,6 +6939,427 @@ test "bulk count-only invert -c -v parity across rare, dense, zero, all, EOF, an
     }
 }
 
+test "whole_word_unicode: UTS #18 Unicode vs ASCII mode and streaming long-line UTF-8 boundary" {
+    const alloc = testing.allocator;
+    const EmptyCountSink = struct {};
+    const finder = try Finder.init("foo", .{});
+
+    // 1. CJK surrounding bytes: Unicode mode rejects, ASCII mode (--no-unicode) matches
+    {
+        const doc = "你好foo世界\n";
+        var uni_sink = EmptyCountSink{};
+        const uni_res = try searchSlice(EmptyCountSink, &uni_sink, doc, "ww-cjk-uni", &finder, .{
+            .whole_word = true,
+            .whole_word_unicode = true,
+        });
+        try testing.expectEqual(@as(u64, 0), uni_res.matched_lines);
+
+        var asc_sink = EmptyCountSink{};
+        const asc_res = try searchSlice(EmptyCountSink, &asc_sink, doc, "ww-cjk-asc", &finder, .{
+            .whole_word = true,
+            .whole_word_unicode = false,
+        });
+        try testing.expectEqual(@as(u64, 1), asc_res.matched_lines);
+    }
+
+    // 2. UTS #18 \w excludes No (`²` U+00B2) and includes Myanmar (U+1000), Kannada (U+0C85), Khmer (U+1780)
+    {
+        const sup2 = "foo\xc2\xb2\n"; // "foo²\n"
+        var s_sup2 = EmptyCountSink{};
+        const r_sup2 = try searchSlice(EmptyCountSink, &s_sup2, sup2, "ww-sup2", &finder, .{
+            .whole_word = true,
+            .whole_word_unicode = true,
+        });
+        try testing.expectEqual(@as(u64, 1), r_sup2.matched_lines);
+
+        const scripts = [_][]const u8{
+            "foo\xe1\x80\x80\n", // Myanmar U+1000
+            "foo\xe0\xb2\x85\n", // Kannada U+0C85
+            "foo\xe1\x9e\x80\n", // Khmer U+1780
+        };
+        for (scripts) |sample| {
+            var su = EmptyCountSink{};
+            const ru = try searchSlice(EmptyCountSink, &su, sample, "ww-script-u", &finder, .{
+                .whole_word = true,
+                .whole_word_unicode = true,
+            });
+            try testing.expectEqual(@as(u64, 0), ru.matched_lines);
+
+            var sa = EmptyCountSink{};
+            const ra = try searchSlice(EmptyCountSink, &sa, sample, "ww-script-a", &finder, .{
+                .whole_word = true,
+                .whole_word_unicode = false,
+            });
+            try testing.expectEqual(@as(u64, 1), ra.matched_lines);
+        }
+    }
+
+    // 2b. Regex `\berror\b` with `unicode_word_boundary = true` vs `false` (--no-unicode)
+    {
+        const doc_b = "你好error世界\nfoo error bar\n";
+        var re_u = try regex_mod.Regex.init(alloc, "\\berror\\b", .{ .unicode_word_boundary = true });
+        defer re_u.deinit();
+        var su_b = EmptyCountSink{};
+        const ru_b = try searchSlice(EmptyCountSink, &su_b, doc_b, "wb-uni", &re_u, .{});
+        try testing.expectEqual(@as(u64, 1), ru_b.matched_lines);
+
+        var re_a = try regex_mod.Regex.init(alloc, "\\berror\\b", .{ .unicode_word_boundary = false });
+        defer re_a.deinit();
+        var sa_b = EmptyCountSink{};
+        const ra_b = try searchSlice(EmptyCountSink, &sa_b, doc_b, "wb-asc", &re_a, .{});
+        try testing.expectEqual(@as(u64, 2), ra_b.matched_lines);
+    }
+
+    // 3. Streaming long-line UTF-8 boundary safety (word adjacent to multibyte chars across slide boundary)
+    {
+        var long_bad = std.ArrayList(u8).empty;
+        defer long_bad.deinit(alloc);
+        try long_bad.appendNTimes(alloc, ' ', 21);
+        try long_bad.appendSlice(alloc, "你好foo世界");
+        try long_bad.appendNTimes(alloc, ' ', 40);
+        try long_bad.append(alloc, '\n');
+
+        var r1 = std.Io.Reader.fixed(long_bad.items);
+        var s1 = EmptyCountSink{};
+        const res1 = try searchReader(EmptyCountSink, alloc, &s1, &r1, "ww-long-uni", &finder, .{
+            .whole_word = true,
+            .whole_word_unicode = true,
+            .buffer_size = 16,
+            .max_line_len = 24,
+        });
+        try testing.expectEqual(@as(u64, 0), res1.matched_lines);
+
+        var r2 = std.Io.Reader.fixed(long_bad.items);
+        var s2 = EmptyCountSink{};
+        const res2 = try searchReader(EmptyCountSink, alloc, &s2, &r2, "ww-long-asc", &finder, .{
+            .whole_word = true,
+            .whole_word_unicode = false,
+            .buffer_size = 16,
+            .max_line_len = 24,
+        });
+        try testing.expectEqual(@as(u64, 1), res2.matched_lines);
+    }
+}
+
+test "multiline dotall: dense BEGIN_TX.{1,120}status=503 and bounded max_newlines window" {
+    const alloc = testing.allocator;
+    const EmptyCountSink = struct {};
+
+    // 1. Dense BEGIN_TX.{1,120}status=503 with --multiline-dotall
+    {
+        var re = try regex_mod.Regex.init(alloc, "BEGIN_TX.{1,120}status=503", .{
+            .multiline = true,
+            .dot_all = true,
+        });
+        defer re.deinit();
+
+        var doc = std.ArrayList(u8).empty;
+        defer doc.deinit(alloc);
+
+        // 32 valid cross-line hits + 32 out-of-range (>120 chars) non-hits
+        for (0..32) |i| {
+            var line_buf: [64]u8 = undefined;
+            const head = try std.fmt.bufPrint(&line_buf, "BEGIN_TX id={d}\n", .{i});
+            try doc.appendSlice(alloc, head);
+            try doc.appendSlice(alloc, "payload=ok\nstatus=503 done\n");
+            // Non-matching block (>120 chars between BEGIN_TX and status=503)
+            try doc.appendSlice(alloc, "BEGIN_TX too_far ");
+            try doc.appendNTimes(alloc, 'x', 130);
+            try doc.appendSlice(alloc, "\nstatus=503 nope\n");
+        }
+
+        // Verify slice search (both .leftmost_first and binary = .quit fused->prepass switch)
+        var cs_slice = EmptyCountSink{};
+        const res_slice = try searchSlice(EmptyCountSink, &cs_slice, doc.items, "y06-slice", &re, .{
+            .multiline = true,
+            .match_mode = .leftmost_first,
+            .binary = .quit,
+        });
+        try testing.expectEqual(@as(u64, 32), res_slice.matched_lines);
+
+        // Verify streaming search matches slice search identically
+        var reader = std.Io.Reader.fixed(doc.items);
+        var cs_stream = EmptyCountSink{};
+        const res_stream = try searchReader(EmptyCountSink, alloc, &cs_stream, &reader, "y06-stream", &re, .{
+            .multiline = true,
+            .match_mode = .leftmost_first,
+            .binary = .quit,
+            .buffer_size = 512,
+        });
+        try testing.expectEqual(@as(u64, 32), res_stream.matched_lines);
+
+        // Greedy leftmost_first vs earliest with two tails within 120 chars
+        const dbl = "BEGIN_TX aa status=503 bb status=503\n";
+        const m_lm = re.find(dbl, 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualStrings("BEGIN_TX aa status=503 bb status=503", dbl[m_lm.start..m_lm.end]);
+        const m_ea = re.find(dbl, 0, .earliest) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualStrings("BEGIN_TX aa status=503", dbl[m_ea.start..m_ea.end]);
+
+        // UTF-8 codepoint counting in bounded .{1,120}: 60 3-byte Han chars = 180 bytes but only 60 codepoints -> MUST match!
+        var utf8_ok = std.ArrayList(u8).empty;
+        defer utf8_ok.deinit(alloc);
+        try utf8_ok.appendSlice(alloc, "BEGIN_TX");
+        for (0..60) |_| try utf8_ok.appendSlice(alloc, "汉");
+        try utf8_ok.appendSlice(alloc, "status=503\n");
+        const m_u8 = re.find(utf8_ok.items, 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(@as(usize, 0), m_u8.start);
+        try testing.expectEqual(utf8_ok.items.len - 1, m_u8.end);
+
+        // Binary NUL between prefix and tail must trigger .binary_quit at exact NUL offset
+        const bin_doc = "BEGIN_TX abc\x00def status=503\n";
+        var bin_sink = EmptyCountSink{};
+        const bin_res = try searchSlice(EmptyCountSink, &bin_sink, bin_doc, "y06-bin", &re, .{
+            .multiline = true,
+            .match_mode = .leftmost_first,
+            .binary = .quit,
+        });
+        try testing.expectEqual(Outcome.binary_quit, bin_res.outcome);
+        try testing.expectEqual(@as(?u64, 12), bin_res.nul_offset);
+        try testing.expectEqual(@as(u64, 0), bin_res.matched_lines);
+    }
+
+    // 2. Bounded max_newlines (`ERROR.*\n.*timeout`) with ASCII & CRLF lines
+    {
+        var re_nl = try regex_mod.Regex.init(alloc, "ERROR.*\\n.*timeout", .{
+            .multiline = true,
+        });
+        defer re_nl.deinit();
+        const ml_doc = "ERROR a\nok\nERROR b\nnext timeout\nERROR c\r\ncrlf timeout\n";
+        var bag = Bag{};
+        defer bag.deinit();
+        const r_nl = try searchSourceSlice(Bag, &bag, "ml-nl", ml_doc, &re_nl, .{
+            .multiline = true,
+            .match_mode = .leftmost_first,
+        });
+        try testing.expectEqual(@as(u64, 2), r_nl.matched_lines);
+        try testing.expectEqualStrings("ERROR b\nnext timeout", bag.matchAt(0).bytes);
+        try testing.expectEqualStrings("ERROR c\r\ncrlf timeout", bag.matchAt(1).bytes);
+    }
+}
+
+test "matched_raw_spans and only_matching_replace fast sink paths" {
+    const alloc = testing.allocator;
+
+    const RawSpanSink = struct {
+        pub const matched_raw_spans = true;
+        alloc: std.mem.Allocator,
+        spans_out: std.ArrayList([]u8) = .empty,
+        replaced_out: std.ArrayList([]u8) = .empty,
+        saw_u16_col: bool = false,
+
+        pub fn deinit(self: *@This()) void {
+            for (self.spans_out.items) |s| self.alloc.free(s);
+            self.spans_out.deinit(self.alloc);
+            for (self.replaced_out.items) |s| self.alloc.free(s);
+            self.replaced_out.deinit(self.alloc);
+        }
+
+        pub fn matched(self: *@This(), line: searcher.Line) bool {
+            if (line.u16_column != null) self.saw_u16_col = true;
+            for (line.matches) |sp| {
+                const seg = self.alloc.dupe(u8, line.bytes[sp.start..sp.end]) catch return false;
+                self.spans_out.append(self.alloc, seg) catch return false;
+            }
+            if (line.replaced) |rep| {
+                const dup = self.alloc.dupe(u8, rep) catch return false;
+                self.replaced_out.append(self.alloc, dup) catch return false;
+            }
+            return true;
+        }
+    };
+
+    const OnlyMatchReplaceSink = struct {
+        pub const matched_raw_spans = true;
+        pub const only_matching_replace = true;
+        alloc: std.mem.Allocator,
+        out: std.ArrayList([]u8) = .empty,
+        saw_line_replaced: bool = false,
+
+        pub fn deinit(self: *@This()) void {
+            for (self.out.items) |s| self.alloc.free(s);
+            self.out.deinit(self.alloc);
+        }
+
+        pub fn matched(self: *@This(), line: searcher.Line) bool {
+            if (line.replaced != null) self.saw_line_replaced = true;
+            for (line.matches) |sp| {
+                const seg = sp.replacement orelse line.bytes[sp.start..sp.end];
+                const dup = self.alloc.dupe(u8, seg) catch return false;
+                self.out.append(self.alloc, dup) catch return false;
+            }
+            return true;
+        }
+    };
+
+    var re = try regex_mod.Regex.init(alloc, "([a-z]+)=([0-9]+)", .{});
+    defer re.deinit();
+    const doc = "k1 a=10 and b=20\n你好 c=30\n";
+
+    // 1. -o mode (matched_raw_spans without replacement)
+    {
+        var sink = RawSpanSink{ .alloc = alloc };
+        defer sink.deinit();
+        const res = try searchSlice(RawSpanSink, &sink, doc, "raw-o", &re, .{
+            .match_mode = .leftmost_first,
+            .allocator = alloc,
+        });
+        try testing.expectEqual(@as(u64, 2), res.matched_lines);
+        try testing.expectEqual(@as(u64, 3), res.matches);
+        try testing.expect(!sink.saw_u16_col);
+        try testing.expectEqual(@as(usize, 3), sink.spans_out.items.len);
+        try testing.expectEqualStrings("a=10", sink.spans_out.items[0]);
+        try testing.expectEqualStrings("b=20", sink.spans_out.items[1]);
+        try testing.expectEqualStrings("c=30", sink.spans_out.items[2]);
+    }
+
+    // 2. -r mode (matched_raw_spans with full-line replacement)
+    {
+        var sink = RawSpanSink{ .alloc = alloc };
+        defer sink.deinit();
+        const res = try searchSlice(RawSpanSink, &sink, doc, "raw-r", &re, .{
+            .match_mode = .leftmost_first,
+            .replacement = "[$2:$1]",
+            .allocator = alloc,
+        });
+        try testing.expectEqual(@as(u64, 2), res.matched_lines);
+        try testing.expectEqual(@as(usize, 2), sink.replaced_out.items.len);
+        try testing.expectEqualStrings("k1 [10:a] and [20:b]", sink.replaced_out.items[0]);
+        try testing.expectEqualStrings("你好 [30:c]", sink.replaced_out.items[1]);
+    }
+
+    // 3. -o -r mode (matched_raw_spans + only_matching_replace)
+    {
+        var sink = OnlyMatchReplaceSink{ .alloc = alloc };
+        defer sink.deinit();
+        const res = try searchSlice(OnlyMatchReplaceSink, &sink, doc, "raw-or", &re, .{
+            .match_mode = .leftmost_first,
+            .replacement = "<$2/$1>",
+            .allocator = alloc,
+        });
+        try testing.expectEqual(@as(u64, 3), res.matches);
+        try testing.expect(!sink.saw_line_replaced);
+        try testing.expectEqual(@as(usize, 3), sink.out.items.len);
+        try testing.expectEqualStrings("<10/a>", sink.out.items[0]);
+        try testing.expectEqualStrings("<20/b>", sink.out.items[1]);
+        try testing.expectEqualStrings("<30/c>", sink.out.items[2]);
+    }
+}
+
+test "compiled replacement templates: literal, $$, $0/$&, $1..$32, and ${name}" {
+    const alloc = testing.allocator;
+    const format_mod = @import("format.zig");
+    const state_mod = @import("state.zig");
+
+    var re = try regex_mod.Regex.init(alloc, "(?P<key>[a-z]+)=(?P<val>[0-9]+)", .{});
+    defer re.deinit();
+
+    // 1. Direct mode classification check
+    try testing.expectEqual(state_mod.ReplMode.none, format_mod.compileReplacement(null, &re).mode);
+    try testing.expectEqual(state_mod.ReplMode.literal_only, format_mod.compileReplacement("CONST", &re).mode);
+    try testing.expectEqual(state_mod.ReplMode.literal_only, format_mod.compileReplacement("a$$b", &re).mode);
+    try testing.expectEqual(state_mod.ReplMode.literal_only, format_mod.compileReplacement("${missing}", &re).mode);
+    try testing.expectEqual(state_mod.ReplMode.whole_match_only, format_mod.compileReplacement("[$0/$&/${0}]", &re).mode);
+    try testing.expectEqual(state_mod.ReplMode.needs_captures, format_mod.compileReplacement("$2:$1", &re).mode);
+    try testing.expectEqual(state_mod.ReplMode.needs_captures, format_mod.compileReplacement("${val}->${key}", &re).mode);
+
+    const ReplSink = struct {
+        alloc: std.mem.Allocator,
+        replaced: std.ArrayList([]u8) = .empty,
+
+        pub fn deinit(self: *@This()) void {
+            for (self.replaced.items) |s| self.alloc.free(s);
+            self.replaced.deinit(self.alloc);
+        }
+
+        pub fn matched(self: *@This(), line: Line) bool {
+            if (line.replaced) |r| {
+                const dup = self.alloc.dupe(u8, r) catch return false;
+                self.replaced.append(self.alloc, dup) catch return false;
+            }
+            return true;
+        }
+    };
+
+    // 2. End-to-end replacement verification across all modes (including AnyMatcher and EOL match)
+    const sample = "x foo=42 bar=99\n";
+    const cases = [_]struct { tmpl: []const u8, expected: []const u8 }{
+        .{ .tmpl = "LIT", .expected = "x LIT LIT" },
+        .{ .tmpl = "a$$b", .expected = "x a$b a$b" },
+        .{ .tmpl = "($0|$&)", .expected = "x (foo=42|foo=42) (bar=99|bar=99)" },
+        .{ .tmpl = "$2:$1", .expected = "x 42:foo 99:bar" },
+        .{ .tmpl = "${val}->${key}", .expected = "x 42->foo 99->bar" },
+        .{ .tmpl = "pre-${missing}-post", .expected = "x pre--post pre--post" },
+    };
+
+    for (cases) |tc| {
+        var rs = ReplSink{ .alloc = alloc };
+        defer rs.deinit();
+        const res = try searchSlice(ReplSink, &rs, sample, "repl-test", &re, .{
+            .match_mode = .leftmost_first,
+            .replacement = tc.tmpl,
+            .allocator = alloc,
+        });
+        try testing.expectEqual(@as(u64, 1), res.matched_lines);
+        try testing.expectEqual(@as(usize, 1), rs.replaced.items.len);
+        try testing.expectEqualStrings(tc.expected, rs.replaced.items[0]);
+    }
+
+    // 2b. Named capture replacement via type-erased AnyMatcher
+    {
+        var any_re = matcher_mod.AnyMatcher.init(regex_mod.Regex, &re);
+        var rs = ReplSink{ .alloc = alloc };
+        defer rs.deinit();
+        const res = try searchSlice(ReplSink, &rs, sample, "repl-any", &any_re, .{
+            .match_mode = .leftmost_first,
+            .replacement = "${val}=${key}",
+            .allocator = alloc,
+        });
+        try testing.expectEqual(@as(u64, 1), res.matched_lines);
+        try testing.expectEqual(@as(usize, 1), rs.replaced.items.len);
+        try testing.expectEqualStrings("x 42=foo 99=bar", rs.replaced.items[0]);
+    }
+
+    // 3. Long line (>4 KiB) exercising geometric replace_buf growth + streaming reader
+    {
+        var big = std.ArrayList(u8).empty;
+        defer big.deinit(alloc);
+        for (0..300) |_| try big.appendSlice(alloc, "ab=123 ");
+        try big.append(alloc, '\n');
+
+        var reader = std.Io.Reader.fixed(big.items);
+        var rs = ReplSink{ .alloc = alloc };
+        defer rs.deinit();
+        const res = try searchReader(ReplSink, alloc, &rs, &reader, "repl-big", &re, .{
+            .match_mode = .leftmost_first,
+            .replacement = "[${val}:${key}:$$]",
+            .allocator = alloc,
+        });
+        try testing.expectEqual(@as(u64, 1), res.matched_lines);
+        try testing.expectEqual(@as(u64, 300), res.matches);
+        try testing.expectEqual(@as(usize, 1), rs.replaced.items.len);
+        try testing.expect(std.mem.startsWith(u8, rs.replaced.items[0], "[123:ab:$] [123:ab:$] "));
+    }
+
+    // 4. CapPlan fast capture extraction with `.*` across UTF-8 multibyte text and greedy rightmost tail
+    {
+        var re_cap = try regex_mod.Regex.init(alloc, "svc=([a-z]+).*latency=([0-9]+ms)", .{});
+        defer re_cap.deinit();
+        const utf8_doc = "2026 level=INFO svc=gateway 用户请求完成 latency=42ms path=/v2\n" ++
+            "2026 level=WARN svc=auth Проверка latency=10ms retry latency=73ms ok\n";
+        var rs = ReplSink{ .alloc = alloc };
+        defer rs.deinit();
+        const res = try searchSlice(ReplSink, &rs, utf8_doc, "repl-capplan", &re_cap, .{
+            .match_mode = .leftmost_first,
+            .replacement = "$1-$2",
+            .allocator = alloc,
+        });
+        try testing.expectEqual(@as(u64, 2), res.matched_lines);
+        try testing.expectEqual(@as(usize, 2), rs.replaced.items.len);
+        try testing.expectEqualStrings("2026 level=INFO gateway-42ms path=/v2", rs.replaced.items[0]);
+        try testing.expectEqualStrings("2026 level=WARN auth-73ms ok", rs.replaced.items[1]);
+    }
+}
+
 test {
     _ = @import("challenger_test.zig");
 }

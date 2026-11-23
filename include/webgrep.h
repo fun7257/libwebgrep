@@ -172,6 +172,13 @@ typedef enum webgrep_entry_kind_e {
     WEBGREP_ENTRY_OTHER     = 2
 } webgrep_entry_kind_t;
 
+/** Whole-word boundary mode for `webgrep_config_t.whole_word`. */
+typedef enum webgrep_whole_word_mode_e {
+    WEBGREP_WHOLE_WORD_OFF     = 0,
+    WEBGREP_WHOLE_WORD_UNICODE = 1,
+    WEBGREP_WHOLE_WORD_ASCII   = 2
+} webgrep_whole_word_mode_t;
+
 /* ============================================================================
  * Opaque Handles
  * ========================================================================= */

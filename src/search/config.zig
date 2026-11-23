@@ -111,10 +111,14 @@ pub const SearchConfig = struct {
     /// though they still invoke `matched` (so counting printers include them, matching ripgrep 15).
     /// Once the limit is reached, no further chunks are read; after-context lines already in the buffer are still emitted.
     max_count: ?u64 = null,
-    /// Whole-word matching. Only checks whether the byte immediately outside the match is an ASCII word character (alphanumeric or underscore).
+    /// Whole-word matching. Checks whether the character immediately outside the match is a word character
+    /// (Unicode UTS #18 word characters when `whole_word_unicode` is true, or ASCII `[0-9A-Za-z_]` when false).
     /// This is a half-boundary check: `-2` matches `(-2)`, but not `x-2` or `-2y`.
     /// Ignored when `whole_line` is also enabled.
     whole_word: bool = false,
+    /// When true (default), `whole_word` uses Unicode UTS #18 word character classification (`Alphabetic | M | Nd | Pc | Join_Control`);
+    /// when false, uses ASCII-only `[0-9A-Za-z_]` matching `rg -w --no-unicode`.
+    whole_word_unicode: bool = true,
     /// Whole-line matching. After stripping LF and a single preceding CR, the entire line content must match one of the patterns.
     whole_line: bool = false,
     /// Enables cross-line matching semantics and sliding-window buffering even if the matcher did not set `isMultiline()`.

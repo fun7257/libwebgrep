@@ -47,6 +47,15 @@ pub const BufMatch = struct {
     single_match: bool = false,
 };
 
+pub const ReplMode = enum { none, literal_only, whole_match_only, needs_captures };
+pub const ReplOp = union(enum) { literal: []const u8, whole_match, group: u8 };
+pub const CompiledReplacement = struct {
+    mode: ReplMode = .none,
+    ops: [32]ReplOp = undefined,
+    len: u8 = 0,
+    overflow: bool = false,
+};
+
 pub const State = struct {
     pos: usize = 0,
     abs_base: u64 = 0,
@@ -126,6 +135,8 @@ pub const State = struct {
     cached_match_buf_len: usize = 0,
     cached_match_from: usize = 0,
     cached_match: ?matcher_mod.Match = null,
+    is_pure_empty: bool = false,
+    compiled_repl: CompiledReplacement = .{},
 
     pub inline fn getCachedMatch(self: *const State, buf: []const u8, pos: usize) ??matcher_mod.Match {
         if (self.cached_match_abs_base == self.abs_base and
@@ -934,7 +945,7 @@ pub fn overlapKeep(matcher: anytype, config: SearchConfig) usize {
         const req_len = if (re.requiredLiteral()) |lit| lit.bytes.len + lit.offset_in_match else 256;
         n = @max(n, @max(req_len, 256));
     }
-    if (config.whole_word) n += 4;
+    if (config.whole_word) n += 8;
     if (n == 0) n = 1;
     const cap = if (config.max_line_len == 0) 1 else config.max_line_len;
     return @min(n, cap);

@@ -39,6 +39,7 @@ const isStartAnchoredMatcher = state_mod.isStartAnchoredMatcher;
 const multilineWindow = state_mod.multilineWindow;
 const rememberBefore = ring_mod.rememberBefore;
 const emitRing = ring_mod.emitRing;
+const emitRingFrom = ring_mod.emitRingFrom;
 const sinkMatched = format_mod.sinkMatched;
 const sinkContext = format_mod.sinkContext;
 
@@ -114,6 +115,134 @@ pub fn matchBuffer(
     return matchBufferWithLimit(S, sink, matcher, buf, buf.len, false, state, config);
 }
 
+fn canBulkInvertCount(
+    comptime S: type,
+    matcher: anytype,
+    state: *const State,
+    config: SearchConfig,
+    limit: usize,
+    buf_len: usize,
+) bool {
+    if (comptime @hasDecl(S, "matched") or @hasDecl(S, "context") or @hasDecl(S, "contextBreak") or @hasDecl(S, "context_break")) {
+        return false;
+    }
+    return config.invert and
+        limit >= buf_len and
+        !config.null_data and
+        !effectiveMultiline(matcher, config) and
+        config.max_count == null and
+        config.max_results == null and
+        !config.exists and
+        !config.files_without_match and
+        !config.passthru and
+        !config.stop_on_nonmatch and
+        !config.whole_line and
+        beforeCount(config) == 0 and
+        afterCount(config) == 0 and
+        state.after_left == 0 and
+        config.contains.len == 0 and
+        config.excludes.len == 0 and
+        config.contains_regexes.len == 0 and
+        config.excludes_regexes.len == 0 and
+        config.line_filter == null and
+        config.resume_from == 0 and
+        config.max_output_bytes == null and
+        config.max_queued_event_bytes == null and
+        (config.progress_interval == null or config.progress_interval.? == 0);
+}
+
+fn bulkInvertCount(
+    matcher: anytype,
+    buf: []const u8,
+    effective_limit: usize,
+    state: *State,
+    config: SearchConfig,
+) bool {
+    const start_pos = state.pos;
+    if (start_pos >= effective_limit) return !state.stopped;
+
+    const has_abort = config.stop != null or config.cancel != null or state.deadline_armed;
+    var pos = start_pos;
+    var matched: u64 = 0;
+    var aborted = false;
+
+    if (config.whole_word) {
+        while (pos < effective_limit) {
+            if (has_abort) {
+                if (state_mod.flagIsSet(config)) {
+                    state.stopped = true;
+                    aborted = true;
+                    break;
+                }
+                if (stopInMatch(state, config)) {
+                    aborted = true;
+                    break;
+                }
+            }
+            const hit = nextMatch(matcher, buf, pos, config) orelse break;
+            if (hit.start >= effective_limit or hit.start < pos) break;
+            matched += 1;
+            const probe = if (hit.end > hit.start and hit.end <= effective_limit and buf[hit.end - 1] == '\n')
+                hit.end - 1
+            else
+                @max(hit.end, pos);
+            pos = if (probe < effective_limit)
+                (if (std.mem.findScalarPos(u8, buf[0..effective_limit], probe, '\n')) |nl| nl + 1 else effective_limit)
+            else
+                effective_limit;
+        }
+    } else {
+        while (pos < effective_limit) {
+            if (has_abort) {
+                if (state_mod.flagIsSet(config)) {
+                    state.stopped = true;
+                    aborted = true;
+                    break;
+                }
+                if (stopInMatch(state, config)) {
+                    aborted = true;
+                    break;
+                }
+            }
+            const hit = matcher.find(buf, pos, config.match_mode) orelse break;
+            if (hit.start >= effective_limit or hit.start < pos) break;
+            matched += 1;
+            const probe = if (hit.end > hit.start and hit.end <= effective_limit and buf[hit.end - 1] == '\n')
+                hit.end - 1
+            else
+                @max(hit.end, pos);
+            pos = if (probe < effective_limit)
+                (if (std.mem.findScalarPos(u8, buf[0..effective_limit], probe, '\n')) |nl| nl + 1 else effective_limit)
+            else
+                effective_limit;
+        }
+    }
+
+    const scan_end = if (aborted) pos else effective_limit;
+    const total_seps: u64 = memchr.count(cfg_mod.width, buf, start_pos, scan_end, '\n');
+    const trailing_line: u64 = @intFromBool(scan_end > start_pos and buf[scan_end - 1] != '\n');
+    const total_lines = total_seps + trailing_line;
+    const non_matching = total_lines -| matched;
+
+    if (state.line_number != null) {
+        state_mod.countLines(buf, start_pos, state, config);
+        state.line_number = state.line_number.? + total_seps;
+        state.last_line_counted = scan_end;
+    }
+    if (non_matching > 0) {
+        state.matched_lines += non_matching;
+        state.matches += non_matching;
+        state.limit_count += non_matching;
+        state.results_out += non_matching;
+        state.has_sunk = true;
+        state.last_abs_end = state.abs_base + @as(u64, scan_end);
+    }
+    state.pos = scan_end;
+    state.last_line_visited = scan_end;
+    state.remembered_until = @max(state.remembered_until, scan_end);
+    return !state.stopped;
+}
+
 pub fn matchBufferWithLimit(
     comptime S: type,
     sink: *S,
@@ -126,6 +255,18 @@ pub fn matchBufferWithLimit(
 ) SliceError!bool {
     const need_ls = needLineStart(S, state, config);
     var effective_limit = @min(limit, buf.len);
+    if (config.invert and canBulkInvertCount(S, matcher, state, config, limit, buf.len)) {
+        if (state.stopped) return false;
+        if (state_mod.flagIsSet(config)) {
+            state.stopped = true;
+            return false;
+        }
+        if (stopInMatch(state, config)) return false;
+        if (state.pending_skip_to != null) {
+            if (!applyInBufferSkip(buf, effective_limit, state, config)) return false;
+        }
+        return bulkInvertCount(matcher, buf, effective_limit, state, config);
+    }
     while (state.pos < effective_limit) {
         if (state.stopped) return false;
         if (state_mod.flagIsSet(config)) {
@@ -849,7 +990,39 @@ pub fn beforeContext(
     state: *State,
     config: SearchConfig,
 ) SliceError!bool {
-    if (beforeCount(config) == 0) return true;
+    const before_n = beforeCount(config);
+    if (before_n == 0) return true;
+    if (!config.passthru and !config.invert and !config.stop_on_nonmatch) {
+        const limit_end = @min(upto, buf.len);
+        const floor = @max(state.remembered_until, state.last_line_visited);
+        if (floor >= limit_end) {
+            return emitRing(S, sink, buf, state, config);
+        }
+        const sep = cfg_mod.recordSep(config);
+        var start_pos = limit_end;
+        var found: u32 = 0;
+        while (found < before_n and start_pos > floor) {
+            const ls = if (memchr.findLast(cfg_mod.width, buf, floor, start_pos - 1, sep)) |at| at + 1 else floor;
+            start_pos = ls;
+            found += 1;
+        }
+        if (found == before_n) {
+            state.ring.clear();
+        } else if (state.ring.count > 0) {
+            const keep = @min(state.ring.count, before_n - found);
+            const skip = state.ring.count - keep;
+            if (!try emitRingFrom(S, sink, buf, state, config, skip)) return false;
+        }
+        state_mod.countLines(buf, start_pos, state, config);
+        var cursor = start_pos;
+        while (nextLine(buf, cursor, limit_end, config)) |line| {
+            cursor = line.end;
+            if (!try sinkContext(S, sink, matcher, buf, line, .before, state, config)) return false;
+            if (state.pending_skip_to != null) return false;
+        }
+        state.remembered_until = @max(state.remembered_until, limit_end);
+        return true;
+    }
     // The match may fall at the start of the current chunk with its before-context lines already pushed into the ring during the previous chunk.
     // In that case `last_line_visited == upto`, and the ring must still be emitted.
     if (state.last_line_visited < upto) {

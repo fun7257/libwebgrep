@@ -8,6 +8,7 @@
 //! [HotPath] `rememberBefore`, `previewLine`, `emitRing`.
 
 const std = @import("std");
+const memchr = @import("../finder/memchr.zig");
 const cfg_mod = @import("config.zig");
 const state_mod = @import("state.zig");
 const format_mod = @import("format.zig");
@@ -184,20 +185,32 @@ pub fn rememberBefore(matcher: anytype, buf: []const u8, state: *State, config: 
         state.remembered_until = @max(state.remembered_until, limit_end);
         return;
     }
-    var cursor = @max(state.remembered_until, state.last_line_visited);
-    if (cursor > limit_end) cursor = limit_end;
+    const floor = @max(state.remembered_until, state.last_line_visited);
+    if (floor >= limit_end) {
+        state.remembered_until = @max(state.remembered_until, limit_end);
+        return;
+    }
+    const cap = state.ring.cap;
+    const sep = cfg_mod.recordSep(config);
+    var start_pos = limit_end;
+    var found: u32 = 0;
+    while (found < cap and start_pos > floor) {
+        const ls = if (memchr.findLast(cfg_mod.width, buf, floor, start_pos - 1, sep)) |at| at + 1 else floor;
+        start_pos = ls;
+        found += 1;
+    }
+    if (found == cap) {
+        state.ring.clear();
+    }
+    var cursor = start_pos;
     while (nextLine(buf, cursor, limit_end, config)) |line| {
-        if (line.end <= state.last_line_visited) {
-            cursor = line.end;
-            continue;
-        }
         const known = if (config.invert) matchInLine(matcher, buf, line, config) else null;
         const preview = previewLine(buf, line, known, config);
         countLines(buf, line.start, state, config);
         state.ring.push(buf, preview, state.abs_base + line.start, state.abs_base + line.end, state.line_number);
         cursor = line.end;
     }
-    state.remembered_until = limit_end;
+    state.remembered_until = @max(state.remembered_until, limit_end);
 }
 
 pub fn emitRing(
@@ -207,7 +220,18 @@ pub fn emitRing(
     state: *State,
     config: SearchConfig,
 ) SliceError!bool {
-    var i: u32 = 0;
+    return emitRingFrom(S, sink, buf, state, config, 0);
+}
+
+pub fn emitRingFrom(
+    comptime S: type,
+    sink: *S,
+    buf: []const u8,
+    state: *State,
+    config: SearchConfig,
+    start_i: u32,
+) SliceError!bool {
+    var i: u32 = start_i;
     while (i < state.ring.count) : (i += 1) {
         const idx = state.ring.index(i);
         const slot = state.ring.slotAt(idx);

@@ -6738,6 +6738,207 @@ test "v0.7.0: replacement templates support ${10}..${32} and named ${name} captu
 }
 
 
+test "lazy backward before-context -C 3 -n parity across slice and streaming chunks" {
+    const alloc = testing.allocator;
+    var doc = std.ArrayList(u8).empty;
+    defer doc.deinit(alloc);
+
+    // Build a 60-line document exercising:
+    // - early hit near start (line 2, fewer than 3 before lines)
+    // - overlapping context windows (hits at lines 6 & 8)
+    // - exact abutting windows with NO break (hits at lines 8 & 15 -> 3 after + 3 before = 6 lines between)
+    // - break separator `--` (hits at lines 15 & 23 -> 7 lines between)
+    // - empty lines, CRLF lines, and long gap before late hits across chunk boundaries (lines 40, 44, 52, 60)
+    var line_buf: [64]u8 = undefined;
+    for (1..61) |ln| {
+        if (ln == 2 or ln == 6 or ln == 8 or ln == 15 or ln == 23 or ln == 40 or ln == 44 or ln == 52 or ln == 60) {
+            const s = try std.fmt.bufPrint(&line_buf, "L{d:0>2}_MATCH_TOKEN", .{ln});
+            try doc.appendSlice(alloc, s);
+        } else if (ln == 12 or ln == 21 or ln == 39) {
+            // empty line inside context window
+        } else {
+            const s = try std.fmt.bufPrint(&line_buf, "L{d:0>2}_padding_text_abcdef", .{ln});
+            try doc.appendSlice(alloc, s);
+        }
+        if (ln == 14 or ln == 22) {
+            try doc.appendSlice(alloc, "\r\n");
+        } else if (ln < 60) {
+            try doc.append(alloc, '\n');
+        }
+    }
+
+    var finder = try Finder.init("MATCH_TOKEN", .{});
+    const base_cfg = SearchConfig{
+        .line_numbers = true,
+        .context = 3,
+        .binary = .none,
+    };
+
+    // Baseline single-slice search (no trailing newline on line 60)
+    var slice_rec = Rec{};
+    defer slice_rec.deinit(alloc);
+    const slice_res = try searchSlice(Rec, &slice_rec, doc.items, "ctx", &finder, base_cfg);
+    try testing.expectEqual(@as(u64, 9), slice_res.matched_lines);
+    // Breaks between: (15 -> 23), (23 -> 40), (44 -> 52), (52 -> 60) = 4 breaks.
+    // Note: (2 -> 6), (6 -> 8), (8 -> 15 exact abutment), (40 -> 44) have NO break.
+    try testing.expectEqual(@as(u32, 4), slice_rec.breaks);
+    try testing.expect(std.mem.startsWith(u8, slice_rec.text.items, "1-L01_padding_text_abcdef\n2:L02_MATCH_TOKEN\n"));
+    try testing.expect(std.mem.endsWith(u8, slice_rec.text.items, "59-L59_padding_text_abcdef\n60:L60_MATCH_TOKEN\n"));
+
+    // Verify 100% parity across many small streaming chunk sizes (forcing ring-only, mixed ring+buf, and buf-only hits)
+    const chunk_sizes = [_]usize{ 28, 32, 40, 48, 64, 96, 128, 256 };
+    for (chunk_sizes) |csz| {
+        var reader = std.Io.Reader.fixed(doc.items);
+        var stream_rec = Rec{};
+        defer stream_rec.deinit(alloc);
+        var scfg = base_cfg;
+        scfg.buffer_size = csz;
+        scfg.max_line_len = 256;
+        const stream_res = try searchReader(Rec, alloc, &stream_rec, &reader, "ctx", &finder, scfg);
+        try testing.expectEqual(slice_res.matched_lines, stream_res.matched_lines);
+        try testing.expectEqual(slice_rec.breaks, stream_rec.breaks);
+        try testing.expectEqualStrings(slice_rec.text.items, stream_rec.text.items);
+    }
+
+    // Also test with trailing newline at EOF and wide context exceeding context_lines_hard_cap (12 > 10)
+    try doc.append(alloc, '\n');
+    const wide_cfg = SearchConfig{
+        .line_numbers = true,
+        .before = 12,
+        .after = 2,
+        .max_context_lines = 16,
+        .allocator = alloc,
+        .binary = .none,
+    };
+    var wide_slice = Rec{};
+    defer wide_slice.deinit(alloc);
+    _ = try searchSlice(Rec, &wide_slice, doc.items, "wide", &finder, wide_cfg);
+
+    var wide_reader = std.Io.Reader.fixed(doc.items);
+    var wide_stream = Rec{};
+    defer wide_stream.deinit(alloc);
+    var wcfg = wide_cfg;
+    wcfg.buffer_size = 64;
+    wcfg.max_line_len = 256;
+    _ = try searchReader(Rec, alloc, &wide_stream, &wide_reader, "wide", &finder, wcfg);
+    try testing.expectEqual(wide_slice.breaks, wide_stream.breaks);
+    try testing.expectEqualStrings(wide_slice.text.items, wide_stream.text.items);
+}
+
+test "bulk count-only invert -c -v parity across rare, dense, zero, all, EOF, and -w" {
+    const alloc = testing.allocator;
+    const EmptyCountSink = struct {};
+
+    // Helper comparing CountSink (bulk invert fast path) vs Rec (full matchInvert) for slice + streaming
+    const checkCase = struct {
+        fn runCheck(a: std.mem.Allocator, hay: []const u8, pat: []const u8, cfg: SearchConfig, expected_nonmatch: u64) !void {
+            var finder = try Finder.init(pat, .{});
+            var rec = Rec{};
+            defer rec.deinit(a);
+            const rec_res = try searchSlice(Rec, &rec, hay, "inv", &finder, cfg);
+            try testing.expectEqual(expected_nonmatch, rec_res.matched_lines);
+
+            var cs_slice = EmptyCountSink{};
+            const slice_res = try searchSlice(EmptyCountSink, &cs_slice, hay, "inv", &finder, cfg);
+            try testing.expectEqual(expected_nonmatch, slice_res.matched_lines);
+            try testing.expectEqual(rec_res.matches, slice_res.matches);
+
+            const chunk_sizes = [_]usize{ 16, 32, 64, 256 };
+            for (chunk_sizes) |csz| {
+                var reader = std.Io.Reader.fixed(hay);
+                var cs_stream = EmptyCountSink{};
+                var scfg = cfg;
+                scfg.buffer_size = csz;
+                scfg.max_line_len = 512;
+                const stream_res = try searchReader(EmptyCountSink, a, &cs_stream, &reader, "inv", &finder, scfg);
+                try testing.expectEqual(expected_nonmatch, stream_res.matched_lines);
+                try testing.expectEqual(rec_res.matches, stream_res.matches);
+            }
+        }
+    }.runCheck;
+
+    const base = SearchConfig{ .invert = true, .binary = .none };
+
+    // 1. Empty input
+    try checkCase(alloc, "", "NEEDLE", base, 0);
+
+    // 2. 0 matches (all lines are inverted hits), with and without trailing newline
+    try checkCase(alloc, "alpha\nbeta\ngamma\n", "MISSING", base, 3);
+    try checkCase(alloc, "alpha\nbeta\ngamma", "MISSING", base, 3);
+    try checkCase(alloc, "single_no_nl", "MISSING", base, 1);
+
+    // 3. All lines match (0 inverted hits), with and without trailing newline
+    try checkCase(alloc, "hit1\nhit2\nhit3\n", "hit", base, 0);
+    try checkCase(alloc, "hit1\nhit2\nhit3", "hit", base, 0);
+    try checkCase(alloc, "a\n\nb\n", "", base, 0);
+
+    // 4. Rare matches (2 matches in 100 lines -> 98 inverted hits)
+    {
+        var rare = std.ArrayList(u8).empty;
+        defer rare.deinit(alloc);
+        for (0..100) |i| {
+            if (i == 17 or i == 83) {
+                try rare.appendSlice(alloc, "line_with_RARE_HIT_here\n");
+            } else {
+                try rare.appendSlice(alloc, "ordinary_nonmatching_log_line\n");
+            }
+        }
+        try checkCase(alloc, rare.items, "RARE_HIT", base, 98);
+        // Also with line_numbers enabled
+        var ln_cfg = base;
+        ln_cfg.line_numbers = true;
+        try checkCase(alloc, rare.items, "RARE_HIT", ln_cfg, 98);
+    }
+
+    // 5. Dense matches (alternating matching/non-matching + no trailing newline)
+    {
+        var dense = std.ArrayList(u8).empty;
+        defer dense.deinit(alloc);
+        for (0..121) |i| {
+            if (i % 2 == 0) {
+                try dense.appendSlice(alloc, "dense_HIT_row_0123456789");
+            } else {
+                try dense.appendSlice(alloc, "other_row_0123456789");
+            }
+            if (i < 120) try dense.append(alloc, '\n');
+        }
+        // 0,2,...,120 = 61 matching lines; 1,3,...,119 = 60 non-matching lines
+        try checkCase(alloc, dense.items, "HIT", base, 60);
+    }
+
+    // 6. Whole-word `-c -v -w`
+    {
+        const ww_doc = "foo bar\nfoobar\n(foo)\nxfoo\nfoo_baz\nbar foo";
+        // Matching whole-word "foo": line 1 ("foo bar"), line 3 ("(foo)"), line 6 ("bar foo") -> 3 matches, 3 non-matches
+        const ww_cfg = SearchConfig{ .invert = true, .whole_word = true, .binary = .none };
+        try checkCase(alloc, ww_doc, "foo", ww_cfg, 3);
+    }
+
+    // 7. Regex `-c -v` (anchored and unanchored)
+    {
+        var re = try regex_mod.Regex.init(alloc, "^err_[0-9]+", .{});
+        defer re.deinit();
+        const re_doc = "err_123 ok\ninfo err_456\nerr_7\nok_tail";
+        var rec = Rec{};
+        defer rec.deinit(alloc);
+        const rec_res = try searchSlice(Rec, &rec, re_doc, "re-inv", &re, base);
+        var cs = EmptyCountSink{};
+        const cs_res = try searchSlice(EmptyCountSink, &cs, re_doc, "re-inv", &re, base);
+        try testing.expectEqual(@as(u64, 2), rec_res.matched_lines);
+        try testing.expectEqual(rec_res.matched_lines, cs_res.matched_lines);
+
+        var reader = std.Io.Reader.fixed(re_doc);
+        var cs_stream = EmptyCountSink{};
+        const st_res = try searchReader(EmptyCountSink, alloc, &cs_stream, &reader, "re-inv", &re, .{
+            .invert = true,
+            .binary = .none,
+            .buffer_size = 16,
+            .max_line_len = 256,
+        });
+        try testing.expectEqual(rec_res.matched_lines, st_res.matched_lines);
+    }
+}
+
 test {
     _ = @import("challenger_test.zig");
 }

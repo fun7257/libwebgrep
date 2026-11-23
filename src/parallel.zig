@@ -107,6 +107,10 @@ const Shared = struct {
     idle_cv: std.Io.Condition = .init,
     stop: std.atomic.Value(bool) = .init(false),
     idle: std.atomic.Value(u32) = .init(0),
+    /// Workers not currently executing a job (includes both parked workers and freshly spawned workers
+    /// that have not yet claimed their first job). Passed to `walker.Host.idle` so the root worker
+    /// fans out initial files deterministically instead of racing worker startup and scanning a huge file inline.
+    available_workers: std.atomic.Value(u32) = .init(0),
     /// Number of jobs currently queued across all worker deques.
     pending_jobs: std.atomic.Value(u32) = .init(0),
     /// Additional sub-worker threads currently leased to intra-source parallel scans.
@@ -330,6 +334,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, req: Run) !Stats {
         .write_output = req.write_output,
         .saw = req.saw_output,
         .workers = workers,
+        .available_workers = .init(workers),
         .on_event = req.on_event,
         .event_ctx = req.event_ctx,
     };
@@ -517,6 +522,8 @@ fn stealJob(shared: *Shared, index: u32) ?*walker.Job {
 }
 
 fn runJob(worker: *Worker, job: *walker.Job) void {
+    _ = worker.shared.available_workers.fetchSub(1, .acq_rel);
+    defer _ = worker.shared.available_workers.fetchAdd(1, .acq_rel);
     var slot = Slot{ .worker = worker };
     var host = makeHost(worker, &slot);
     walker.process(&host, job);
@@ -529,7 +536,7 @@ fn makeHost(worker: *Worker, slot: *Slot) walker.Host {
         .config = worker.shared.walk,
         .session = worker.shared.session,
         .stop = &worker.shared.stop,
-        .idle = &worker.shared.idle,
+        .idle = &worker.shared.available_workers,
         .push = pushJob,
         .push_ctx = slot,
         .on_file = onFile,

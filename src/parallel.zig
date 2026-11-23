@@ -531,6 +531,7 @@ fn makeHost(worker: *Worker, slot: *Slot) walker.Host {
         .config = worker.shared.walk,
         .session = worker.shared.session,
         .stop = &worker.shared.stop,
+        .idle = &worker.shared.idle,
         .push = pushJob,
         .push_ctx = slot,
         .on_file = onFile,
@@ -595,7 +596,6 @@ fn onFile(ctx: *anyopaque, visit: walker.Visit) anyerror!walker.Control {
         return .cont;
     };
     defer file.close(shared.io);
-    platform.adviseSequentialFile(file);
     searchOpen(worker, file, visit.path) catch |err| {
         shared.note(visit.path, err);
         switch (err) {
@@ -732,7 +732,7 @@ fn runFileOrMmap(
                     cfg.max_source_bytes == null and
                     cfg.max_request_bytes == null and
                     cfg.compression == .none and
-                    cfg.encoding == .none and
+                    (cfg.encoding == .none or cfg.encoding == .auto) and
                     cfg.charset == null)
                 {
                     const need: usize = @intCast(info.size);
@@ -749,7 +749,9 @@ fn runFileOrMmap(
                         if (n == 0) break;
                         got += n;
                     }
-                    return searcher.searchSlice(S, sink, worker.scratch[0..got], path, engine, cfg);
+                    var slice_cfg = cfg;
+                    if (slice_cfg.decode_allocator == null) slice_cfg.decode_allocator = shared.allocator;
+                    return searcher.searchSlice(S, sink, worker.scratch[0..got], path, engine, slice_cfg);
                 }
             }
         }

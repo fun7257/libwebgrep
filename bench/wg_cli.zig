@@ -220,7 +220,7 @@ fn searchOneFile(
 }
 
 pub fn main(init: std.process.Init) !u8 {
-    const gpa = init.gpa;
+    const gpa = std.heap.smp_allocator;
     const io = init.io;
 
     var cli = CliArgs{};
@@ -347,6 +347,7 @@ pub fn main(init: std.process.Init) !u8 {
             break :blk .{ .regex = libwebgrep.Regex.init(gpa, cli.patterns.items[0], .{
                 .case = case_mode,
                 .unicode_case = !cli.no_unicode,
+                .unicode_classes = !cli.no_unicode,
                 .multiline = cli.multiline,
                 .dot_all = cli.multiline_dotall,
             }) catch return 2 };
@@ -374,6 +375,7 @@ pub fn main(init: std.process.Init) !u8 {
             break :blk .{ .regex = libwebgrep.Regex.init(gpa, joined, .{
                 .case = case_mode,
                 .unicode_case = !cli.no_unicode,
+                .unicode_classes = !cli.no_unicode,
                 .multiline = cli.multiline,
                 .dot_all = cli.multiline_dotall,
             }) catch return 2 };

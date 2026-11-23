@@ -78,6 +78,9 @@ pub const Host = struct {
     config: Config,
     session: *Session,
     stop: *std.atomic.Value(bool),
+    /// Optional count of currently parked workers; when non-null and zero, leaf files are visited
+    /// inline on the current worker without duplicating directory fds or allocating per-file jobs.
+    idle: ?*const std.atomic.Value(u32) = null,
     push: *const fn (*anyopaque, *Job) anyerror!void,
     push_ctx: *anyopaque,
     on_file: *const fn (*anyopaque, Visit) anyerror!Control,
@@ -87,13 +90,15 @@ pub const Host = struct {
 };
 
 pub const Job = struct {
-    dir: std.Io.Dir,
+    /// Open directory handle when already opened (root jobs), or `null` for deferred jobs opened on demand
+    /// when a worker executes the job (preventing fd-table growth / `expand_files` RCU stalls).
+    dir: ?std.Io.Dir = null,
     /// Root path passed by the caller; must remain valid throughout traversal.
     root: []const u8,
     rel: []u8,
     ignore: *const ignore.Set,
     depth: u32,
-    /// Device ID of this directory. 0 means unavailable and is not used for cross-device checks.
+    /// Device ID of this directory (or parent directory when `dir == null`). 0 means unavailable.
     dev: u64 = 0,
     allocator: std.mem.Allocator,
     /// When non-null, this job visits only these filenames without listing the directory. Names are freed by this job.
@@ -104,7 +109,7 @@ pub const Job = struct {
             for (names) |name| self.allocator.free(name);
             self.allocator.free(names);
         }
-        self.dir.close(io);
+        if (self.dir) |d| d.close(io);
         self.allocator.free(self.rel);
         self.allocator.destroy(self);
     }
@@ -219,10 +224,31 @@ fn withoutLinkResolve(options: anytype) @TypeOf(options) {
     return out;
 }
 
+fn openJobDir(host: *Host, job: *const Job) !std.Io.Dir {
+    if (job.rel.len == 0) return openRoot(host.io, job.root);
+    if (job.root.len == 0) return openRoot(host.io, job.rel);
+    var stack_path: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    if (job.root.len + 1 + job.rel.len <= stack_path.len) {
+        @memcpy(stack_path[0..job.root.len], job.root);
+        stack_path[job.root.len] = '/';
+        @memcpy(stack_path[job.root.len + 1 ..][0..job.rel.len], job.rel);
+        return openRoot(host.io, stack_path[0 .. job.root.len + 1 + job.rel.len]);
+    }
+    const heap_path = try displayPath(host.allocator, job.root, job.rel);
+    defer host.allocator.free(heap_path);
+    return openRoot(host.io, heap_path);
+}
+
 pub fn process(host: *Host, job: *Job) void {
+    defer job.destroy(host.io);
+    if (host.stop.load(.acquire)) return;
+
     if (job.files) |names| {
-        defer job.destroy(host.io);
-        if (host.stop.load(.acquire)) return;
+        const dir = job.dir orelse (openJobDir(host, job) catch |err| {
+            report(host, job, "", err);
+            return;
+        });
+        defer if (job.dir == null) dir.close(host.io);
         for (names) |name| {
             if (host.stop.load(.acquire)) return;
             var rel_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -230,14 +256,31 @@ pub fn process(host: *Host, job: *Job) void {
                 report(host, job, name, error.NameTooLong);
                 continue;
             };
-            visitCheckedFile(host, job, name, rel);
+            visitCheckedFile(host, job, dir, name, rel);
         }
         return;
     }
 
-    defer job.destroy(host.io);
-    if (host.stop.load(.acquire)) return;
     if (job.depth > host.config.effectiveMaxDepth()) return;
+
+    const dir = job.dir orelse (openJobDir(host, job) catch |err| {
+        report(host, job, "", err);
+        return;
+    });
+    defer if (job.dir == null) dir.close(host.io);
+
+    if (job.dir == null) {
+        if (host.config.one_file_system and job.dev != 0) {
+            if (directoryDevice(dir)) |child_dev| {
+                if (child_dev != job.dev) return;
+                job.dev = child_dev;
+            }
+        }
+        job.ignore = loadRules(host, dir, job.ignore, job.rel.len) catch |err| {
+            report(host, job, "", err);
+            return;
+        };
+    }
 
     const scratch = host.allocator.alignedAlloc(
         u8,
@@ -249,7 +292,7 @@ pub fn process(host: *Host, job: *Job) void {
     };
     defer host.allocator.free(scratch);
 
-    var lister = list_dir.Lister.init(job.dir, scratch);
+    var lister = list_dir.Lister.init(dir, scratch);
     var entries: [64]std.Io.Dir.Entry = undefined;
     var batch: FileBatch = .{};
     while (!host.stop.load(.acquire)) {
@@ -260,11 +303,11 @@ pub fn process(host: *Host, job: *Job) void {
         if (n == 0) break;
         for (entries[0..n]) |entry| {
             if (host.stop.load(.acquire)) break;
-            handleEntry(host, job, entry, &batch);
-            if (batch.len == file_batch) flushFiles(host, job, &batch);
+            handleEntry(host, job, dir, entry, &batch);
+            if (batch.len == file_batch) flushFiles(host, job, dir, &batch);
         }
     }
-    flushFiles(host, job, &batch);
+    flushFiles(host, job, dir, &batch);
 }
 
 const file_batch = 16;
@@ -277,18 +320,18 @@ const FileBatch = struct {
     /// Total files already dispatched from this directory, used to adapt batch granularity.
     dispatched: usize = 0,
 
-    fn push(self: *FileBatch, host: *Host, job: *Job, name: []const u8) void {
+    fn push(self: *FileBatch, host: *Host, job: *Job, dir: std.Io.Dir, name: []const u8) void {
         if (name.len > self.storage.len) {
             var rel_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
             const rel = joinRel(&rel_buf, job.rel, name) catch {
                 report(host, job, name, error.NameTooLong);
                 return;
             };
-            visitCheckedFile(host, job, name, rel);
+            visitCheckedFile(host, job, dir, name, rel);
             return;
         }
         if (self.used + name.len > self.storage.len or self.len == file_batch) {
-            flushFiles(host, job, self);
+            flushFiles(host, job, dir, self);
         }
         const slice = self.storage[self.used..][0..name.len];
         @memcpy(slice, name);
@@ -298,12 +341,12 @@ const FileBatch = struct {
     }
 };
 
-fn dispatchFileSlice(host: *Host, job: *Job, names: []const []const u8) void {
+fn dispatchFileSlice(host: *Host, job: *Job, dir: std.Io.Dir, names: []const []const u8) void {
     const child = createFileJob(host, job, names) catch {
         for (names) |name| {
             var rel_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
             const rel = joinRel(&rel_buf, job.rel, name) catch continue;
-            visitCheckedFile(host, job, name, rel);
+            visitCheckedFile(host, job, dir, name, rel);
         }
         return;
     };
@@ -313,12 +356,12 @@ fn dispatchFileSlice(host: *Host, job: *Job, names: []const []const u8) void {
         for (names) |name| {
             var rel_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
             const rel = joinRel(&rel_buf, job.rel, name) catch continue;
-            visitCheckedFile(host, job, name, rel);
+            visitCheckedFile(host, job, dir, name, rel);
         }
     };
 }
 
-fn flushFiles(host: *Host, job: *Job, batch: *FileBatch) void {
+fn flushFiles(host: *Host, job: *Job, dir: std.Io.Dir, batch: *FileBatch) void {
     if (batch.len == 0) return;
     const count = batch.len;
     batch.len = 0;
@@ -326,28 +369,28 @@ fn flushFiles(host: *Host, job: *Job, batch: *FileBatch) void {
     if (host.config.threads > 1) {
         // Dispatch the first 8 files in a directory individually so directories containing a few
         // large files fan out across all cores immediately; batch subsequent files (8 per job)
-        // to cut `fcntl(F_DUPFD_CLOEXEC)` / `close` / heap overhead in large small-file directories.
+        // to cut heap overhead in large small-file directories.
         var idx: usize = 0;
         while (idx < count and batch.dispatched < 8) : ({
             idx += 1;
             batch.dispatched += 1;
         }) {
             const single = [_][]const u8{batch.names[idx]};
-            dispatchFileSlice(host, job, &single);
+            dispatchFileSlice(host, job, dir, &single);
         }
         while (idx < count) {
             const end = @min(idx + 8, count);
-            dispatchFileSlice(host, job, batch.names[idx..end]);
+            dispatchFileSlice(host, job, dir, batch.names[idx..end]);
             batch.dispatched += end - idx;
             idx = end;
         }
     } else {
         batch.dispatched += count;
-        dispatchFileSlice(host, job, batch.names[0..count]);
+        dispatchFileSlice(host, job, dir, batch.names[0..count]);
     }
 }
 
-fn handleEntry(host: *Host, job: *Job, entry: std.Io.Dir.Entry, batch: *FileBatch) void {
+fn handleEntry(host: *Host, job: *Job, dir: std.Io.Dir, entry: std.Io.Dir.Entry, batch: *FileBatch) void {
     const name = entry.name;
     if (name.len == 0) return;
     if (host.config.skip_git and std.mem.eql(u8, name, ".git")) return;
@@ -364,24 +407,17 @@ fn handleEntry(host: *Host, job: *Job, entry: std.Io.Dir.Entry, batch: *FileBatc
         .directory => {
             if (job.depth >= host.config.effectiveMaxDepth()) return;
             if (ignore.isIgnored(job.ignore, rel, true, &scratch) or blockDirectory(host, rel)) return;
-            const child_dir = job.dir.openDir(
-                host.io,
-                name,
-                withoutLinkResolve(std.Io.Dir.OpenOptions{ .iterate = true }),
-            ) catch |err| {
-                report(host, job, name, err);
-                return;
-            };
-            descend(host, job, name, rel, child_dir);
+            descendDeferred(host, job, name, rel);
         },
         .file => {
             if (ignore.isIgnored(job.ignore, rel, false, &scratch)) return;
             if (!allowFile(host, rel)) return;
             if (!types.matchesWithTable(host.config.custom_types, host.config.types, host.config.types_not, name)) return;
-            if (host.config.threads > 1) {
-                batch.push(host, job, name);
+            const should_batch = host.config.threads > 1 and (host.idle == null or host.idle.?.load(.acquire) > 0);
+            if (should_batch) {
+                batch.push(host, job, dir, name);
             } else {
-                visitCheckedFile(host, job, name, rel);
+                visitCheckedFile(host, job, dir, name, rel);
             }
         },
         // Symbolic links themselves are never entered; targets are not read even inside the search root, and traversal cannot escape the root via links.
@@ -396,23 +432,13 @@ fn directoryDevice(dir: std.Io.Dir) ?u64 {
     return id.dev;
 }
 
-fn descend(
+fn descendDeferred(
     host: *Host,
     job: *Job,
     name: []const u8,
     rel: []const u8,
-    child_dir: std.Io.Dir,
 ) void {
-    if (host.config.one_file_system and job.dev != 0) {
-        if (directoryDevice(child_dir)) |child_dev| {
-            if (child_dev != job.dev) {
-                child_dir.close(host.io);
-                return;
-            }
-        }
-    }
-    const child = createJob(host, child_dir, job.root, rel, job.ignore, job.depth + 1) catch |err| {
-        child_dir.close(host.io);
+    const child = createDeferredDirJob(host, job.root, rel, job.ignore, job.depth + 1, job.dev) catch |err| {
         report(host, job, name, err);
         return;
     };
@@ -425,12 +451,13 @@ fn descend(
 fn visitCheckedFile(
     host: *Host,
     job: *Job,
+    dir: std.Io.Dir,
     name: []const u8,
     rel: []const u8,
 ) void {
     var size: u64 = 0;
     if (host.config.max_filesize) |limit| {
-        const stat = job.dir.statFile(
+        const stat = dir.statFile(
             host.io,
             name,
             withoutLinkResolve(std.Io.Dir.StatFileOptions{}),
@@ -470,7 +497,7 @@ fn visitCheckedFile(
     };
     const control = host.on_file(host.file_ctx, .{
         .path = path,
-        .dir = job.dir,
+        .dir = dir,
         .name = name,
         .size = size,
     }) catch |err| {
@@ -480,18 +507,7 @@ fn visitCheckedFile(
     if (control == .stop) host.stop.store(true, .release);
 }
 
-fn duplicateDir(dir: std.Io.Dir) ?std.Io.Dir {
-    if (builtin.os.tag == .windows) return null;
-    // `std.posix.system` uses direct Linux syscalls when libc is not linked.
-    // `std.c.fcntl` is extern "c" and would force linking libc on Linux.
-    const rc = std.posix.system.fcntl(dir.handle, std.posix.F.DUPFD_CLOEXEC, @as(usize, 0));
-    if (std.posix.errno(rc) != .SUCCESS) return null;
-    return .{ .handle = @intCast(rc) };
-}
-
 fn createFileJob(host: *Host, parent: *Job, names: []const []const u8) !*Job {
-    const dir = duplicateDir(parent.dir) orelse return error.SystemResources;
-    errdefer dir.close(host.io);
     const job = try host.allocator.create(Job);
     errdefer host.allocator.destroy(job);
     const rel_copy = try host.allocator.dupe(u8, parent.rel);
@@ -505,7 +521,7 @@ fn createFileJob(host: *Host, parent: *Job, names: []const []const u8) !*Job {
         filled += 1;
     }
     job.* = .{
-        .dir = dir,
+        .dir = null,
         .root = parent.root,
         .rel = rel_copy,
         .ignore = parent.ignore,
@@ -513,6 +529,30 @@ fn createFileJob(host: *Host, parent: *Job, names: []const []const u8) !*Job {
         .dev = parent.dev,
         .allocator = host.allocator,
         .files = owned,
+    };
+    return job;
+}
+
+fn createDeferredDirJob(
+    host: *Host,
+    root: []const u8,
+    rel: []const u8,
+    parent: *const ignore.Set,
+    depth: u32,
+    dev: u64,
+) !*Job {
+    const job = try host.allocator.create(Job);
+    errdefer host.allocator.destroy(job);
+    const rel_copy = try host.allocator.dupe(u8, rel);
+    errdefer host.allocator.free(rel_copy);
+    job.* = .{
+        .dir = null,
+        .root = root,
+        .rel = rel_copy,
+        .ignore = parent,
+        .depth = depth,
+        .dev = dev,
+        .allocator = host.allocator,
     };
     return job;
 }
@@ -525,6 +565,19 @@ fn createJob(
     parent: *const ignore.Set,
     depth: u32,
 ) !*Job {
+    const dev = if (host.config.one_file_system) (directoryDevice(dir) orelse 0) else 0;
+    return createJobWithDev(host, dir, root, rel, parent, depth, dev);
+}
+
+fn createJobWithDev(
+    host: *Host,
+    dir: std.Io.Dir,
+    root: []const u8,
+    rel: []const u8,
+    parent: *const ignore.Set,
+    depth: u32,
+    dev: u64,
+) !*Job {
     const job = try host.allocator.create(Job);
     errdefer host.allocator.destroy(job);
     const rel_copy = try host.allocator.dupe(u8, rel);
@@ -536,7 +589,7 @@ fn createJob(
         .rel = rel_copy,
         .ignore = rules,
         .depth = depth,
-        .dev = directoryDevice(dir) orelse 0,
+        .dev = dev,
         .allocator = host.allocator,
     };
     return job;

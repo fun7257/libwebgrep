@@ -253,6 +253,339 @@ pub const PackedPair = struct {
     }
 };
 
+/// Exact SIMD packed-pair matcher where each pattern byte has an optional single-bit OR-mask
+/// (`(h | mask) == val`, where `mask == 0` for exact bytes or `@popCount(mask) == 1` for 2-variant
+/// case-folded UTF-8 bytes such as ASCII `a/A`, Latin-1 `é/É` (`0xA9/0x89`), Greek `δ/Δ`, etc.).
+/// Guarantees zero false positives and zero false negatives without UTF-8 decoding in the hot path.
+pub const MaskedPair = struct {
+    len: u8,
+    values: [64]u8,
+    masks: [64]u8,
+    anchor_index: u8,
+    other_index: u8,
+    third_index: u8,
+    fourth_index: u8,
+    anchor_val: u8,
+    anchor_mask: u8,
+    other_val: u8,
+    other_mask: u8,
+    third_val: u8,
+    third_mask: u8,
+    fourth_val: u8,
+    fourth_mask: u8,
+
+    pub fn init(values: []const u8, masks: []const u8, rank: *const [256]u8) MaskedPair {
+        std.debug.assert(values.len >= 2 and values.len <= 64 and values.len == masks.len);
+        var vals_buf: [64]u8 = @splat(0);
+        var mask_buf: [64]u8 = @splat(0);
+        @memcpy(vals_buf[0..values.len], values);
+        @memcpy(mask_buf[0..masks.len], masks);
+
+        var eff_ranks: [64]u16 = undefined;
+        for (0..values.len) |i| {
+            const v = vals_buf[i];
+            const m = mask_buf[i];
+            eff_ranks[i] = if (m == 0)
+                rank[v]
+            else
+                @as(u16, @max(rank[v], rank[v ^ m])) + 15;
+        }
+
+        var best: usize = 0;
+        var second: usize = 1;
+        if (eff_ranks[second] < eff_ranks[best]) {
+            best = 1;
+            second = 0;
+        }
+        var i: usize = 2;
+        while (i < values.len) : (i += 1) {
+            const r = eff_ranks[i];
+            if (r < eff_ranks[best]) {
+                second = best;
+                best = i;
+            } else if (r < eff_ranks[second]) {
+                second = i;
+            } else if (r == eff_ranks[second]) {
+                const cur_dist = if (second > best) second - best else best - second;
+                const new_dist = if (i > best) i - best else best - i;
+                if (new_dist > cur_dist) second = i;
+            }
+        }
+        var third_idx: usize = second;
+        var third_rank: u16 = std.math.maxInt(u16);
+        for (0..values.len) |idx| {
+            if (idx == best or idx == second) continue;
+            if (eff_ranks[idx] < third_rank) {
+                third_rank = eff_ranks[idx];
+                third_idx = idx;
+            }
+        }
+        var fourth_idx: usize = third_idx;
+        var fourth_rank: u16 = std.math.maxInt(u16);
+        for (0..values.len) |idx| {
+            if (idx == best or idx == second or idx == third_idx) continue;
+            if (eff_ranks[idx] < fourth_rank) {
+                fourth_rank = eff_ranks[idx];
+                fourth_idx = idx;
+            }
+        }
+        return .{
+            .len = @intCast(values.len),
+            .values = vals_buf,
+            .masks = mask_buf,
+            .anchor_index = @intCast(best),
+            .other_index = @intCast(second),
+            .third_index = @intCast(third_idx),
+            .fourth_index = @intCast(fourth_idx),
+            .anchor_val = vals_buf[best],
+            .anchor_mask = mask_buf[best],
+            .other_val = vals_buf[second],
+            .other_mask = mask_buf[second],
+            .third_val = vals_buf[third_idx],
+            .third_mask = mask_buf[third_idx],
+            .fourth_val = vals_buf[fourth_idx],
+            .fourth_mask = mask_buf[fourth_idx],
+        };
+    }
+
+    pub inline fn confirmAt(self: *const MaskedPair, haystack: []const u8, origin: usize) bool {
+        const m: usize = self.len;
+        const window = haystack[origin..][0..m];
+        for (0..m) |k| {
+            if ((window[k] | self.masks[k]) != self.values[k]) return false;
+        }
+        return true;
+    }
+
+    pub fn find(self: *const MaskedPair, comptime width: comptime_int, haystack: []const u8, start: usize) ?usize {
+        var unused: ?usize = null;
+        return self.findInner(width, haystack, start, false, &unused);
+    }
+
+    pub fn findWatchingNul(
+        self: *const MaskedPair,
+        comptime width: comptime_int,
+        haystack: []const u8,
+        start: usize,
+        nul_out: *?usize,
+    ) ?usize {
+        return self.findInner(width, haystack, start, true, nul_out);
+    }
+
+    fn findInner(
+        self: *const MaskedPair,
+        comptime width: comptime_int,
+        haystack: []const u8,
+        start: usize,
+        comptime watch_nul: bool,
+        nul_out: *?usize,
+    ) ?usize {
+        comptime if (width != 16 and width != 32 and width != 64) @compileError("packed pair width must be 16, 32, or 64");
+        const m: usize = self.len;
+        if (m > haystack.len or start > haystack.len - m) {
+            if (watch_nul and start <= haystack.len) {
+                _ = noteNul(haystack[start..], start, nul_out);
+            }
+            return null;
+        }
+        const last = haystack.len - m;
+        if (self.anchor_mask == 0) {
+            if (self.other_mask == 0) {
+                return self.findLoop(width, haystack, start, last, false, false, watch_nul, nul_out);
+            }
+            return self.findLoop(width, haystack, start, last, false, true, watch_nul, nul_out);
+        } else {
+            if (self.other_mask == 0) {
+                return self.findLoop(width, haystack, start, last, true, false, watch_nul, nul_out);
+            }
+            return self.findLoop(width, haystack, start, last, true, true, watch_nul, nul_out);
+        }
+    }
+
+    inline fn maskedByteVec(
+        comptime width: comptime_int,
+        block: @Vector(width, u8),
+        val: u8,
+        mask: u8,
+        comptime use_mask: bool,
+    ) @Vector(width, bool) {
+        if (!use_mask) return block == @as(@Vector(width, u8), @splat(val));
+        return (block | @as(@Vector(width, u8), @splat(mask))) == @as(@Vector(width, u8), @splat(val));
+    }
+
+    inline fn hotMask(
+        self: *const MaskedPair,
+        comptime width: comptime_int,
+        haystack: []const u8,
+        origin: usize,
+        comptime a_masked: bool,
+        comptime o_masked: bool,
+        comptime watch_nul: bool,
+    ) @Vector(width, bool) {
+        const left: @Vector(width, u8) = haystack[origin + self.anchor_index ..][0..width].*;
+        const right: @Vector(width, u8) = haystack[origin + self.other_index ..][0..width].*;
+        const hits = maskedByteVec(width, left, self.anchor_val, self.anchor_mask, a_masked) &
+            maskedByteVec(width, right, self.other_val, self.other_mask, o_masked);
+        if (!watch_nul) return hits;
+        const cover = if (self.anchor_index <= self.other_index) left else right;
+        return hits | (cover == @as(@Vector(width, u8), @splat(0)));
+    }
+
+    fn findLoop(
+        self: *const MaskedPair,
+        comptime width: comptime_int,
+        haystack: []const u8,
+        start: usize,
+        last: usize,
+        comptime a_masked: bool,
+        comptime o_masked: bool,
+        comptime watch_nul: bool,
+        nul_out: *?usize,
+    ) ?usize {
+        const max_index: usize = @max(@max(self.anchor_index, self.other_index), @max(self.third_index, self.fourth_index));
+        const cover_index: usize = @min(self.anchor_index, self.other_index);
+        if (watch_nul and cover_index > 0) {
+            const prefix_end = @min(haystack.len, start + cover_index);
+            if (noteNul(haystack[start..prefix_end], start, nul_out)) return null;
+        }
+        var origin = start;
+        const stride = width * 4;
+        while (origin <= last and origin + max_index + stride <= haystack.len) {
+            var masks: [4]@Vector(width, bool) = undefined;
+            inline for (0..4) |k| {
+                masks[k] = self.hotMask(width, haystack, origin + k * width, a_masked, o_masked, watch_nul);
+            }
+            if (@reduce(.Or, (masks[0] | masks[1]) | (masks[2] | masks[3]))) {
+                @branchHint(.unlikely);
+                inline for (0..4) |k| {
+                    if (@reduce(.Or, masks[k])) {
+                        const at = origin + k * width;
+                        const rel = @call(
+                            .never_inline,
+                            takeHitMasked,
+                            .{ self, width, haystack, at, last, a_masked, o_masked, watch_nul, nul_out },
+                        );
+                        if (watch_nul and nul_out.* != null) return null;
+                        if (rel) |found| return at + found;
+                    }
+                }
+            }
+            origin += stride;
+        }
+        while (origin <= last and origin + max_index + width <= haystack.len) {
+            if (@reduce(.Or, self.hotMask(width, haystack, origin, a_masked, o_masked, watch_nul))) {
+                @branchHint(.unlikely);
+                const rel = @call(
+                    .never_inline,
+                    takeHitMasked,
+                    .{ self, width, haystack, origin, last, a_masked, o_masked, watch_nul, nul_out },
+                );
+                if (watch_nul and nul_out.* != null) return null;
+                if (rel) |found| return origin + found;
+            }
+            origin += width;
+        }
+        var tail_hit: ?usize = null;
+        var i = origin;
+        while (i <= last) : (i += 1) {
+            if ((haystack[i + self.anchor_index] | self.anchor_mask) != self.anchor_val) continue;
+            if ((haystack[i + self.other_index] | self.other_mask) != self.other_val) continue;
+            if (self.confirmAt(haystack, i)) {
+                tail_hit = i;
+                break;
+            }
+        }
+        if (watch_nul) {
+            const from = @min(haystack.len, origin + cover_index);
+            const nul_limit = if (tail_hit) |pos| @min(haystack.len, @max(from, pos + self.len)) else haystack.len;
+            if (noteNul(haystack[from..nul_limit], from, nul_out)) return null;
+        }
+        return tail_hit;
+    }
+
+    fn takeHitMasked(
+        self: *const MaskedPair,
+        comptime width: comptime_int,
+        haystack: []const u8,
+        origin: usize,
+        last: usize,
+        comptime a_masked: bool,
+        comptime o_masked: bool,
+        comptime watch_nul: bool,
+        nul_out: *?usize,
+    ) ?usize {
+        const cover_index: usize = @min(self.anchor_index, self.other_index);
+        const left: @Vector(width, u8) = haystack[origin + self.anchor_index ..][0..width].*;
+        const right: @Vector(width, u8) = haystack[origin + self.other_index ..][0..width].*;
+        var hits = maskedByteVec(width, left, self.anchor_val, self.anchor_mask, a_masked) &
+            maskedByteVec(width, right, self.other_val, self.other_mask, o_masked);
+        if (self.len >= 4) {
+            const b3: @Vector(width, u8) = haystack[origin + self.third_index ..][0..width].*;
+            const b4: @Vector(width, u8) = haystack[origin + self.fourth_index ..][0..width].*;
+            hits = hits &
+                maskedByteVec(width, b3, self.third_val, self.third_mask, true) &
+                maskedByteVec(width, b4, self.fourth_val, self.fourth_mask, true);
+        }
+
+        if (comptime builtin.cpu.arch.endian() == .little) {
+            const MaskInt = @Int(.unsigned, width);
+            var mask: MaskInt = @bitCast(hits);
+            while (mask != 0) : (mask &= mask - 1) {
+                const rel: usize = @ctz(mask);
+                const at = origin + rel;
+                if (at > last) continue;
+                if (self.confirmAt(haystack, at)) {
+                    if (watch_nul) {
+                        const check_start = @min(haystack.len, origin + cover_index);
+                        const check_end = @min(haystack.len, @max(check_start, at + self.len));
+                        if (noteNul(haystack[check_start..check_end], check_start, nul_out)) return null;
+                    }
+                    return rel;
+                }
+            }
+        } else {
+            const Index = std.simd.VectorIndex(@TypeOf(hits));
+            const indices = comptime std.simd.iota(Index, width);
+            while (std.simd.firstTrue(hits)) |rel| {
+                hits = @select(
+                    bool,
+                    indices == @as(@Vector(width, Index), @splat(rel)),
+                    @as(@Vector(width, bool), @splat(false)),
+                    hits,
+                );
+                const at = origin + @as(usize, rel);
+                if (at > last) continue;
+                if (self.confirmAt(haystack, at)) {
+                    if (watch_nul) {
+                        const check_start = @min(haystack.len, origin + cover_index);
+                        const check_end = @min(haystack.len, @max(check_start, at + self.len));
+                        if (noteNul(haystack[check_start..check_end], check_start, nul_out)) return null;
+                    }
+                    return @as(usize, rel);
+                }
+            }
+        }
+
+        if (watch_nul) {
+            const block: @Vector(width, u8) = haystack[origin + cover_index ..][0..width].*;
+            const zeros = block == @as(@Vector(width, u8), @splat(0));
+            if (comptime builtin.cpu.arch.endian() == .little) {
+                const MaskInt = @Int(.unsigned, width);
+                const zmask: MaskInt = @bitCast(zeros);
+                if (zmask != 0) {
+                    nul_out.* = origin + cover_index + @as(usize, @ctz(zmask));
+                    return null;
+                }
+            } else if (@reduce(.Or, zeros)) {
+                const zrel = std.simd.firstTrue(zeros).?;
+                nul_out.* = origin + cover_index + @as(usize, zrel);
+                return null;
+            }
+        }
+        return null;
+    }
+};
+
 fn confirm(self: PackedPair, haystack: []const u8, origin: usize) bool {
     const pat = self.pattern;
     const window = haystack[origin..][0..pat.len];

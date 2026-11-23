@@ -191,6 +191,29 @@ fn bulkInvertCount(
             else
                 effective_limit;
         }
+    } else if (comptime @hasDecl(state_mod.MatcherType(@TypeOf(matcher)), "findEnd")) {
+        while (pos < effective_limit) {
+            if (has_abort) {
+                if (state_mod.flagIsSet(config)) {
+                    state.stopped = true;
+                    aborted = true;
+                    break;
+                }
+                if (stopInMatch(state, config)) {
+                    aborted = true;
+                    break;
+                }
+            }
+            const end_pos = matcher.findEnd(buf, pos, .earliest) orelse break;
+            if (end_pos < pos or end_pos > buf.len) break;
+            const probe = if (end_pos > pos and buf[end_pos - 1] != '\n') end_pos - 1 else end_pos;
+            if (probe >= effective_limit) break;
+            matched += 1;
+            pos = if (probe < effective_limit)
+                (if (std.mem.findScalarPos(u8, buf[0..effective_limit], probe, '\n')) |nl| nl + 1 else effective_limit)
+            else
+                effective_limit;
+        }
     } else {
         while (pos < effective_limit) {
             if (has_abort) {
@@ -243,6 +266,26 @@ fn bulkInvertCount(
     return !state.stopped;
 }
 
+fn canUseFindEnd(comptime S: type, matcher: anytype, config: SearchConfig, need_ls: bool) bool {
+    const T = state_mod.MatcherType(@TypeOf(matcher));
+    if (comptime !@hasDecl(T, "findEnd")) return false;
+    if (comptime @hasDecl(S, "matched")) {
+        if (comptime !(@hasDecl(S, "matched_fast_line") and S.matched_fast_line)) return false;
+        if (config.replacement != null or config.binary == .report) return false;
+    } else if (need_ls) {
+        // CountSink with need_ls still doesn't inspect match start/end spans
+    }
+    return !effectiveMultiline(matcher, config) and
+        !config.whole_word and
+        !config.whole_line and
+        !config.null_data and
+        config.line_filter == null and
+        config.contains.len == 0 and
+        config.excludes.len == 0 and
+        config.contains_regexes.len == 0 and
+        config.excludes_regexes.len == 0;
+}
+
 pub fn matchBufferWithLimit(
     comptime S: type,
     sink: *S,
@@ -254,6 +297,7 @@ pub fn matchBufferWithLimit(
     config: SearchConfig,
 ) SliceError!bool {
     const need_ls = needLineStart(S, state, config);
+    const allow_find_end = canUseFindEnd(S, matcher, config, need_ls);
     var effective_limit = @min(limit, buf.len);
     if (config.invert and canBulkInvertCount(S, matcher, state, config, limit, buf.len)) {
         if (state.stopped) return false;
@@ -288,7 +332,7 @@ pub fn matchBufferWithLimit(
                 if (!applyInBufferSkip(buf, effective_limit, state, config)) return false;
                 continue;
             }
-        } else if (try findLineLimitOpts(matcher, buf, state, effective_limit, config, need_ls)) |line| {
+        } else if (try findLineLimitInternal(matcher, buf, state, effective_limit, config, need_ls, allow_find_end)) |line| {
             if (effective_limit < buf.len and line.end > effective_limit and (line.start > 0 or can_hold_zero)) {
                 effective_limit = line.start;
                 break;
@@ -442,11 +486,75 @@ pub fn findLineOpts(matcher: anytype, buf: []const u8, state: *State, config: Se
 }
 
 pub fn findLineLimitOpts(matcher: anytype, buf: []const u8, state: *State, limit: usize, config: SearchConfig, need_ls: bool) SliceError!?FoundLine {
+    const allow_find_end = !need_ls and
+        !effectiveMultiline(matcher, config) and
+        !config.whole_word and
+        !config.whole_line and
+        !config.null_data and
+        config.line_filter == null and
+        config.contains.len == 0 and
+        config.excludes.len == 0 and
+        config.contains_regexes.len == 0 and
+        config.excludes_regexes.len == 0;
+    return findLineLimitInternal(matcher, buf, state, limit, config, need_ls, allow_find_end);
+}
+
+fn findLineLimitInternal(matcher: anytype, buf: []const u8, state: *State, limit: usize, config: SearchConfig, need_ls: bool, allow_find_end: bool) SliceError!?FoundLine {
     if (state.exceeded(config)) return null;
     const is_ml = effectiveMultiline(matcher, config);
     const max_start = @min(limit, buf.len);
     var pos = state.pos;
     while (pos < max_start) {
+        if (allow_find_end) {
+            const T = state_mod.MatcherType(@TypeOf(matcher));
+            if (comptime @hasDecl(T, "findEnd")) {
+                if (state.getCachedMatch(buf, pos) == null) {
+                    const end_pos = matcher.findEnd(buf, pos, .earliest) orelse return null;
+                    if (end_pos > buf.len or end_pos < pos) return null;
+                    const probe = if (end_pos > pos and buf[end_pos - 1] != '\n') end_pos - 1 else end_pos;
+                    if (!need_ls and limit >= buf.len) {
+                        if (probe >= max_start) return null;
+                        const end = lineEnd(buf, probe, config);
+                        return .{
+                            .start = pos,
+                            .end = end,
+                            .mstart = probe,
+                            .mend = end_pos,
+                            .mpid = null,
+                            .single_match = false,
+                        };
+                    }
+                    const start = lineStart(buf, probe, config);
+                    if (start >= max_start or start == buf.len) return null;
+                    const end = lineEnd(buf, probe, config);
+                    if (end == start) {
+                        pos = @min(buf.len, start + 1);
+                        continue;
+                    }
+                    var mstart = probe;
+                    var mend = end_pos;
+                    var mpid: ?u32 = null;
+                    if (config.max_line_len > 0) {
+                        const ce = contentEnd(buf, .{ .start = start, .end = end }, config);
+                        if (ce - start > config.max_line_len) {
+                            if (matcher.find(buf[0..ce], start, config.match_mode)) |exact_m| {
+                                mstart = exact_m.start;
+                                mend = exact_m.end;
+                                mpid = exact_m.pattern_id;
+                            }
+                        }
+                    }
+                    return .{
+                        .start = start,
+                        .end = end,
+                        .mstart = mstart,
+                        .mend = mend,
+                        .mpid = mpid,
+                        .single_match = false,
+                    };
+                }
+            }
+        }
         const found = if (config.whole_line)
             matcher.find(buf, pos, config.match_mode)
         else

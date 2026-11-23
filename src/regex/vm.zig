@@ -14,7 +14,8 @@ const builtin = @import("builtin");
 const std = @import("std");
 const matcher = @import("../matcher.zig");
 const Finder = @import("../finder/finder.zig").Finder;
-const Multi = @import("../finder/multi.zig").Multi;
+const multi_mod = @import("../finder/multi.zig");
+const Multi = multi_mod.Multi;
 const memchr = @import("../finder/memchr.zig");
 const unicode_fold = @import("../finder/unicode_fold.zig");
 const inst_mod = @import("inst.zig");
@@ -189,6 +190,8 @@ pub const Regex = struct {
     dfa_prefix_state: u16 = dfa_mod.start_state,
     dfa_prefix_len: usize = 0,
     dfa_suffix_state: u16 = 0,
+    alt_dfa_prefix_state: [32]u16 = @splat(dfa_mod.start_state),
+    alt_dfa_prefix_len: [32]u8 = @splat(0),
     max_newlines: ?u32 = null,
     /// Counts NFA state transition steps for unit tests asserting linear time complexity.
     steps: usize = 0,
@@ -326,9 +329,10 @@ pub const Regex = struct {
             if (self.prefilter == null and self.alt_prefilter == null and !self.anchored_start) {
                 if (allocator.create(UnanchoredDfa)) |udfa| {
                     udfa.* = .{};
-                    if (udfa.determinize(self.insts, self.unicode_ranges, self.start_pc, self.multiline, options.max_dfa_states)) {
+                    if (udfa.determinize(allocator, self.insts, self.unicode_ranges, self.start_pc, self.multiline, options.max_dfa_states)) {
                         self.unanchored_dfa = udfa;
                     } else {
+                        udfa.deinit(allocator);
                         allocator.destroy(udfa);
                     }
                 } else |_| {}
@@ -364,6 +368,29 @@ pub const Regex = struct {
                             }
                         }
                     }
+                    if (self.alt_is_prefix and self.alt_literal_slices.len > 0 and self.alt_literal_slices.len <= 32 and (!self.ignore_case or !self.unicode_case)) {
+                        for (self.alt_literal_slices, 0..) |lit, id| {
+                            if (lit.len == 0 or lit.len > std.math.maxInt(u8)) continue;
+                            var s: u16 = dfa_mod.start_state;
+                            var ok = true;
+                            var any_prefix_match = heap_dfa.is_match[s];
+                            for (lit, 0..) |b, idx| {
+                                const n = heap_dfa.trans[s][b];
+                                if (n == dfa_mod.unknown_transition or n == dfa_mod.bailout_transition or n == dfa_mod.dead_state) {
+                                    ok = false;
+                                    break;
+                                }
+                                s = n;
+                                if (idx + 1 < lit.len and heap_dfa.is_match[s]) {
+                                    any_prefix_match = true;
+                                }
+                            }
+                            if (ok and !any_prefix_match and s != dfa_mod.dead_state) {
+                                self.alt_dfa_prefix_state[id] = s;
+                                self.alt_dfa_prefix_len[id] = @intCast(lit.len);
+                            }
+                        }
+                    }
                 } else {
                     allocator.destroy(heap_dfa);
                 }
@@ -379,7 +406,10 @@ pub const Regex = struct {
         for (self.group_names[0..self.group_count]) |name| {
             if (name.len != 0) self.allocator.free(name);
         }
-        if (self.unanchored_dfa) |ud| self.allocator.destroy(ud);
+        if (self.unanchored_dfa) |ud| {
+            ud.deinit(self.allocator);
+            self.allocator.destroy(ud);
+        }
         if (self.precomputed_dfa) |d| self.allocator.destroy(d);
         if (self.req_literal_bytes.len != 0) self.allocator.free(self.req_literal_bytes);
         if (self.tail_literal_bytes.len != 0) self.allocator.free(self.tail_literal_bytes);
@@ -484,6 +514,39 @@ pub const Regex = struct {
     /// Alias for `find` on `*const Regex`.
     pub fn findReadOnly(self: *const Regex, haystack: []const u8, start: usize, mode: MatchMode) ?Match {
         return self.findInternal(haystack, start, mode, null, null);
+    }
+
+    /// Half-match fast path returning the exact match end offset (`?usize`) without recovering `start`.
+    /// When `unanchored_dfa` reaches an exact accepting state (`exact_imm`, 1-byte delayed `exact_del`, or `eoi_exact`),
+    /// returns immediately with 0 PikeVM calls, 0 `windowLimit`, and 0 `lineStartAt`.
+    pub fn findEnd(self: *const Regex, haystack: []const u8, start: usize, mode: MatchMode) ?usize {
+        if (start > haystack.len) return null;
+        if (self.anchored_start and start > 0) return null;
+        if (self.unanchored_dfa) |udfa| {
+            if (mode == .earliest and !self.multiline and udfa.has_exact_match) {
+                const steps: ?*usize = if (comptime builtin.is_test) @constCast(&self.steps) else null;
+                var unused_nul: ?usize = null;
+                return self.runUnanchoredDfaEnd(udfa, haystack, start, haystack.len, steps, false, &unused_nul);
+            }
+        }
+        const m = self.find(haystack, start, mode) orelse return null;
+        return m.end;
+    }
+
+    /// NUL-watched half-match fast path returning the exact match end offset (`?usize`).
+    /// Sets `nul.*` and returns `null` if a NUL byte occurs strictly before the match ends.
+    pub fn findEndWatched(self: *const Regex, haystack: []const u8, start: usize, mode: MatchMode, nul: *?usize) ?usize {
+        if (start > haystack.len) return null;
+        if (!self.anchored_start) {
+            if (self.unanchored_dfa) |udfa| {
+                if (mode == .earliest and !self.multiline and udfa.has_exact_match) {
+                    const steps: ?*usize = if (comptime builtin.is_test) @constCast(&self.steps) else null;
+                    return self.runUnanchoredDfaEnd(udfa, haystack, start, haystack.len, steps, true, nul);
+                }
+            }
+        }
+        const m = self.findWatched(haystack, start, nul) orelse return null;
+        return m.end;
     }
 
     /// Searches `haystack` using caller-supplied `RegexScratch` to reuse heap NFA buffers and the 256-state `HeapDfa`.
@@ -881,41 +944,31 @@ pub const Regex = struct {
             if (self.alt_is_prefix) {
                 if (self.precomputed_dfa) |dfa| {
                     if (dfa.stops_on_crlf) {
-                        while (pos <= haystack.len) {
-                            const hit = ap.find(haystack, pos, .leftmost_first) orelse return null;
-                            if (dfa.matchPrefixDeterminized(haystack[hit.start..], dfa_mod.start_state, 0, true)) |_| {
-                                const win_end = if (!self.multiline and cached_win_end != std.math.maxInt(usize) and hit.start <= cached_win_end)
-                                    cached_win_end
-                                else blk: {
-                                    const w = self.windowLimit(haystack, hit.start);
-                                    cached_win_end = w;
-                                    break :blk w;
-                                };
-                                if (self.runRangeAllowed(haystack, hit.start, hit.start, win_end, mode, AllowAny{}, steps, scratch)) |m| {
-                                    return m;
-                                }
-                            }
-                            pos = hit.start + 1;
-                        }
-                        return null;
-                    }
-                    while (pos <= haystack.len) {
-                        const hit = ap.find(haystack, pos, .leftmost_first) orelse return null;
-                        const win_end = if (!self.multiline and cached_win_end != std.math.maxInt(usize) and hit.start <= cached_win_end)
-                            cached_win_end
-                        else blk: {
-                            const w = self.windowLimit(haystack, hit.start);
-                            cached_win_end = w;
-                            break :blk w;
+                        var verifier = AltDfaVerifier(true, false, false){
+                            .regex = self,
+                            .dfa = dfa,
+                            .full_haystack = haystack,
+                            .mode = mode,
+                            .steps = steps,
+                            .scratch = scratch,
                         };
-                        if (dfa.matchPrefixDeterminized(haystack[hit.start..win_end], dfa_mod.start_state, 0, true)) |_| {
-                            if (self.runRangeAllowed(haystack, hit.start, hit.start, win_end, mode, AllowAny{}, steps, scratch)) |m| {
-                                return m;
-                            }
-                        }
-                        pos = hit.start + 1;
+                        return switch (ap.findVerified(haystack, pos, .leftmost_first, &verifier)) {
+                            .match => |vm| Match{ .start = vm.start, .end = vm.end, .pattern_id = null },
+                            .none, .aborted => null,
+                        };
                     }
-                    return null;
+                    var verifier = AltDfaVerifier(false, false, false){
+                        .regex = self,
+                        .dfa = dfa,
+                        .full_haystack = haystack,
+                        .mode = mode,
+                        .steps = steps,
+                        .scratch = scratch,
+                    };
+                    return switch (ap.findVerified(haystack, pos, .leftmost_first, &verifier)) {
+                        .match => |vm| Match{ .start = vm.start, .end = vm.end, .pattern_id = null },
+                        .none, .aborted => null,
+                    };
                 }
             }
             while (pos <= haystack.len) {
@@ -975,22 +1028,241 @@ pub const Regex = struct {
         return self.runWithDfaGeneric(StackDfa, &stack_dfa, haystack, start, limit, mode, steps, scratch);
     }
 
-    fn runUnanchoredDfa(
+    fn AltDfaVerifier(comptime stops_on_crlf: bool, comptime watch_abort: bool, comptime bounded_cand: bool) type {
+        return struct {
+            regex: *const Regex,
+            dfa: *const HeapDfa,
+            full_haystack: []const u8,
+            mode: MatchMode,
+            steps: ?*usize,
+            scratch: ?*RegexScratch,
+            cached_win_start: usize = std.math.maxInt(usize),
+            cached_win_end: usize = std.math.maxInt(usize),
+            cand_limit: usize = std.math.maxInt(usize),
+            orig_start: usize = 0,
+            rejects: usize = 0,
+
+            pub inline fn verify(self: *@This(), _: []const u8, pat_start: usize, pat_end: usize, pat_id: usize) multi_mod.VerifyResult {
+                if (comptime bounded_cand) {
+                    if (pat_start >= self.cand_limit) return .reject;
+                }
+                const haystack = self.full_haystack;
+                const can_skip = pat_id < 32 and self.regex.alt_dfa_prefix_len[pat_id] != 0 and (pat_end - pat_start) == self.regex.alt_dfa_prefix_len[pat_id];
+                const s0: u16 = if (can_skip) self.regex.alt_dfa_prefix_state[pat_id] else dfa_mod.start_state;
+                const p0: usize = if (can_skip) self.regex.alt_dfa_prefix_len[pat_id] else 0;
+                if (comptime stops_on_crlf) {
+                    if (self.dfa.matchPrefixDeterminized(haystack[pat_start..], s0, p0, true) != null) {
+                        const win_end = if (!self.regex.multiline and self.cached_win_end != std.math.maxInt(usize) and
+                            pat_start >= self.cached_win_start and pat_start <= self.cached_win_end)
+                            self.cached_win_end
+                        else blk: {
+                            const w = self.regex.windowLimit(haystack, pat_start);
+                            self.cached_win_start = pat_start;
+                            self.cached_win_end = w;
+                            break :blk w;
+                        };
+                        if (self.regex.runRangeAllowed(haystack, pat_start, pat_start, win_end, self.mode, AllowAny{}, self.steps, self.scratch)) |m| {
+                            return .{ .accept = m.end };
+                        }
+                    }
+                } else {
+                    const win_end = if (!self.regex.multiline and self.cached_win_end != std.math.maxInt(usize) and
+                        pat_start >= self.cached_win_start and pat_start <= self.cached_win_end)
+                        self.cached_win_end
+                    else blk: {
+                        const w = self.regex.windowLimit(haystack, pat_start);
+                        self.cached_win_start = pat_start;
+                        self.cached_win_end = w;
+                        break :blk w;
+                    };
+                    if (self.dfa.matchPrefixDeterminized(haystack[pat_start..win_end], s0, p0, true) != null) {
+                        if (self.regex.runRangeAllowed(haystack, pat_start, pat_start, win_end, self.mode, AllowAny{}, self.steps, self.scratch)) |m| {
+                            return .{ .accept = m.end };
+                        }
+                    }
+                }
+                if (comptime watch_abort) {
+                    self.rejects += 1;
+                    if (self.rejects >= 16 and pat_start <= self.orig_start + 32 * 1024 and haystack.len - pat_start >= 64 * 1024) {
+                        return .abort;
+                    }
+                }
+                return .reject;
+            }
+        };
+    }
+
+    fn scanUnanchoredChunk(
+        comptime TableT: type,
+        comptime skip_tag: dfa_mod.StartSkipTag,
+        comptime track_active: bool,
+        dfa: *const UnanchoredDfa,
+        trans: [*]const TableT,
+        haystack: []const u8,
+        pos_ptr: *usize,
+        chunk_limit: usize,
+        state_ptr: *u16,
+        active_since_ptr: *usize,
+        local_steps: *usize,
+    ) void {
+        const classes = &dfa.classes;
+        const start_max = dfa.start_max_off;
+        const match_start = dfa.match_start_off;
+        const vecs = UnanchoredDfa.initSkipVecs(skip_tag, dfa.start_skip);
+
+        var pos = pos_ptr.*;
+        var s = state_ptr.*;
+        var active_since = active_since_ptr.*;
+
+        while (pos < chunk_limit) {
+            if (s <= start_max) {
+                var sc: usize = 0;
+                while (sc < 4 and pos < chunk_limit) : (sc += 1) {
+                    const ns: u16 = trans[s + classes[haystack[pos]]];
+                    if (comptime builtin.is_test) local_steps.* += 1;
+                    if (ns > start_max) {
+                        if (comptime track_active) active_since = pos;
+                        s = ns;
+                        pos += 1;
+                        break;
+                    }
+                    s = ns;
+                    pos += 1;
+                }
+                if (s >= match_start) break;
+                if (s <= start_max) {
+                    if (pos >= chunk_limit) break;
+                    if (comptime skip_tag != .none) {
+                        if (chunk_limit - pos >= memchr.native_width) {
+                            if (UnanchoredDfa.skipStartVec(skip_tag, vecs, haystack, pos, chunk_limit)) |next_pos| {
+                                if (comptime builtin.is_test) local_steps.* += next_pos - pos;
+                                if (next_pos > pos) {
+                                    s = dfa.startStateForByte(haystack[next_pos - 1]);
+                                    pos = next_pos;
+                                }
+                                const ns: u16 = trans[s + classes[haystack[pos]]];
+                                if (comptime builtin.is_test) local_steps.* += 1;
+                                if (ns > start_max) {
+                                    if (comptime track_active) active_since = pos;
+                                }
+                                s = ns;
+                                pos += 1;
+                                if (s >= match_start) break;
+                                if (s <= start_max) continue;
+                            } else {
+                                if (comptime builtin.is_test) local_steps.* += chunk_limit - pos;
+                                if (chunk_limit > pos) {
+                                    s = dfa.startStateForByte(haystack[chunk_limit - 1]);
+                                    pos = chunk_limit;
+                                }
+                                break;
+                            }
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+            }
+
+            // Active non-start state: 4x unrolled compact ByteClasses + pre-scaled table DFA loop
+            while (pos + 4 <= chunk_limit) {
+                const s1: u16 = trans[s + classes[haystack[pos]]];
+                if (s1 >= match_start) {
+                    if (comptime builtin.is_test) local_steps.* += 1;
+                    s = s1;
+                    pos += 1;
+                    break;
+                }
+                if (comptime track_active) {
+                    if (s1 <= start_max) active_since = pos + 1;
+                }
+                const s2: u16 = trans[s1 + classes[haystack[pos + 1]]];
+                if (s2 >= match_start) {
+                    if (comptime builtin.is_test) local_steps.* += 2;
+                    s = s2;
+                    pos += 2;
+                    break;
+                }
+                if (comptime track_active) {
+                    if (s2 <= start_max) active_since = pos + 2;
+                }
+                const s3: u16 = trans[s2 + classes[haystack[pos + 2]]];
+                if (s3 >= match_start) {
+                    if (comptime builtin.is_test) local_steps.* += 3;
+                    s = s3;
+                    pos += 3;
+                    break;
+                }
+                if (comptime track_active) {
+                    if (s3 <= start_max) active_since = pos + 3;
+                }
+                const s4: u16 = trans[s3 + classes[haystack[pos + 3]]];
+                if (comptime builtin.is_test) local_steps.* += 4;
+                s = s4;
+                pos += 4;
+                if (comptime track_active) {
+                    if (s <= start_max) active_since = pos;
+                }
+                if (s >= match_start or s <= start_max) break;
+            }
+            if (s >= match_start) break;
+            if (s <= start_max) continue;
+
+            while (pos < chunk_limit) {
+                s = trans[s + classes[haystack[pos]]];
+                if (comptime builtin.is_test) local_steps.* += 1;
+                pos += 1;
+                if (s >= match_start) break;
+                if (s <= start_max) {
+                    if (comptime track_active) active_since = pos;
+                    break;
+                }
+            }
+            if (s >= match_start) break;
+        }
+
+        pos_ptr.* = pos;
+        state_ptr.* = s;
+        active_since_ptr.* = active_since;
+    }
+
+    inline fn dispatchScanUnanchored(
+        comptime track_active: bool,
+        dfa: *const UnanchoredDfa,
+        haystack: []const u8,
+        pos_ptr: *usize,
+        chunk_limit: usize,
+        state_ptr: *u16,
+        active_since_ptr: *usize,
+        local_steps: *usize,
+    ) void {
+        if (dfa.use_u8) {
+            const trans: [*]const u8 = &dfa.trans_u8;
+            switch (dfa.start_skip) {
+                inline else => |_, tag| scanUnanchoredChunk(u8, tag, track_active, dfa, trans, haystack, pos_ptr, chunk_limit, state_ptr, active_since_ptr, local_steps),
+            }
+        } else {
+            const trans: [*]const u16 = dfa.trans_u16.ptr;
+            switch (dfa.start_skip) {
+                inline else => |_, tag| scanUnanchoredChunk(u16, tag, track_active, dfa, trans, haystack, pos_ptr, chunk_limit, state_ptr, active_since_ptr, local_steps),
+            }
+        }
+    }
+
+    fn runUnanchoredDfaEnd(
         self: *const Regex,
         dfa: *const UnanchoredDfa,
         haystack: []const u8,
         start: usize,
         limit: usize,
-        mode: MatchMode,
         steps: ?*usize,
-        scratch: ?*RegexScratch,
         comptime watch_nul: bool,
         nul: *?usize,
-    ) ?Match {
+    ) ?usize {
         if (start > limit) return null;
-        const start_id = UnanchoredDfa.start_id;
-        const match_start = dfa.match_start;
-        const trans = &dfa.trans;
+        const match_start = dfa.match_start_off;
 
         var scan_limit: usize = limit;
         var nul_checked_to: usize = start;
@@ -998,8 +1270,8 @@ pub const Regex = struct {
 
         var pos: usize = start;
         var search_floor: usize = start;
-        var active_since: usize = start;
-        var s: u8 = start_id;
+        var unused_active: usize = start;
+        var s: u16 = dfa.startStateAt(haystack, start);
         var cached_win_end: usize = std.math.maxInt(usize);
         var cached_line_start: usize = start;
 
@@ -1024,91 +1296,127 @@ pub const Regex = struct {
             }
             const chunk_limit = if (watch_nul) @min(scan_limit, nul_checked_to) else scan_limit;
 
-            while (pos < chunk_limit) {
-                if (s == start_id) {
-                    const s_next = trans[start_id][haystack[pos]];
-                    if (comptime builtin.is_test) local_steps += 1;
-                    if (s_next == start_id) {
-                        pos += 1;
-                        if (pos < chunk_limit) {
-                            const s_next2 = trans[start_id][haystack[pos]];
-                            if (comptime builtin.is_test) local_steps += 1;
-                            if (s_next2 == start_id) {
-                                pos += 1;
-                                if (dfa.start_skip != .none and chunk_limit - pos >= memchr.native_width) {
-                                    if (dfa.skipStartBytes(haystack, pos, chunk_limit)) |next_pos| {
-                                        if (comptime builtin.is_test) local_steps += next_pos - pos;
-                                        pos = next_pos;
-                                    } else {
-                                        if (comptime builtin.is_test) local_steps += chunk_limit - pos;
-                                        pos = chunk_limit;
-                                        break;
-                                    }
-                                }
-                                continue;
-                            }
-                            active_since = pos;
-                            s = s_next2;
-                            pos += 1;
-                            if (s >= match_start) break;
-                            continue;
-                        }
-                        break;
-                    }
-                    active_since = pos;
-                    s = s_next;
-                    pos += 1;
-                    if (s >= match_start) break;
-                }
-
-                // Active non-start state: 4x unrolled table-driven DFA loop (no is_match[] lookup)
-                while (pos + 4 <= chunk_limit) {
-                    const s1 = trans[s][haystack[pos]];
-                    if (s1 >= match_start) {
-                        if (comptime builtin.is_test) local_steps += 1;
-                        s = s1;
-                        pos += 1;
-                        break;
-                    }
-                    const s2 = trans[s1][haystack[pos + 1]];
-                    if (s2 >= match_start) {
-                        if (comptime builtin.is_test) local_steps += 2;
-                        s = s2;
-                        pos += 2;
-                        break;
-                    }
-                    const s3 = trans[s2][haystack[pos + 2]];
-                    if (s3 >= match_start) {
-                        if (comptime builtin.is_test) local_steps += 3;
-                        s = s3;
-                        pos += 3;
-                        break;
-                    }
-                    const s4 = trans[s3][haystack[pos + 3]];
-                    if (comptime builtin.is_test) local_steps += 4;
-                    s = s4;
-                    pos += 4;
-                    if (s >= match_start or s == start_id) break;
-                }
-                if (s >= match_start) break;
-                if (s == start_id) continue;
-
-                while (pos < chunk_limit) {
-                    s = trans[s][haystack[pos]];
-                    if (comptime builtin.is_test) local_steps += 1;
-                    pos += 1;
-                    if (s >= match_start or s == start_id) break;
-                }
-                if (s >= match_start) break;
-            }
+            dispatchScanUnanchored(false, dfa, haystack, &pos, chunk_limit, &s, &unused_active, &local_steps);
 
             if (s < match_start) continue;
 
-            // Phase-2 exact PikeVM verification on candidate ending at `pos`
+            // Exact match fast path: 0 PikeVM calls, 0 windowLimit, 0 lineStartAt!
+            if (s == dfa.exact_del_off) return pos - 1;
+            if (s == dfa.exact_imm_off) return pos;
+
+            // Rare verify_match fallback (non-ASCII / ambiguous `\b` candidate)
+            const cand_end: usize = if (s == dfa.verify_del_off) pos - 1 else pos;
+            const probe_pos: usize = if (cand_end > 0) cand_end - 1 else 0;
+            if (cached_win_end == std.math.maxInt(usize) or probe_pos > cached_win_end) {
+                cached_win_end = self.windowLimit(haystack, probe_pos);
+                cached_line_start = @max(search_floor, lineStartAt(haystack, probe_pos));
+            }
+            var win_end = @min(scan_limit, cached_win_end);
+            if (watch_nul and win_end > nul_checked_to) {
+                if (memchr.find(memchr.native_width, haystack[0..win_end], nul_checked_to, 0)) |z| {
+                    nul_found = z;
+                    scan_limit = z;
+                    win_end = z;
+                    nul_checked_to = z;
+                } else {
+                    nul_checked_to = win_end;
+                }
+            }
+            const line_start = @max(search_floor, cached_line_start);
+            const start_hi = if (cand_end > 0) cand_end - 1 else 0;
+            if (cand_end > 0 and line_start <= start_hi) {
+                if (self.runRangeAllowed(haystack, line_start, start_hi, win_end, .earliest, AllowAny{}, steps, null)) |m| {
+                    return m.end;
+                }
+            }
+            search_floor = cand_end;
+            pos = cand_end;
+            s = dfa.startStateAt(haystack, cand_end);
+        }
+
+        // End-of-input (EOF / NUL-limit) pending `\b`/`\B` check
+        if (s < match_start and pos > search_floor) {
+            const eoi = dfa.eoi_kind[@intCast(s / dfa.stride)];
+            if (eoi == .exact) return pos;
+            if (eoi == .verify) {
+                const probe_pos = pos - 1;
+                const line_start = @max(search_floor, lineStartAt(haystack, probe_pos));
+                if (line_start <= probe_pos) {
+                    if (self.runRangeAllowed(haystack, line_start, probe_pos, pos, .earliest, AllowAny{}, steps, null)) |m| {
+                        return m.end;
+                    }
+                }
+            }
+        }
+
+        if (watch_nul) {
+            if (nul_found) |z| {
+                nul.* = z;
+            }
+        }
+        return null;
+    }
+
+    fn runUnanchoredDfa(
+        self: *const Regex,
+        dfa: *const UnanchoredDfa,
+        haystack: []const u8,
+        start: usize,
+        limit: usize,
+        mode: MatchMode,
+        steps: ?*usize,
+        scratch: ?*RegexScratch,
+        comptime watch_nul: bool,
+        nul: *?usize,
+    ) ?Match {
+        if (start > limit) return null;
+        const match_start = dfa.match_start_off;
+
+        var scan_limit: usize = limit;
+        var nul_checked_to: usize = start;
+        var nul_found: ?usize = null;
+
+        var pos: usize = start;
+        var search_floor: usize = start;
+        var active_since: usize = start;
+        var s: u16 = dfa.startStateAt(haystack, start);
+        var cached_win_end: usize = std.math.maxInt(usize);
+        var cached_line_start: usize = start;
+
+        var local_steps: usize = 0;
+        defer if (comptime builtin.is_test) {
+            if (steps) |st| {
+                if (local_steps > 0) _ = @atomicRmw(usize, st, .Add, local_steps, .monotonic);
+            }
+        };
+
+        while (pos < scan_limit) {
+            if (watch_nul and pos >= nul_checked_to) {
+                const check_end = @min(scan_limit, pos + 32768);
+                if (memchr.find(memchr.native_width, haystack[0..check_end], pos, 0)) |z| {
+                    nul_found = z;
+                    scan_limit = z;
+                    nul_checked_to = z;
+                    if (pos >= scan_limit) break;
+                } else {
+                    nul_checked_to = check_end;
+                }
+            }
+            const chunk_limit = if (watch_nul) @min(scan_limit, nul_checked_to) else scan_limit;
+
+            dispatchScanUnanchored(true, dfa, haystack, &pos, chunk_limit, &s, &active_since, &local_steps);
+
+            if (s < match_start) continue;
+
+            const is_delayed = (s == dfa.verify_del_off or s == dfa.exact_del_off);
+            const cand_end: usize = if (is_delayed) pos - 1 else pos;
+            const probe_pos: usize = if (cand_end > 0) cand_end - 1 else 0;
+
+            // Phase-2 exact PikeVM start/end recovery on candidate ending at `cand_end`
             if (!self.multiline) {
-                if (cached_win_end == std.math.maxInt(usize) or pos > cached_win_end) {
-                    cached_win_end = self.windowLimit(haystack, pos);
-                    cached_line_start = @max(search_floor, lineStartAt(haystack, pos));
+                if (cached_win_end == std.math.maxInt(usize) or probe_pos > cached_win_end) {
+                    cached_win_end = self.windowLimit(haystack, probe_pos);
+                    cached_line_start = @max(search_floor, lineStartAt(haystack, probe_pos));
                 }
                 var win_end = @min(scan_limit, cached_win_end);
                 if (watch_nul and win_end > nul_checked_to) {
@@ -1135,18 +1443,18 @@ pub const Regex = struct {
                     if (watch_nul and pos > nul_checked_to) nul_checked_to = pos;
                     search_floor = pos;
                     active_since = pos;
-                    s = start_id;
+                    s = dfa.startStateAt(haystack, pos);
                     continue;
                 }
 
                 const search_lo = @max(line_start, active_since);
-                const start_hi = pos - 1;
-                if (search_lo <= start_hi) {
+                const start_hi = probe_pos;
+                if (cand_end > 0 and search_lo <= start_hi) {
                     if (self.runRangeAllowed(haystack, search_lo, start_hi, win_end, mode, AllowAny{}, steps, scratch)) |m| {
-                        if (mode == .earliest and m.end > pos) {
+                        if (mode == .earliest and m.end > cand_end + 1) {
                             const earlier_lim = @min(m.end, win_end);
-                            if (pos <= earlier_lim) {
-                                if (self.runRangeAllowed(haystack, pos, earlier_lim, earlier_lim, .earliest, AllowAny{}, steps, scratch)) |m2| {
+                            if (cand_end < earlier_lim) {
+                                if (self.runRangeAllowed(haystack, cand_end, earlier_lim, earlier_lim, .earliest, AllowAny{}, steps, scratch)) |m2| {
                                     if (m2.end < m.end or (m2.end == m.end and m2.start < m.start)) {
                                         return m2;
                                     }
@@ -1156,16 +1464,17 @@ pub const Regex = struct {
                         return m;
                     }
                 }
-                search_floor = pos;
-                active_since = pos;
-                s = start_id;
+                search_floor = cand_end;
+                active_since = cand_end;
+                pos = cand_end;
+                s = dfa.startStateAt(haystack, cand_end);
             } else {
                 const search_lo = blk: {
-                    var lo = @max(search_floor, pos -| self.max_multiline_window);
+                    var lo = @max(search_floor, cand_end -| self.max_multiline_window);
                     if (!dfa.start_reentrant) lo = @max(lo, active_since);
                     break :blk lo;
                 };
-                const raw_verify_limit = @min(scan_limit, (pos - 1) +| self.max_multiline_window);
+                const raw_verify_limit = @min(scan_limit, probe_pos +| self.max_multiline_window);
                 if (watch_nul and raw_verify_limit > nul_checked_to) {
                     if (memchr.find(memchr.native_width, haystack[0..raw_verify_limit], nul_checked_to, 0)) |z| {
                         nul_found = z;
@@ -1176,13 +1485,13 @@ pub const Regex = struct {
                     }
                 }
                 const eff_verify_limit = @min(raw_verify_limit, scan_limit);
-                const start_hi = pos - 1;
-                if (search_lo <= start_hi) {
+                const start_hi = probe_pos;
+                if (cand_end > 0 and search_lo <= start_hi) {
                     if (self.runRangeAllowed(haystack, search_lo, start_hi, eff_verify_limit, mode, AllowAny{}, steps, scratch)) |m| {
-                        if (mode == .earliest and m.end > pos) {
+                        if (mode == .earliest and m.end > cand_end + 1) {
                             const earlier_lim = @min(m.end, eff_verify_limit);
-                            if (pos <= earlier_lim) {
-                                if (self.runRangeAllowed(haystack, pos, earlier_lim, earlier_lim, .earliest, AllowAny{}, steps, scratch)) |m2| {
+                            if (cand_end < earlier_lim) {
+                                if (self.runRangeAllowed(haystack, cand_end, earlier_lim, earlier_lim, .earliest, AllowAny{}, steps, scratch)) |m2| {
                                     if (m2.end < m.end or (m2.end == m.end and m2.start < m.start)) {
                                         return m2;
                                     }
@@ -1192,9 +1501,25 @@ pub const Regex = struct {
                         return m;
                     }
                 }
-                search_floor = pos;
-                active_since = pos;
-                s = start_id;
+                search_floor = cand_end;
+                active_since = cand_end;
+                pos = cand_end;
+                s = dfa.startStateAt(haystack, cand_end);
+            }
+        }
+
+        // End-of-input (EOF / NUL-limit) pending `\b`/`\B` check
+        if (s < match_start and pos > search_floor) {
+            const eoi = dfa.eoi_kind[@intCast(s / dfa.stride)];
+            if (eoi != .none) {
+                const probe_pos = pos - 1;
+                const line_start = @max(search_floor, lineStartAt(haystack, probe_pos));
+                const search_lo = if (dfa.start_reentrant) line_start else @max(line_start, active_since);
+                if (search_lo <= probe_pos) {
+                    if (self.runRangeAllowed(haystack, search_lo, probe_pos, pos, mode, AllowAny{}, steps, scratch)) |m| {
+                        return m;
+                    }
+                }
             }
         }
 
@@ -1321,6 +1646,531 @@ pub const Regex = struct {
         return m;
     }
 
+    fn findWatchedWordBoundedChunked(
+        self: *const Regex,
+        pf: *const Finder,
+        haystack: []const u8,
+        start_pos: usize,
+        nul: *?usize,
+    ) ?Match {
+        var scan_pos = start_pos;
+        var chunk_size: usize = 64 * 1024;
+        const max_chunk_size: usize = 256 * 1024;
+        const max_lit_len = if (self.ignore_case and self.unicode_case) self.req_literal_bytes.len *| 3 else self.req_literal_bytes.len;
+        const overlap = max_lit_len -| 1;
+
+        while (scan_pos <= haystack.len) {
+            const chunk_end = @min(haystack.len, scan_pos +| chunk_size);
+            const nul_in_chunk = memchr.find(memchr.native_width, haystack[0..chunk_end], scan_pos, 0);
+            const has_nul = nul_in_chunk != null;
+            const eff_end = nul_in_chunk orelse chunk_end;
+            const prefilter_end = if (has_nul) eff_end else @min(haystack.len, eff_end +| overlap);
+            const pf_slice = haystack[0..prefilter_end];
+
+            var pos = scan_pos;
+            while (pos < eff_end) {
+                const hit = pf.findReadOnly(pf_slice, pos, .earliest) orelse break;
+                if (hit.start >= eff_end) break;
+                if (checkAssert(.word_boundary, haystack, hit.start) and checkAssert(.word_boundary, haystack, hit.end)) {
+                    if (has_nul) {
+                        if (hit.end <= eff_end) return hit;
+                        nul.* = eff_end;
+                        return null;
+                    }
+                    return checkWatchedMatch(haystack, eff_end, hit, nul);
+                }
+                pos = hit.start + self.req_prefix_shift;
+            }
+            if (has_nul) {
+                nul.* = eff_end;
+                return null;
+            }
+            if (eff_end >= haystack.len) return null;
+            scan_pos = eff_end;
+            chunk_size = @min(max_chunk_size, chunk_size * 2);
+        }
+        return null;
+    }
+
+    fn findWatchedPrefixChainChunked(
+        pf: *const Finder,
+        haystack: []const u8,
+        start_pos: usize,
+        p0: usize,
+        clen: usize,
+        u_lo: u8,
+        u_sp: u8,
+        shift: usize,
+        nul: *?usize,
+    ) ?Match {
+        var scan_pos = start_pos;
+        var chunk_size: usize = 64 * 1024;
+        const max_chunk_size: usize = 256 * 1024;
+        const overlap = p0 -| 1;
+
+        while (scan_pos <= haystack.len) {
+            const chunk_end = @min(haystack.len, scan_pos +| chunk_size);
+            const nul_in_chunk = memchr.find(memchr.native_width, haystack[0..chunk_end], scan_pos, 0);
+            const has_nul = nul_in_chunk != null;
+            const eff_end = nul_in_chunk orelse chunk_end;
+            const prefilter_end = if (has_nul) eff_end else @min(haystack.len, eff_end +| overlap);
+            const pf_slice = haystack[0..prefilter_end];
+
+            var pos = scan_pos;
+            while (pos < eff_end) {
+                const hit = pf.findReadOnly(pf_slice, pos, .earliest) orelse break;
+                if (hit.start >= eff_end) break;
+                const rem_start = hit.start + p0;
+                if (rem_start + clen <= haystack.len) {
+                    const p = haystack[rem_start..][0..clen];
+                    if ((p[clen - 1] -% u_lo) <= u_sp) {
+                        var ok = true;
+                        for (p[0 .. clen - 1]) |ch| {
+                            if ((ch -% u_lo) > u_sp) {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if (ok) {
+                            const m = Match{ .start = hit.start, .end = rem_start + clen, .pattern_id = null };
+                            if (has_nul) {
+                                if (m.end <= eff_end) return m;
+                                nul.* = eff_end;
+                                return null;
+                            }
+                            return checkWatchedMatch(haystack, eff_end, m, nul);
+                        }
+                    }
+                }
+                pos = hit.start + shift;
+            }
+            if (has_nul) {
+                nul.* = eff_end;
+                return null;
+            }
+            if (eff_end >= haystack.len) return null;
+            scan_pos = eff_end;
+            chunk_size = @min(max_chunk_size, chunk_size * 2);
+        }
+        return null;
+    }
+
+    fn findWatchedPrefixChunked(
+        self: *const Regex,
+        pf: *const Finder,
+        haystack: []const u8,
+        start_pos: usize,
+        nul: *?usize,
+    ) ?Match {
+        var scan_pos = start_pos;
+        var chunk_size: usize = 64 * 1024;
+        const max_chunk_size: usize = 256 * 1024;
+        const max_lit_len = if (self.ignore_case and self.unicode_case) self.req_literal_bytes.len *| 3 else self.req_literal_bytes.len;
+        const overlap = max_lit_len -| 1;
+        const exact_for_mode = self.dfa_is_exact and !self.has_alt;
+        var cached_win_end: usize = std.math.maxInt(usize);
+
+        while (scan_pos <= haystack.len) {
+            const chunk_end = @min(haystack.len, scan_pos +| chunk_size);
+            const nul_in_chunk = memchr.find(memchr.native_width, haystack[0..chunk_end], scan_pos, 0);
+            const has_nul = nul_in_chunk != null;
+            const eff_end = nul_in_chunk orelse chunk_end;
+            const prefilter_end = if (has_nul) eff_end else @min(haystack.len, eff_end +| overlap);
+            const pf_slice = haystack[0..prefilter_end];
+
+            var pos = scan_pos;
+            if (self.precomputed_dfa) |dfa| {
+                if (exact_for_mode and dfa.stops_on_crlf) {
+                    const fixed_prefix = self.dfa_prefix_len > 0 and self.dfa_prefix_len == self.req_literal_bytes.len and (!self.ignore_case or !self.unicode_case);
+                    while (pos < eff_end) {
+                        const hit = pf.findReadOnly(pf_slice, pos, .earliest) orelse break;
+                        if (hit.start >= eff_end) break;
+                        const can_skip = fixed_prefix or (hit.end - hit.start == self.dfa_prefix_len);
+                        const s0: u16 = if (can_skip) self.dfa_prefix_state else dfa_mod.start_state;
+                        const p0: usize = if (can_skip) self.dfa_prefix_len else 0;
+                        if (dfa.matchPrefixDeterminized(haystack[hit.start..], s0, p0, false)) |match_len| {
+                            const m = Match{ .start = hit.start, .end = hit.start + match_len, .pattern_id = null };
+                            if (has_nul) {
+                                if (m.end <= eff_end) return m;
+                                nul.* = eff_end;
+                                return null;
+                            }
+                            return checkWatchedMatch(haystack, eff_end, m, nul);
+                        }
+                        pos = hit.start + self.req_prefix_shift;
+                    }
+                } else {
+                    while (pos < eff_end) {
+                        const hit = pf.findReadOnly(pf_slice, pos, .earliest) orelse break;
+                        if (hit.start >= eff_end) break;
+                        const can_skip = (hit.end - hit.start == self.dfa_prefix_len);
+                        const s0: u16 = if (can_skip) self.dfa_prefix_state else dfa_mod.start_state;
+                        const p0: usize = if (can_skip) self.dfa_prefix_len else 0;
+                        const win_end = if (!self.multiline and cached_win_end != std.math.maxInt(usize) and hit.start <= cached_win_end)
+                            cached_win_end
+                        else blk: {
+                            const w = self.windowLimit(haystack, hit.start);
+                            cached_win_end = w;
+                            break :blk w;
+                        };
+                        if (dfa.matchPrefixDeterminized(haystack[hit.start..win_end], s0, p0, !exact_for_mode)) |match_len| {
+                            const m_opt = if (exact_for_mode)
+                                Match{ .start = hit.start, .end = hit.start + match_len, .pattern_id = null }
+                            else
+                                self.runRangeAllowed(haystack, hit.start, hit.start, win_end, .earliest, AllowAny{}, null, null);
+                            if (m_opt) |m| {
+                                if (has_nul) {
+                                    if (m.end <= eff_end) return m;
+                                    nul.* = eff_end;
+                                    return null;
+                                }
+                                return checkWatchedMatch(haystack, eff_end, m, nul);
+                            }
+                        }
+                        pos = hit.start + self.req_prefix_shift;
+                    }
+                }
+            } else {
+                while (pos < eff_end) {
+                    const hit = pf.findReadOnly(pf_slice, pos, .earliest) orelse break;
+                    if (hit.start >= eff_end) break;
+                    const win_end = if (!self.multiline and cached_win_end != std.math.maxInt(usize) and hit.start <= cached_win_end)
+                        cached_win_end
+                    else blk: {
+                        const w = self.windowLimit(haystack, hit.start);
+                        cached_win_end = w;
+                        break :blk w;
+                    };
+                    var rejected = false;
+                    if (self.tail_finder) |*tf| {
+                        if (tf.findReadOnly(haystack[0..win_end], hit.end, .earliest) == null) rejected = true;
+                    }
+                    if (!rejected) {
+                        const p_hi = if (self.multiline) hit.start else win_end;
+                        if (self.runRangeAllowed(haystack, hit.start, p_hi, win_end, .earliest, AllowAny{}, null, null)) |m| {
+                            if (has_nul) {
+                                if (m.end <= eff_end) return m;
+                                nul.* = eff_end;
+                                return null;
+                            }
+                            return checkWatchedMatch(haystack, eff_end, m, nul);
+                        }
+                    }
+                    pos = if (!self.multiline) @min(haystack.len + 1, win_end + 1) else hit.start + 1;
+                }
+            }
+            if (has_nul) {
+                nul.* = eff_end;
+                return null;
+            }
+            if (eff_end >= haystack.len) return null;
+            scan_pos = eff_end;
+            chunk_size = @min(max_chunk_size, chunk_size * 2);
+        }
+        return null;
+    }
+
+    fn findWatchedInteriorChunked(
+        self: *const Regex,
+        pf: *const Finder,
+        haystack: []const u8,
+        start_pos: usize,
+        start_min_start: usize,
+        nul: *?usize,
+    ) ?Match {
+        var scan_pos = start_pos;
+        var min_start = start_min_start;
+        var chunk_size: usize = 64 * 1024;
+        const max_chunk_size: usize = 256 * 1024;
+        const max_lit_len = if (self.ignore_case and self.unicode_case) self.req_literal_bytes.len *| 3 else self.req_literal_bytes.len;
+        const overlap = (max_lit_len -| 1) + @as(usize, if (self.byte_ctx_prefilter != null) 1 else 0);
+        const exact_for_mode = self.dfa_is_exact and !self.has_alt;
+        const ascii_exact_for_mode = self.dfa_exact_on_ascii and !self.has_alt;
+        var cached_win_end: usize = std.math.maxInt(usize);
+
+        while (scan_pos <= haystack.len) {
+            const chunk_end = @min(haystack.len, scan_pos +| chunk_size);
+            const nul_in_chunk = memchr.find(memchr.native_width, haystack[0..chunk_end], scan_pos, 0);
+            const has_nul = nul_in_chunk != null;
+            const eff_end = nul_in_chunk orelse chunk_end;
+            const prefilter_end = if (has_nul) eff_end else @min(haystack.len, eff_end +| overlap);
+            const pf_slice = haystack[0..prefilter_end];
+
+            var pos = scan_pos;
+            while (pos < eff_end) {
+                const hit_opt: ?Match = if (self.pair_prefilter) |*pp| blk: {
+                    const pf_pre: usize = self.pair_prefilter_prefix_len;
+                    const pair_search_from = @max(pos, min_start + self.req_min_before) -| pf_pre;
+                    if (pair_search_from >= prefilter_end) break :blk null;
+                    const ph = pp.find(pf_slice, pair_search_from, .earliest) orelse break :blk null;
+                    break :blk Match{ .start = ph.start + pf_pre, .end = ph.end, .pattern_id = null };
+                } else if (self.byte_ctx_prefilter) |bcp| blk: {
+                    const at = bcp.find(pf_slice, pos, min_start + self.req_min_before) orelse break :blk null;
+                    break :blk Match{ .start = at, .end = at + 1, .pattern_id = null };
+                } else pf.findReadOnly(pf_slice, pos, .earliest);
+                const hit = hit_opt orelse break;
+
+                if (hit.start >= eff_end) break;
+                if (self.multiline and hit.end - hit.start > self.max_multiline_window) {
+                    pos = hit.start + 1;
+                    min_start = pos;
+                    continue;
+                }
+                if (hit.start < min_start + self.req_min_before) {
+                    pos = hit.start + self.req_prefix_shift;
+                    continue;
+                }
+                if (self.req_has_prev_mask) {
+                    if (!self.req_prev_masks[0].contains(haystack[hit.start - 1]) or
+                        (self.req_prev_mask_len >= 2 and !self.req_prev_masks[1].contains(haystack[hit.start - 2])) or
+                        (self.req_prev_mask_len >= 3 and !self.req_prev_masks[2].contains(haystack[hit.start - 3])))
+                    {
+                        pos = hit.start + self.req_prefix_shift;
+                        continue;
+                    }
+                }
+                if (self.req_prefix_uclass_pc != std.math.maxInt(u32) and self.dfa_suffix_is_exact) {
+                    if (self.precomputed_dfa) |dfa| {
+                        if (dfa.matchPrefixDeterminized(haystack[hit.end..], self.dfa_suffix_state, 0, false)) |suf_len| {
+                            const uc = self.insts[self.req_prefix_uclass_pc].unicode_class;
+                            const ranges = self.unicode_ranges[uc.range_idx].ranges;
+                            if (matchPrefixUclassReverse(haystack, min_start, hit.start, uc, ranges, self.req_prefix_uclass_min)) |run_start| {
+                                const m = Match{ .start = run_start, .end = hit.end + suf_len, .pattern_id = null };
+                                if (has_nul) {
+                                    if (m.end <= eff_end) return m;
+                                    nul.* = eff_end;
+                                    return null;
+                                }
+                                return checkWatchedMatch(haystack, eff_end, m, nul);
+                            }
+                        }
+                        pos = hit.start + self.req_prefix_shift;
+                        continue;
+                    }
+                }
+                if (self.dfa_suffix_state != 0 and !self.multiline) {
+                    if (self.precomputed_dfa) |dfa| {
+                        if (dfa.matchPrefixDeterminized(haystack[hit.end..], self.dfa_suffix_state, 0, true) == null) {
+                            pos = hit.start + self.req_prefix_shift;
+                            continue;
+                        }
+                    }
+                }
+                const win_end = if (!self.multiline and cached_win_end != std.math.maxInt(usize) and hit.start <= cached_win_end)
+                    cached_win_end
+                else blk: {
+                    const w = self.windowLimit(haystack, hit.start);
+                    cached_win_end = w;
+                    break :blk w;
+                };
+                if (self.tail_finder) |*tf| {
+                    if (hit.end > win_end or tf.findReadOnly(haystack[0..win_end], hit.end, .earliest) == null) {
+                        pos = if (!self.multiline) @min(haystack.len + 1, win_end + 1) else hit.start + 1;
+                        min_start = pos;
+                        continue;
+                    }
+                }
+                const narrowed_local = !self.multiline and (self.req_max_before != null or self.req_has_prefix_bytes_mask);
+                const search_from = blk: {
+                    if (self.multiline) break :blk @max(min_start, hit.end -| self.max_multiline_window);
+                    var lo = min_start;
+                    if (self.req_max_before) |max_b| lo = @max(lo, hit.start -| max_b);
+                    if (self.req_has_prefix_bytes_mask) {
+                        var cur = hit.start;
+                        while (cur > lo and self.req_prefix_bytes_mask.contains(haystack[cur - 1])) cur -= 1;
+                        lo = cur;
+                    }
+                    if (self.req_max_before != null or self.req_has_prefix_bytes_mask) {
+                        if (lo < hit.start and (!self.req_has_prefix_bytes_mask or self.req_prefix_bytes_mask.contains('\n'))) {
+                            if (memchr.findLast(memchr.native_width, haystack, lo, hit.start, '\n')) |nl| lo = nl + 1;
+                        }
+                        break :blk lo;
+                    }
+                    break :blk @max(min_start, lineStartAt(haystack, hit.start));
+                };
+                const p_hi = if (self.multiline or narrowed_local) hit.start -| self.req_min_before else win_end;
+                if (self.precomputed_dfa) |dfa| {
+                    var p = search_from;
+                    while (p <= p_hi) : (p += 1) {
+                        if (p < win_end and dfa.trans[dfa_mod.start_state][haystack[p]] == dfa_mod.dead_state) continue;
+                        const p_win = if (self.multiline) self.windowLimit(haystack, p) else win_end;
+                        if (dfa.matchPrefixDeterminized(haystack[p..p_win], dfa_mod.start_state, 0, !exact_for_mode and !ascii_exact_for_mode)) |match_len| {
+                            const m_opt = if (exact_for_mode or (ascii_exact_for_mode and isAsciiBytes(haystack[p .. p + match_len])))
+                                Match{ .start = p, .end = p + match_len, .pattern_id = null }
+                            else
+                                self.runRangeAllowed(haystack, p, p, p_win, .earliest, AllowAny{}, null, null);
+                            if (m_opt) |m| {
+                                if (has_nul) {
+                                    if (m.end <= eff_end) return m;
+                                    nul.* = eff_end;
+                                    return null;
+                                }
+                                return checkWatchedMatch(haystack, eff_end, m, nul);
+                            }
+                        }
+                    }
+                } else if (search_from <= p_hi) {
+                    if (self.runRangeAllowed(haystack, search_from, p_hi, win_end, .earliest, AllowAny{}, null, null)) |m| {
+                        if (has_nul) {
+                            if (m.end <= eff_end) return m;
+                            nul.* = eff_end;
+                            return null;
+                        }
+                        return checkWatchedMatch(haystack, eff_end, m, nul);
+                    }
+                }
+                pos = if (narrowed_local)
+                    hit.start + self.req_prefix_shift
+                else if (!self.multiline)
+                    @min(haystack.len + 1, win_end + 1)
+                else
+                    hit.start + 1;
+                if (!narrowed_local) min_start = @min(pos, eff_end);
+            }
+            if (has_nul) {
+                nul.* = eff_end;
+                return null;
+            }
+            if (eff_end >= haystack.len) return null;
+            scan_pos = eff_end;
+            chunk_size = @min(max_chunk_size, chunk_size * 2);
+        }
+        return null;
+    }
+
+    fn findWatchedAltDfaChunked(
+        self: *const Regex,
+        ap: *const Multi,
+        dfa: *const HeapDfa,
+        haystack: []const u8,
+        start_pos: usize,
+        max_ap_len: usize,
+        nul: *?usize,
+    ) ?Match {
+        var scan_pos = start_pos;
+        var chunk_size: usize = 64 * 1024;
+        const max_chunk_size: usize = 256 * 1024;
+        const overlap = max_ap_len -| 1;
+
+        while (scan_pos <= haystack.len) {
+            const chunk_end = @min(haystack.len, scan_pos +| chunk_size);
+            const nul_in_chunk = memchr.find(memchr.native_width, haystack[0..chunk_end], scan_pos, 0);
+            const has_nul = nul_in_chunk != null;
+            const eff_end = nul_in_chunk orelse chunk_end;
+            const prefilter_end = if (has_nul) eff_end else @min(haystack.len, eff_end +| overlap);
+
+            const step = if (dfa.stops_on_crlf) blk: {
+                var verifier = AltDfaVerifier(true, false, true){
+                    .regex = self,
+                    .dfa = dfa,
+                    .full_haystack = haystack,
+                    .mode = .earliest,
+                    .steps = null,
+                    .scratch = null,
+                    .cand_limit = eff_end,
+                };
+                break :blk ap.findVerified(haystack[0..prefilter_end], scan_pos, .leftmost_first, &verifier);
+            } else blk: {
+                var verifier = AltDfaVerifier(false, false, true){
+                    .regex = self,
+                    .dfa = dfa,
+                    .full_haystack = haystack,
+                    .mode = .earliest,
+                    .steps = null,
+                    .scratch = null,
+                    .cand_limit = eff_end,
+                };
+                break :blk ap.findVerified(haystack[0..prefilter_end], scan_pos, .leftmost_first, &verifier);
+            };
+
+            switch (step) {
+                .match => |vm| {
+                    const m = Match{ .start = vm.start, .end = vm.end, .pattern_id = null };
+                    if (has_nul) {
+                        if (m.end <= eff_end) return m;
+                        nul.* = eff_end;
+                        return null;
+                    }
+                    return checkWatchedMatch(haystack, eff_end, m, nul);
+                },
+                .none, .aborted => {
+                    if (has_nul) {
+                        nul.* = eff_end;
+                        return null;
+                    }
+                    if (eff_end >= haystack.len) return null;
+                    scan_pos = eff_end;
+                    chunk_size = @min(max_chunk_size, chunk_size * 2);
+                },
+            }
+        }
+        return null;
+    }
+
+    fn findWatchedAltGeneralChunked(
+        self: *const Regex,
+        ap: *const Multi,
+        haystack: []const u8,
+        start_pos: usize,
+        start_min_start: usize,
+        max_ap_len: usize,
+        nul: *?usize,
+    ) ?Match {
+        var scan_pos = start_pos;
+        var min_start = start_min_start;
+        var chunk_size: usize = 64 * 1024;
+        const max_chunk_size: usize = 256 * 1024;
+        const overlap = max_ap_len -| 1;
+        var cached_win_end: usize = std.math.maxInt(usize);
+
+        while (scan_pos <= haystack.len) {
+            const chunk_end = @min(haystack.len, scan_pos +| chunk_size);
+            const nul_in_chunk = memchr.find(memchr.native_width, haystack[0..chunk_end], scan_pos, 0);
+            const has_nul = nul_in_chunk != null;
+            const eff_end = nul_in_chunk orelse chunk_end;
+            const prefilter_end = if (has_nul) eff_end else @min(haystack.len, eff_end +| overlap);
+            const pf_slice = haystack[0..prefilter_end];
+
+            var pos = scan_pos;
+            while (pos < eff_end) {
+                const hit = ap.find(pf_slice, pos, .leftmost_first) orelse break;
+                if (hit.start >= eff_end) break;
+                const search_from = if (!self.multiline)
+                    @max(min_start, lineStartAt(haystack, hit.start))
+                else
+                    @max(min_start, hit.start);
+                const win_end = if (!self.multiline and cached_win_end != std.math.maxInt(usize) and hit.start <= cached_win_end)
+                    cached_win_end
+                else blk: {
+                    const w = self.windowLimit(haystack, hit.start);
+                    cached_win_end = w;
+                    break :blk w;
+                };
+                const p_hi = if (self.multiline) hit.start else win_end;
+                if (search_from <= p_hi) {
+                    if (self.runRangeAllowed(haystack, search_from, p_hi, win_end, .earliest, AllowAny{}, null, null)) |m| {
+                        if (has_nul) {
+                            if (m.end <= eff_end) return m;
+                            nul.* = eff_end;
+                            return null;
+                        }
+                        return checkWatchedMatch(haystack, eff_end, m, nul);
+                    }
+                }
+                pos = if (!self.multiline) @min(haystack.len + 1, win_end + 1) else hit.start + 1;
+                min_start = @min(pos, eff_end);
+            }
+            if (has_nul) {
+                nul.* = eff_end;
+                return null;
+            }
+            if (eff_end >= haystack.len) return null;
+            scan_pos = eff_end;
+            chunk_size = @min(max_chunk_size, chunk_size * 2);
+        }
+        return null;
+    }
+
     pub fn findWatched(self: *const Regex, haystack: []const u8, start: usize, nul: *?usize) ?Match {
         if (start > haystack.len) return null;
         if (!self.anchored_start) {
@@ -1332,6 +2182,7 @@ pub const Regex = struct {
             if (self.req_word_bounded) {
                 if (self.prefilter) |*pf| {
                     var pos = start;
+                    var rejects: usize = 0;
                     while (pos <= haystack.len) {
                         const hit = pf.findWatched(haystack, pos, nul) orelse return null;
                         if (checkAssert(.word_boundary, haystack, hit.start) and checkAssert(.word_boundary, haystack, hit.end)) {
@@ -1346,6 +2197,10 @@ pub const Regex = struct {
                             }
                         }
                         pos = next_pos;
+                        rejects += 1;
+                        if (rejects >= 16 and pos <= start + 32 * 1024 and haystack.len -| pos >= 64 * 1024) {
+                            return self.findWatchedWordBoundedChunked(pf, haystack, pos, nul);
+                        }
                     }
                     return null;
                 }
@@ -1381,6 +2236,7 @@ pub const Regex = struct {
             if (self.req_is_prefix) {
                 if (self.prefilter) |*pf| {
                     var pos = start;
+                    var rejects: usize = 0;
                     const exact_for_mode = self.dfa_is_exact and !self.has_alt;
                     if (self.precomputed_dfa) |dfa| {
                         if (exact_for_mode and dfa.stops_on_crlf) {
@@ -1416,6 +2272,10 @@ pub const Regex = struct {
                                             }
                                         }
                                         pos = hit.start + shift;
+                                        rejects += 1;
+                                        if (rejects >= 16 and pos <= start + 32 * 1024 and haystack.len -| pos >= 64 * 1024) {
+                                            return findWatchedPrefixChainChunked(pf, haystack, pos, p0, clen, u_lo, u_sp, shift, nul);
+                                        }
                                     }
                                     return null;
                                 }
@@ -1429,6 +2289,10 @@ pub const Regex = struct {
                                         }, nul);
                                     }
                                     pos = hit.start + shift;
+                                    rejects += 1;
+                                    if (rejects >= 16 and pos <= start + 32 * 1024 and haystack.len -| pos >= 64 * 1024) {
+                                        return self.findWatchedPrefixChunked(pf, haystack, pos, nul);
+                                    }
                                 }
                                 return null;
                             }
@@ -1453,6 +2317,10 @@ pub const Regex = struct {
                                     }
                                 }
                                 pos = next_pos;
+                                rejects += 1;
+                                if (rejects >= 16 and pos <= start + 32 * 1024 and haystack.len -| pos >= 64 * 1024) {
+                                    return self.findWatchedPrefixChunked(pf, haystack, pos, nul);
+                                }
                             }
                             return null;
                         }
@@ -1490,6 +2358,10 @@ pub const Regex = struct {
                                 }
                             }
                             pos = next_pos;
+                            rejects += 1;
+                            if (rejects >= 16 and pos <= start + 32 * 1024 and haystack.len -| pos >= 64 * 1024) {
+                                return self.findWatchedPrefixChunked(pf, haystack, pos, nul);
+                            }
                         }
                         return null;
                     }
@@ -1524,6 +2396,10 @@ pub const Regex = struct {
                             }
                         }
                         pos = next_pos;
+                        rejects += 1;
+                        if (rejects >= 16 and pos <= start + 32 * 1024 and haystack.len -| pos >= 64 * 1024) {
+                            return self.findWatchedPrefixChunked(pf, haystack, pos, nul);
+                        }
                     }
                     return null;
                 }
@@ -1531,6 +2407,7 @@ pub const Regex = struct {
             if (self.prefilter) |*pf| {
                 var pos = start;
                 var min_start = start;
+                var rejects: usize = 0;
                 var cached_win_end: usize = std.math.maxInt(usize);
                 const exact_for_mode = self.dfa_is_exact and !self.has_alt;
                 const ascii_exact_for_mode = self.dfa_exact_on_ascii and !self.has_alt;
@@ -1554,6 +2431,10 @@ pub const Regex = struct {
                     if (self.multiline and hit.end - hit.start > self.max_multiline_window) {
                         pos = hit.start + 1;
                         min_start = pos;
+                        rejects += 1;
+                        if (rejects >= 16 and pos <= start + 32 * 1024 and haystack.len -| pos >= 64 * 1024) {
+                            return self.findWatchedInteriorChunked(pf, haystack, pos, min_start, nul);
+                        }
                         continue;
                     }
                     const prev_fail = hit.start < min_start + self.req_min_before or
@@ -1570,6 +2451,10 @@ pub const Regex = struct {
                             }
                         }
                         pos = next_pos;
+                        rejects += 1;
+                        if (rejects >= 16 and pos <= start + 32 * 1024 and haystack.len -| pos >= 64 * 1024) {
+                            return self.findWatchedInteriorChunked(pf, haystack, pos, min_start, nul);
+                        }
                         continue;
                     }
                     if (self.req_prefix_uclass_pc != std.math.maxInt(u32) and self.dfa_suffix_is_exact) {
@@ -1594,6 +2479,10 @@ pub const Regex = struct {
                                 }
                             }
                             pos = next_pos;
+                            rejects += 1;
+                            if (rejects >= 16 and pos <= start + 32 * 1024 and haystack.len -| pos >= 64 * 1024) {
+                                return self.findWatchedInteriorChunked(pf, haystack, pos, min_start, nul);
+                            }
                             continue;
                         }
                     }
@@ -1609,6 +2498,10 @@ pub const Regex = struct {
                                     }
                                 }
                                 pos = next_pos;
+                                rejects += 1;
+                                if (rejects >= 16 and pos <= start + 32 * 1024 and haystack.len -| pos >= 64 * 1024) {
+                                    return self.findWatchedInteriorChunked(pf, haystack, pos, min_start, nul);
+                                }
                                 continue;
                             }
                         }
@@ -1632,6 +2525,10 @@ pub const Regex = struct {
                             }
                             pos = next_pos;
                             min_start = pos;
+                            rejects += 1;
+                            if (rejects >= 16 and pos <= start + 32 * 1024 and haystack.len -| pos >= 64 * 1024) {
+                                return self.findWatchedInteriorChunked(pf, haystack, pos, min_start, nul);
+                            }
                             continue;
                         }
                     }
@@ -1702,6 +2599,10 @@ pub const Regex = struct {
                     }
                     pos = next_pos;
                     if (!narrowed_local) min_start = pos;
+                    rejects += 1;
+                    if (rejects >= 16 and pos <= start + 32 * 1024 and haystack.len -| pos >= 64 * 1024) {
+                        return self.findWatchedInteriorChunked(pf, haystack, pos, min_start, nul);
+                    }
                 }
                 return null;
             }
@@ -1714,57 +2615,42 @@ pub const Regex = struct {
 
                 var pos = start;
                 var min_start = start;
+                var rejects: usize = 0;
                 var cached_win_end: usize = std.math.maxInt(usize);
                 if (self.alt_is_prefix) {
                     if (self.precomputed_dfa) |dfa| {
-                        if (dfa.stops_on_crlf) {
-                            while (pos <= haystack.len) {
-                                const raw_hit = ap.findWatched(haystack, pos, nul) orelse return null;
-                                const lo = @max(pos, raw_hit.end -| max_ap_len);
-                                const hi_slice = @min(haystack.len, raw_hit.start +| max_ap_len);
-                                const hit = if (lo < raw_hit.start)
-                                    (ap.find(haystack[0..hi_slice], lo, .leftmost_first) orelse raw_hit)
-                                else
-                                    raw_hit;
-                                if (dfa.matchPrefixDeterminized(haystack[hit.start..], dfa_mod.start_state, 0, true)) |_| {
-                                    const win_end = if (!self.multiline and cached_win_end != std.math.maxInt(usize) and hit.start <= cached_win_end)
-                                        cached_win_end
-                                    else blk: {
-                                        const w = self.windowLimit(haystack, hit.start);
-                                        cached_win_end = w;
-                                        break :blk w;
-                                    };
-                                    if (self.runRangeAllowed(haystack, hit.start, hit.start, win_end, .earliest, AllowAny{}, null, null)) |m| {
-                                        return checkWatchedMatch(haystack, raw_hit.end, m, nul);
-                                    }
-                                }
-                                pos = hit.start + 1;
-                            }
-                            return null;
-                        }
-                        while (pos <= haystack.len) {
-                            const raw_hit = ap.findWatched(haystack, pos, nul) orelse return null;
-                            const lo = @max(pos, raw_hit.end -| max_ap_len);
-                            const hi_slice = @min(haystack.len, raw_hit.start +| max_ap_len);
-                            const hit = if (lo < raw_hit.start)
-                                (ap.find(haystack[0..hi_slice], lo, .leftmost_first) orelse raw_hit)
-                            else
-                                raw_hit;
-                            const win_end = if (!self.multiline and cached_win_end != std.math.maxInt(usize) and hit.start <= cached_win_end)
-                                cached_win_end
-                            else blk: {
-                                const w = self.windowLimit(haystack, hit.start);
-                                cached_win_end = w;
-                                break :blk w;
+                        const step = if (dfa.stops_on_crlf) blk: {
+                            var verifier = AltDfaVerifier(true, true, false){
+                                .regex = self,
+                                .dfa = dfa,
+                                .full_haystack = haystack,
+                                .mode = .earliest,
+                                .steps = null,
+                                .scratch = null,
+                                .orig_start = start,
                             };
-                            if (dfa.matchPrefixDeterminized(haystack[hit.start..win_end], dfa_mod.start_state, 0, true)) |_| {
-                                if (self.runRangeAllowed(haystack, hit.start, hit.start, win_end, .earliest, AllowAny{}, null, null)) |m| {
-                                    return checkWatchedMatch(haystack, raw_hit.end, m, nul);
-                                }
-                            }
-                            pos = hit.start + 1;
-                        }
-                        return null;
+                            break :blk ap.findVerifiedWatched(haystack, pos, .leftmost_first, nul, &verifier);
+                        } else blk: {
+                            var verifier = AltDfaVerifier(false, true, false){
+                                .regex = self,
+                                .dfa = dfa,
+                                .full_haystack = haystack,
+                                .mode = .earliest,
+                                .steps = null,
+                                .scratch = null,
+                                .orig_start = start,
+                            };
+                            break :blk ap.findVerifiedWatched(haystack, pos, .leftmost_first, nul, &verifier);
+                        };
+                        return switch (step) {
+                            .match => |vm| checkWatchedMatch(haystack, vm.start, Match{
+                                .start = vm.start,
+                                .end = vm.end,
+                                .pattern_id = null,
+                            }, nul),
+                            .none => null,
+                            .aborted => |resume_pos| self.findWatchedAltDfaChunked(ap, dfa, haystack, resume_pos, max_ap_len, nul),
+                        };
                     }
                 }
                 while (pos <= haystack.len) {
@@ -1802,6 +2688,10 @@ pub const Regex = struct {
                     }
                     pos = next_pos;
                     min_start = pos;
+                    rejects += 1;
+                    if (rejects >= 16 and pos <= start + 32 * 1024 and haystack.len -| pos >= 64 * 1024) {
+                        return self.findWatchedAltGeneralChunked(ap, haystack, pos, min_start, max_ap_len, nul);
+                    }
                 }
                 return null;
             }

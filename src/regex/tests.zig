@@ -826,3 +826,335 @@ test "P4: Uniform terminal prefix DFA chain for \"uid\":[0-9]{7} on single-line 
     try std.testing.expect(re.findWatched(json_nul, 0, &nul2) == null);
     try std.testing.expectEqual(@as(?usize, 14), nul2);
 }
+
+test "X01 & X01u: exact ASCII \\b/\\B UnanchoredDfa, ByteClasses, findEnd/findEndWatched parity, and UTF-8 boundaries" {
+    const alloc = std.testing.allocator;
+
+    // 1. X01 exact ASCII `\b` properties & compact u8 ByteClasses
+    {
+        var re = try Regex.init(alloc, "\\b[a-z]{6,10}\\s+[0-9]{3,5}\\b", .{});
+        defer re.deinit();
+        const udfa = re.unanchored_dfa orelse return error.TestUnexpectedResult;
+        try std.testing.expect(udfa.has_word_boundary);
+        try std.testing.expect(udfa.has_exact_match);
+        try std.testing.expect(udfa.use_u8);
+        try std.testing.expect(!udfa.start_reentrant);
+        try std.testing.expect(udfa.start_skip == .range1);
+
+        // BOF & EOF
+        const bof_eof = "worker 1280";
+        const m_be = re.find(bof_eof, 0, .earliest) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("worker 1280", bof_eof[m_be.start..m_be.end]);
+        try std.testing.expectEqual(@as(?usize, m_be.end), re.findEnd(bof_eof, 0, .earliest));
+        var nul_be: ?usize = null;
+        try std.testing.expectEqual(@as(?usize, m_be.end), re.findEndWatched(bof_eof, 0, .earliest, &nul_be));
+        try std.testing.expect(nul_be == null);
+
+        // Stale active_since regression line (mid-stride start-state transitions)
+        const line9 = "2026-11-23T12:00:00Z [INFO] svc=router  routing table refresh router 404 ok\n";
+        const m9 = re.find(line9, 0, .earliest) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("router 404", line9[m9.start..m9.end]);
+        try std.testing.expectEqual(@as(?usize, m9.end), re.findEnd(line9, 0, .earliest));
+
+        // start > 0 preceded by ASCII word vs non-word vs UTF-8 word vs UTF-8 non-word
+        const s_word = "Xworker 1280 ";
+        try std.testing.expect(re.find(s_word, 1, .earliest) == null);
+        try std.testing.expect(re.findEnd(s_word, 1, .earliest) == null);
+
+        const s_nonword = " worker 1280 ";
+        const mnw = re.find(s_nonword, 1, .earliest) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("worker 1280", s_nonword[mnw.start..mnw.end]);
+        try std.testing.expectEqual(@as(?usize, mnw.end), re.findEnd(s_nonword, 1, .earliest));
+
+        const s_cjk_word = "你worker 1280 ";
+        try std.testing.expect(re.find(s_cjk_word, 0, .earliest) == null);
+        try std.testing.expect(re.findEnd(s_cjk_word, 0, .earliest) == null);
+        try std.testing.expect(re.find(s_cjk_word, 3, .earliest) == null);
+        try std.testing.expect(re.findEnd(s_cjk_word, 3, .earliest) == null);
+
+        const s_cjk_punct = "。worker 1280 ";
+        const mcp = re.find(s_cjk_punct, 0, .earliest) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("worker 1280", s_cjk_punct[mcp.start..mcp.end]);
+        try std.testing.expectEqual(@as(?usize, mcp.end), re.findEnd(s_cjk_punct, 0, .earliest));
+        const mcp3 = re.find(s_cjk_punct, 3, .earliest) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("worker 1280", s_cjk_punct[mcp3.start..mcp3.end]);
+        try std.testing.expectEqual(@as(?usize, mcp3.end), re.findEnd(s_cjk_punct, 3, .earliest));
+
+        // Trailing UTF-8 word vs non-word
+        const trail_word = "worker 1280你";
+        try std.testing.expect(re.find(trail_word, 0, .earliest) == null);
+        try std.testing.expect(re.findEnd(trail_word, 0, .earliest) == null);
+
+        const trail_punct = "worker 1280。";
+        const mtp = re.find(trail_punct, 0, .earliest) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("worker 1280", trail_punct[mtp.start..mtp.end]);
+        try std.testing.expectEqual(@as(?usize, mtp.end), re.findEnd(trail_punct, 0, .earliest));
+
+        // Dirty delayed match ending at `\n` followed by clean match on next line
+        const nl_dirty = "你worker 1280\nrouter 404\n";
+        const mnd = re.find(nl_dirty, 0, .earliest) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("router 404", nl_dirty[mnd.start..mnd.end]);
+        try std.testing.expectEqual(@as(?usize, mnd.end), re.findEnd(nl_dirty, 0, .earliest));
+
+        const nl_punct = "。worker 1280\nrouter 404\n";
+        const mnp = re.find(nl_punct, 0, .earliest) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("worker 1280", nl_punct[mnp.start..mnp.end]);
+        try std.testing.expectEqual(@as(?usize, mnp.end), re.findEnd(nl_punct, 0, .earliest));
+
+        // findEndWatched with NUL before, inside, right at m.end, and after
+        const nul_before = "abc \x00 worker 1280 ";
+        var n1: ?usize = null;
+        try std.testing.expect(re.findEndWatched(nul_before, 0, .earliest, &n1) == null);
+        try std.testing.expectEqual(@as(?usize, 4), n1);
+
+        const nul_inside = "worker \x001280 ";
+        var n2: ?usize = null;
+        try std.testing.expect(re.findEndWatched(nul_inside, 0, .earliest, &n2) == null);
+        try std.testing.expectEqual(@as(?usize, 7), n2);
+
+        const nul_at_end = "worker 1280\x00";
+        var n3: ?usize = null;
+        try std.testing.expectEqual(@as(?usize, 11), re.findEndWatched(nul_at_end, 0, .earliest, &n3));
+        try std.testing.expect(n3 == null);
+    }
+
+    // 2. Negated word boundary `\B` in UnanchoredDfa
+    {
+        var re_nb = try Regex.init(alloc, "\\B[a-z]{4}\\s+[0-9]{3}\\B", .{});
+        defer re_nb.deinit();
+        try std.testing.expect(re_nb.unanchored_dfa != null);
+        try std.testing.expect(re_nb.unanchored_dfa.?.has_exact_match);
+
+        const good = "Xabcd 123Y";
+        const mg = re_nb.find(good, 0, .earliest) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("abcd 123", good[mg.start..mg.end]);
+        try std.testing.expectEqual(@as(?usize, mg.end), re_nb.findEnd(good, 0, .earliest));
+
+        // start > 0 preceded by word char satisfies leading \B
+        const mg1 = re_nb.find(good, 1, .earliest) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("abcd 123", good[mg1.start..mg1.end]);
+        try std.testing.expectEqual(@as(?usize, mg1.end), re_nb.findEnd(good, 1, .earliest));
+
+        try std.testing.expect(re_nb.find(" abcd 123Y", 0, .earliest) == null);
+        try std.testing.expect(re_nb.findEnd(" abcd 123Y", 0, .earliest) == null);
+        try std.testing.expect(re_nb.find("Xabcd 123 ", 0, .earliest) == null);
+        try std.testing.expect(re_nb.findEnd("Xabcd 123 ", 0, .earliest) == null);
+        try std.testing.expect(re_nb.find("Xabcd 123", 0, .earliest) == null);
+        try std.testing.expect(re_nb.findEnd("Xabcd 123", 0, .earliest) == null);
+    }
+
+    // 3. X01u Unicode mode: ASCII hits take exact_match, UTF-8 hits fall back cleanly to verify_match
+    {
+        var re_u = try Regex.init(alloc, "\\b[a-z]{6,10}\\s+[0-9]{3,5}\\b", .{ .unicode_classes = true });
+        defer re_u.deinit();
+        const udfa = re_u.unanchored_dfa orelse return error.TestUnexpectedResult;
+        try std.testing.expect(udfa.has_word_boundary);
+        try std.testing.expect(udfa.has_exact_match);
+
+        const hay_ascii = "前缀 worker 1280 后缀";
+        const ma = re_u.find(hay_ascii, 0, .earliest) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("worker 1280", hay_ascii[ma.start..ma.end]);
+        try std.testing.expectEqual(@as(?usize, ma.end), re_u.findEnd(hay_ascii, 0, .earliest));
+
+        const hay_uni = "前缀测试 你worker 1280  metric\u{00A0}\u{3000}2048  后缀";
+        const mu = re_u.find(hay_uni, 0, .earliest) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("metric\u{00A0}\u{3000}2048", hay_uni[mu.start..mu.end]);
+        try std.testing.expectEqual(@as(?usize, mu.end), re_u.findEnd(hay_uni, 0, .earliest));
+
+        var nul_u: ?usize = null;
+        try std.testing.expectEqual(@as(?usize, mu.end), re_u.findEndWatched(hay_uni, 0, .earliest, &nul_u));
+        try std.testing.expect(nul_u == null);
+    }
+
+    // 4. Case-insensitive `\b` with ASCII and non-ASCII boundaries
+    {
+        var re_ci = try Regex.init(alloc, "\\b[a-z]{6,8}\\s+[0-9]{3}\\b", .{ .case = .insensitive });
+        defer re_ci.deinit();
+        try std.testing.expect(re_ci.unanchored_dfa != null);
+        const h1 = "你WORKER 123  ROUTER 404 ";
+        const m1 = re_ci.find(h1, 0, .earliest) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("ROUTER 404", h1[m1.start..m1.end]);
+        try std.testing.expectEqual(@as(?usize, m1.end), re_ci.findEnd(h1, 0, .earliest));
+    }
+}
+
+test "X02 & X13: fused Fast Path 4 alt-prefix skip and L2-chunked NUL prepass across high-decoy buffers" {
+    const alloc = std.testing.allocator;
+
+    // 1. X02: (?:err|warn|fail|crit|fatal)_[a-z]+_[0-9]{3}
+    {
+        var re = try Regex.init(alloc, "(?:err|warn|fail|crit|fatal)_[a-z]+_[0-9]{3}", .{});
+        defer re.deinit();
+        try std.testing.expect(re.precomputed_dfa != null);
+        try std.testing.expect(!re.precomputed_dfa.?.has_loop_exits);
+        try std.testing.expectEqual(@as(u8, 4), re.alt_dfa_prefix_len[0]); // "err_"
+        try std.testing.expectEqual(@as(u8, 5), re.alt_dfa_prefix_len[1]); // "warn_"
+        try std.testing.expectEqual(@as(u8, 6), re.alt_dfa_prefix_len[4]); // "fatal_"
+
+        // Build a 160 KiB buffer with hundreds of decoys before a match past 64 KiB
+        const buf_len: usize = 160 * 1024;
+        const buf = try alloc.alloc(u8, buf_len);
+        defer alloc.free(buf);
+        @memset(buf, ' ');
+
+        const decoys = [_][]const u8{ "err_999 ", "warn_abc_12 ", "fail_123 ", "crit_xyz ", "fatal_00 " };
+        var off: usize = 16;
+        var idx: usize = 0;
+        while (off + 32 < buf_len) : (off += 128) {
+            const d = decoys[idx % decoys.len];
+            @memcpy(buf[off..][0..d.len], d);
+            idx += 1;
+        }
+
+        // 0-match high-decoy buffer (triggers L2-chunked NUL prepass)
+        var nul0: ?usize = null;
+        try std.testing.expect(re.find(buf, 0, .earliest) == null);
+        try std.testing.expect(re.findWatched(buf, 0, &nul0) == null);
+        try std.testing.expect(nul0 == null);
+
+        // 0-match with NUL in second chunk (~100 KiB)
+        const late_nul: usize = 100 * 1024 + 7;
+        buf[late_nul] = 0;
+        var nul1: ?usize = null;
+        try std.testing.expect(re.findWatched(buf, 0, &nul1) == null);
+        try std.testing.expectEqual(@as(?usize, late_nul), nul1);
+        buf[late_nul] = ' ';
+
+        // True match straddling 64 KiB chunk boundary
+        const straddle_pos: usize = 64 * 1024 - 2;
+        const hit_str = "crit_timeout_503";
+        @memcpy(buf[straddle_pos..][0..hit_str.len], hit_str);
+
+        const ms = re.find(buf, 0, .earliest) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(straddle_pos, ms.start);
+        try std.testing.expectEqual(straddle_pos + hit_str.len, ms.end);
+
+        var nul_s: ?usize = null;
+        const msw = re.findWatched(buf, 0, &nul_s) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(nul_s == null);
+        try std.testing.expectEqual(ms, msw);
+
+        // NUL right at m.end -> must return match with nul == null
+        buf[straddle_pos + hit_str.len] = 0;
+        var nul_eq: ?usize = null;
+        const msw_eq = re.findWatched(buf, 0, &nul_eq) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(nul_eq == null);
+        try std.testing.expectEqual(ms, msw_eq);
+        buf[straddle_pos + hit_str.len] = ' ';
+
+        // NUL inside match -> must return null with nul at exact offset
+        const saved_ch = buf[straddle_pos + 8];
+        buf[straddle_pos + 8] = 0;
+        var nul_in: ?usize = null;
+        try std.testing.expect(re.findWatched(buf, 0, &nul_in) == null);
+        try std.testing.expectEqual(@as(?usize, straddle_pos + 8), nul_in);
+        buf[straddle_pos + 8] = saved_ch;
+
+        // NUL before match (among decoys at ~20 KiB) -> must return null with nul at exact offset
+        const mid_nul: usize = 20 * 1024 + 3;
+        buf[mid_nul] = 0;
+        var nul_mid: ?usize = null;
+        try std.testing.expect(re.findWatched(buf, 0, &nul_mid) == null);
+        try std.testing.expectEqual(@as(?usize, mid_nul), nul_mid);
+    }
+
+    // 2. X13: "uid":[0-9]{7} on 160 KiB high-decoy buffer (Fast Path 2 uniform chain chunked prepass)
+    {
+        var re = try Regex.init(alloc, "\"uid\":[0-9]{7}", .{});
+        defer re.deinit();
+        try std.testing.expect(re.precomputed_dfa != null);
+        try std.testing.expect(!re.precomputed_dfa.?.has_loop_exits);
+
+        const buf_len: usize = 160 * 1024;
+        const buf = try alloc.alloc(u8, buf_len);
+        defer alloc.free(buf);
+        @memset(buf, ' ');
+
+        var off: usize = 8;
+        while (off + 24 < buf_len) : (off += 96) {
+            @memcpy(buf[off..][0..12], "\"uid\":123456");
+        }
+
+        // 0-match
+        var nul0: ?usize = null;
+        try std.testing.expect(re.findWatched(buf, 0, &nul0) == null);
+        try std.testing.expect(nul0 == null);
+
+        // True match at 110 KiB
+        const hit_pos: usize = 110 * 1024 + 13;
+        const good = "\"uid\":7654321";
+        @memcpy(buf[hit_pos..][0..good.len], good);
+
+        var nul1: ?usize = null;
+        const mw = re.findWatched(buf, 0, &nul1) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(nul1 == null);
+        try std.testing.expectEqual(hit_pos, mw.start);
+        try std.testing.expectEqual(hit_pos + good.len, mw.end);
+
+        // NUL before match in chunked region (at 80 KiB)
+        const nul_pos: usize = 80 * 1024 + 5;
+        buf[nul_pos] = 0;
+        var nul2: ?usize = null;
+        try std.testing.expect(re.findWatched(buf, 0, &nul2) == null);
+        try std.testing.expectEqual(@as(?usize, nul_pos), nul2);
+    }
+
+    // 3. Fast Path 1b (`\bneedle\b`) & Fast Path 3 (`[a-z]{4,7}=[0-9]{3,4}ms`) L2-chunked NUL prepass
+    {
+        var re_wb = try Regex.init(alloc, "\\bneedle\\b", .{});
+        defer re_wb.deinit();
+        try std.testing.expect(re_wb.req_word_bounded);
+
+        const buf_len: usize = 140 * 1024;
+        const buf = try alloc.alloc(u8, buf_len);
+        defer alloc.free(buf);
+        @memset(buf, ' ');
+        var off: usize = 8;
+        while (off + 16 < buf_len) : (off += 128) {
+            @memcpy(buf[off..][0..8], "xneedlex");
+        }
+        const match_at: usize = 90 * 1024 + 32;
+        @memcpy(buf[match_at..][0..6], "needle");
+
+        var n_wb: ?usize = null;
+        const m_wb = re_wb.findWatched(buf, 0, &n_wb) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(n_wb == null);
+        try std.testing.expectEqual(match_at, m_wb.start);
+        try std.testing.expectEqual(match_at + 6, m_wb.end);
+
+        buf[70 * 1024] = 0;
+        var n_wb2: ?usize = null;
+        try std.testing.expect(re_wb.findWatched(buf, 0, &n_wb2) == null);
+        try std.testing.expectEqual(@as(?usize, 70 * 1024), n_wb2);
+    }
+
+    {
+        var re_int = try Regex.init(alloc, "[a-z]{4,7}=[0-9]{3,4}ms", .{});
+        defer re_int.deinit();
+        try std.testing.expect(re_int.prefilter != null);
+        try std.testing.expect(!re_int.req_is_prefix);
+
+        const buf_len: usize = 140 * 1024;
+        const buf = try alloc.alloc(u8, buf_len);
+        defer alloc.free(buf);
+        @memset(buf, ' ');
+        var off: usize = 8;
+        while (off + 16 < buf_len) : (off += 128) {
+            @memcpy(buf[off..][0..10], "abcd=123xx");
+        }
+        const match_at: usize = 95 * 1024 + 4;
+        const good = "latency=1234ms";
+        @memcpy(buf[match_at..][0..good.len], good);
+
+        var n_int: ?usize = null;
+        const m_int = re_int.findWatched(buf, 0, &n_int) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(n_int == null);
+        try std.testing.expectEqual(match_at, m_int.start);
+        try std.testing.expectEqual(match_at + good.len, m_int.end);
+
+        buf[75 * 1024 + 2] = 0;
+        var n_int2: ?usize = null;
+        try std.testing.expect(re_int.findWatched(buf, 0, &n_int2) == null);
+        try std.testing.expectEqual(@as(?usize, 75 * 1024 + 2), n_int2);
+    }
+}

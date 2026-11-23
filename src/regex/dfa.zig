@@ -11,6 +11,7 @@
 //!      in Phase 1 (zero false negatives) and verified exactly by Phase 2 PikeVM.
 //! [HotPath] `BoundedDfa.step` (1 table lookup per input byte once determinized).
 
+const builtin = @import("builtin");
 const std = @import("std");
 const matcher = @import("../matcher.zig");
 const memchr = @import("../finder/memchr.zig");
@@ -63,6 +64,29 @@ pub fn isExactOnAsciiInsts(insts: []const Inst) bool {
     return true;
 }
 
+/// Returns true when every NFA transition is exact on pure ASCII slices (`b < 0x80`),
+/// additionally allowing `\b` and `\B` word-boundary assertions (tracked directly in `UnanchoredDfa`).
+pub fn isExactOnAsciiWithWordBoundary(insts: []const Inst) bool {
+    for (insts) |inst| {
+        switch (inst) {
+            .byte, .split, .jmp, .save, .match, .match_id, .any_cont => {},
+            .class => {},
+            .unicode_class => |uc| {
+                if (uc.ignore_case) return false;
+            },
+            .assert => |as| {
+                if (as.kind != .word_boundary and as.kind != .not_word_boundary) return false;
+            },
+            .any => return false,
+        }
+    }
+    return true;
+}
+
+pub inline fn isAsciiWord(b: u8) bool {
+    return (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or (b >= '0' and b <= '9') or b == '_';
+}
+
 pub fn BoundedDfa(comptime max_states_cap: u16) type {
     return struct {
         const Self = @This();
@@ -89,6 +113,8 @@ pub fn BoundedDfa(comptime max_states_cap: u16) type {
         loop_exit_count: [max_states_cap]u8 = @splat(0),
         /// Exit byte values for self-loop states when `loop_exit_count[s]` is 1 or 2.
         loop_exit_bytes: [max_states_cap][2]u8 = undefined,
+        /// True when at least one determinized state has `loop_exit_count[s] != 0`.
+        has_loop_exits: bool = false,
         /// Cold NFA closure sets used only during state construction, never touched on hot scan path.
         meta: [max_states_cap]StateMeta = undefined,
         num_states: u16 = 0,
@@ -109,6 +135,7 @@ pub fn BoundedDfa(comptime max_states_cap: u16) type {
             self.flushes = 0;
             self.bailouts = 0;
             self.stops_on_crlf = false;
+            self.has_loop_exits = false;
             self.compiled_insts_ptr = 0;
             self.compiled_start_pc = std.math.maxInt(u32);
         }
@@ -170,6 +197,7 @@ pub fn BoundedDfa(comptime max_states_cap: u16) type {
             self.chain_uniform_lo = @splat(0);
             self.chain_uniform_span = @splat(0xFF);
             self.loop_exit_count = @splat(0);
+            self.has_loop_exits = false;
             if (self.flushes == 0 and self.bailouts == 0 and self.num_states > 1) {
                 self.computeLoopExitsForRange(1, self.num_states);
                 self.computeChainAndTerminalForRange(1, self.num_states);
@@ -250,6 +278,7 @@ pub fn BoundedDfa(comptime max_states_cap: u16) type {
                 if (diff_count == 1 or diff_count == 2) {
                     self.loop_exit_count[s] = @intCast(diff_count);
                     self.loop_exit_bytes[s] = exits;
+                    self.has_loop_exits = true;
                 } else {
                     self.loop_exit_count[s] = 0;
                 }
@@ -336,31 +365,33 @@ pub fn BoundedDfa(comptime max_states_cap: u16) type {
             var last_match: ?usize = if (self.is_match[curr_state]) prefix_offset else null;
             var idx: usize = 0;
             while (idx < rem.len) {
-                const lex = self.loop_exit_count[curr_state];
-                if (lex != 0) {
-                    const eb = self.loop_exit_bytes[curr_state];
-                    const next_pos = if (lex == 1)
-                        memchr.find(memchr.native_width, rem, idx, eb[0])
-                    else
-                        memchr.findEither(memchr.native_width, rem, idx, eb[0], eb[1]);
-                    if (next_pos) |at| {
-                        idx = at;
-                        if (self.is_match[curr_state]) {
-                            last_match = prefix_offset + idx;
+                if (self.has_loop_exits) {
+                    const lex = self.loop_exit_count[curr_state];
+                    if (lex != 0) {
+                        const eb = self.loop_exit_bytes[curr_state];
+                        const next_pos = if (lex == 1)
+                            memchr.find(memchr.native_width, rem, idx, eb[0])
+                        else
+                            memchr.findEither(memchr.native_width, rem, idx, eb[0], eb[1]);
+                        if (next_pos) |at| {
+                            idx = at;
+                            if (self.is_match[curr_state]) {
+                                last_match = prefix_offset + idx;
+                            }
+                            curr_state = self.trans[curr_state][rem[idx]];
+                            idx += 1;
+                            if (curr_state == dead_state) break;
+                            if (self.is_match[curr_state]) {
+                                if (earliest) return prefix_offset + idx;
+                                last_match = prefix_offset + idx;
+                            }
+                            continue;
+                        } else {
+                            if (self.is_match[curr_state]) {
+                                last_match = prefix_offset + rem.len;
+                            }
+                            break;
                         }
-                        curr_state = self.trans[curr_state][rem[idx]];
-                        idx += 1;
-                        if (curr_state == dead_state) break;
-                        if (self.is_match[curr_state]) {
-                            if (earliest) return prefix_offset + idx;
-                            last_match = prefix_offset + idx;
-                        }
-                        continue;
-                    } else {
-                        if (self.is_match[curr_state]) {
-                            last_match = prefix_offset + rem.len;
-                        }
-                        break;
                     }
                 }
                 const clen: usize = self.chain_len[curr_state];
@@ -728,58 +759,560 @@ pub const StartSkip = union(enum) {
     range3: [3]ByteRange,
 };
 
-/// Ahead-of-time unanchored Phase-1 search DFA with `u8` state IDs (up to 254 active states).
-/// Every state transition implicitly unions `epsilon_closure(start_pc)`, so a single linear pass
-/// visits each input byte at most once with zero restarts. States are partitioned so that all
-/// non-match states have IDs `< match_start` and all accepting states have IDs `>= match_start`.
-pub const UnanchoredDfa = struct {
-    pub const start_id: u8 = 1;
-    pub const max_states: u16 = 255;
+pub const StartSkipTag = std.meta.Tag(StartSkip);
 
-    /// Dense 256-byte-stride transition table (`state << 8` indexing).
-    trans: [256][256]u8 = undefined,
+pub const EoiKind = enum(u2) {
+    none = 0,
+    verify = 1,
+    exact = 2,
+};
+
+const WordKind = enum(u2) {
+    nonword = 0,
+    word = 1,
+    maybe = 2,
+};
+
+inline fn byteWordKind(b: u8) WordKind {
+    if (b >= 0x80) return .maybe;
+    if (isAsciiWord(b)) return .word;
+    return .nonword;
+}
+
+inline fn firstMaskBit(comptime width: comptime_int, m: @Vector(width, bool)) ?usize {
+    const MaskInt = @Int(.unsigned, width);
+    const mask: MaskInt = @bitCast(m);
+    if (mask == 0) return null;
+    if (comptime builtin.cpu.arch.endian() == .little) {
+        return @as(usize, @ctz(mask));
+    } else {
+        return @as(usize, @clz(mask));
+    }
+}
+
+/// Expands epsilon edges (`.jmp`, `.split`, `.save`), stopping at consuming instructions
+/// AND stopping at `.assert` instructions so `\b`/`\B` can be evaluated with next-byte look-around.
+fn computeClosureStopAtAssert(
+    insts: []const Inst,
+    start_pc: u32,
+    out_pcs: *[max_closure_pcs]u16,
+    out_len: *u8,
+    out_is_match: *bool,
+) bool {
+    var stack: [128]u32 = undefined;
+    var sp: usize = 0;
+    stack[0] = start_pc;
+    sp = 1;
+
+    var visited_pcs: [128]u32 = undefined;
+    var visited_len: usize = 0;
+
+    while (sp > 0) {
+        sp -= 1;
+        const pc = stack[sp];
+        if (pc >= insts.len or pc > std.math.maxInt(u16)) return false;
+
+        if (std.mem.findScalar(u32, visited_pcs[0..visited_len], pc) != null) continue;
+        if (visited_len >= visited_pcs.len) return false;
+        visited_pcs[visited_len] = pc;
+        visited_len += 1;
+
+        switch (insts[pc]) {
+            .jmp => |target| {
+                if (sp >= stack.len) return false;
+                stack[sp] = target;
+                sp += 1;
+            },
+            .split => |s| {
+                if (sp + 2 > stack.len) return false;
+                stack[sp] = s.out2;
+                stack[sp + 1] = s.out1;
+                sp += 2;
+            },
+            .save => |sv| {
+                if (sp >= stack.len) return false;
+                stack[sp] = sv.out;
+                sp += 1;
+            },
+            .match, .match_id => {
+                out_is_match.* = true;
+            },
+            .assert, .byte, .any, .any_cont, .class, .unicode_class => {
+                const pc16: u16 = @intCast(pc);
+                if (std.mem.findScalar(u16, out_pcs[0..out_len.*], pc16) == null) {
+                    if (out_len.* >= max_closure_pcs) return false;
+                    out_pcs[out_len.*] = pc16;
+                    out_len.* += 1;
+                }
+            },
+        }
+    }
+    return true;
+}
+
+const ResolvedBoundary = struct {
+    pcs: [max_closure_pcs]u16 = undefined,
+    from_ambig: [max_closure_pcs]bool = @splat(false),
+    len: u8 = 0,
+    delayed_match: bool = false,
+    ambiguous_match: bool = false,
+};
+
+fn resolveAssertsAtBoundary(
+    insts: []const Inst,
+    src_pcs: []const u16,
+    prev_kind: WordKind,
+    next_kind: WordKind,
+    out: *ResolvedBoundary,
+) bool {
+    const boundary_ambig = (prev_kind == .maybe or next_kind == .maybe);
+
+    const StackItem = struct { pc: u32, ambig: bool };
+    var stack: [128]StackItem = undefined;
+    var sp: usize = 0;
+
+    // Seed consuming PCs directly and push `.assert` PCs onto worklist.
+    for (src_pcs) |pc_u16| {
+        if (insts[pc_u16] == .assert) {
+            if (sp >= stack.len) return false;
+            stack[sp] = .{ .pc = pc_u16, .ambig = false };
+            sp += 1;
+        } else {
+            if (out.len >= max_closure_pcs) return false;
+            out.pcs[out.len] = pc_u16;
+            out.from_ambig[out.len] = false;
+            out.len += 1;
+        }
+    }
+
+    var visited_clean: [128]u32 = undefined;
+    var visited_clean_len: usize = 0;
+    var visited_ambig: [128]u32 = undefined;
+    var visited_ambig_len: usize = 0;
+
+    while (sp > 0) {
+        sp -= 1;
+        const item = stack[sp];
+        const pc = item.pc;
+        if (pc >= insts.len or pc > std.math.maxInt(u16)) return false;
+
+        if (item.ambig) {
+            if (std.mem.findScalar(u32, visited_ambig[0..visited_ambig_len], pc) != null) continue;
+            if (visited_ambig_len >= visited_ambig.len) return false;
+            visited_ambig[visited_ambig_len] = pc;
+            visited_ambig_len += 1;
+        } else {
+            if (std.mem.findScalar(u32, visited_clean[0..visited_clean_len], pc) != null) continue;
+            if (visited_clean_len >= visited_clean.len) return false;
+            visited_clean[visited_clean_len] = pc;
+            visited_clean_len += 1;
+        }
+
+        switch (insts[pc]) {
+            .jmp => |target| {
+                if (sp >= stack.len) return false;
+                stack[sp] = .{ .pc = target, .ambig = item.ambig };
+                sp += 1;
+            },
+            .split => |s| {
+                if (sp + 2 > stack.len) return false;
+                stack[sp] = .{ .pc = s.out2, .ambig = item.ambig };
+                stack[sp + 1] = .{ .pc = s.out1, .ambig = item.ambig };
+                sp += 2;
+            },
+            .save => |sv| {
+                if (sp >= stack.len) return false;
+                stack[sp] = .{ .pc = sv.out, .ambig = item.ambig };
+                sp += 1;
+            },
+            .assert => |as| {
+                const pass = switch (as.kind) {
+                    .word_boundary => boundary_ambig or (prev_kind != next_kind),
+                    .not_word_boundary => boundary_ambig or (prev_kind == next_kind),
+                    else => return false,
+                };
+                if (pass) {
+                    if (sp >= stack.len) return false;
+                    stack[sp] = .{ .pc = as.out, .ambig = item.ambig or boundary_ambig };
+                    sp += 1;
+                }
+            },
+            .match, .match_id => {
+                out.delayed_match = true;
+                if (item.ambig) out.ambiguous_match = true;
+            },
+            .byte, .any, .any_cont, .class, .unicode_class => {
+                const pc16: u16 = @intCast(pc);
+                if (std.mem.findScalar(u16, out.pcs[0..out.len], pc16)) |existing| {
+                    if (item.ambig) out.from_ambig[existing] = true;
+                } else {
+                    if (out.len >= max_closure_pcs) return false;
+                    out.pcs[out.len] = pc16;
+                    out.from_ambig[out.len] = item.ambig;
+                    out.len += 1;
+                }
+            },
+        }
+    }
+    return true;
+}
+
+/// Ahead-of-time unanchored search DFA with compact `ByteClasses`, pre-scaled state offsets,
+/// exact ASCII `\b`/`\B` look-around tracking, and SIMD start-state skipping.
+///
+/// State layout (pre-scaled by `stride`):
+///   - `0 .. start_max_off`: start-family states (`start_nonword = 0`, optional `start_word`, `start_maybe_word`).
+///   - `start_max_off + stride .. match_start_off - stride`: active non-accepting states.
+///   - `>= match_start_off`: 4 accepting sink IDs (never indexed into `trans`):
+///       * `verify_imm_off = match_start_off + 0`: candidate match ending at `pos` (requires Phase-2 PikeVM)
+///       * `verify_del_off = match_start_off + 1`: 1-byte delayed candidate match ending at `pos - 1` (PikeVM)
+///       * `exact_imm_off  = match_start_off + 2`: exact match ending at `pos` (0 PikeVM calls in `findEnd`)
+///       * `exact_del_off  = match_start_off + 3`: exact 1-byte delayed match ending at `pos - 1` (0 PikeVM calls)
+pub const UnanchoredDfa = struct {
+    pub const max_non_match_states: u16 = 250;
+
+    /// Byte-to-equivalence-class map (`classes[b] < stride`).
+    classes: [256]u8 = @splat(0),
+    /// Inline compact transition table when `exact_del_off <= 255` (`use_u8 == true`).
+    trans_u8: [256]u8 = @splat(0),
+    /// Heap-allocated pre-scaled transition table when `!use_u8` (`len == match_start_off`).
+    trans_u16: []u16 = &.{},
+    /// End-of-input (EOF / NUL-limit) acceptance status indexed by unscaled non-match state ID.
+    eoi_kind: [256]EoiKind = @splat(.none),
     num_states: u16 = 0,
-    match_start: u8 = 255,
+    num_non_match: u16 = 0,
+    stride: u16 = 1,
+    use_u8: bool = true,
+    start_word_off: u16 = 0,
+    start_maybe_off: u16 = 0,
+    start_max_off: u16 = 0,
+    match_start_off: u16 = 255,
+    verify_imm_off: u16 = 252,
+    verify_del_off: u16 = 253,
+    exact_imm_off: u16 = 254,
+    exact_del_off: u16 = 255,
+    has_word_boundary: bool = false,
+    has_exact_match: bool = false,
     /// True if any non-empty NFA move can land back inside `start_state`'s PC set (e.g., `(ab)*c`).
-    /// When false, `curr_state == start_id` guarantees no match from an earlier offset survived.
+    /// When false, `curr_state <= start_max_off` guarantees no match from an earlier offset survived.
     start_reentrant: bool = false,
-    /// Precomputed SIMD skip descriptor for self-looping bytes on `start_id`.
+    /// Precomputed SIMD skip descriptor for start-family self-looping bytes.
     start_skip: StartSkip = .none,
+
+    pub fn deinit(self: *UnanchoredDfa, allocator: std.mem.Allocator) void {
+        if (self.trans_u16.len != 0) {
+            allocator.free(self.trans_u16);
+            self.trans_u16 = &.{};
+        }
+    }
+
+    pub inline fn startStateForByte(self: *const UnanchoredDfa, b: u8) u16 {
+        if (!self.has_word_boundary) return 0;
+        if (b >= 0x80) return self.start_maybe_off;
+        if (isAsciiWord(b)) return self.start_word_off;
+        return 0;
+    }
+
+    pub inline fn startStateAt(self: *const UnanchoredDfa, haystack: []const u8, pos: usize) u16 {
+        if (pos == 0 or !self.has_word_boundary) return 0;
+        return self.startStateForByte(haystack[pos - 1]);
+    }
 
     pub fn determinize(
         self: *UnanchoredDfa,
+        allocator: std.mem.Allocator,
         insts: []const Inst,
         unicode_ranges: []const UnicodeRangeList,
         start_pc: u32,
         multiline: bool,
         max_states_cap: u16,
     ) bool {
-        const cap: u16 = @min(max_states, max_states_cap);
+        self.deinit(allocator);
+        const cap: u16 = @min(max_non_match_states, max_states_cap);
         if (cap < 4 or insts.len == 0) return false;
+
+        // Zero-length match or unmatchable empty closure stays on PikeVM
+        var zero_pcs: [max_closure_pcs]u16 = undefined;
+        var zero_len: u8 = 0;
+        var zero_match = false;
+        if (!computeEpsilonClosure(insts, start_pc, &zero_pcs, &zero_len, &zero_match)) return false;
+        if (zero_match or zero_len == 0) return false;
+
+        if (!multiline and isExactOnAsciiWithWordBoundary(insts)) {
+            if (self.determinizeExact(allocator, insts, unicode_ranges, start_pc, cap)) {
+                return true;
+            }
+            self.deinit(allocator);
+        }
+        return self.determinizeLegacy(allocator, insts, unicode_ranges, start_pc, multiline, cap);
+    }
+
+    const raw_verify_imm: u16 = 0xFFFC;
+    const raw_verify_del: u16 = 0xFFFD;
+    const raw_exact_imm: u16 = 0xFFFE;
+    const raw_exact_del: u16 = 0xFFFF;
+
+    fn determinizeExact(
+        self: *UnanchoredDfa,
+        allocator: std.mem.Allocator,
+        insts: []const Inst,
+        unicode_ranges: []const UnicodeRangeList,
+        start_pc: u32,
+        cap: u16,
+    ) bool {
+        var has_wb = false;
+        for (insts) |inst| {
+            if (inst == .assert) {
+                has_wb = true;
+                break;
+            }
+        }
+        const all_bytes_exact = !has_wb and isExactInsts(insts);
+
+        var start_pcs: [max_closure_pcs]u16 = undefined;
+        var start_len: u8 = 0;
+        var start_match = false;
+        if (!computeClosureStopAtAssert(insts, start_pc, &start_pcs, &start_len, &start_match)) return false;
+        if (start_match or start_len == 0) return false;
+        sortU16(start_pcs[0..start_len]);
 
         const Meta = struct {
             pcs: [max_closure_pcs]u16 = undefined,
             pc_len: u8 = 0,
+            prev_kind: WordKind = .nonword,
+            dirty: bool = false,
         };
-        var meta: [256]Meta = undefined;
-        var is_match_tmp: [256]bool = @splat(false);
+
+        const meta = allocator.alloc(Meta, cap) catch return false;
+        defer allocator.free(meta);
+        const raw_trans = allocator.alloc([256]u16, cap) catch return false;
+        defer allocator.free(raw_trans);
+
+        const num_starts: u16 = if (has_wb) 3 else 1;
+        if (num_starts >= cap) return false;
+
+        meta[0] = .{ .pcs = start_pcs, .pc_len = start_len, .prev_kind = .nonword, .dirty = false };
+        if (has_wb) {
+            meta[1] = .{ .pcs = start_pcs, .pc_len = start_len, .prev_kind = .word, .dirty = false };
+            meta[2] = .{ .pcs = start_pcs, .pc_len = start_len, .prev_kind = .maybe, .dirty = false };
+        }
+
+        var num_non_match: u16 = num_starts;
+        var start_reentrant = false;
+        var saw_exact = false;
+        var eoi_tmp: [256]EoiKind = @splat(.none);
+
+        var q_head: u16 = 0;
+        while (q_head < num_non_match) : (q_head += 1) {
+            const src_meta = meta[q_head];
+            const src_pcs = src_meta.pcs[0..src_meta.pc_len];
+
+            // Precompute EOI (next_kind = .nonword) acceptance for this non-match state
+            var eoi_res = ResolvedBoundary{};
+            if (!resolveAssertsAtBoundary(insts, src_pcs, src_meta.prev_kind, .nonword, &eoi_res)) return false;
+            if (eoi_res.delayed_match) {
+                if (src_meta.dirty or eoi_res.ambiguous_match) {
+                    eoi_tmp[q_head] = .verify;
+                } else {
+                    eoi_tmp[q_head] = .exact;
+                    saw_exact = true;
+                }
+            } else {
+                eoi_tmp[q_head] = .none;
+            }
+
+            // Pre-resolve boundary assertions for each of the 3 possible next WordKinds (nonword, word, maybe)
+            var resolved: [3]ResolvedBoundary = .{ .{}, .{}, .{} };
+            for (0..3) |wk_idx| {
+                const nk: WordKind = @enumFromInt(wk_idx);
+                if (!resolveAssertsAtBoundary(insts, src_pcs, src_meta.prev_kind, nk, &resolved[wk_idx])) return false;
+            }
+
+            var b_idx: u16 = 0;
+            while (b_idx < 256) : (b_idx += 1) {
+                const byte: u8 = @truncate(b_idx);
+                const nk = byteWordKind(byte);
+                const res = &resolved[@intFromEnum(nk)];
+
+                // Step 1: Delayed match from pending `\b`/`\B` resolved BEFORE consuming `byte`
+                if (res.delayed_match) {
+                    if (src_meta.dirty or res.ambiguous_match) {
+                        raw_trans[q_head][byte] = raw_verify_del;
+                    } else {
+                        raw_trans[q_head][byte] = raw_exact_del;
+                        saw_exact = true;
+                    }
+                    continue;
+                }
+
+                // Step 2: Consume `byte` (in single-line mode, `\n` kills all active consuming threads)
+                if (byte == '\n') {
+                    raw_trans[q_head]['\n'] = 0; // start_nonword
+                    continue;
+                }
+
+                var next_pcs: [max_closure_pcs]u16 = undefined;
+                var next_len: u8 = 0;
+                var next_imm_match = false;
+                var next_used_ambig = false;
+
+                for (res.pcs[0..res.len], 0..) |pc_u16, r_idx| {
+                    var matched_byte = false;
+                    var target_pc: u32 = 0;
+                    switch (insts[pc_u16]) {
+                        .byte => |by| {
+                            matched_byte = if (by.ignore_case)
+                                std.ascii.toLower(byte) == std.ascii.toLower(by.b)
+                            else
+                                byte == by.b;
+                            target_pc = by.out;
+                        },
+                        .any_cont => |ac| {
+                            matched_byte = (byte & 0xC0) == 0x80;
+                            target_pc = ac.out;
+                        },
+                        .class => |cl| {
+                            if (cl.utf8_negated and byte >= 0x80) {
+                                matched_byte = true;
+                                target_pc = if (byte >= 0xC2 and byte <= 0xDF)
+                                    (if (cl.cont1 != 0) cl.cont1 else cl.out)
+                                else if (byte >= 0xE0 and byte <= 0xEF)
+                                    (if (cl.cont2 != 0) cl.cont2 else cl.out)
+                                else if (byte >= 0xF0 and byte <= 0xF4)
+                                    (if (cl.cont3 != 0) cl.cont3 else cl.out)
+                                else
+                                    cl.out;
+                            } else if (cl.set.contains(byte)) {
+                                matched_byte = true;
+                                target_pc = cl.out;
+                            }
+                        },
+                        .unicode_class => |uc| {
+                            if (byte < 0x80) {
+                                const ranges = unicode_ranges[uc.range_idx].ranges;
+                                const in_set = (uc.has_ascii_set and uc.ascii_set.contains(byte)) or inRanges(byte, ranges);
+                                matched_byte = if (uc.negated) !in_set else in_set;
+                                target_pc = uc.out;
+                            } else if (byte >= 0xC2 and byte <= 0xF4) {
+                                matched_byte = true;
+                                target_pc = if (byte <= 0xDF)
+                                    (if (uc.cont1 != 0) uc.cont1 else uc.out)
+                                else if (byte <= 0xEF)
+                                    (if (uc.cont2 != 0) uc.cont2 else uc.out)
+                                else
+                                    (if (uc.cont3 != 0) uc.cont3 else uc.out);
+                            }
+                        },
+                        else => {},
+                    }
+                    if (matched_byte) {
+                        if (res.from_ambig[r_idx]) next_used_ambig = true;
+                        if (!computeClosureStopAtAssert(insts, target_pc, &next_pcs, &next_len, &next_imm_match)) return false;
+                    }
+                }
+
+                const byte_dirty = (!all_bytes_exact and byte >= 0x80);
+                if (next_imm_match) {
+                    if (src_meta.dirty or next_used_ambig or byte_dirty) {
+                        raw_trans[q_head][byte] = raw_verify_imm;
+                    } else {
+                        raw_trans[q_head][byte] = raw_exact_imm;
+                        saw_exact = true;
+                    }
+                    continue;
+                }
+
+                const clean_start_id: u16 = if (!has_wb) 0 else switch (nk) {
+                    .nonword => 0,
+                    .word => 1,
+                    .maybe => 2,
+                };
+                if (next_len == 0) {
+                    raw_trans[q_head][byte] = clean_start_id;
+                    continue;
+                }
+
+                if (!start_reentrant) {
+                    if (isSubsetU16(next_pcs[0..next_len], start_pcs[0..start_len])) {
+                        start_reentrant = true;
+                    }
+                }
+
+                // Union `start_pcs` so a new match can begin at every byte offset
+                for (start_pcs[0..start_len]) |sp| {
+                    if (std.mem.findScalar(u16, next_pcs[0..next_len], sp) == null) {
+                        if (next_len >= max_closure_pcs) return false;
+                        next_pcs[next_len] = sp;
+                        next_len += 1;
+                    }
+                }
+                sortU16(next_pcs[0..next_len]);
+
+                const next_dirty = src_meta.dirty or next_used_ambig or byte_dirty;
+                const next_prev_kind: WordKind = if (has_wb) nk else .nonword;
+
+                var found_id: ?u16 = null;
+                for (0..num_non_match) |idx| {
+                    if (meta[idx].prev_kind == next_prev_kind and
+                        meta[idx].dirty == next_dirty and
+                        meta[idx].pc_len == next_len and
+                        std.mem.eql(u16, meta[idx].pcs[0..next_len], next_pcs[0..next_len]))
+                    {
+                        found_id = @intCast(idx);
+                        break;
+                    }
+                }
+                if (found_id) |fid| {
+                    raw_trans[q_head][byte] = fid;
+                } else {
+                    if (num_non_match >= cap) return false;
+                    const new_id = num_non_match;
+                    meta[new_id] = .{
+                        .pcs = next_pcs,
+                        .pc_len = next_len,
+                        .prev_kind = next_prev_kind,
+                        .dirty = next_dirty,
+                    };
+                    num_non_match += 1;
+                    raw_trans[q_head][byte] = new_id;
+                }
+            }
+        }
+
+        return self.finalizeTables(allocator, raw_trans[0..num_non_match], &eoi_tmp, num_non_match, num_starts, has_wb, saw_exact, start_reentrant);
+    }
+
+    fn determinizeLegacy(
+        self: *UnanchoredDfa,
+        allocator: std.mem.Allocator,
+        insts: []const Inst,
+        unicode_ranges: []const UnicodeRangeList,
+        start_pc: u32,
+        multiline: bool,
+        cap: u16,
+    ) bool {
+        const Meta = struct {
+            pcs: [max_closure_pcs]u16 = undefined,
+            pc_len: u8 = 0,
+        };
+        const meta = allocator.alloc(Meta, cap) catch return false;
+        defer allocator.free(meta);
+        const raw_trans = allocator.alloc([256]u16, cap) catch return false;
+        defer allocator.free(raw_trans);
 
         var start_pcs: [max_closure_pcs]u16 = undefined;
         var start_len: u8 = 0;
         var start_match = false;
         if (!computeEpsilonClosure(insts, start_pc, &start_pcs, &start_len, &start_match)) return false;
-        // Zero-length match or unmatchable empty closure stays on PikeVM
         if (start_match or start_len == 0) return false;
         sortU16(start_pcs[0..start_len]);
 
-        meta[start_id] = .{ .pcs = start_pcs, .pc_len = start_len };
-        is_match_tmp[start_id] = false;
-        self.trans[0] = @splat(start_id);
-        var num_states: u16 = 2;
-        self.start_reentrant = false;
+        meta[0] = .{ .pcs = start_pcs, .pc_len = start_len };
+        var num_non_match: u16 = 1;
+        var start_reentrant = false;
 
-        var q_head: u16 = start_id;
-        while (q_head < num_states) : (q_head += 1) {
+        var q_head: u16 = 0;
+        while (q_head < num_non_match) : (q_head += 1) {
             const src_len = meta[q_head].pc_len;
             const src_pcs = meta[q_head].pcs[0..src_len];
 
@@ -787,7 +1320,7 @@ pub const UnanchoredDfa = struct {
             while (b_idx < 256) : (b_idx += 1) {
                 const byte: u8 = @truncate(b_idx);
                 if (!multiline and byte == '\n') {
-                    self.trans[q_head]['\n'] = start_id;
+                    raw_trans[q_head]['\n'] = 0;
                     continue;
                 }
 
@@ -865,18 +1398,19 @@ pub const UnanchoredDfa = struct {
                     }
                 }
 
-                if (next_len == 0 and !next_is_match) {
-                    self.trans[q_head][byte] = start_id;
+                if (next_is_match) {
+                    raw_trans[q_head][byte] = raw_verify_imm;
                     continue;
                 }
-
-                if (!next_is_match and !self.start_reentrant) {
+                if (next_len == 0) {
+                    raw_trans[q_head][byte] = 0;
+                    continue;
+                }
+                if (!start_reentrant) {
                     if (isSubsetU16(next_pcs[0..next_len], start_pcs[0..start_len])) {
-                        self.start_reentrant = true;
+                        start_reentrant = true;
                     }
                 }
-
-                // Union `start_pcs` into `next_pcs` so a new match can begin at every byte offset
                 for (start_pcs[0..start_len]) |sp| {
                     if (std.mem.findScalar(u16, next_pcs[0..next_len], sp) == null) {
                         if (next_len >= max_closure_pcs) return false;
@@ -886,9 +1420,9 @@ pub const UnanchoredDfa = struct {
                 }
                 sortU16(next_pcs[0..next_len]);
 
-                var found_id: ?u8 = null;
-                for (1..num_states) |idx| {
-                    if (meta[idx].pc_len == next_len and is_match_tmp[idx] == next_is_match and
+                var found_id: ?u16 = null;
+                for (0..num_non_match) |idx| {
+                    if (meta[idx].pc_len == next_len and
                         std.mem.eql(u16, meta[idx].pcs[0..next_len], next_pcs[0..next_len]))
                     {
                         found_id = @intCast(idx);
@@ -896,62 +1430,113 @@ pub const UnanchoredDfa = struct {
                     }
                 }
                 if (found_id) |fid| {
-                    self.trans[q_head][byte] = fid;
+                    raw_trans[q_head][byte] = fid;
                 } else {
-                    if (num_states >= cap) return false;
-                    const new_id: u8 = @intCast(num_states);
-                    meta[num_states] = .{ .pcs = next_pcs, .pc_len = next_len };
-                    is_match_tmp[num_states] = next_is_match;
-                    num_states += 1;
-                    self.trans[q_head][byte] = new_id;
+                    if (num_non_match >= cap) return false;
+                    const new_id = num_non_match;
+                    meta[new_id] = .{ .pcs = next_pcs, .pc_len = next_len };
+                    num_non_match += 1;
+                    raw_trans[q_head][byte] = new_id;
                 }
             }
         }
 
-        // Partition states `2 .. num_states - 1`: non-match states first, match states `>= match_start`
-        var remap: [256]u8 = @splat(0);
-        remap[start_id] = start_id;
-        var next_id: u16 = 2;
-        for (2..num_states) |s| {
-            if (!is_match_tmp[s]) {
-                remap[s] = @intCast(next_id);
-                next_id += 1;
+        const eoi_none: [256]EoiKind = @splat(.none);
+        return self.finalizeTables(allocator, raw_trans[0..num_non_match], &eoi_none, num_non_match, 1, false, false, start_reentrant);
+    }
+
+    fn finalizeTables(
+        self: *UnanchoredDfa,
+        allocator: std.mem.Allocator,
+        raw_trans: []const [256]u16,
+        eoi_tmp: *const [256]EoiKind,
+        num_non_match: u16,
+        num_starts: u16,
+        has_wb: bool,
+        has_exact: bool,
+        start_reentrant: bool,
+    ) bool {
+        // 1. Compute byte equivalence classes across all non-match states
+        var classes: [256]u8 = undefined;
+        var rep_bytes: [256]u8 = undefined;
+        var num_classes: u16 = 0;
+
+        for (0..256) |b_usize| {
+            const b: u8 = @intCast(b_usize);
+            var found: ?u8 = null;
+            for (0..num_classes) |c| {
+                const rb = rep_bytes[c];
+                var same = true;
+                for (0..num_non_match) |s| {
+                    if (raw_trans[s][b] != raw_trans[s][rb]) {
+                        same = false;
+                        break;
+                    }
+                }
+                if (same) {
+                    found = @intCast(c);
+                    break;
+                }
             }
-        }
-        const match_start_u16 = next_id;
-        for (2..num_states) |s| {
-            if (is_match_tmp[s]) {
-                remap[s] = @intCast(next_id);
-                next_id += 1;
+            if (found) |cid| {
+                classes[b] = cid;
+            } else {
+                classes[b] = @intCast(num_classes);
+                rep_bytes[num_classes] = b;
+                num_classes += 1;
             }
         }
 
-        for (1..num_states) |s| {
-            for (0..256) |b| {
-                self.trans[s][b] = remap[self.trans[s][b]];
+        const stride: u16 = num_classes;
+        const total_entries_u32: u32 = @as(u32, num_non_match) * @as(u32, stride);
+        if (total_entries_u32 + 4 > std.math.maxInt(u16)) return false;
+
+        const match_start_off: u16 = @intCast(total_entries_u32);
+        const verify_imm_off: u16 = match_start_off + 0;
+        const verify_del_off: u16 = match_start_off + 1;
+        const exact_imm_off: u16 = match_start_off + 2;
+        const exact_del_off: u16 = match_start_off + 3;
+        const use_u8 = exact_del_off <= 255;
+
+        // 2. Build compact pre-scaled transition table
+        if (use_u8) {
+            self.trans_u16 = &.{};
+            for (0..num_non_match) |s| {
+                const row_off = s * stride;
+                for (0..num_classes) |c| {
+                    const rb = rep_bytes[c];
+                    const dst = raw_trans[s][rb];
+                    const enc: u16 = switch (dst) {
+                        raw_verify_imm => verify_imm_off,
+                        raw_verify_del => verify_del_off,
+                        raw_exact_imm => exact_imm_off,
+                        raw_exact_del => exact_del_off,
+                        else => dst * stride,
+                    };
+                    self.trans_u8[row_off + c] = @intCast(enc);
+                }
             }
+        } else {
+            const tbl = allocator.alloc(u16, match_start_off) catch return false;
+            for (0..num_non_match) |s| {
+                const row_off = s * stride;
+                for (0..num_classes) |c| {
+                    const rb = rep_bytes[c];
+                    const dst = raw_trans[s][rb];
+                    const enc: u16 = switch (dst) {
+                        raw_verify_imm => verify_imm_off,
+                        raw_verify_del => verify_del_off,
+                        raw_exact_imm => exact_imm_off,
+                        raw_exact_del => exact_del_off,
+                        else => dst * stride,
+                    };
+                    tbl[row_off + c] = enc;
+                }
+            }
+            self.trans_u16 = tbl;
         }
 
-        // Permute transition rows in-place via cycle decomposition
-        var placed: [256]bool = @splat(false);
-        for (1..num_states) |s| {
-            if (placed[s] or remap[s] == s) {
-                placed[s] = true;
-                continue;
-            }
-            var cur: usize = s;
-            var carry: [256]u8 = self.trans[cur];
-            while (!placed[cur]) {
-                placed[cur] = true;
-                const dst: usize = remap[cur];
-                const saved: [256]u8 = self.trans[dst];
-                self.trans[dst] = carry;
-                carry = saved;
-                cur = dst;
-            }
-        }
-
-        // Analyze start_id exit bytes to select optimal SIMD start-state skip strategy
+        // 3. Analyze start-family exit bytes to select optimal SIMD StartSkip strategy
         var exits: [4]u8 = undefined;
         var exit_count: usize = 0;
         var ranges: [4]ByteRange = undefined;
@@ -962,7 +1547,13 @@ pub const UnanchoredDfa = struct {
         var b_scan: u16 = 0;
         while (b_scan < 256) : (b_scan += 1) {
             const byte: u8 = @truncate(b_scan);
-            const is_exit = self.trans[start_id][byte] != start_id;
+            var is_exit = false;
+            for (0..num_starts) |u| {
+                if (raw_trans[u][byte] >= num_starts) {
+                    is_exit = true;
+                    break;
+                }
+            }
             if (is_exit) {
                 if (exit_count < 4) exits[exit_count] = byte;
                 exit_count += 1;
@@ -1003,78 +1594,132 @@ pub const UnanchoredDfa = struct {
             self.start_skip = .none;
         }
 
-        self.num_states = num_states;
-        self.match_start = @intCast(match_start_u16);
+        self.classes = classes;
+        self.eoi_kind = eoi_tmp.*;
+        self.num_non_match = num_non_match;
+        self.num_states = num_non_match + 4;
+        self.stride = stride;
+        self.use_u8 = use_u8;
+        self.has_word_boundary = has_wb;
+        self.has_exact_match = has_exact;
+        self.start_word_off = if (has_wb) stride else 0;
+        self.start_maybe_off = if (has_wb) 2 * stride else 0;
+        self.start_max_off = if (has_wb) 2 * stride else 0;
+        self.match_start_off = match_start_off;
+        self.verify_imm_off = verify_imm_off;
+        self.verify_del_off = verify_del_off;
+        self.exact_imm_off = exact_imm_off;
+        self.exact_del_off = exact_del_off;
+        self.start_reentrant = start_reentrant;
         return true;
     }
 
-    pub inline fn skipStartBytes(self: *const UnanchoredDfa, haystack: []const u8, from: usize, limit: usize) ?usize {
+    pub fn SkipVecs(comptime tag: StartSkipTag) type {
         const width = memchr.native_width;
         const V = @Vector(width, u8);
-        switch (self.start_skip) {
+        return switch (tag) {
+            .none => void,
+            .byte1 => u8,
+            .byte2 => [2]u8,
+            .byte3 => [3]u8,
+            .range1 => struct { lo: u8, sp: u8, v_lo: V, v_sp: V },
+            .range2 => struct { r: [2]ByteRange, lo0: V, sp0: V, lo1: V, sp1: V },
+            .range3 => struct { r: [3]ByteRange, lo0: V, sp0: V, lo1: V, sp1: V, lo2: V, sp2: V },
+        };
+    }
+
+    pub inline fn initSkipVecs(comptime tag: StartSkipTag, skip: StartSkip) SkipVecs(tag) {
+        return switch (tag) {
+            .none => {},
+            .byte1 => skip.byte1,
+            .byte2 => skip.byte2,
+            .byte3 => skip.byte3,
+            .range1 => .{
+                .lo = skip.range1.lo,
+                .sp = skip.range1.span,
+                .v_lo = @splat(skip.range1.lo),
+                .v_sp = @splat(skip.range1.span),
+            },
+            .range2 => .{
+                .r = skip.range2,
+                .lo0 = @splat(skip.range2[0].lo),
+                .sp0 = @splat(skip.range2[0].span),
+                .lo1 = @splat(skip.range2[1].lo),
+                .sp1 = @splat(skip.range2[1].span),
+            },
+            .range3 => .{
+                .r = skip.range3,
+                .lo0 = @splat(skip.range3[0].lo),
+                .sp0 = @splat(skip.range3[0].span),
+                .lo1 = @splat(skip.range3[1].lo),
+                .sp1 = @splat(skip.range3[1].span),
+                .lo2 = @splat(skip.range3[2].lo),
+                .sp2 = @splat(skip.range3[2].span),
+            },
+        };
+    }
+
+    pub inline fn skipStartVec(
+        comptime tag: StartSkipTag,
+        vecs: SkipVecs(tag),
+        haystack: []const u8,
+        from: usize,
+        limit: usize,
+    ) ?usize {
+        const width = memchr.native_width;
+        const V = @Vector(width, u8);
+        switch (tag) {
             .none => return from,
-            .byte1 => |b0| return memchr.find(width, haystack[0..limit], from, b0),
-            .byte2 => |bs| return memchr.findEither(width, haystack[0..limit], from, bs[0], bs[1]),
-            .byte3 => |bs| {
-                const hit = memchr.findAny(width, haystack[0..limit], from, bs[0], bs[1], bs[2]) orelse return null;
+            .byte1 => return memchr.find(width, haystack[0..limit], from, vecs),
+            .byte2 => return memchr.findEither(width, haystack[0..limit], from, vecs[0], vecs[1]),
+            .byte3 => {
+                const hit = memchr.findAny(width, haystack[0..limit], from, vecs[0], vecs[1], vecs[2]) orelse return null;
                 return hit.index;
             },
-            .range1 => |r| {
-                const v_lo: V = @splat(r.lo);
-                const v_sp: V = @splat(r.span);
+            .range1 => {
                 var i = from;
                 while (i + width <= limit) : (i += width) {
                     const v: V = haystack[i..][0..width].*;
-                    const m = (v -% v_lo) <= v_sp;
-                    if (@reduce(.Or, m)) {
-                        return i + @as(usize, std.simd.firstTrue(m).?);
-                    }
+                    const m = (v -% vecs.v_lo) <= vecs.v_sp;
+                    if (firstMaskBit(width, m)) |rel| return i + rel;
                 }
                 while (i < limit) : (i += 1) {
-                    if ((haystack[i] -% r.lo) <= r.span) return i;
+                    if ((haystack[i] -% vecs.lo) <= vecs.sp) return i;
                 }
                 return null;
             },
-            .range2 => |rs| {
-                const lo0: V = @splat(rs[0].lo);
-                const sp0: V = @splat(rs[0].span);
-                const lo1: V = @splat(rs[1].lo);
-                const sp1: V = @splat(rs[1].span);
+            .range2 => {
                 var i = from;
                 while (i + width <= limit) : (i += width) {
                     const v: V = haystack[i..][0..width].*;
-                    const m = ((v -% lo0) <= sp0) | ((v -% lo1) <= sp1);
-                    if (@reduce(.Or, m)) {
-                        return i + @as(usize, std.simd.firstTrue(m).?);
-                    }
+                    const m = ((v -% vecs.lo0) <= vecs.sp0) | ((v -% vecs.lo1) <= vecs.sp1);
+                    if (firstMaskBit(width, m)) |rel| return i + rel;
                 }
                 while (i < limit) : (i += 1) {
                     const b = haystack[i];
-                    if ((b -% rs[0].lo) <= rs[0].span or (b -% rs[1].lo) <= rs[1].span) return i;
+                    if ((b -% vecs.r[0].lo) <= vecs.r[0].span or (b -% vecs.r[1].lo) <= vecs.r[1].span) return i;
                 }
                 return null;
             },
-            .range3 => |rs| {
-                const lo0: V = @splat(rs[0].lo);
-                const sp0: V = @splat(rs[0].span);
-                const lo1: V = @splat(rs[1].lo);
-                const sp1: V = @splat(rs[1].span);
-                const lo2: V = @splat(rs[2].lo);
-                const sp2: V = @splat(rs[2].span);
+            .range3 => {
                 var i = from;
                 while (i + width <= limit) : (i += width) {
                     const v: V = haystack[i..][0..width].*;
-                    const m = ((v -% lo0) <= sp0) | ((v -% lo1) <= sp1) | ((v -% lo2) <= sp2);
-                    if (@reduce(.Or, m)) {
-                        return i + @as(usize, std.simd.firstTrue(m).?);
-                    }
+                    const m = ((v -% vecs.lo0) <= vecs.sp0) | ((v -% vecs.lo1) <= vecs.sp1) | ((v -% vecs.lo2) <= vecs.sp2);
+                    if (firstMaskBit(width, m)) |rel| return i + rel;
                 }
                 while (i < limit) : (i += 1) {
                     const b = haystack[i];
-                    if ((b -% rs[0].lo) <= rs[0].span or (b -% rs[1].lo) <= rs[1].span or (b -% rs[2].lo) <= rs[2].span) return i;
+                    if ((b -% vecs.r[0].lo) <= vecs.r[0].span or (b -% vecs.r[1].lo) <= vecs.r[1].span or (b -% vecs.r[2].lo) <= vecs.r[2].span) return i;
                 }
                 return null;
             },
         }
+    }
+
+    pub inline fn skipStartBytes(self: *const UnanchoredDfa, haystack: []const u8, from: usize, limit: usize) ?usize {
+        return switch (self.start_skip) {
+            inline else => |_, tag| skipStartVec(tag, initSkipVecs(tag, self.start_skip), haystack, from, limit),
+        };
     }
 };

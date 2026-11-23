@@ -409,6 +409,18 @@ pub fn convertAllocWithMap(
 ) error{OutOfMemory}![]u8 {
     const mode = sniffToCodedMode(kind) orelse return allocator.dupe(u8, input);
     const len = convertedLen(mode, input);
+    return convertAllocWithMapKnownLen(allocator, kind, input, raw_base, offset_map, len);
+}
+
+pub fn convertAllocWithMapKnownLen(
+    allocator: std.mem.Allocator,
+    kind: Sniff,
+    input: []const u8,
+    raw_base: u64,
+    offset_map: ?*decompress.OffsetMap,
+    len: usize,
+) error{OutOfMemory}![]u8 {
+    const mode = sniffToCodedMode(kind) orelse return allocator.dupe(u8, input);
     const buf = try allocator.alloc(u8, len);
     errdefer allocator.free(buf);
     const n = try convertIntoWithMap(allocator, mode, input, buf, raw_base, offset_map);
@@ -437,6 +449,30 @@ pub fn convertScratchWithMap(
         return decode_buf.*[0..input.len];
     };
     const len = convertedLen(mode, input);
+    return convertScratchWithMapKnownLen(buf_alloc, decode_buf, map_alloc, kind, input, raw_base, offset_map, len);
+}
+
+pub fn convertScratchWithMapKnownLen(
+    buf_alloc: std.mem.Allocator,
+    decode_buf: *[]u8,
+    map_alloc: std.mem.Allocator,
+    kind: Sniff,
+    input: []const u8,
+    raw_base: u64,
+    offset_map: ?*decompress.OffsetMap,
+    len: usize,
+) error{OutOfMemory}![]u8 {
+    const mode = sniffToCodedMode(kind) orelse {
+        if (decode_buf.len < input.len) {
+            if (decode_buf.len == 0) {
+                decode_buf.* = try buf_alloc.alloc(u8, input.len);
+            } else {
+                decode_buf.* = try buf_alloc.realloc(decode_buf.*, input.len);
+            }
+        }
+        if (input.len > 0) @memcpy(decode_buf.*[0..input.len], input);
+        return decode_buf.*[0..input.len];
+    };
     if (decode_buf.len < len) {
         if (decode_buf.len == 0) {
             decode_buf.* = try buf_alloc.alloc(u8, len);
@@ -613,43 +649,81 @@ pub const Decoder = struct {
             },
             .raw => {
                 if (self.fallback_mode != .raw) {
-                    const copy = try allocator.dupe(u8, dest[0..n]);
-                    defer allocator.free(copy);
-                    return self.acceptFallback(allocator, copy, dest, false);
+                    self.mode = self.fallback_mode;
+                    self.in_i = 0;
+                    self.in_len = 0;
+                    try self.appendIn(allocator, dest[0..n]);
+                    return self.decodeAvailable(allocator, dest, false);
                 }
                 self.mode = .raw;
                 return .{ .n = n, .eof = false };
             },
             else => {
-                const copy = try allocator.dupe(u8, dest[0..n]);
-                defer allocator.free(copy);
-                return self.acceptBom(allocator, kind, copy, dest, false);
+                const cmode = sniffToCodedMode(kind) orelse .utf8;
+                self.mode = codedToMode(cmode);
+                const bom = bomLen(cmode);
+                self.raw_consumed = bom;
+                if (self.offset_map) |m| m.base_raw_offset = bom;
+                const payload = if (n >= bom) dest[bom..n] else dest[n..n];
+                self.in_i = 0;
+                self.in_len = 0;
+                if (payload.len != 0) try self.appendIn(allocator, payload);
+                return self.decodeAvailable(allocator, dest, false);
             },
         }
     }
 
     fn decide(self: *Decoder, allocator: std.mem.Allocator, dest: []u8, eof: bool) !Pull {
-        const pending = self.in[self.in_i..self.in_len];
+        const pending = self.raw_buf[self.in_i..self.in_len];
         const kind = sniff(pending, eof);
         switch (kind) {
             .need_more => return .{ .n = 0, .eof = false },
             .raw => {
                 if (self.fallback_mode != .raw) {
-                    const copy = try allocator.dupe(u8, pending);
-                    defer allocator.free(copy);
-                    self.in_i = self.in_len;
-                    return self.acceptFallback(allocator, copy, dest, eof);
+                    self.mode = if (self.fallback_mode == .detect) encodingToMode(detectEncoding(pending)) else self.fallback_mode;
+                    return self.decodeAvailable(allocator, dest, eof);
                 }
                 self.mode = .raw;
                 return self.emitPending(dest, eof);
             },
             else => {
-                const copy = try allocator.dupe(u8, pending);
-                defer allocator.free(copy);
-                self.in_i = self.in_len;
-                return self.acceptBom(allocator, kind, copy, dest, eof);
+                const cmode = sniffToCodedMode(kind) orelse .utf8;
+                self.mode = codedToMode(cmode);
+                const bom = bomLen(cmode);
+                self.raw_consumed = bom;
+                if (self.offset_map) |m| m.base_raw_offset = bom;
+                self.in_i += @min(bom, self.in_len - self.in_i);
+                return self.decodeAvailable(allocator, dest, eof);
             },
         }
+    }
+
+    fn codedToMode(mode: coded_mode) Mode {
+        return switch (mode) {
+            .utf8 => .utf8,
+            .utf16le => .utf16le,
+            .utf16be => .utf16be,
+            .gbk => .gbk,
+            .latin1 => .latin1,
+            .windows1252 => .windows1252,
+            .gb18030 => .gb18030,
+            .shift_jis => .shift_jis,
+            .euc_jp => .euc_jp,
+            .big5 => .big5,
+            .euc_kr => .euc_kr,
+            .windows1251 => .windows1251,
+            .utf32le => .utf32le,
+            .utf32be => .utf32be,
+        };
+    }
+
+    fn bomLen(mode: coded_mode) usize {
+        return switch (mode) {
+            .utf8 => 3,
+            .utf16le, .utf16be => 2,
+            .utf32le, .utf32be => 4,
+            else => 0,
+        };
     }
 
     fn encodingToMode(enc: Encoding) Mode {
@@ -670,60 +744,6 @@ pub const Decoder = struct {
             .utf32le => .utf32le,
             .utf32be => .utf32be,
         };
-    }
-
-    fn acceptFallback(
-        self: *Decoder,
-        allocator: std.mem.Allocator,
-        raw: []const u8,
-        dest: []u8,
-        eof: bool,
-    ) !Pull {
-        self.mode = if (self.fallback_mode == .detect) encodingToMode(detectEncoding(raw)) else self.fallback_mode;
-        self.in_i = 0;
-        self.in_len = 0;
-        if (raw.len != 0) try self.appendIn(allocator, raw);
-        return self.decodeAvailable(allocator, dest, eof);
-    }
-
-    fn acceptBom(
-        self: *Decoder,
-        allocator: std.mem.Allocator,
-        kind: Sniff,
-        raw: []const u8,
-        dest: []u8,
-        eof: bool,
-    ) !Pull {
-        const mode = sniffToCodedMode(kind) orelse .utf8;
-        self.mode = switch (mode) {
-            .utf8 => .utf8,
-            .utf16le => .utf16le,
-            .utf16be => .utf16be,
-            .gbk => .gbk,
-            .latin1 => .latin1,
-            .windows1252 => .windows1252,
-            .gb18030 => .gb18030,
-            .shift_jis => .shift_jis,
-            .euc_jp => .euc_jp,
-            .big5 => .big5,
-            .euc_kr => .euc_kr,
-            .windows1251 => .windows1251,
-            .utf32le => .utf32le,
-            .utf32be => .utf32be,
-        };
-        const bom: usize = switch (mode) {
-            .utf8 => 3,
-            .utf16le, .utf16be => 2,
-            .utf32le, .utf32be => 4,
-            else => 0,
-        };
-        self.raw_consumed = bom;
-        if (self.offset_map) |m| m.base_raw_offset = bom;
-        const payload = if (raw.len >= bom) raw[bom..] else raw[raw.len..];
-        self.in_i = 0;
-        self.in_len = 0;
-        if (payload.len != 0) try self.appendIn(allocator, payload);
-        return self.decodeAvailable(allocator, dest, eof);
     }
 
     fn pullCoded(
@@ -748,7 +768,7 @@ pub const Decoder = struct {
     }
 
     fn emitPending(self: *Decoder, dest: []u8, eof: bool) Pull {
-        const pending = self.in[self.in_i..self.in_len];
+        const pending = self.raw_buf[self.in_i..self.in_len];
         const n = @min(pending.len, dest.len);
         @memcpy(dest[0..n], pending[0..n]);
         self.in_i += n;
@@ -773,12 +793,24 @@ pub const Decoder = struct {
         read_ctx: *anyopaque,
         raw_cap: usize,
     ) !usize {
-        if (self.raw_buf.len == 0) {
-            self.raw_buf = try allocator.alloc(u8, @max(raw_cap, 1));
+        self.compactIn();
+        const want = @max(raw_cap, 1);
+        if (self.raw_buf.len < want or self.raw_buf.len - self.in_len < @min(want, 4)) {
+            const need = @max(self.in_len + want, want + 4);
+            const cap = @max(need, if (self.raw_buf.len == 0) need else self.raw_buf.len * 2);
+            if (self.raw_buf.len == 0) {
+                self.raw_buf = try allocator.alloc(u8, cap);
+            } else {
+                self.raw_buf = try allocator.realloc(self.raw_buf, cap);
+            }
         }
-        const want = @min(self.raw_buf.len, @max(raw_cap, 1));
-        const n = try readFn(read_ctx, self.raw_buf[0..want]);
-        if (n != 0) try self.appendIn(allocator, self.raw_buf[0..n]);
+        const avail = self.raw_buf.len - self.in_len;
+        const to_read = @min(want, avail);
+        const n = try readFn(read_ctx, self.raw_buf[self.in_len..][0..to_read]);
+        if (n != 0) {
+            if (self.in_len + n > self.max_in) return error.DecodeLimit;
+            self.in_len += n;
+        }
         return n;
     }
 
@@ -787,22 +819,22 @@ pub const Decoder = struct {
         self.compactIn();
         const need = self.in_len + bytes.len;
         if (need > self.max_in) return error.DecodeLimit;
-        if (self.in.len < need) {
-            const cap = @max(need, if (self.in.len == 0) need else self.in.len * 2);
-            if (self.in.len == 0) {
-                self.in = try allocator.alloc(u8, cap);
+        if (self.raw_buf.len < need) {
+            const cap = @max(need, if (self.raw_buf.len == 0) need else self.raw_buf.len * 2);
+            if (self.raw_buf.len == 0) {
+                self.raw_buf = try allocator.alloc(u8, cap);
             } else {
-                self.in = try allocator.realloc(self.in, cap);
+                self.raw_buf = try allocator.realloc(self.raw_buf, cap);
             }
         }
-        @memcpy(self.in[self.in_len..][0..bytes.len], bytes);
+        @memcpy(self.raw_buf[self.in_len..][0..bytes.len], bytes);
         self.in_len += bytes.len;
     }
 
     fn compactIn(self: *Decoder) void {
         if (self.in_i == 0) return;
         const rest = self.in_len - self.in_i;
-        if (rest != 0) @memmove(self.in[0..rest], self.in[self.in_i..self.in_len]);
+        if (rest != 0) @memmove(self.raw_buf[0..rest], self.raw_buf[self.in_i..self.in_len]);
         self.in_len = rest;
         self.in_i = 0;
     }
@@ -820,58 +852,133 @@ pub const Decoder = struct {
     }
 
     fn decodeInto(self: *Decoder, allocator: std.mem.Allocator, dest: []u8, eof: bool) error{OutOfMemory}!usize {
+        if (self.offset_map) |m| {
+            return switch (self.coded()) {
+                inline else => |mode| self.decodeIntoModeImpl(mode, true, allocator, dest, eof, m),
+            };
+        }
         return switch (self.coded()) {
-            inline else => |m| self.decodeIntoMode(m, allocator, dest, eof),
+            inline else => |mode| self.decodeIntoModeImpl(mode, false, allocator, dest, eof, undefined),
         };
     }
 
-    fn decodeIntoMode(self: *Decoder, comptime mode: coded_mode, allocator: std.mem.Allocator, dest: []u8, eof: bool) error{OutOfMemory}!usize {
+    fn decodeIntoModeImpl(
+        self: *Decoder,
+        comptime mode: coded_mode,
+        comptime has_map: bool,
+        allocator: std.mem.Allocator,
+        dest: []u8,
+        eof: bool,
+        m: if (has_map) *decompress.OffsetMap else void,
+    ) error{OutOfMemory}!usize {
         var filled = self.drainOut(dest);
-        while (filled < dest.len) {
-            const rest = self.in[self.in_i..self.in_len];
+        while (filled < dest.len and self.in_i < self.in_len) {
+            const rest = self.raw_buf[self.in_i..self.in_len];
             if (comptime mode == .utf16le) {
-                if (self.offset_map == null) {
-                    if (comptime std.simd.suggestVectorLength(u16)) |chunk_len| {
-                        const byte_step = chunk_len * 2;
-                        const Vec16 = @Vector(chunk_len, u16);
-                        const mask: Vec16 = @splat(std.mem.nativeToLittle(u16, 0x7F));
-                        var run_in: usize = 0;
-                        var run_out: usize = 0;
-                        while (run_in + byte_step <= rest.len and filled + run_out + chunk_len <= dest.len) {
-                            const raw_bytes: @Vector(byte_step, u8) = rest[run_in..][0..byte_step].*;
-                            const chunk: Vec16 = @bitCast(raw_bytes);
-                            if (@reduce(.Or, (chunk | mask) != mask)) break;
-                            const ascii_chunk: @Vector(chunk_len, u8) = @truncate(std.mem.nativeToLittle(Vec16, chunk));
-                            dest[filled + run_out ..][0..chunk_len].* = ascii_chunk;
-                            run_in += byte_step;
-                            run_out += chunk_len;
-                        }
-                        if (run_out != 0) {
-                            self.in_i += run_in;
-                            self.raw_consumed += run_in;
-                            filled += run_out;
-                            self.out_produced += run_out;
-                            continue;
-                        }
+                const ascii_units = copyUtf16LeAsciiPrefix(dest[filled..], rest);
+                if (ascii_units != 0) {
+                    const run_in = ascii_units * 2;
+                    if (comptime has_map) {
+                        try m.recordRun(allocator, self.out_produced, self.raw_consumed, self.out_produced + ascii_units, self.raw_consumed + run_in);
+                    }
+                    self.in_i += run_in;
+                    self.raw_consumed += run_in;
+                    filled += ascii_units;
+                    self.out_produced += ascii_units;
+                    continue;
+                }
+                // Tight inline BMP non-ASCII loop (avoids re-entering SIMD or calling utf8Encode per char)
+                var si: usize = 0;
+                var di: usize = filled;
+                const run_out_start = self.out_produced;
+                const run_raw_start = self.raw_consumed;
+                while (si + 2 <= rest.len and di + 3 <= dest.len) {
+                    const u = std.mem.readInt(u16, rest[si..][0..2], .little);
+                    if (u < 0x80) break;
+                    if (u >= 0x0800) {
+                        if (u >= 0xD800 and u <= 0xDFFF) break;
+                        dest[di] = @intCast(0xE0 | (u >> 12));
+                        dest[di + 1] = @intCast(0x80 | ((u >> 6) & 0x3F));
+                        dest[di + 2] = @intCast(0x80 | (u & 0x3F));
+                        si += 2;
+                        di += 3;
+                    } else {
+                        if (comptime has_map) break;
+                        dest[di] = @intCast(0xC0 | (u >> 6));
+                        dest[di + 1] = @intCast(0x80 | (u & 0x3F));
+                        si += 2;
+                        di += 2;
                     }
                 }
-            }
-            if (comptime isAsciiCompatible(mode)) {
-                if (self.offset_map == null and rest.len > 0 and rest[0] < 0x80) {
-                    const limit = @min(rest.len, dest.len - filled);
-                    var run: usize = 0;
-                    while (run < limit and rest[run] < 0x80) : (run += 1) {
-                        dest[filled + run] = rest[run];
+                if (si != 0) {
+                    const run_out = di - filled;
+                    if (comptime has_map) {
+                        try m.recordRun(allocator, run_out_start, run_raw_start, run_out_start + run_out, run_raw_start + si);
                     }
-                    self.in_i += run;
-                    self.raw_consumed += run;
-                    filled += run;
-                    self.out_produced += run;
+                    self.in_i += si;
+                    self.raw_consumed += si;
+                    filled = di;
+                    self.out_produced += run_out;
                     continue;
+                }
+            } else if (comptime isAsciiCompatible(mode)) {
+                const ascii_run = copyAsciiPrefix(dest[filled..], rest);
+                if (ascii_run != 0) {
+                    if (comptime has_map) {
+                        try m.recordRun(allocator, self.out_produced, self.raw_consumed, self.out_produced + ascii_run, self.raw_consumed + ascii_run);
+                    }
+                    self.in_i += ascii_run;
+                    self.raw_consumed += ascii_run;
+                    filled += ascii_run;
+                    self.out_produced += ascii_run;
+                    continue;
+                }
+                if (comptime mode == .gbk) {
+                    var si: usize = 0;
+                    var di: usize = filled;
+                    const run_out_start = self.out_produced;
+                    const run_raw_start = self.raw_consumed;
+                    while (si + 2 <= rest.len and di + 3 <= dest.len) {
+                        const b1 = rest[si];
+                        if (b1 <= 0x80 or b1 == 0xFF) break;
+                        const b2 = rest[si + 1];
+                        if (b2 < 0x40 or b2 == 0x7F or b2 == 0xFF) break;
+                        const trail_idx: usize = @as(usize, b2) - 0x40 - @intFromBool(b2 > 0x7F);
+                        const cp: u16 = gbk_table.table[@as(usize, b1 - 0x81) * 190 + trail_idx];
+                        if (cp >= 0x0800) {
+                            dest[di] = @intCast(0xE0 | (cp >> 12));
+                            dest[di + 1] = @intCast(0x80 | ((cp >> 6) & 0x3F));
+                            dest[di + 2] = @intCast(0x80 | (cp & 0x3F));
+                            di += 3;
+                            si += 2;
+                        } else if (cp >= 0x0080) {
+                            if (comptime has_map) break;
+                            dest[di] = @intCast(0xC0 | (cp >> 6));
+                            dest[di + 1] = @intCast(0x80 | (cp & 0x3F));
+                            di += 2;
+                            si += 2;
+                        } else {
+                            if (comptime has_map) break;
+                            dest[di] = @intCast(cp);
+                            di += 1;
+                            si += 2;
+                        }
+                    }
+                    if (si != 0) {
+                        const run_out = di - filled;
+                        if (comptime has_map) {
+                            try m.recordRun(allocator, run_out_start, run_raw_start, run_out_start + run_out, run_raw_start + si);
+                        }
+                        self.in_i += si;
+                        self.raw_consumed += si;
+                        filled = di;
+                        self.out_produced += run_out;
+                        continue;
+                    }
                 }
             }
             const step = decodeModeComptime(mode, rest, eof) orelse break;
-            if (self.offset_map) |m| {
+            if (comptime has_map) {
                 try m.record(allocator, self.out_produced, self.raw_consumed);
             }
             self.in_i += step.n;
@@ -885,7 +992,7 @@ pub const Decoder = struct {
                 self.out_produced += self.out_len;
                 filled += self.drainOut(dest[filled..]);
             }
-            if (self.offset_map) |m| {
+            if (comptime has_map) {
                 try m.record(allocator, self.out_produced, self.raw_consumed);
             }
         }
@@ -962,37 +1069,196 @@ fn isAsciiCompatible(comptime mode: coded_mode) bool {
     };
 }
 
+/// Returns the length of the leading pure-ASCII prefix (`b < 0x80`) of `src`.
+inline fn countAsciiPrefix(src: []const u8) usize {
+    const W = memchr.native_width;
+    const V = @Vector(W, u8);
+    const S = @Vector(W, i8);
+    const zero_s: S = @splat(0);
+    var i: usize = 0;
+    while (i + W * 2 <= src.len) : (i += W * 2) {
+        const v0: V = src[i..][0..W].*;
+        const v1: V = src[i + W ..][0..W].*;
+        const combined: V = v0 | v1;
+        if (@reduce(.Or, @as(S, @bitCast(combined)) < zero_s)) {
+            const hi0 = @as(S, @bitCast(v0)) < zero_s;
+            if (@reduce(.Or, hi0)) return i + std.simd.firstTrue(hi0).?;
+            const hi1 = @as(S, @bitCast(v1)) < zero_s;
+            return i + W + std.simd.firstTrue(hi1).?;
+        }
+    }
+    while (i + W <= src.len) : (i += W) {
+        const v: V = src[i..][0..W].*;
+        const hi = @as(S, @bitCast(v)) < zero_s;
+        if (@reduce(.Or, hi)) return i + std.simd.firstTrue(hi).?;
+    }
+    while (i < src.len and src[i] < 0x80) : (i += 1) {}
+    return i;
+}
+
+/// Copies the leading pure-ASCII prefix (`b < 0x80`) of `src` into `dst`.
+/// May write up to `W` bytes within `dst[0..@min(dst.len, src.len)]` on a SIMD hit, returning the exact ASCII prefix length.
+inline fn copyAsciiPrefix(dst: []u8, src: []const u8) usize {
+    const limit = @min(dst.len, src.len);
+    const W = memchr.native_width;
+    const V = @Vector(W, u8);
+    const S = @Vector(W, i8);
+    const zero_s: S = @splat(0);
+    var i: usize = 0;
+    while (i + W * 2 <= limit) : (i += W * 2) {
+        const v0: V = src[i..][0..W].*;
+        const v1: V = src[i + W ..][0..W].*;
+        const combined: V = v0 | v1;
+        if (@reduce(.Or, @as(S, @bitCast(combined)) < zero_s)) {
+            const hi0 = @as(S, @bitCast(v0)) < zero_s;
+            dst[i..][0..W].* = v0;
+            if (@reduce(.Or, hi0)) return i + std.simd.firstTrue(hi0).?;
+            const hi1 = @as(S, @bitCast(v1)) < zero_s;
+            dst[i + W ..][0..W].* = v1;
+            return i + W + std.simd.firstTrue(hi1).?;
+        }
+        dst[i..][0..W].* = v0;
+        dst[i + W ..][0..W].* = v1;
+    }
+    while (i + W <= limit) : (i += W) {
+        const v: V = src[i..][0..W].*;
+        const hi = @as(S, @bitCast(v)) < zero_s;
+        dst[i..][0..W].* = v;
+        if (@reduce(.Or, hi)) return i + std.simd.firstTrue(hi).?;
+    }
+    while (i < limit and src[i] < 0x80) : (i += 1) {
+        dst[i] = src[i];
+    }
+    return i;
+}
+
+/// Returns the number of leading ASCII UTF-16LE code units in `src` (consuming `2 * ret` bytes).
+inline fn countUtf16LeAsciiPrefix(src: []const u8) usize {
+    const max_units = src.len >> 1;
+    var di: usize = 0;
+    if (comptime std.simd.suggestVectorLength(u16)) |suggested| {
+        const chunk_len = comptime @min(suggested, 16);
+        const byte_step = chunk_len * 2;
+        const Vec16 = @Vector(chunk_len, u16);
+        const hi_mask: Vec16 = @splat(std.mem.nativeToLittle(u16, 0xFF80));
+        const zero16: Vec16 = @splat(0);
+        while (di + chunk_len * 2 <= max_units) : (di += chunk_len * 2) {
+            const si = di * 2;
+            const raw0: @Vector(byte_step, u8) = src[si..][0..byte_step].*;
+            const raw1: @Vector(byte_step, u8) = src[si + byte_step ..][0..byte_step].*;
+            const chunk0: Vec16 = @bitCast(raw0);
+            const chunk1: Vec16 = @bitCast(raw1);
+            if (@reduce(.Or, ((chunk0 | chunk1) & hi_mask) != zero16)) {
+                const hi0 = (chunk0 & hi_mask) != zero16;
+                if (@reduce(.Or, hi0)) return di + std.simd.firstTrue(hi0).?;
+                const hi1 = (chunk1 & hi_mask) != zero16;
+                return di + chunk_len + std.simd.firstTrue(hi1).?;
+            }
+        }
+        while (di + chunk_len <= max_units) : (di += chunk_len) {
+            const si = di * 2;
+            const raw: @Vector(byte_step, u8) = src[si..][0..byte_step].*;
+            const chunk: Vec16 = @bitCast(raw);
+            const hi = (chunk & hi_mask) != zero16;
+            if (@reduce(.Or, hi)) return di + std.simd.firstTrue(hi).?;
+        }
+    }
+    while (di < max_units) : (di += 1) {
+        const si = di * 2;
+        if (src[si + 1] != 0 or src[si] >= 0x80) break;
+    }
+    return di;
+}
+
+/// Copies leading ASCII UTF-16LE code units from `src` into `dst` (consuming `2 * ret` raw bytes, producing `ret` UTF-8 bytes).
+inline fn copyUtf16LeAsciiPrefix(dst: []u8, src: []const u8) usize {
+    const max_units = @min(dst.len, src.len >> 1);
+    var di: usize = 0;
+    if (comptime std.simd.suggestVectorLength(u16)) |suggested| {
+        const chunk_len = comptime @min(suggested, 16);
+        const byte_step = chunk_len * 2;
+        const Vec16 = @Vector(chunk_len, u16);
+        const Vec8 = @Vector(chunk_len, u8);
+        const hi_mask: Vec16 = @splat(std.mem.nativeToLittle(u16, 0xFF80));
+        const zero16: Vec16 = @splat(0);
+        while (di + chunk_len * 2 <= max_units) : (di += chunk_len * 2) {
+            const si = di * 2;
+            const raw0: @Vector(byte_step, u8) = src[si..][0..byte_step].*;
+            const raw1: @Vector(byte_step, u8) = src[si + byte_step ..][0..byte_step].*;
+            const chunk0: Vec16 = @bitCast(raw0);
+            const chunk1: Vec16 = @bitCast(raw1);
+            if (@reduce(.Or, ((chunk0 | chunk1) & hi_mask) != zero16)) {
+                const hi0 = (chunk0 & hi_mask) != zero16;
+                dst[di..][0..chunk_len].* = @as(Vec8, @truncate(std.mem.nativeToLittle(Vec16, chunk0)));
+                if (@reduce(.Or, hi0)) return di + std.simd.firstTrue(hi0).?;
+                const hi1 = (chunk1 & hi_mask) != zero16;
+                dst[di + chunk_len ..][0..chunk_len].* = @as(Vec8, @truncate(std.mem.nativeToLittle(Vec16, chunk1)));
+                return di + chunk_len + std.simd.firstTrue(hi1).?;
+            }
+            dst[di..][0..chunk_len].* = @as(Vec8, @truncate(std.mem.nativeToLittle(Vec16, chunk0)));
+            dst[di + chunk_len ..][0..chunk_len].* = @as(Vec8, @truncate(std.mem.nativeToLittle(Vec16, chunk1)));
+        }
+        while (di + chunk_len <= max_units) : (di += chunk_len) {
+            const si = di * 2;
+            const raw: @Vector(byte_step, u8) = src[si..][0..byte_step].*;
+            const chunk: Vec16 = @bitCast(raw);
+            const hi = (chunk & hi_mask) != zero16;
+            dst[di..][0..chunk_len].* = @as(Vec8, @truncate(std.mem.nativeToLittle(Vec16, chunk)));
+            if (@reduce(.Or, hi)) return di + std.simd.firstTrue(hi).?;
+        }
+    }
+    while (di < max_units) : (di += 1) {
+        const si = di * 2;
+        if (src[si + 1] != 0 or src[si] >= 0x80) break;
+        dst[di] = src[si];
+    }
+    return di;
+}
+
 fn convertedLenMode(comptime mode: coded_mode, input: []const u8) usize {
     var i: usize = 0;
     var n: usize = 0;
     while (i < input.len) {
         if (comptime mode == .utf16le) {
-            if (comptime std.simd.suggestVectorLength(u16)) |chunk_len| {
-                const byte_step = chunk_len * 2;
-                const Vec16 = @Vector(chunk_len, u16);
-                const mask: Vec16 = @splat(std.mem.nativeToLittle(u16, 0x7F));
-                var progressed = false;
-                while (i + byte_step <= input.len) {
-                    const raw_bytes: @Vector(byte_step, u8) = input[i..][0..byte_step].*;
-                    const chunk: Vec16 = @bitCast(raw_bytes);
-                    if (@reduce(.Or, (chunk | mask) != mask)) break;
-                    n += chunk_len;
-                    i += byte_step;
-                    progressed = true;
+            const ascii_units = countUtf16LeAsciiPrefix(input[i..]);
+            if (ascii_units != 0) {
+                n += ascii_units;
+                i += ascii_units * 2;
+                continue;
+            }
+            while (i + 2 <= input.len) {
+                const u = std.mem.readInt(u16, input[i..][0..2], .little);
+                if (u < 0x80) break;
+                if (u >= 0x0800) {
+                    if (u >= 0xD800 and u <= 0xDFFF) break;
+                    n += 3;
+                    i += 2;
+                } else {
+                    n += 2;
+                    i += 2;
                 }
-                if (progressed) continue;
             }
-            if (i + 2 <= input.len and input[i + 1] == 0 and input[i] < 0x80) {
-                n += 1;
-                i += 2;
+            if (i >= input.len) break;
+            if (i + 2 <= input.len and input[i + 1] == 0 and input[i] < 0x80) continue;
+        } else if (comptime isAsciiCompatible(mode)) {
+            const ascii_run = countAsciiPrefix(input[i..]);
+            if (ascii_run != 0) {
+                n += ascii_run;
+                i += ascii_run;
                 continue;
             }
-        }
-        if (comptime isAsciiCompatible(mode)) {
-            if (input[i] < 0x80) {
-                n += 1;
-                i += 1;
-                continue;
+            if (comptime mode == .gbk) {
+                while (i + 2 <= input.len) {
+                    const b1 = input[i];
+                    if (b1 <= 0x80 or b1 == 0xFF) break;
+                    const b2 = input[i + 1];
+                    if (b2 < 0x40 or b2 == 0x7F or b2 == 0xFF) break;
+                    const trail_idx: usize = @as(usize, b2) - 0x40 - @intFromBool(b2 > 0x7F);
+                    const cp: u16 = gbk_table.table[@as(usize, b1 - 0x81) * 190 + trail_idx];
+                    n += if (cp >= 0x0800) @as(usize, 3) else if (cp >= 0x0080) @as(usize, 2) else @as(usize, 1);
+                    i += 2;
+                }
+                if (i >= input.len or input[i] < 0x80) continue;
             }
         }
         const step = decodeModeComptime(mode, input[i..], true) orelse break;
@@ -1004,63 +1270,8 @@ fn convertedLenMode(comptime mode: coded_mode, input: []const u8) usize {
 
 fn convertInto(mode: coded_mode, input: []const u8, out: []u8) usize {
     return switch (mode) {
-        inline else => |m| convertIntoMode(m, input, out),
+        inline else => |m| convertIntoModeImpl(m, false, undefined, input, out, 0, undefined) catch unreachable,
     };
-}
-
-fn convertIntoMode(comptime mode: coded_mode, input: []const u8, out: []u8) usize {
-    var i: usize = 0;
-    var w: usize = 0;
-    if (comptime mode == .utf16le) {
-        const even_len = input.len & ~@as(usize, 1);
-        if (even_len != 0 and (@intFromPtr(input.ptr) & 1) == 0) {
-            const aligned_bytes: []align(2) const u8 = @alignCast(input[0..even_len]);
-            if (unicode.utf16LeToUtf8(out, std.mem.bytesAsSlice(u16, aligned_bytes))) |written| {
-                w = written;
-                i = even_len;
-                if (i == input.len) return w;
-            } else |_| {}
-        }
-    }
-    while (i < input.len) {
-        if (comptime mode == .utf16le) {
-            if (comptime std.simd.suggestVectorLength(u16)) |chunk_len| {
-                const byte_step = chunk_len * 2;
-                const Vec16 = @Vector(chunk_len, u16);
-                const mask: Vec16 = @splat(std.mem.nativeToLittle(u16, 0x7F));
-                var progressed = false;
-                while (i + byte_step <= input.len) {
-                    const raw_bytes: @Vector(byte_step, u8) = input[i..][0..byte_step].*;
-                    const chunk: Vec16 = @bitCast(raw_bytes);
-                    if (@reduce(.Or, (chunk | mask) != mask)) break;
-                    const ascii_chunk: @Vector(chunk_len, u8) = @truncate(std.mem.nativeToLittle(Vec16, chunk));
-                    out[w..][0..chunk_len].* = ascii_chunk;
-                    w += chunk_len;
-                    i += byte_step;
-                    progressed = true;
-                }
-                if (progressed) continue;
-            }
-            if (i + 2 <= input.len and input[i + 1] == 0 and input[i] < 0x80) {
-                out[w] = input[i];
-                w += 1;
-                i += 2;
-                continue;
-            }
-        }
-        if (comptime isAsciiCompatible(mode)) {
-            if (input[i] < 0x80) {
-                out[w] = input[i];
-                w += 1;
-                i += 1;
-                continue;
-            }
-        }
-        const step = decodeModeComptime(mode, input[i..], true) orelse break;
-        w += encodeCp(step.cp, out[w..]);
-        i += step.n;
-    }
-    return w;
 }
 
 fn convertIntoWithMap(
@@ -1071,32 +1282,123 @@ fn convertIntoWithMap(
     raw_base: u64,
     offset_map: ?*decompress.OffsetMap,
 ) error{OutOfMemory}!usize {
-    if (offset_map == null) {
-        return convertInto(mode, input, out);
+    if (offset_map) |m| {
+        return switch (mode) {
+            inline else => |cm| convertIntoModeImpl(cm, true, allocator, input, out, raw_base, m),
+        };
     }
-    return switch (mode) {
-        inline else => |m| convertIntoWithMapMode(m, allocator, input, out, raw_base, offset_map.?),
-    };
+    return convertInto(mode, input, out);
 }
 
-fn convertIntoWithMapMode(
+fn convertIntoModeImpl(
     comptime mode: coded_mode,
-    allocator: std.mem.Allocator,
+    comptime has_map: bool,
+    allocator: if (has_map) std.mem.Allocator else void,
     input: []const u8,
     out: []u8,
     raw_base: u64,
-    m: *decompress.OffsetMap,
+    m: if (has_map) *decompress.OffsetMap else void,
 ) error{OutOfMemory}!usize {
-    m.base_raw_offset = raw_base;
+    if (comptime has_map) {
+        m.base_raw_offset = raw_base;
+    }
     var i: usize = 0;
     var w: usize = 0;
     while (i < input.len) {
+        if (comptime mode == .utf16le) {
+            const ascii_units = copyUtf16LeAsciiPrefix(out[w..], input[i..]);
+            if (ascii_units != 0) {
+                const run_in = ascii_units * 2;
+                if (comptime has_map) {
+                    try m.recordRun(allocator, w, raw_base + i, w + ascii_units, raw_base + i + run_in);
+                }
+                w += ascii_units;
+                i += run_in;
+                continue;
+            }
+            const si0 = i;
+            const di0 = w;
+            while (i + 2 <= input.len and w + 3 <= out.len) {
+                const u = std.mem.readInt(u16, input[i..][0..2], .little);
+                if (u < 0x80) break;
+                if (u >= 0x0800) {
+                    if (u >= 0xD800 and u <= 0xDFFF) break;
+                    out[w] = @intCast(0xE0 | (u >> 12));
+                    out[w + 1] = @intCast(0x80 | ((u >> 6) & 0x3F));
+                    out[w + 2] = @intCast(0x80 | (u & 0x3F));
+                    i += 2;
+                    w += 3;
+                } else {
+                    if (comptime has_map) break;
+                    out[w] = @intCast(0xC0 | (u >> 6));
+                    out[w + 1] = @intCast(0x80 | (u & 0x3F));
+                    i += 2;
+                    w += 2;
+                }
+            }
+            if (i != si0) {
+                if (comptime has_map) {
+                    try m.recordRun(allocator, di0, raw_base + si0, w, raw_base + i);
+                }
+                continue;
+            }
+        } else if (comptime isAsciiCompatible(mode)) {
+            const ascii_run = copyAsciiPrefix(out[w..], input[i..]);
+            if (ascii_run != 0) {
+                if (comptime has_map) {
+                    try m.recordRun(allocator, w, raw_base + i, w + ascii_run, raw_base + i + ascii_run);
+                }
+                w += ascii_run;
+                i += ascii_run;
+                continue;
+            }
+            if (comptime mode == .gbk) {
+                const si0 = i;
+                const di0 = w;
+                while (i + 2 <= input.len and w + 3 <= out.len) {
+                    const b1 = input[i];
+                    if (b1 <= 0x80 or b1 == 0xFF) break;
+                    const b2 = input[i + 1];
+                    if (b2 < 0x40 or b2 == 0x7F or b2 == 0xFF) break;
+                    const trail_idx: usize = @as(usize, b2) - 0x40 - @intFromBool(b2 > 0x7F);
+                    const cp: u16 = gbk_table.table[@as(usize, b1 - 0x81) * 190 + trail_idx];
+                    if (cp >= 0x0800) {
+                        out[w] = @intCast(0xE0 | (cp >> 12));
+                        out[w + 1] = @intCast(0x80 | ((cp >> 6) & 0x3F));
+                        out[w + 2] = @intCast(0x80 | (cp & 0x3F));
+                        w += 3;
+                        i += 2;
+                    } else if (cp >= 0x0080) {
+                        if (comptime has_map) break;
+                        out[w] = @intCast(0xC0 | (cp >> 6));
+                        out[w + 1] = @intCast(0x80 | (cp & 0x3F));
+                        w += 2;
+                        i += 2;
+                    } else {
+                        if (comptime has_map) break;
+                        out[w] = @intCast(cp);
+                        w += 1;
+                        i += 2;
+                    }
+                }
+                if (i != si0) {
+                    if (comptime has_map) {
+                        try m.recordRun(allocator, di0, raw_base + si0, w, raw_base + i);
+                    }
+                    continue;
+                }
+            }
+        }
         const step = decodeModeComptime(mode, input[i..], true) orelse break;
-        try m.record(allocator, w, raw_base + i);
+        if (comptime has_map) {
+            try m.record(allocator, w, raw_base + i);
+        }
         w += encodeCp(step.cp, out[w..]);
         i += step.n;
     }
-    try m.record(allocator, w, raw_base + i);
+    if (comptime has_map) {
+        try m.record(allocator, w, raw_base + i);
+    }
     return w;
 }
 
@@ -1559,4 +1861,119 @@ test "v0.8 encodings: Windows-1252, GB18030, Shift_JIS, EUC-JP, Big5, EUC-KR, Wi
         if (pulled.eof) break;
     }
     try testing.expectEqualStrings("こんにちはｱｲｳ", out_buf[0..filled]);
+}
+
+test "SIMD GBK and UTF-16LE parity with and without OffsetMap across slice and streaming" {
+    const alloc = testing.allocator;
+
+    // Build a realistic >128-byte mixed GBK log payload (ASCII runs > 64B, short ASCII runs,
+    // consecutive GBK Hanzi, 2-byte UTF-8 GBK punctuation/Cyrillic, Euro 0x80, invalid byte 0xFF)
+    const gbk_payload =
+        "2026-11-23T00:00:01Z level=INFO svc=gateway latency=12ms status=200 path=/api/v1/orders msg=" ++
+        "\xC4\xE3\xBA\xC3\xCA\xC0\xBD\xE7" ++ // 你好世界
+        " ok " ++
+        "\xB2\xE2\xCA\xD4\xB4\xED\xCE\xF3" ++ // 测试错误
+        "\x80" ++ // € (0x80)
+        "\xA7\xA1" ++ // А (U+0410, 2-byte UTF-8 in GBK)
+        " tail_0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789\n";
+
+    // 1. Slice without OffsetMap vs with OffsetMap
+    const gbk_no_map = try convertAlloc(alloc, .gbk, gbk_payload);
+    defer alloc.free(gbk_no_map);
+
+    var gbk_map = decompress.OffsetMap{};
+    defer gbk_map.deinit(alloc);
+    const gbk_len = decodedSize(.gbk, gbk_payload);
+    try testing.expectEqual(gbk_no_map.len, gbk_len);
+    const gbk_with_map = try convertAllocWithMapKnownLen(alloc, .gbk, gbk_payload, 0, &gbk_map, gbk_len);
+    defer alloc.free(gbk_with_map);
+    try testing.expectEqualStrings(gbk_no_map, gbk_with_map);
+
+    // Verify exact raw offsets for GBK line landmarks:
+    // After 92-byte ASCII prefix: raw=92, out=92; after 4 Hanzi (8 raw, 12 out): raw=100, out=104
+    try testing.expectEqual(@as(u64, 92), gbk_map.map(92));
+    try testing.expectEqual(@as(u64, 100), gbk_map.map(104));
+    try testing.expectEqual(@as(u64, gbk_payload.len), gbk_map.map(gbk_no_map.len));
+
+    // 2. Streaming Decoder with small chunks (17B) without map vs with map
+    var stream_no_map: std.ArrayList(u8) = .empty;
+    defer stream_no_map.deinit(alloc);
+    {
+        var src = Chunk{ .rest = gbk_payload, .cap = 17 };
+        var dec = Decoder.init(.gbk);
+        defer dec.deinit(alloc);
+        var tmp: [29]u8 = undefined;
+        var rb: u64 = 0;
+        while (true) {
+            const p = try dec.pull(alloc, Chunk.read, &src, 17, &tmp, &rb);
+            try stream_no_map.appendSlice(alloc, tmp[0..p.n]);
+            if (p.eof) break;
+        }
+        try testing.expectEqual(@as(u64, gbk_payload.len), rb);
+    }
+    try testing.expectEqualStrings(gbk_no_map, stream_no_map.items);
+
+    var stream_with_map: std.ArrayList(u8) = .empty;
+    defer stream_with_map.deinit(alloc);
+    var stream_gbk_map = decompress.OffsetMap{};
+    defer stream_gbk_map.deinit(alloc);
+    {
+        var src = Chunk{ .rest = gbk_payload, .cap = 19 };
+        var dec = Decoder.init(.gbk);
+        defer dec.deinit(alloc);
+        dec.offset_map = &stream_gbk_map;
+        var tmp: [31]u8 = undefined;
+        var rb: u64 = 0;
+        while (true) {
+            const p = try dec.pull(alloc, Chunk.read, &src, 19, &tmp, &rb);
+            try stream_with_map.appendSlice(alloc, tmp[0..p.n]);
+            if (p.eof) break;
+        }
+    }
+    try testing.expectEqualStrings(gbk_no_map, stream_with_map.items);
+    try testing.expectEqual(@as(u64, 92), stream_gbk_map.map(92));
+    try testing.expectEqual(@as(u64, 100), stream_gbk_map.map(104));
+
+    // 3. UTF-16LE with long ASCII (>64 units), short ASCII before CJK, 2-byte BMP (é), 3-byte BMP (你好), surrogate (😀)
+    const utf8_ref =
+        "2026-11-23T00:00:01Z level=INFO svc=auth latency=5ms host=node-0123456789abcdef " ++
+        "café 你好世界 😀 " ++
+        "short_ascii_tail_0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ\n";
+    const u16_units = try unicode.utf8ToUtf16LeAlloc(alloc, utf8_ref);
+    defer alloc.free(u16_units);
+    const u16_raw = std.mem.sliceAsBytes(u16_units);
+
+    const u16_no_map = try convertAlloc(alloc, .utf16le, u16_raw);
+    defer alloc.free(u16_no_map);
+    try testing.expectEqualStrings(utf8_ref, u16_no_map);
+
+    var u16_map = decompress.OffsetMap{};
+    defer u16_map.deinit(alloc);
+    const u16_with_map = try convertAllocWithMap(alloc, .utf16le, u16_raw, 2, &u16_map);
+    defer alloc.free(u16_with_map);
+    try testing.expectEqualStrings(utf8_ref, u16_with_map);
+    try testing.expectEqual(@as(u64, 2 + 80 * 2), u16_map.map(80));
+    try testing.expectEqual(@as(u64, 2 + u16_raw.len), u16_map.map(utf8_ref.len));
+
+    // Streaming UTF-16LE with and without map
+    var u16_stream: std.ArrayList(u8) = .empty;
+    defer u16_stream.deinit(alloc);
+    var u16_stream_map = decompress.OffsetMap{};
+    defer u16_stream_map.deinit(alloc);
+    {
+        var src = Chunk{ .rest = u16_raw, .cap = 37 };
+        var dec = Decoder.init(.utf16le);
+        defer dec.deinit(alloc);
+        dec.offset_map = &u16_stream_map;
+        var tmp: [43]u8 = undefined;
+        var rb: u64 = 0;
+        while (true) {
+            const p = try dec.pull(alloc, Chunk.read, &src, 37, &tmp, &rb);
+            try u16_stream.appendSlice(alloc, tmp[0..p.n]);
+            if (p.eof) break;
+        }
+    }
+    try testing.expectEqualStrings(utf8_ref, u16_stream.items);
+    try testing.expectEqual(@as(u64, 80 * 2), u16_stream_map.map(80));
+    try testing.expectEqual(@as(u64, u16_raw.len), u16_stream_map.map(utf8_ref.len));
 }

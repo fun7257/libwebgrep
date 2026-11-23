@@ -56,7 +56,11 @@ pub const OffsetMap = struct {
                 const d_out2 = out_offset - last.out_offset;
                 const d_raw2 = raw_offset -| last.raw_offset;
                 if (d_out1 > 0 and d_out2 > 0 and last.raw_offset >= prev.raw_offset and raw_offset >= last.raw_offset) {
-                    if (@as(u128, d_raw1) * @as(u128, d_out2) == @as(u128, d_raw2) * @as(u128, d_out1)) {
+                    const collinear = if ((d_raw1 | d_out2 | d_raw2 | d_out1) <= std.math.maxInt(u32))
+                        d_raw1 * d_out2 == d_raw2 * d_out1
+                    else
+                        @as(u128, d_raw1) * @as(u128, d_out2) == @as(u128, d_raw2) * @as(u128, d_out1);
+                    if (collinear) {
                         last.out_offset = out_offset;
                         last.raw_offset = raw_offset;
                         return;
@@ -68,6 +72,20 @@ pub const OffsetMap = struct {
             .out_offset = out_offset,
             .raw_offset = raw_offset,
         });
+    }
+
+    /// Records a constant-slope run `[start_out..end_out] -> [start_raw..end_raw]` in O(1),
+    /// producing anchors identical to calling `record` for each collinear step in the run.
+    pub inline fn recordRun(
+        self: *OffsetMap,
+        allocator: std.mem.Allocator,
+        start_out: SearchByteOffset,
+        start_raw: RawByteOffset,
+        end_out: SearchByteOffset,
+        end_raw: RawByteOffset,
+    ) error{OutOfMemory}!void {
+        try self.record(allocator, start_out, start_raw);
+        try self.record(allocator, end_out, end_raw);
     }
 
     /// Given an absolute offset `out_offset` in the searchable stream, returns the corresponding raw byte stream offset.
@@ -118,5 +136,45 @@ test "offset_map: collinear compaction and exact interpolation" {
     for (0..101) |k| {
         const out_off: u64 = @intCast(k);
         try std.testing.expectEqual(2 + out_off * 2, om.map(out_off));
+    }
+}
+
+test "offset_map: recordRun matches step-by-step record across mixed slopes" {
+    const gpa = std.testing.allocator;
+    var by_step: OffsetMap = .{};
+    defer by_step.deinit(gpa);
+    var by_run: OffsetMap = .{};
+    defer by_run.deinit(gpa);
+
+    // 10 ASCII bytes (1:1), 4 GBK Hanzi (2 raw -> 3 UTF-8), 8 ASCII bytes (1:1)
+    var out_off: u64 = 0;
+    var raw_off: u64 = 0;
+    for (0..10) |_| {
+        try by_step.record(gpa, out_off, raw_off);
+        out_off += 1;
+        raw_off += 1;
+        try by_step.record(gpa, out_off, raw_off);
+    }
+    for (0..4) |_| {
+        try by_step.record(gpa, out_off, raw_off);
+        out_off += 3;
+        raw_off += 2;
+        try by_step.record(gpa, out_off, raw_off);
+    }
+    for (0..8) |_| {
+        try by_step.record(gpa, out_off, raw_off);
+        out_off += 1;
+        raw_off += 1;
+        try by_step.record(gpa, out_off, raw_off);
+    }
+
+    try by_run.recordRun(gpa, 0, 0, 10, 10);
+    try by_run.recordRun(gpa, 10, 10, 22, 18);
+    try by_run.recordRun(gpa, 22, 18, 30, 26);
+
+    try std.testing.expectEqual(by_step.anchors.items.len, by_run.anchors.items.len);
+    for (0..31) |k| {
+        const off: u64 = @intCast(k);
+        try std.testing.expectEqual(by_step.map(off), by_run.map(off));
     }
 }

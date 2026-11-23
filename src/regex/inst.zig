@@ -196,6 +196,8 @@ pub const RegexOptions = struct {
     unicode_case: bool = true,
     /// When true, `\d`/`\D`, `\w`/`\W`, and `\s`/`\S` match full Unicode classes (`\p{Nd}`, UAX #29 word, `White_Space`) instead of ASCII-only. Can also be toggled inline via `(?u)` / `(?-u)`.
     unicode_classes: bool = false,
+    /// When true (default), `\b`/`\B` use Unicode UTS #18 word boundaries; when false, ASCII `[0-9A-Za-z_]` word boundaries. Can also be toggled inline via `(?u)` / `(?-u)`.
+    unicode_word_boundary: bool = true,
     /// Allow matches to span multiple lines (including `\n`), with `^` and `$` matching line boundaries.
     multiline: bool = false,
     /// Allow `.` to match `\n` (requires `multiline = true` to cross lines).
@@ -307,6 +309,8 @@ pub const AssertKind = enum {
     end_input_before_nl,
     word_boundary,
     not_word_boundary,
+    ascii_word_boundary,
+    not_ascii_word_boundary,
 };
 
 pub const Thread = struct {
@@ -413,7 +417,7 @@ pub fn hasTopLevelAlt(pattern: []const u8) bool {
                     var neg = false;
                     var next_ext = extended;
                     var only_flags = false;
-                    while (j < pattern.len and (pattern[j] == 'i' or pattern[j] == 'm' or pattern[j] == 's' or pattern[j] == 'x' or pattern[j] == 'U' or pattern[j] == '-')) : (j += 1) {
+                    while (j < pattern.len and (pattern[j] == 'i' or pattern[j] == 'm' or pattern[j] == 's' or pattern[j] == 'x' or pattern[j] == 'U' or pattern[j] == 'u' or pattern[j] == '-')) : (j += 1) {
                         only_flags = true;
                         if (pattern[j] == '-') neg = true else if (pattern[j] == 'x') next_ext = !neg;
                     }
@@ -440,7 +444,7 @@ pub fn lineStartAt(haystack: []const u8, pos: usize) usize {
 }
 
 pub fn isWordChar(b: u8) bool {
-    return std.ascii.isAlphanumeric(b) or b == '_';
+    return unicode_fold.isAsciiWordByte(b);
 }
 
 pub fn checkAssert(kind: AssertKind, haystack: []const u8, pos: usize) bool {
@@ -458,6 +462,16 @@ pub fn checkAssert(kind: AssertKind, haystack: []const u8, pos: usize) bool {
         .not_word_boundary => blk: {
             const left = unicode_fold.isWordBefore(haystack, pos);
             const right = unicode_fold.isWordAt(haystack, pos);
+            break :blk left == right;
+        },
+        .ascii_word_boundary => blk: {
+            const left = pos > 0 and pos <= haystack.len and isWordChar(haystack[pos - 1]);
+            const right = pos < haystack.len and isWordChar(haystack[pos]);
+            break :blk left != right;
+        },
+        .not_ascii_word_boundary => blk: {
+            const left = pos > 0 and pos <= haystack.len and isWordChar(haystack[pos - 1]);
+            const right = pos < haystack.len and isWordChar(haystack[pos]);
             break :blk left == right;
         },
     };
@@ -563,7 +577,7 @@ pub fn hasLiteralUpper(pattern: []const u8, unicode_case: bool) bool {
             i += 2;
             var neg = false;
             var next_ext = extended;
-            while (i < pattern.len and (pattern[i] == 'i' or pattern[i] == 'm' or pattern[i] == 's' or pattern[i] == 'x' or pattern[i] == 'U' or pattern[i] == '-')) : (i += 1) {
+            while (i < pattern.len and (pattern[i] == 'i' or pattern[i] == 'm' or pattern[i] == 's' or pattern[i] == 'x' or pattern[i] == 'U' or pattern[i] == 'u' or pattern[i] == '-')) : (i += 1) {
                 if (pattern[i] == '-') neg = true else if (pattern[i] == 'x') next_ext = !neg;
             }
             if (i < pattern.len and pattern[i] == ')') {

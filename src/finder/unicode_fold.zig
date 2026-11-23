@@ -223,11 +223,23 @@ pub fn findFolded(haystack: []const u8, pattern: []const u8, start: usize) ?stru
     return null;
 }
 
-/// Returns whether the character immediately ending at `pos` in `haystack` is a word character (ASCII or UTF-8).
-pub fn isWordBefore(haystack: []const u8, pos: usize) bool {
+const ascii_word_lut: [256]bool = blk: {
+    var lut: [256]bool = @splat(false);
+    for ('0'..'9' + 1) |c| lut[c] = true;
+    for ('A'..'Z' + 1) |c| lut[c] = true;
+    for ('a'..'z' + 1) |c| lut[c] = true;
+    lut['_'] = true;
+    break :blk lut;
+};
+
+/// Branchless ASCII word-byte check (`[0-9A-Za-z_]`; returns false for non-ASCII bytes >= 0x80).
+pub inline fn isAsciiWordByte(b: u8) bool {
+    return ascii_word_lut[b];
+}
+
+pub noinline fn isWordBeforeNonAscii(haystack: []const u8, pos: usize) bool {
+    @branchHint(.cold);
     if (pos == 0 or pos > haystack.len) return false;
-    const prev = haystack[pos - 1];
-    if (prev < 0x80) return isUnicodeWordCodepoint(prev);
     // Walk back up to 4 bytes to find the UTF-8 lead byte
     var start = pos - 1;
     const min_start = pos -| 4;
@@ -240,15 +252,30 @@ pub fn isWordBefore(haystack: []const u8, pos: usize) bool {
     return isUnicodeWordCodepoint(cp);
 }
 
-/// Returns whether the character starting at `pos` in `haystack` is a word character (ASCII or UTF-8).
-pub fn isWordAt(haystack: []const u8, pos: usize) bool {
+pub noinline fn isWordAtNonAscii(haystack: []const u8, pos: usize) bool {
+    @branchHint(.cold);
     if (pos >= haystack.len) return false;
     const b = haystack[pos];
-    if (b < 0x80) return isUnicodeWordCodepoint(b);
     const seq_len = std.unicode.utf8ByteSequenceLength(b) catch return false;
     if (pos + seq_len > haystack.len) return false;
     const cp = decodeUtf8(haystack[pos .. pos + seq_len]) catch return false;
     return isUnicodeWordCodepoint(cp);
+}
+
+/// Returns whether the character immediately ending at `pos` in `haystack` is a word character (ASCII or UTF-8).
+pub inline fn isWordBefore(haystack: []const u8, pos: usize) bool {
+    if (pos == 0 or pos > haystack.len) return false;
+    const b = haystack[pos - 1];
+    if (b < 0x80) return isAsciiWordByte(b);
+    return isWordBeforeNonAscii(haystack, pos);
+}
+
+/// Returns whether the character starting at `pos` in `haystack` is a word character (ASCII or UTF-8).
+pub inline fn isWordAt(haystack: []const u8, pos: usize) bool {
+    if (pos >= haystack.len) return false;
+    const b = haystack[pos];
+    if (b < 0x80) return isAsciiWordByte(b);
+    return isWordAtNonAscii(haystack, pos);
 }
 
 /// Checks whether `pattern` contains codepoints that require folding beyond plain ASCII (such as non-ASCII letters or cross-ASCII `k`/`s`).

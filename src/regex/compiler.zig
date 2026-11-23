@@ -38,6 +38,7 @@ pub const Compiler = struct {
     ignore_case: bool,
     unicode_case: bool = true,
     unicode_classes: bool = false,
+    unicode_word_boundary: bool = true,
     multiline: bool,
     dot_all: bool,
     capture_count: u8 = 0,
@@ -675,6 +676,7 @@ pub const Compiler = struct {
                         const saved_x = self.extended;
                         const saved_u = self.ungreedy;
                         const saved_uc = self.unicode_classes;
+                        const saved_uwb = self.unicode_word_boundary;
                         self.depth += 1;
                         const inner = blk: {
                             errdefer self.depth -= 1;
@@ -688,6 +690,7 @@ pub const Compiler = struct {
                         self.extended = saved_x;
                         self.ungreedy = saved_u;
                         self.unicode_classes = saved_uc;
+                        self.unicode_word_boundary = saved_uwb;
                         if (self.pos >= self.pattern.len or self.pattern[self.pos] != ')') {
                             return self.fail(error.RegexSyntax, .unclosed_group, paren_pos, "unclosed named capture group '('");
                         }
@@ -709,6 +712,7 @@ pub const Compiler = struct {
                     var new_x = self.extended;
                     var new_u = self.ungreedy;
                     var new_uc = self.unicode_classes;
+                    var new_uwb = self.unicode_word_boundary;
                     var neg = false;
                     var saw_flag = false;
                     while (self.pos < self.pattern.len) {
@@ -746,6 +750,7 @@ pub const Compiler = struct {
                             },
                             'u' => {
                                 new_uc = !neg;
+                                new_uwb = !neg;
                                 saw_flag = true;
                                 self.pos += 1;
                             },
@@ -761,6 +766,7 @@ pub const Compiler = struct {
                         self.extended = new_x;
                         self.ungreedy = new_u;
                         self.unicode_classes = new_uc;
+                        self.unicode_word_boundary = new_uwb;
                         if (new_i) self.saw_ignore_case = true;
                         if (new_m) self.saw_scoped_m = true;
                         if (new_x) self.saw_extended = true;
@@ -777,6 +783,7 @@ pub const Compiler = struct {
                         const saved_x = self.extended;
                         const saved_u = self.ungreedy;
                         const saved_uc = self.unicode_classes;
+                        const saved_uwb = self.unicode_word_boundary;
                         self.ignore_case = new_i;
                         self.multiline = new_m;
                         self.explicit_neg_m = new_neg_m;
@@ -784,6 +791,7 @@ pub const Compiler = struct {
                         self.extended = new_x;
                         self.ungreedy = new_u;
                         self.unicode_classes = new_uc;
+                        self.unicode_word_boundary = new_uwb;
                         if (new_i) self.saw_ignore_case = true;
                         if (new_m) self.saw_scoped_m = true;
                         if (new_x) self.saw_extended = true;
@@ -798,6 +806,7 @@ pub const Compiler = struct {
                             self.extended = saved_x;
                             self.ungreedy = saved_u;
                             self.unicode_classes = saved_uc;
+                            self.unicode_word_boundary = saved_uwb;
                         }
                         const inner = try self.parseAlt();
                         if (self.pos >= self.pattern.len or self.pattern[self.pos] != ')') {
@@ -820,6 +829,7 @@ pub const Compiler = struct {
                 const saved_x = self.extended;
                 const saved_u = self.ungreedy;
                 const saved_uc = self.unicode_classes;
+                const saved_uwb = self.unicode_word_boundary;
                 self.depth += 1;
                 const inner = blk: {
                     errdefer self.depth -= 1;
@@ -833,6 +843,7 @@ pub const Compiler = struct {
                 self.extended = saved_x;
                 self.ungreedy = saved_u;
                 self.unicode_classes = saved_uc;
+                self.unicode_word_boundary = saved_uwb;
                 if (self.pos >= self.pattern.len or self.pattern[self.pos] != ')') {
                     return self.fail(error.RegexSyntax, .unclosed_group, paren_pos, "unclosed group parenthesis '('");
                 }
@@ -1033,11 +1044,13 @@ pub const Compiler = struct {
                 return .{ .start = pc, .end = pc };
             },
             'b' => {
-                const pc = try self.emit(.{ .assert = .{ .kind = .word_boundary, .out = 0 } });
+                const kind: AssertKind = if (self.unicode_word_boundary) .word_boundary else .ascii_word_boundary;
+                const pc = try self.emit(.{ .assert = .{ .kind = kind, .out = 0 } });
                 return .{ .start = pc, .end = pc };
             },
             'B' => {
-                const pc = try self.emit(.{ .assert = .{ .kind = .not_word_boundary, .out = 0 } });
+                const kind: AssertKind = if (self.unicode_word_boundary) .not_word_boundary else .not_ascii_word_boundary;
+                const pc = try self.emit(.{ .assert = .{ .kind = kind, .out = 0 } });
                 return .{ .start = pc, .end = pc };
             },
             'Q' => {
@@ -1145,26 +1158,11 @@ pub const Compiler = struct {
         }
     }
 
-    fn buildUnicodeWordRanges(allocator: std.mem.Allocator) error{OutOfMemory}![]const CodepointRange {
-        var list = std.ArrayList(CodepointRange).empty;
-        errdefer list.deinit(allocator);
-        try list.appendSlice(allocator, &prop_table.gc_L);
-        try list.appendSlice(allocator, &prop_table.gc_M);
-        try list.appendSlice(allocator, &prop_table.gc_N);
-        try list.appendSlice(allocator, &prop_table.gc_Pc);
-        try list.append(allocator, .{ .start = 0x200C, .end = 0x200D });
-        return sortAndMergeRanges(allocator, &list);
-    }
-
     fn emitUnicodeShorthand(self: *Compiler, kind: u8, is_neg: bool) Error!Frag {
         const range_idx: u32 = switch (kind) {
             'd', 'D' => try self.addUnicodeRangeList(&prop_table.gc_Nd, false),
             's', 'S' => try self.addUnicodeRangeList(&prop_table.prop_Whitespace, false),
-            'w', 'W' => blk: {
-                const owned = try buildUnicodeWordRanges(self.allocator);
-                errdefer self.allocator.free(owned);
-                break :blk try self.addUnicodeRangeList(owned, true);
-            },
+            'w', 'W' => try self.addUnicodeRangeList(&prop_table.prop_Word, false),
             else => unreachable,
         };
         return self.emitUnicodeClassInst(range_idx, is_neg, .{}, false);
@@ -1378,12 +1376,10 @@ pub const Compiler = struct {
                             }
                         },
                         'w', 'W' => {
-                            const word_ranges = try buildUnicodeWordRanges(self.allocator);
-                            defer self.allocator.free(word_ranges);
                             if (is_neg) {
-                                try appendComplementRanges(self.allocator, &unicode_list, word_ranges);
+                                try appendComplementRanges(self.allocator, &unicode_list, &prop_table.prop_Word);
                             } else {
-                                try unicode_list.appendSlice(self.allocator, word_ranges);
+                                try unicode_list.appendSlice(self.allocator, &prop_table.prop_Word);
                             }
                         },
                         else => unreachable,

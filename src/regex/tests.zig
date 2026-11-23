@@ -1158,3 +1158,403 @@ test "X02 & X13: fused Fast Path 4 alt-prefix skip and L2-chunked NUL prepass ac
         try std.testing.expectEqual(@as(?usize, 75 * 1024 + 2), n_int2);
     }
 }
+
+test "P0-1 RegexSet: 10 prefix-literal set (FP1), findWatched NULs, findEnd parity, and matches()" {
+    const alloc = std.testing.allocator;
+    const patterns = [_][]const u8{
+        "ERR_AUTH_[0-9]{3}",
+        "ERR_DISK_[a-z]+",
+        "^WARN_NET_[0-9]{2,4}",
+        "\\bCRIT_DB_[0-9]{4}\\b",
+        "(?:FATAL|PANIC)_OOM_[0-9]+",
+        "TIMEOUT_RPC_[0-9]{2}ms",
+        "RETRY_QUEUE_[a-z]{3,6}",
+        "DROP_PKT_[0-9]{4}",
+        "SYNC_FAIL_[0-9]{3}",
+        "LEASE_EXP_[a-z0-9]{4}",
+    };
+
+    var set = try RegexSet.init(alloc, &patterns, .{});
+    defer set.deinit();
+
+    try std.testing.expectEqual(@as(usize, 10), set.len());
+    try std.testing.expect(set.prefilter != null);
+    try std.testing.expect(set.all_prefix);
+    try std.testing.expect(!set.all_exact);
+    // All 10 prefix patterns require a constrained trailing byte class -> next-byte mask active
+    try std.testing.expect(set.pf_has_next_mask.len > 0);
+    for (set.pf_has_next_mask) |has_m| {
+        try std.testing.expect(has_m);
+    }
+    // EOF right after prefix literal must cleanly reject without OOB
+    try std.testing.expect(set.find("ERR_AUTH_", 0, .earliest) == null);
+    try std.testing.expect(set.find("ERR_AUTH_x", 0, .earliest) == null);
+
+    // Pattern with optional suffix (`[0-9]*`) must NOT reject on next-byte mask
+    {
+        var opt_set = try RegexSet.init(alloc, &.{ "ERR_OPT_[0-9]*", "WARN_OPT_[a-z]+" }, .{});
+        defer opt_set.deinit();
+        try std.testing.expect(!opt_set.pf_has_next_mask[0]);
+        try std.testing.expect(opt_set.pf_has_next_mask[1]);
+        const mo = opt_set.find("ERR_OPT_!", 0, .earliest) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("ERR_OPT_", "ERR_OPT_!"[mo.start..mo.end]);
+        const mo_eof = opt_set.find("ERR_OPT_", 0, .earliest) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("ERR_OPT_", "ERR_OPT_"[mo_eof.start..mo_eof.end]);
+    }
+
+    const hay =
+        "INFO ok ERR_AUTH_12 WARN_NET_99\n" ++
+        "WARN_NET_404 recovered\n" ++
+        "xCRIT_DB_1234x  CRIT_DB_9876!\n" ++
+        "svc PANIC_OOM_512 and LEASE_EXP_a9z0\n";
+
+    // Line 1: WARN_NET_99 is not at start of line, so first match is line 2 `WARN_NET_404` (pat 2)
+    const m1 = set.find(hay, 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?u32, 2), m1.pattern_id);
+    try std.testing.expectEqualStrings("WARN_NET_404", hay[m1.start..m1.end]);
+    try std.testing.expectEqual(@as(?usize, m1.end), set.findEnd(hay, 0, .leftmost_first));
+
+    const m1_e = set.find(hay, 0, .earliest) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?u32, 2), m1_e.pattern_id);
+    try std.testing.expectEqual(m1.start, m1_e.start);
+    try std.testing.expectEqualStrings("WARN_NET_40", hay[m1_e.start..m1_e.end]);
+    try std.testing.expectEqual(@as(?usize, m1_e.end), set.findEnd(hay, 0, .earliest));
+    try std.testing.expect(set.isMatch(hay));
+
+    // Line 3: `xCRIT_DB_1234x` fails `\b`, `CRIT_DB_9876` matches pat 3
+    const m2 = set.find(hay, m1.end, .leftmost_first) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?u32, 3), m2.pattern_id);
+    try std.testing.expectEqualStrings("CRIT_DB_9876", hay[m2.start..m2.end]);
+    try std.testing.expectEqual(@as(?usize, m2.end), set.findEnd(hay, m1.end, .earliest));
+
+    // matches() returns sorted matching pattern IDs: 2, 3, 4, 9
+    var ids: [16]u32 = undefined;
+    const n_ids = set.matches(hay, &ids);
+    try std.testing.expectEqual(@as(usize, 4), n_ids);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 3, 4, 9 }, ids[0..n_ids]);
+
+    // findWatched & L2-chunked NUL prepass on 140 KiB high-decoy buffer
+    const buf = try alloc.alloc(u8, 140 * 1024);
+    defer alloc.free(buf);
+    @memset(buf, ' ');
+    var off: usize = 16;
+    while (off + 32 < buf.len) : (off += 128) {
+        @memcpy(buf[off..][0..12], "ERR_AUTH_xx ");
+    }
+    const target_pos: usize = 92 * 1024 + 10;
+    const target_str = "SYNC_FAIL_503";
+    @memcpy(buf[target_pos..][0..target_str.len], target_str);
+
+    var nul0: ?usize = null;
+    const mw = set.findWatched(buf, 0, &nul0) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(nul0 == null);
+    try std.testing.expectEqual(@as(?u32, 8), mw.pattern_id);
+    try std.testing.expectEqual(target_pos, mw.start);
+    try std.testing.expectEqual(target_pos + target_str.len, mw.end);
+
+    var nul_e: ?usize = null;
+    try std.testing.expectEqual(@as(?usize, mw.end), set.findEndWatched(buf, 0, .earliest, &nul_e));
+    try std.testing.expect(nul_e == null);
+
+    // NUL right at m.end -> match succeeds with nul == null
+    buf[target_pos + target_str.len] = 0;
+    var nul_at_end: ?usize = null;
+    const mw_end = set.findWatched(buf, 0, &nul_at_end) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(nul_at_end == null);
+    try std.testing.expectEqual(mw, mw_end);
+    buf[target_pos + target_str.len] = ' ';
+
+    // NUL before match in chunked region -> null with exact nul offset
+    const nul_before: usize = 70 * 1024 + 5;
+    buf[nul_before] = 0;
+    var nul_b: ?usize = null;
+    try std.testing.expect(set.findWatched(buf, 0, &nul_b) == null);
+    try std.testing.expectEqual(@as(?usize, nul_before), nul_b);
+}
+
+test "P0-1 RegexSet: 50 interior-literal set (FP2 single-hit & multi-hit lines, chunked NUL)" {
+    const alloc = std.testing.allocator;
+
+    var pat_bufs: [50][32]u8 = undefined;
+    var pat_slices: [50][]const u8 = undefined;
+    for (0..50) |i| {
+        pat_slices[i] = try std.fmt.bufPrint(&pat_bufs[i], "[a-z]{{3,6}}_EVT_{d:0>2}_[0-9]{{3}}", .{i});
+    }
+
+    var set = try RegexSet.init(alloc, &pat_slices, .{});
+    defer set.deinit();
+
+    try std.testing.expectEqual(@as(usize, 50), set.len());
+    try std.testing.expect(set.prefilter != null);
+    try std.testing.expect(!set.all_prefix);
+    try std.testing.expect(!set.all_exact);
+
+    // Single-hit line + decoy line + multi-hit line
+    const hay =
+        "decoy 12_EVT_05_999 short\n" ++
+        "svc alpha_EVT_27_404 done\n" ++
+        "two hits: zzz_EVT_49_111 and beta_EVT_03_222 end\n";
+
+    const m1 = set.find(hay, 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?u32, 27), m1.pattern_id);
+    try std.testing.expectEqualStrings("alpha_EVT_27_404", hay[m1.start..m1.end]);
+    try std.testing.expectEqual(@as(?usize, m1.end), set.findEnd(hay, 0, .earliest));
+
+    // Multi-hit line: `zzz_EVT_49_111` starts & ends before `beta_EVT_03_222`
+    const m2 = set.find(hay, m1.end, .leftmost_first) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?u32, 49), m2.pattern_id);
+    try std.testing.expectEqualStrings("zzz_EVT_49_111", hay[m2.start..m2.end]);
+    try std.testing.expectEqual(@as(?usize, m2.end), set.findEnd(hay, m1.end, .earliest));
+
+    // matches() must discover all 3 matched patterns: 3, 27, 49
+    var ids: [64]u32 = undefined;
+    const n_ids = set.matches(hay, &ids);
+    try std.testing.expectEqual(@as(usize, 3), n_ids);
+    try std.testing.expectEqualSlices(u32, &.{ 3, 27, 49 }, ids[0..n_ids]);
+
+    // 140 KiB high-decoy buffer with a match straddling the 64 KiB chunk boundary
+    const buf = try alloc.alloc(u8, 140 * 1024);
+    defer alloc.free(buf);
+    @memset(buf, ' ');
+    var off: usize = 16;
+    while (off + 40 < buf.len) : (off += 128) {
+        @memcpy(buf[off..][0..16], "99_EVT_12_xxx\n  ");
+    }
+    const straddle: usize = 64 * 1024 - 4;
+    const good = "node_EVT_38_808";
+    @memcpy(buf[straddle..][0..good.len], good);
+
+    var nul0: ?usize = null;
+    const mw = set.findWatched(buf, 0, &nul0) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(nul0 == null);
+    try std.testing.expectEqual(@as(?u32, 38), mw.pattern_id);
+    try std.testing.expectEqual(straddle, mw.start);
+    try std.testing.expectEqual(straddle + good.len, mw.end);
+
+    // NUL inside match -> null with exact NUL offset
+    const saved = buf[straddle + 6];
+    buf[straddle + 6] = 0;
+    var nul_in: ?usize = null;
+    try std.testing.expect(set.findWatched(buf, 0, &nul_in) == null);
+    try std.testing.expectEqual(@as(?usize, straddle + 6), nul_in);
+    buf[straddle + 6] = saved;
+}
+
+test "P0-1 RegexSet: 20 zero-literal \\b patterns (Unicode & ASCII --no-unicode), SetUnanchoredDfa & findEnd parity" {
+    const alloc = std.testing.allocator;
+    const patterns = [_][]const u8{
+        "\\b[a-z]{6,10}\\s+[0-9]{3,5}\\b",
+        "\\b[A-Z]{3}-[0-9]{4}\\b",
+        "\\b[0-9]{2}:[0-9]{2}:[0-9]{2}\\b",
+        "\\b[a-f0-9]{8}-[a-f0-9]{4}\\b",
+        "\\b[A-Z]{2}_[0-9]{3}\\b",
+        "\\b[a-z]{4}=[0-9]{4}\\b",
+        "\\b[0-9]{3}\\.[0-9]{3}\\b",
+        "\\b[a-z]{5}/[0-9]{3}\\b",
+        "\\b[A-Z]{4}#[0-9]{2}\\b",
+        "\\b[a-z]{3}:[0-9]{5}\\b",
+        "\\b[0-9]{4}ms\\b",
+        "\\b[0-9]{4}kb\\b",
+        "\\b[0-9]{4}mb\\b",
+        "\\b[0-9]{4}gb\\b",
+        "\\b[A-Z]{3}\\+[0-9]{2}\\b",
+        "\\b[a-z]{4}@[0-9]{3}\\b",
+        "\\b[0-9]{2}%[a-z]{3}\\b",
+        "\\b[A-Z]{2}:[A-Z]{2}:[0-9]{2}\\b",
+        "\\b[a-z]{3}_[a-z]{3}_[0-9]{2}\\b",
+        "\\b[0-9]{3}-[a-z]{4}\\b",
+    };
+
+    // 1. Default Unicode word boundaries
+    {
+        var set_u = try RegexSet.init(alloc, &patterns, .{});
+        defer set_u.deinit();
+
+        try std.testing.expect(set_u.prefilter == null);
+        try std.testing.expect(set_u.has_byte_classes);
+
+        const hay = "你worker 1280  。worker 1280  code=9999  ABC-2026\n";
+        const m = set_u.find(hay, 0, .earliest) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(?u32, 0), m.pattern_id);
+        try std.testing.expectEqualStrings("worker 1280", hay[m.start..m.end]);
+        try std.testing.expectEqual(@as(?usize, m.end), set_u.findEnd(hay, 0, .earliest));
+
+        var nul: ?usize = null;
+        const mw = set_u.findWatched(hay, 0, &nul) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(nul == null);
+        try std.testing.expectEqual(m, mw);
+        try std.testing.expectEqual(@as(?usize, m.end), set_u.findEndWatched(hay, 0, .earliest, &nul));
+
+        var ids: [32]u32 = undefined;
+        const n = set_u.matches(hay, &ids);
+        try std.testing.expectEqual(@as(usize, 3), n);
+        try std.testing.expectEqualSlices(u32, &.{ 0, 1, 5 }, ids[0..n]);
+
+        // NUL before match
+        const hay_nul = "prefix \x00 worker 1280\n";
+        var nul2: ?usize = null;
+        try std.testing.expect(set_u.findWatched(hay_nul, 0, &nul2) == null);
+        try std.testing.expectEqual(@as(?usize, 7), nul2);
+        var nul3: ?usize = null;
+        try std.testing.expect(set_u.findEndWatched(hay_nul, 0, .earliest, &nul3) == null);
+        try std.testing.expectEqual(@as(?usize, 7), nul3);
+    }
+
+    // 2. ASCII word boundaries (`--no-unicode` -> `unicode_word_boundary = false`)
+    {
+        var opts = inst_mod.RegexOptions{};
+        if (@hasField(inst_mod.RegexOptions, "unicode_word_boundary")) {
+            opts.unicode_word_boundary = false;
+        }
+        var set_a = try RegexSet.init(alloc, &patterns, opts);
+        defer set_a.deinit();
+
+        try std.testing.expect(set_a.prefilter == null);
+        const hay_cjk = "你worker 1280\n";
+        if (@hasField(inst_mod.RegexOptions, "unicode_word_boundary")) {
+            const ma = set_a.find(hay_cjk, 0, .earliest) orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("worker 1280", hay_cjk[ma.start..ma.end]);
+            try std.testing.expectEqual(@as(?usize, ma.end), set_a.findEnd(hay_cjk, 0, .earliest));
+            var nul: ?usize = null;
+            try std.testing.expectEqual(@as(?usize, ma.end), set_a.findEndWatched(hay_cjk, 0, .earliest, &nul));
+            try std.testing.expect(nul == null);
+        }
+    }
+}
+
+test "P0-1 RegexSet: FP0 exact literals, smart-case & mixed-case soundness, and overlapping prefixes" {
+    const alloc = std.testing.allocator;
+
+    // 1. FP0 exact literals with duplicate & overlapping literals
+    {
+        var set = try RegexSet.init(alloc, &.{ "err", "error", "err", "warn" }, .{});
+        defer set.deinit();
+        try std.testing.expect(set.all_exact);
+        try std.testing.expect(set.has_prefix_overlap);
+
+        const hay = "ok error warn";
+        const ml = set.find(hay, 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(?u32, 0), ml.pattern_id);
+        try std.testing.expectEqualStrings("err", hay[ml.start..ml.end]);
+        try std.testing.expectEqual(@as(?usize, ml.end), set.findEnd(hay, 0, .leftmost_first));
+
+        var ids: [8]u32 = undefined;
+        const n = set.matches(hay, &ids);
+        try std.testing.expectEqual(@as(usize, 4), n);
+        try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3 }, ids[0..n]);
+    }
+
+    // 2. Smart-case mixed set: lowercase pattern ignores case, uppercase pattern is strictly case-sensitive
+    {
+        var set = try RegexSet.init(alloc, &.{ "foo", "BAR", "baz_[0-9]+" }, .{ .case = .smart });
+        defer set.deinit();
+        try std.testing.expect(set.prefilter != null);
+        try std.testing.expect(!set.all_exact); // mixed case must verify per-pattern case!
+
+        try std.testing.expect(set.find("bar", 0, .leftmost_first) == null);
+        const m_bar = set.find("bar BAR", 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(?u32, 1), m_bar.pattern_id);
+        try std.testing.expectEqualStrings("BAR", "bar BAR"[m_bar.start..m_bar.end]);
+
+        const m_foo = set.find("xx FOO yy", 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(?u32, 0), m_foo.pattern_id);
+        try std.testing.expectEqualStrings("FOO", "xx FOO yy"[m_foo.start..m_foo.end]);
+
+        const m_baz = set.find("BAZ_42", 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(?u32, 2), m_baz.pattern_id);
+        try std.testing.expectEqualStrings("BAZ_42", "BAZ_42"[m_baz.start..m_baz.end]);
+    }
+
+    // 3. Inline (?i) mixed with case-sensitive sibling
+    {
+        var set = try RegexSet.init(alloc, &.{ "(?i)alpha", "BETA" }, .{ .case = .sensitive });
+        defer set.deinit();
+        try std.testing.expect(set.prefilter != null);
+        try std.testing.expect(!set.all_exact);
+
+        try std.testing.expect(set.find("beta", 0, .leftmost_first) == null);
+        const m_a = set.find("beta ALPHA", 0, .leftmost_first) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(?u32, 0), m_a.pattern_id);
+    }
+}
+
+test "P0-1 RegexSet: LazySetDfa bounded cache flush, graceful PikeVM bailout, and >=16 KiB Tier-B scan" {
+    const alloc = std.testing.allocator;
+
+    // Direct LazySetDfa unit test forcing flushes and bailout via tight max_states_override = 6
+    {
+        var set = try RegexSet.init(alloc, &.{
+            "\\b[a-z]{6}\\b",
+            "\\b[0-9]{6}\\b",
+            "\\b[A-Z]{6}\\b",
+        }, .{});
+        defer set.deinit();
+
+        const bc = dfa_mod.ByteClasses.compute(set.insts, set.unicode_ranges, set.multiline);
+        var lazy = dfa_mod.LazySetDfa.init(alloc, set.insts, set.unicode_ranges, &bc, set.start_pc, set.multiline, 6, 2) orelse
+            return error.TestUnexpectedResult;
+        defer lazy.deinit();
+
+        const feed = "abcde 12345 ABCDE fghij 67890 FGHIJ klmno 13579 KLMNO pqrst 24680 PQRST ";
+        var s: u16 = lazy.startStateAt(feed, 0);
+        var saw_bailout = false;
+        for (feed) |b| {
+            const ns = lazy.step(s, b);
+            if (ns == dfa_mod.LazySetDfa.bailout_trans) {
+                saw_bailout = true;
+                break;
+            }
+            if (ns < dfa_mod.LazySetDfa.sentinel_min) {
+                s = ns;
+            } else {
+                s = lazy.startStateForByte(b);
+            }
+        }
+        try std.testing.expectEqual(@as(u32, 2), lazy.flushes);
+        try std.testing.expect(saw_bailout);
+        try std.testing.expect(lazy.bailed_out);
+    }
+
+    // End-to-end >= 16 KiB scan on a zero-literal set (verifies Tier A or Tier B + PikeVM parity)
+    {
+        var set = try RegexSet.init(alloc, &.{
+            "\\b[a-z]{5,8}_[0-9]{4}\\b",
+            "\\b[A-Z]{4}:[0-9]{3,5}\\b",
+        }, .{});
+        defer set.deinit();
+
+        const buf = try alloc.alloc(u8, 24 * 1024);
+        defer alloc.free(buf);
+        @memset(buf, ' ');
+        const hit_pos: usize = 20 * 1024 + 13;
+        const target = "worker_9001";
+        @memcpy(buf[hit_pos..][0..target.len], target);
+
+        const m = set.find(buf, 0, .earliest) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(?u32, 0), m.pattern_id);
+        try std.testing.expectEqual(hit_pos, m.start);
+        try std.testing.expectEqual(hit_pos + target.len, m.end);
+        try std.testing.expectEqual(@as(?usize, m.end), set.findEnd(buf, 0, .earliest));
+
+        var nul: ?usize = null;
+        try std.testing.expectEqual(@as(?usize, m.end), set.findEndWatched(buf, 0, .earliest, &nul));
+        try std.testing.expect(nul == null);
+    }
+}
+
+test "P0-3 contract: dfa.isExactOnAsciiAnyInsts allows .any and rejects .assert / utf8_negated" {
+    const alloc = std.testing.allocator;
+
+    var re_any = try Regex.init(alloc, "ERROR.{1,5}timeout", .{ .multiline = true, .dot_all = true });
+    defer re_any.deinit();
+    try std.testing.expect(!dfa_mod.isExactOnAsciiInsts(re_any.insts));
+    try std.testing.expect(dfa_mod.isExactOnAsciiAnyInsts(re_any.insts));
+
+    var re_wb = try Regex.init(alloc, "\\bERROR\\b", .{});
+    defer re_wb.deinit();
+    try std.testing.expect(!dfa_mod.isExactOnAsciiAnyInsts(re_wb.insts));
+
+    var re_neg = try Regex.init(alloc, "[^a]+", .{});
+    defer re_neg.deinit();
+    try std.testing.expect(!dfa_mod.isExactOnAsciiAnyInsts(re_neg.insts));
+}

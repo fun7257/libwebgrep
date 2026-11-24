@@ -4,6 +4,7 @@
 //! `--files`, `--sort`/`--sortr`, `-a`/`--text`, `--binary`, `--no-binary`, `-j`, `--no-config`,
 //! `--no-unicode`, `--no-ignore`, `--mmap`, and `--no-mmap`, emitting output format & exit codes identical to `rg`.
 
+const builtin = @import("builtin");
 const std = @import("std");
 const libwebgrep = @import("libwebgrep_internal");
 const internal = libwebgrep;
@@ -101,6 +102,7 @@ fn writeSinkBytes(
     out: *std.Io.Writer,
     prefix_path: ?[]const u8,
     line_numbers: bool,
+    may_contain_nl: bool,
     bytes: []const u8,
     base_line_num: ?u64,
     sep: u8,
@@ -108,7 +110,7 @@ fn writeSinkBytes(
     if (prefix_path == null and !line_numbers) {
         return writeFastBytesTo(out, bytes);
     }
-    if (std.mem.findScalar(u8, bytes, '\n') != null) {
+    if (may_contain_nl and std.mem.findScalar(u8, bytes, '\n') != null) {
         var it = std.mem.splitScalar(u8, bytes, '\n');
         var idx: u64 = 0;
         while (it.next()) |sub| : (idx += 1) {
@@ -188,7 +190,7 @@ fn writeOnlyMatchingSpans(
             }
             break :blk n + nl_acc;
         } else null;
-        if (!writeSinkBytes(out, prefix_path, line_numbers, seg, base_ln, ':')) return false;
+        if (!writeSinkBytes(out, prefix_path, line_numbers, if (with_replace) true else multiline, seg, base_ln, ':')) return false;
     }
     return true;
 }
@@ -206,6 +208,8 @@ fn PrintSink(comptime mode: PrintMode) type {
             prefix_path: ?[]const u8 = null,
             line_numbers: bool = false,
             multiline: bool = false,
+            last_line_number: u64 = 0,
+            last_line_offset: u64 = 0,
 
             inline fn writeFastBytes(self: *@This(), bytes: []const u8) bool {
                 return writeFastBytesTo(self.out, bytes);
@@ -221,12 +225,18 @@ fn PrintSink(comptime mode: PrintMode) type {
 
             pub fn matched(self: *@This(), line: libwebgrep.Line) bool {
                 if (line.binary_status == .detected) return false;
+                if (self.line_numbers) {
+                    if (line.number) |n| {
+                        self.last_line_number = n;
+                        self.last_line_offset = line.offset;
+                    }
+                }
                 return writeOnlyMatchingSpans(false, self.out, self.prefix_path, self.line_numbers, self.multiline, line);
             }
 
             pub fn context(self: *@This(), line: libwebgrep.Line) bool {
                 if (line.binary_status == .detected) return false;
-                return writeSinkBytes(self.out, self.prefix_path, self.line_numbers, line.bytes, line.number, '-');
+                return writeSinkBytes(self.out, self.prefix_path, self.line_numbers, self.multiline, line.bytes, line.number, '-');
             }
 
             pub fn contextBreak(self: *@This()) bool {
@@ -253,12 +263,20 @@ fn PrintSink(comptime mode: PrintMode) type {
         prefix_path: ?[]const u8 = null,
         line_numbers: bool = false,
         multiline: bool = false,
+        last_line_number: u64 = 0,
+        last_line_offset: u64 = 0,
 
         pub fn matched(self: *@This(), line: libwebgrep.Line) bool {
             if (line.binary_status == .detected) return false;
+            if (self.line_numbers) {
+                if (line.number) |n| {
+                    self.last_line_number = n;
+                    self.last_line_offset = line.offset;
+                }
+            }
             switch (mode) {
-                .line => return writeSinkBytes(self.out, self.prefix_path, self.line_numbers, line.bytes, line.number, ':'),
-                .replace => return writeSinkBytes(self.out, self.prefix_path, self.line_numbers, line.replaced orelse line.bytes, line.number, ':'),
+                .line => return writeSinkBytes(self.out, self.prefix_path, self.line_numbers, self.multiline, line.bytes, line.number, ':'),
+                .replace => return writeSinkBytes(self.out, self.prefix_path, self.line_numbers, true, line.replaced orelse line.bytes, line.number, ':'),
                 .only_matching_replace => return writeOnlyMatchingSpans(true, self.out, self.prefix_path, self.line_numbers, self.multiline, line),
                 .only_matching => comptime unreachable,
             }
@@ -266,7 +284,7 @@ fn PrintSink(comptime mode: PrintMode) type {
 
         pub fn context(self: *@This(), line: libwebgrep.Line) bool {
             if (line.binary_status == .detected) return false;
-            return writeSinkBytes(self.out, self.prefix_path, self.line_numbers, line.bytes, line.number, '-');
+            return writeSinkBytes(self.out, self.prefix_path, self.line_numbers, self.multiline, line.bytes, line.number, '-');
         }
 
         pub fn contextBreak(self: *@This()) bool {
@@ -459,6 +477,183 @@ fn parseSortArg(val: []const u8, reverse: bool) ?internal.walker.SortBy {
     return null;
 }
 
+inline fn searchSliceCompiled(
+    comptime S: type,
+    sink: *S,
+    haystack: []const u8,
+    path: []const u8,
+    cm: *const CompiledMatcher,
+    cfg: libwebgrep.SearchConfig,
+) !libwebgrep.Result {
+    return switch (cm.*) {
+        .finder => |*f| libwebgrep.searchSlice(S, sink, haystack, path, f, cfg),
+        .multi => |*m| libwebgrep.searchSlice(S, sink, haystack, path, m, cfg),
+        .regex => |*r| libwebgrep.searchSlice(S, sink, haystack, path, r, cfg),
+        .regex_set => |*rs| libwebgrep.searchSlice(S, sink, haystack, path, rs, cfg),
+        .none => unreachable,
+    };
+}
+
+fn isMultilineCompiled(cm: *const CompiledMatcher) bool {
+    return switch (cm.*) {
+        .finder => |*f| f.isMultiline(),
+        .multi => |*m| m.isMultiline(),
+        .regex => |*r| r.isMultiline(),
+        .regex_set => |*rs| rs.isMultiline(),
+        .none => false,
+    };
+}
+
+/// Zero-copy 8 MiB windowed `mmap` loop for large single-threaded files.
+/// Keeps PTE pages and `struct page` refcount entries L2/L3-hot at `munmap` time,
+/// avoiding the L3-cold teardown cost of whole-file `munmap` while preserving
+/// kernel sequential readahead via one-time `POSIX_FADV_SEQUENTIAL` and per-window
+/// `MADV_SEQUENTIAL` (no `MADV_HUGEPAGE`, no `MADV_DONTNEED`).
+/// Returns `null` when windowing cannot apply at offset 0 (e.g., BOM present or
+/// first 8 MiB contains no record separator), letting the caller fall back to
+/// whole-file `MemoryMap`.
+fn searchWindowedMmap(
+    comptime S: type,
+    file: std.Io.File,
+    file_size: u64,
+    path: []const u8,
+    sink: *S,
+    cm: *const CompiledMatcher,
+    cfg: libwebgrep.SearchConfig,
+) !?libwebgrep.Result {
+    if (comptime builtin.os.tag != .linux) return null;
+
+    const win_size: usize = 8 * 1024 * 1024;
+    const page_size: u64 = std.heap.pageSize();
+    if (page_size == 0 or !std.math.isPowerOfTwo(page_size) or page_size >= win_size) return null;
+    const page_mask: u64 = page_size - 1;
+    const sep: u8 = if (cfg.null_data) 0 else '\n';
+
+    internal.platform.adviseSequentialFile(file);
+
+    var offset: u64 = 0;
+    var next_line_no: u64 = 1;
+    var agg = libwebgrep.Result{ .outcome = .complete };
+
+    while (offset < file_size) {
+        const map_off: u64 = offset & ~page_mask;
+        const delta: usize = @intCast(offset - map_off);
+        const remaining: u64 = file_size - map_off;
+        const map_len: usize = @intCast(@min(remaining, @as(u64, win_size)));
+        const valid_len: usize = map_len - delta;
+        const at_eof: bool = (offset + valid_len >= file_size);
+
+        const mapped = std.posix.mmap(
+            null,
+            map_len,
+            .{ .READ = true },
+            .{ .TYPE = .PRIVATE },
+            file.handle,
+            map_off,
+        ) catch {
+            if (offset == 0) return null;
+            return error.ReadFailed;
+        };
+        var still_mapped = true;
+        defer if (still_mapped) std.posix.munmap(mapped);
+
+        std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.SEQUENTIAL) catch {};
+        const slice = mapped[delta .. delta + valid_len];
+
+        if (offset == 0 and cfg.encoding == .auto) {
+            const bom = internal.encoding.sniff(slice, true);
+            if (bom != .raw and bom != .need_more) return null;
+        }
+
+        const chunk: []const u8 = if (at_eof)
+            slice
+        else blk: {
+            const last_nl = internal.memchr.findLast(internal.memchr.native_width, slice, 0, slice.len, sep) orelse {
+                std.posix.munmap(mapped);
+                still_mapped = false;
+                if (offset == 0) return null;
+                const rem_len: usize = @intCast(remaining);
+                const rem_mapped = std.posix.mmap(
+                    null,
+                    rem_len,
+                    .{ .READ = true },
+                    .{ .TYPE = .PRIVATE },
+                    file.handle,
+                    map_off,
+                ) catch return error.ReadFailed;
+                defer std.posix.munmap(rem_mapped);
+                std.posix.madvise(rem_mapped.ptr, rem_mapped.len, std.posix.MADV.SEQUENTIAL) catch {};
+                var rem_cfg = cfg;
+                rem_cfg.encoding = .none;
+                if (cfg.line_numbers) rem_cfg.initial_line_number = next_line_no;
+                const rem_res = try searchSliceCompiled(S, sink, rem_mapped[delta..rem_len], path, cm, rem_cfg);
+                agg.matched_lines += rem_res.matched_lines;
+                agg.matches += rem_res.matches;
+                agg.bytes_read += rem_res.bytes_read;
+                agg.bytes_searched += rem_res.bytes_searched;
+                agg.output_bytes += rem_res.output_bytes;
+                agg.outcome = rem_res.outcome;
+                if (rem_res.nul_offset) |no| {
+                    agg.nul_offset = offset + no;
+                    agg.binary_offset = offset + no;
+                }
+                agg.limit_hit = rem_res.limit_hit;
+                agg.partial = rem_res.partial;
+                agg.soft_error = rem_res.soft_error;
+                agg.scanned_all = rem_res.scanned_all;
+                return agg;
+            };
+            break :blk slice[0 .. last_nl + 1];
+        };
+
+        var win_cfg = cfg;
+        win_cfg.encoding = .none;
+        if (cfg.line_numbers) win_cfg.initial_line_number = next_line_no;
+        if (comptime @hasField(S, "last_line_number")) {
+            sink.last_line_number = 0;
+            sink.last_line_offset = 0;
+        }
+
+        const res = try searchSliceCompiled(S, sink, chunk, path, cm, win_cfg);
+
+        agg.matched_lines += res.matched_lines;
+        agg.matches += res.matches;
+        agg.bytes_read += res.bytes_read;
+        agg.bytes_searched += res.bytes_searched;
+        agg.output_bytes += res.output_bytes;
+
+        if (res.outcome == .binary_quit or res.outcome == .binary_matched or res.outcome == .stopped) {
+            agg.outcome = res.outcome;
+            if (res.nul_offset) |no| {
+                agg.nul_offset = offset + no;
+                agg.binary_offset = offset + no;
+            }
+            agg.limit_hit = res.limit_hit;
+            agg.partial = res.partial;
+            agg.soft_error = res.soft_error;
+            return agg;
+        }
+
+        if (cfg.line_numbers and !at_eof) {
+            if (comptime @hasField(S, "last_line_number")) {
+                if (sink.last_line_number != 0 and sink.last_line_offset <= chunk.len) {
+                    const tail_start: usize = @intCast(sink.last_line_offset);
+                    next_line_no = sink.last_line_number + internal.memchr.count(internal.memchr.native_width, chunk, tail_start, chunk.len, sep);
+                } else {
+                    next_line_no += internal.memchr.count(internal.memchr.native_width, chunk, 0, chunk.len, sep);
+                }
+            } else {
+                next_line_no += internal.memchr.count(internal.memchr.native_width, chunk, 0, chunk.len, sep);
+            }
+        }
+
+        offset += chunk.len;
+    }
+
+    agg.scanned_all = true;
+    return agg;
+}
+
 fn searchSingleFileWithSink(
     comptime S: type,
     gpa: std.mem.Allocator,
@@ -479,6 +674,26 @@ fn searchSingleFileWithSink(
         const st = file.stat(io) catch null;
         if (st) |info| {
             if (info.kind == .file and info.size > 0 and info.size <= std.math.maxInt(usize)) {
+                if ((comptime builtin.os.tag == .linux) and
+                    !can_parallel and
+                    !is_coded and
+                    !cfg.multiline and
+                    !isMultilineCompiled(cm) and
+                    cfg.binary != .report and
+                    cfg.byte_range == null and
+                    cfg.resume_from == 0 and
+                    cfg.before == null and
+                    cfg.after == null and
+                    cfg.context == 0 and
+                    cfg.max_count == null and
+                    cfg.max_results == null and
+                    !cfg.exists and
+                    info.size > 12 * 1024 * 1024)
+                {
+                    if (try searchWindowedMmap(S, file, info.size, path, sink, cm, cfg)) |res| {
+                        return res;
+                    }
+                }
                 var mm = std.Io.File.MemoryMap.create(io, file, .{
                     .len = @intCast(info.size),
                     .offset = 0,
@@ -512,13 +727,7 @@ fn searchSingleFileWithSink(
                             .none => unreachable,
                         };
                     }
-                    return switch (cm.*) {
-                        .finder => |*f| libwebgrep.searchSlice(S, sink, mapped.memory, path, f, cfg),
-                        .multi => |*m| libwebgrep.searchSlice(S, sink, mapped.memory, path, m, cfg),
-                        .regex => |*r| libwebgrep.searchSlice(S, sink, mapped.memory, path, r, cfg),
-                        .regex_set => |*rs| libwebgrep.searchSlice(S, sink, mapped.memory, path, rs, cfg),
-                        .none => unreachable,
-                    };
+                    return searchSliceCompiled(S, sink, mapped.memory, path, cm, cfg);
                 }
             }
         }

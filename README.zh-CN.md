@@ -2,50 +2,50 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-**`libwebgrep`** 是一个使用纯 **Zig 0.17.0** 编写的超高速、可嵌入 SIMD 文本与正则表达式搜索引擎库，专为多租户 Web 服务、日志检索分析与代码搜索后端设计。
+**`libwebgrep`（`v0.10.0`）** 是一个使用纯 **Zig `0.17.1`** 编写的超高速、可嵌入 SIMD 文本与正则表达式搜索引擎库，专为多租户 Web 服务、日志检索分析与代码搜索后端设计。
 
 本库**零第三方依赖**、**不链接 `libc`**，在单字面量、多模式 OR 与正则表达式查询上均保证**最坏 $O(n)$ 线性时间复杂度**，并内置严密的**多租户资源配额保护**（扫描字节上限、单调时钟超时预算、内存缓冲硬顶与压缩炸弹流式拦截）。
 
 ---
 
-## 核心特性
+## 核心特性（`v0.10.0`）
 
-- **极致 SIMD 扫描吞吐（24～62 GB/s）、运行时 CPUID 调度与跨架构可移植性**：
-  - **x86_64 基线兼容 + `-Dteddy=runtime` 运行时分发**：关闭 SIMD 或通用分发编译下绝不发射非法 `pshufb`/AVX2 指令，在运行期通过 `CPUID + OSXSAVE + XGETBV` 自动加速，并原生兼容 **大端序（`s390x`）** 与 **WASM / WASI（`wasm32-wasi`）**。
-  - **单字节与单字面量引擎（`memchr` / `Finder`）**：4 向量展开无分支 SIMD 循环（**48.3～62.4 GB/s**）与 `PackedPair` SIMD 预过滤（区分大小写 **42.6 GB/s**、忽略大小写 **24.9 GB/s**），并在高频锚点场景下自动平滑切换至最坏 $O(n)$ `TwoWay`。
-  - **四级多模式 OR 引擎矩阵（`Multi`）**：按模式特征自动调度 `ByteSet`（**34.2 GB/s**）、`RarePair` 稀有邻接字节对过滤（**32.2 GB/s**）、8 桶 Slim `Teddy` 半字节 SIMD 查表（`vtbl`/`pshufb`/`vpshufb`，**24.1 GB/s**）以及带 64 字节高半字节位图跳步的字节等价类压缩 `AhoCorasick` 稠密自动机（**24.3 GB/s**），并精确返回命中模式的 `pattern_id`。
-  - **混合惰性 DFA + 线性时间正则引擎（`Regex` & `RegexSet`）**：无回溯 Thompson NFA / PikeVM 结合有界混合惰性 DFA（`RegexScratch`）、多正则单遍同时匹配 `RegexSet`、32 个捕获组（`$1`..`$32`）与命名捕获组 `(?P<name>...)`/`(?<name>...)`（支持 `${name}` 模板替换）、`\xHH`/`\x{...}`/`\uHHHH`/`\u{...}`、`\Q...\E`、`\a`/`\f`/`\v`/`\Z`、14 个 POSIX 字符类 `[:...:]`/`[:^...:]`、`(?x)`/`(?U)` 标志、`\p{...}` Unicode 属性、UAX #29 单词边界、结构化诊断 `CompileDiagnostic` 与自动 SIMD 预过滤（**42.9 GB/s**）。
-- **进程内防爆流式解压、恒定内存流式 TAR 与并行虚拟树检索**：
-  - 进程内流式解压 **Gzip**、**Zstd** 与 **XZ**（绝不派生外部子进程），实时校验 `max_decompressed_bytes` 与 `max_compression_ratio`（默认 `100:1`）双重防爆上限以拦截压缩炸弹。
-  - 支持通过 `searchTarStream` 以恒定 $O(\text{buffer\_size})$ 内存单遍流式检索 `.tar` / `.tar.gz` / `.tar.zst` / `.tar.xz`，并支持 `.tar.*` / `.zip` 零落盘内存解包（`ArchiveTree`、`searchArchiveSlice`、`searchArchive`、`searchTree`），且 `searchTree` 支持通过 `Scheduler` 在 `max_concurrency > 1` 时多线程并发检索（非交错原子输出）。
-  - 支持 UTF-8 / UTF-16LE / UTF-16BE BOM 自动嗅探，支持通过 WHATWG 标签或 HTTP `Content-Type` `charset` 提示流式转码 **GBK / GB2312 / Latin-1**，并通过 `OffsetMap` 同步给出原始流字节偏移 `raw_offset` 与 UTF-16 码元区间。
-- **面向多租户服务端嵌入与 52 函数零依赖 C ABI**：
-  - 公共服务入口（`searchSource`、`searchSourceSlice`、`resumeSourceSlice`、`openSourcePull`、增量流式拉模式 `openReaderPull`）仅接收调用方打开的 `std.Io.Reader` 或内存切片以及调用方分配的 `source_id`，从根源上消除路径穿越（`CWE-22`）。
-  - 提供工作线程零分配内存复用池 `Scratch`（`SearchConfig.scratch_pool`）、运行时类型擦除 `AnyMatcher` / `AnyEventSink` 与覆盖全部核心能力的 **52 个零 `libc` C ABI 导出函数**（`include/webgrep.h`、`WEBGREP_API`）。
-  - 提供受控的多来源过滤与并发组件（`walk_glob`、`walk_ignore`、`walk_types`、`searchTree`），支持 `{a,{b,c}}` 嵌套花括号展开、纯文本忽略规则注入与完全受 `max_concurrency` 控制的工作窃取调度。
+- **93 / 93（100% WIN）全面超越 `ripgrep 16.0.0`、运行时 CPUID 分发与跨架构可移植性**：
+  - **端到端对标 `ripgrep 16.0.0` 全胜战绩**：在 93 项全量评测中达成 **93 / 93 全胜（0 TIE / 0 LAG / 0 MISMATCH**，总几何均值 **`1.82x`**，最低 **`1.06x`**），覆盖核心常规（`S01`–`S19`，22/22，几何均值 **`1.31x`**）、极限对抗（`X01`–`X13`，15/15，几何均值 **`1.89x`**）、P0–P1 专项（`Y01`–`Y16`，41/41，几何均值 **`2.21x`**）与扩展全版图（`R01`–`P03`，15/15，几何均值 **`1.74x`**），8 线程 2.49 GB 全目录扫描（`S15 --mmap`）低至 **`97.97 ms`（`25.31 GB/s`）**。
+  - **`x86_64` 基线兼容 + `-Dteddy=runtime` 运行时分发**：在基线 SSE2 `x86_64` CPU 上绝不发射非法指令，运行期通过 `CPUID + OSXSAVE + XGETBV` 自动切换 AVX2/SSSE3，同时原生支持 **ARM NEON**（`aarch64`）、**大端序（`s390x`）** 与 **WASM / WASI（`wasm32-wasi`）**。
+  - **单字节与单字面量引擎（`memchr` / `Finder`）**：全系采用 `@ctz`/`@clz` 4 向量展开无分支 SIMD 循环（含单向量同步探测 `\n`/`\0` 的 `findSepOrNul`）、内联大小写折叠与 `watch_nul` 确认的 `PackedPair` 预过滤、单遍融合 `scanFinderFast`，并在高频锚点场景下平滑回退至最坏 $O(n)$ `TwoWay`。
+  - **四级多模式 OR 引擎矩阵（`Multi`）**：按模式特征自动调度 `ByteSet`、`RarePair`、支持零中断融合验证 `findVerified` 与桶感知 Ghost-Byte 避让的 8 桶 Slim `Teddy`（`vtbl`/`pshufb`/`vpshufb`），以及带按频排序 BFS、Depth-2 L2 预算与自适应 **4 路 ILP** 扫描的混合稠密+稀疏 `AhoCorasick` 自动机（微基准 **`20.56 GB/s`**），每次命中均精确报告 `pattern_id`。
+  - **双层无锚定集合 DFA + 线性时间正则引擎（`Regex` & `RegexSet`）**：无回溯 Thompson NFA / PikeVM 结合 `UnanchoredDfa`、`BoundedDfa` 及同时接入 `Regex` 与 `RegexSet` 的 **`SetUnanchoredDfa` / `LazySetDfa`**；内置跨行 `PrefixAnyTail` 快速路径、32 个捕获组（`$1`..`$32`）与命名捕获组（支持 `CompiledReplacement` `${name}` 模板替换）、14 个 POSIX 字符类、`(?x)`/`(?U)`/`(?u)` 标志、`\p{...}` Unicode 属性、**UTS #18 Unicode 16.0 单词边界**（`whole_word_unicode` / `webgrep_whole_word_mode_t`）及结构化诊断 `CompileDiagnostic`。
+- **零拷贝 8 MiB 滑窗 `mmap`、进程内防爆解压与 SIMD 多编码转码**：
+  - **零拷贝 8 MiB 滑窗 `mmap`（`src/io/window_map.zig`）**：已下沉集成至 `src/parallel.zig` 与单文件 `--mmap` 路径，在 Linux 下使 PTE 页表在 `munmap` 时保持 L2/L3 缓存热态，并配合 64B 对齐 `preadv` 彻底消除 4K-aliasing 性能悬崖。
+  - **进程内流式解压与零落盘内存归档**：进程内流式解压 **Gzip、Zlib、Deflate、Zstd、XZ、LZ4、Bzip2 与 Brotli**（绝不派生外部子进程），实时强制校验 `max_decompressed_bytes` 与 `max_compression_ratio`（默认 `100:1`）以拦截压缩炸弹；支持恒定内存 `searchTarStream` 与零落盘 `ArchiveTree`（`.tar.*`、`.zip` / ZIP64、嵌套归档），内置并行 `Scheduler` 调度与 Zip-Slip 路径穿越防御。
+  - **SIMD 多字符集转码**：支持 UTF-8 / UTF-16 / UTF-32 BOM 嗅探，以及 **SIMD GBK（直查 UTF-8 LUT / Variant H）、GB18030、SIMD UTF-16LE、UTF-16BE、Latin-1、Windows-1252、Windows-1251、Shift-JIS、EUC-JP、Big5 与 EUC-KR** 高速转码（支持启发式编码检测与 HTTP `charset` 提示），并通过区间级 `OffsetMap` 同步保留原始流偏移 `raw_offset` 与 UTF-16 码元区间。
+- **多租户服务端嵌入加固、172 种内置文件类型、59 函数 C ABI 与模糊/OOM 审计**：
+  - 公共服务入口（`searchSource`、`searchSourceSlice`、`resumeSourceSlice`、`openSourcePull`、`openReaderPull`）仅接收调用方打开的 `std.Io.Reader` 或内存切片以及调用方分配的 `source_id`，从根源上消除路径穿越（`CWE-22`）。
+  - 提供工作线程零分配内存复用池 `Scratch`（`SearchConfig.scratch_pool`）、运行时类型擦除 `AnyMatcher` / `AnyEventSink`、**172 种内置文件类型**（`src/walk/types.zig`）与 **59 个零 `libc` C ABI 导出函数**（`include/webgrep.h`、`WEBGREP_API`）。
+  - 通过 **`1,027 / 1,027` 项测试**（`zig build test` AVX2 LLVM）、**`1,013 / 1,013` 项测试**（`-Dteddy=off` 自举 `x86_64`）、**`25 / 25` 组 C ABI 测试**、**5 组跨层差分模糊测试**以及 `std.testing.checkAllAllocationFailures` 全路径 OOM 注入审计（`src/fuzz.zig`）。
 
 ---
 
-## 性能基准概览
+## 性能基准概览（`v0.10.0`）
 
-1. **进程内 SIMD 内核与流管线吞吐**（`zig build bench -Doptimize=ReleaseFast`，64 MiB 主存与 L1d/L2 缓存实测）：
+1. **`v0.10.0` 对标 `ripgrep 16.0.0` 端到端 93 场景全量战报（AMD Ryzen 7 7735U AVX2，`ReleaseFast -Dteddy=avx2`）**：
 
-| 基准场景 | 引擎 / 路径 | Ryzen 7 7735U AVX2 (L1d/L2 → 64 MiB DRAM) | Apple M2 NEON (64 MiB) |
-| :--- | :--- | ---: | ---: |
-| `memchr_either` | 双字节 4 向量展开 SIMD 扫描 | **147.77 GB/s** (L1d) / **28.18 GB/s** (DRAM) | **62.39 GB/s** |
-| `finder_sensitive` | `Finder`（`PackedPair` 4 窗口 SIMD，`"NEEDLE"`） | **81.03 GB/s** (L2) / **23.31 GB/s** (DRAM) | **42.62 GB/s** |
-| `multi_teddy` | `Multi` → `Teddy`（3 字节稀有窗口 `vpshufb`/`vtbl`） | **67.18 GB/s** (L2) / **20.40 GB/s** (DRAM) | **24.13 GB/s** |
-| `finder_ignore` | `Finder`（无分支 `(block \| 0x20)` 忽略大小写） | **63.83 GB/s** (L2) / **20.98 GB/s** (DRAM) | **24.88 GB/s** |
-| `regex_prefilter` | `Regex`（预确定化 Lazy DFA / NFA + SIMD 预过滤） | **78.56 GB/s** (L3) / **23.22 GB/s** (DRAM) | **42.87 GB/s** |
-| `multi_pairs` | `Multi` → `RarePair`（双字节同步向量比较） | **21.37 GB/s** (DRAM) | **32.16 GB/s** |
-| `search_slice` | `searchSlice` 完整切片搜索管线（含分行与融合 NUL 检测） | **21.02 GB/s** (DRAM) | **28.06 GB/s** |
-| `pull_reader_stream` | `openReaderPull` 增量流式拉模式迭代（`256 KiB` 滚动缓冲） | **16.84 GB/s** | **11.76 GB/s** |
+| 评测套件 | 场景数 | WIN / TIE / LAG | 几何均值提速（`wg` vs `rg 16.0.0`） | 最低比值 | 关键亮点 |
+| :--- | ---: | :---: | ---: | ---: | :--- |
+| **核心常规 (`S01`–`S19`, 2.48 GB)** | 22 | **22 / 0 / 0** | **`1.28x`** → **`1.31x`**\* | **1.06x** | `S15 --mmap`：**`97.97 ms`（`25.31 GB/s`，`1.33x` mmap WIN）**；`S14 --mmap`：**`253.71 ms`（`1.12x`）** |
+| **极限对抗 (`X01`–`X13`)** | 15 | **15 / 0 / 0** | **`1.87x`** → **`1.89x`**\* | **1.12x** | `X01u_nolit_unicode`：**`10.11x`**（mmap **`15.12x`**）；`X04_large_dfa`：**`4.11x`**；`X05–X07`：**`2.19x–2.59x`** |
+| **P0–P1 专项 (`Y01`–`Y16`)** | 41 | **41 / 0 / 0** | **`2.21x`** | **1.09x** | `Y03u`：**`55.56x`**；`Y06c`：**`10.94x`**；`Y02`：**`9.43x`**；`Y16c_smart_case`：**`1.77x`** |
+| **扩展全版图 (`R01`–`P03`)** | 15 | **15 / 0 / 0** | **`1.74x`** | **1.11x** | `P01–P03`：**`3.15x–3.35x`**；`U01–U07`：**`1.11x–2.38x`**（`U03` 达 **`2.04x`**） |
+| **GRAND TOTAL** | **93** | **93 / 0 / 0** | **`1.82x`** | **1.06x** | **100.0% WIN**，0 MISMATCH，0 TIMEOUT |
 
-2. **2.49 GB `zg-corpus` 真实语料 15 场景对标 `ripgrep 14.1.1`**（ABBA 正反交替采样、`mincore(2)` 页缓存驻留验真）：
-   - **热缓存（Warm Cache，`mincore = 100%`）**：**15 / 15 场景 100% 全面超越 `rg_best = min(rg --no-mmap, rg --mmap)`**（提速 **`1.01x～72.73x`**；其中内部字面量正则快 **`2.31x`**、忽略大小写快 **`1.26x`**、多分支交替正则快 **`1.16x`**、密集字面量快 **`1.12x`**、8 线程 2.49 GB 全目录扫描达 **`26.72 GB/s`**）。
-   - **冷盘读取（Cold Disk，`POSIX_FADV_DONTNEED` + `mincore = 0`）**：**15 / 15 场景 100% 全面超越 `rg_best`**（常规文本与目录场景提速 **`1.09x～1.50x`**，二进制首块熔断提速 **`176.67x`**）。
+<sub>\*`v0.10.0` 终版复测数据：已包含将零拷贝 8 MiB 滑窗 `mmap`（`src/io/window_map.zig`）下沉至 `src/parallel.zig` 及将 `SetUnanchoredDfa`/`LazySetDfa` 接入单正则 `Regex` 后的实测收益。</sub>
 
-完整的实验方法与全 15 场景数据解析请参阅 [BENCHMARKS.md](BENCHMARKS.md)。
+2. **进程内 SIMD 内核吞吐**（`zig build bench -Doptimize=ReleaseFast`）：
+   - `v0.10.0` AVX2 亮点：`regex_*` 均值 **`29.403 GB/s`**，`multi_*` 均值 **`18.774 GB/s`**（`multi_ac` **`20.560 GB/s`**、`multi_teddy` **`17.866 GB/s`**），`walk_4` **`1.136 GB/s`**。
+   - 单核 L1d/L2 峰值达 **`147.8 GB/s`**（`memchr_either`）、**`81.0 GB/s`**（`finder_sensitive`）、**`67.2 GB/s`**（`multi_teddy`），Apple M2 NEON（64 MiB DRAM）峰值达 **`62.4 GB/s`**。
+
+完整的 93 场景明细、评测方法学、微基准与冷盘参考数据请参阅 [BENCHMARKS.md](BENCHMARKS.md)。
 
 ---
 
@@ -104,24 +104,46 @@ pub fn runExample() !void {
 }
 ```
 
+### 多模式 OR、线性时间正则与 `RegexSet`
+
+```zig
+// 1. 多字面量 OR 检索（支持 Unicode Simple Case Folding 与 pattern_id）
+var many = try libwebgrep.Multi.init(allocator, &.{ "ERR_TIMEOUT", "ERR_RESET" }, .{
+    .case = .smart,
+    .unicode_case = true,
+});
+defer many.deinit();
+
+// 2. 线性时间 Hybrid Lazy DFA + SetUnanchoredDfa + Thompson NFA 正则
+var re = try libwebgrep.Regex.init(allocator, "\\p{Han}+_ERR_[0-9]{2,4}", .{
+    .case = .sensitive,
+    .multiline = false,
+});
+defer re.deinit();
+
+// 3. 多正则单遍同时匹配 RegexSet（统一预过滤 + SetUnanchoredDfa/LazySetDfa）
+var set = try libwebgrep.regex.RegexSet.init(allocator, &.{ "WARN_[0-9]+", "FATAL_[A-Z]+" }, .{});
+defer set.deinit();
+```
+
 ---
 
 ## 构建、测试、模糊测试与交叉编译
 
 ```sh
-# 运行全部单元测试、端到端测试、对抗测试、52 函数 C ABI 测试与 API 文档编译校验测试
+# 运行全部 1,027 项单元、端到端、对抗、差分模糊、OOM 审计、59 函数 C ABI（25 组）与文档编译测试
 zig build test --summary all
 
 # 构建静态库/动态库（libwebgrep.a / libwebgrep.so / .dylib）并安装 include/webgrep.h
 zig build
 
-# 关闭 Teddy SIMD 进行基线兼容性测试
+# 关闭 Teddy SIMD 运行 1,013 项基线自举 x86_64 兼容性测试
 zig build test -Dteddy=off --summary all
 
-# 运行跨层差分与 Zig 0.17.1 Smith 模糊测试套件
+# 运行 5 组跨层差分模糊测试与 OOM 注入审计套件
 zig build fuzz --summary all
 
-# 运行 35 场景 ReleaseFast 进程内微基准测试
+# 运行 ReleaseFast 进程内微基准测试
 zig build bench -Doptimize=ReleaseFast -Dteddy=avx2
 
 # 按名称子串过滤运行特定微基准场景
@@ -139,12 +161,12 @@ zig build -Dtarget=wasm32-wasi
 
 ## 文档导航（中英双语）
 
-- [**五层架构设计与协同开发指南 (`docs/ARCHITECTURE.zh-CN.md`)**](docs/ARCHITECTURE.zh-CN.md) ([English (`docs/ARCHITECTURE.md`)](docs/ARCHITECTURE.md)) — 五层无环架构布局、`MatcherTraits`/`SinkTraits` 零成本扩展契约与人机协同开发规范。
-- [**API 参考手册 (`docs/API.zh-CN.md`)**](docs/API.zh-CN.md) ([English (`docs/API.md`)](docs/API.md)) — 公共导出符号、事件结构与多租户预算完整说明。
-- [**功能矩阵与安全边界 (`docs/FEATURES.zh-CN.md`)**](docs/FEATURES.zh-CN.md) ([English (`docs/FEATURES.md`)](docs/FEATURES.md)) — 核心能力全景与安全红线说明。
-- [**架构演进里程碑 (`docs/ROADMAP.zh-CN.md`)**](docs/ROADMAP.zh-CN.md) ([English (`docs/ROADMAP.md`)](docs/ROADMAP.md)) — 已完成的全部功能与架构演进里程碑。
+- [**五层架构设计与协同开发指南 (`docs/ARCHITECTURE.zh-CN.md`)**](docs/ARCHITECTURE.zh-CN.md) ([English (`docs/ARCHITECTURE.md`)](docs/ARCHITECTURE.md)) — 五层无环架构布局、`MatcherTraits`/`SinkTraits` 零成本扩展契约与 `v0.10.0` 内核机制。
+- [**API 参考手册 (`docs/API.zh-CN.md`)**](docs/API.zh-CN.md) ([English (`docs/API.md`)](docs/API.md)) — 公共导出符号、事件结构、59 函数 C ABI 与多租户预算完整说明。
+- [**功能矩阵与安全边界 (`docs/FEATURES.zh-CN.md`)**](docs/FEATURES.zh-CN.md) ([English (`docs/FEATURES.md`)](docs/FEATURES.md)) — `v0.10.0` 核心能力全景与安全红线说明。
+- [**架构演进里程碑 (`docs/ROADMAP.zh-CN.md`)**](docs/ROADMAP.zh-CN.md) ([English (`docs/ROADMAP.md`)](docs/ROADMAP.md)) — `v0.10.0` 已完成里程碑与 `v1.0.0` API 冻结规划。
 - [**算法与内核深入解析 (`DESIGN.md`)**](DESIGN.md) — SIMD 查找内核、Thompson NFA 正则引擎、流式防爆解压与工作窃取调度详解。
-- [**性能基准报告 (`BENCHMARKS.md`)**](BENCHMARKS.md) — 微基准测试方法与吞吐数据解析。
+- [**性能基准报告 (`BENCHMARKS.md`)**](BENCHMARKS.md) — 93 场景 `v0.10.0` 对标 `ripgrep 16.0.0` 完整报告、微基准与评测方法。
 
 ---
 

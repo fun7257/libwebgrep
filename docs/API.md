@@ -2,7 +2,7 @@
 
 [English](API.md) | [简体中文](API.zh-CN.md)
 
-This document is the complete reference for all public declarations exported by `src/root.zig`. Importing the module as `@import("libwebgrep")` gives access to every type, function, and submodule documented below.
+This document is the complete reference for **libwebgrep v0.10.0** (Zig `0.17.1`, zero-libc, 59 exported C ABI functions) covering all public declarations exported by `src/root.zig` and `include/webgrep.h`. Importing the module as `@import("libwebgrep")` gives access to every type, function, and submodule documented below.
 
 `libwebgrep` searches byte streams and in-memory slices provided by the caller. Entry points that allocate or perform I/O accept an explicit `std.mem.Allocator` and `std.Io`. Pure in-memory slice search requires neither. The library holds no mutable global state.
 
@@ -607,15 +607,15 @@ Adapter wrapping a `GzipIndex` and a compressed `RandomAccess` source into an un
 
 ### archive
 
-Re-exports `src/codec/archive.zig`, providing zero-disk-landing in-memory archive unpacking (`ArchiveFormat`, `ArchiveEntryMeta`, `ArchiveOptions`, `ArchiveError`, `ArchiveTree`) for `.tar` (USTAR, GNU `@LongLink`, PAX `path=`/`size=`), `.tar.gz`/`.tgz`, `.tar.zst`, `.tar.xz`, and `.zip` (Store & Deflate).
+Re-exports `src/codec/archive.zig`, providing zero-disk-landing in-memory archive unpacking (`ArchiveFormat`, `ArchiveEntryMeta`, `ArchiveOptions`, `ArchiveError`, `ArchiveTree`) for `.tar` (USTAR, GNU `@LongLink`, PAX `path=`/`size=`), `.tar.gz`/`.tgz`, `.tar.zst`, `.tar.xz`, `.tar.bz2`, `.tar.lz4`, and `.zip` (Store & Deflate).
 
 ### ArchiveFormat
 
 ```zig
-pub const ArchiveFormat = enum { auto, tar, tar_gz, tar_zst, tar_xz, zip };
+pub const ArchiveFormat = enum { auto, tar, tar_gz, tar_zst, tar_xz, tar_bz2, tar_lz4, zip };
 ```
 
-Archive container format selector (`auto` sniffs magic bytes for `.zip`, `.tar.gz`, `.tar.zst`, `.tar.xz`, and `.tar`).
+Archive container format selector (`auto` sniffs magic bytes for `.zip`, `.tar.gz`, `.tar.zst`, `.tar.xz`, `.tar.bz2`, `.tar.lz4`, and `.tar`).
 
 ### ArchiveEntryMeta
 
@@ -640,6 +640,7 @@ Sanitized archive entry metadata passed to `ArchiveOptions.entry_filter` strictl
 | `max_entry_bytes` | `u64` | `64 MiB` | Maximum uncompressed bytes for a single entry (`error.ArchiveLimit`) |
 | `max_total_bytes` | `u64` | `256 MiB` | Maximum total uncompressed bytes across the archive (`error.ArchiveLimit`) |
 | `max_compression_ratio` | `u64` | `100` | Maximum decompression expansion ratio (`error.ArchiveLimit`) |
+| `max_archive_depth` | `usize` | `0` | Maximum nesting depth for expanding inner archives (e.g. `.tar.gz` inside `.zip`); `0` disables nested expansion |
 | `entry_filter` / `entry_filter_ctx` | `?fn` / `?*anyopaque` | `null` | Optional pre-decompression callback `(ctx, ArchiveEntryMeta) -> bool`; returning `false` skips the entry before decompression and quota checks |
 
 ### ArchiveError
@@ -813,14 +814,14 @@ pub fn resetStats(self: *const Regex) void
 ```
 
 Supported regular expression syntax:
-- Literals and escapes: `\d`, `\D`, `\w`, `\W`, `\s`, `\S`, `\b`, `\B` (UAX #29 Unicode word boundaries when `unicode_case = true`), `\A`, `\z`, `\Z` (before optional trailing `\n` at end of input), `\n`, `\r`, `\t`, `\a`, `\f`, `\v`, `\xHH`, `\x{H...}`, `\uHHHH`, `\u{H...}`, literal quoting `\Q...\E`, and escaped metacharacters.
+- Literals and escapes: `\d`, `\D`, `\w`, `\W`, `\s`, `\S` (ASCII by default, or full Unicode classes when `unicode_classes = true` or `(?u)` is active), `\b`, `\B` (UTS #18 Unicode 16.0 word boundaries `Alphabetic | M | Nd | Pc | Join_Control` when `unicode_word_boundary = true` / `(?u)`, or ASCII `[0-9A-Za-z_]` when `unicode_word_boundary = false` / `(?-u)`), `\A`, `\z`, `\Z` (before optional trailing `\n` at end of input), `\n`, `\r`, `\t`, `\a`, `\f`, `\v`, `\xHH`, `\x{H...}`, `\uHHHH`, `\u{H...}`, literal quoting `\Q...\E`, and escaped metacharacters.
 - Unicode General Category & Script properties: `\p{L}`, `\p{Lu}`, `\p{Ll}`, `\p{N}`, `\p{Nd}`, `\p{P}`, `\p{S}`, `\p{Sc}`, `\p{Z}`, `\p{ASCII}`, `\p{Han}`, `\p{Hiragana}`, `\p{Katakana}`, `\p{Greek}`, `\p{Cyrillic}`, `\p{Latin}`, and negated `\P{...}` (`src/tables/unicode_prop_table.zig`).
 - Wildcard and anchors: `.` (any valid UTF-8 codepoint except `\n`, or including `\n` when `dot_all = true` and `multiline = true`), `^` (start of line/input), `$` (end of line/input).
 - Character classes: `[a-z0-9_]`, multi-byte UTF-8 classes `[你好α-ω]`, negated `[^a-z]` or `[!a-z]`, all 14 POSIX character classes (`[:alnum:]`, `[:alpha:]`, `[:ascii:]`, `[:blank:]`, `[:cntrl:]`, `[:digit:]`, `[:graph:]`, `[:lower:]`, `[:print:]`, `[:punct:]`, `[:space:]`, `[:upper:]`, `[:word:]`, `[:xdigit:]`) and negated `[:^...:]`, plus shorthand/property classes inside brackets.
 - Quantifiers: `*`, `+`, `?`, `{m}`, `{m,}`, `{m,n}` (greedy and lazy `*?`, `+?`, `??`, `{m,n}?`, operating on complete UTF-8 codepoints; sense inverted under `(?U)` ungreedy mode).
-- Alternation, grouping, and inline flags: `a|b`, numbered capture groups `(expr)` and named capture groups `(?P<name>expr)` / `(?<name>expr)` (`$1`..`$32` / `${name}`), `(?:expr)`, inline and scoped flags `(?i)`, `(?m)`, `(?s)`, `(?U)`, `(?x)` (extended whitespace & `#` comments), `(?-imsUx)`, `(?imsUx:expr)`.
+- Alternation, grouping, and inline flags: `a|b`, numbered capture groups `(expr)` and named capture groups `(?P<name>expr)` / `(?<name>expr)` (`$1`..`$32` / `${name}`), `(?:expr)`, inline and scoped flags `(?i)`, `(?m)`, `(?s)`, `(?U)`, `(?u)`, `(?x)` (extended whitespace & `#` comments), `(?-imsUux)`, `(?imsUux:expr)`.
 
-Executes a bounded Hybrid Lazy DFA for eligible patterns with lockstep Thompson NFA / PikeVM fallback, guaranteeing worst-case $O(n)$ time complexity, immunity to catastrophic backtracking (ReDoS), and lock-free `*const Regex` concurrency.
+Executes a multi-tier linear-time engine: SIMD literal/alternation prefiltering, a specialized `PrefixAnyTail` fast path for multiline and single-line `<prefix_lit>.{min,max}<tail_lit>` / `<prefix_lit>.*<tail_lit>` patterns, an AOT `UnanchoredDfa` + bounded Hybrid Lazy DFA, and—for complex literal-less single `Regex` patterns exceeding `UnanchoredDfa`'s cap—the same two-tier unanchored multi-table DFA (`SetUnanchoredDfa` Tier A + `LazySetDfa` Tier B) used by `RegexSet`, with lockstep Thompson NFA / PikeVM fallback and compiled linear capture plans (`extractCaptures`). Guarantees worst-case $O(n)$ time complexity, immunity to catastrophic backtracking (ReDoS), and lock-free `*const Regex` concurrency.
 
 ### RegexScratch
 
@@ -843,21 +844,26 @@ pub fn initDiagnostic(allocator: std.mem.Allocator, patterns: []const []const u8
 pub fn deinit(self: *RegexSet) void
 pub fn isMatch(self: *const RegexSet, haystack: []const u8) bool
 pub fn find(self: *const RegexSet, haystack: []const u8, start: usize, mode: MatchMode) ?Match
+pub fn findWatched(self: *const RegexSet, haystack: []const u8, start: usize, nul: *?usize) ?Match
+pub fn findEnd(self: *const RegexSet, haystack: []const u8, start: usize, mode: MatchMode) ?usize
+pub fn findEndWatched(self: *const RegexSet, haystack: []const u8, start: usize, mode: MatchMode, nul: *?usize) ?usize
 pub fn matches(self: *const RegexSet, haystack: []const u8, out_ids: []u32) usize
 ```
 
-Compiles up to `1,024` regular expressions into a combined Thompson NFA with `match_id` accepting states and an automatic `Multi` SIMD prefix prefilter when all patterns have extractable literal prefixes. Evaluates all patterns in a single pass, reporting the winning `Match.pattern_id` in `find()` or writing all matching 0-based pattern IDs in ascending order into `out_ids` via `matches()`.
+Compiles up to `1,024` regular expressions into a combined Thompson NFA accelerated by a unified `RegexSet` SIMD prefilter (`Multi` prefix/inner/exact literal prefiltering with next-byte mask verification), per-pattern stack-buffered NFA verification, and a two-tier unanchored set DFA (`SetUnanchoredDfa` Tier A + `LazySetDfa` Tier B) for literal-less or mixed pattern sets. Evaluates all patterns in a single lock-free `*const RegexSet` pass, reporting the winning `Match.pattern_id` in `find()` or writing all matching 0-based pattern IDs in ascending order into `out_ids` via `matches()`.
 
 ### DiagnosticCode
 
-Structured error classification enum for `CompileDiagnostic` (`none`, `unexpected_end_of_pattern`, `invalid_escape`, `invalid_hex_escape`, `invalid_unicode_escape`, `unknown_unicode_property`, `invalid_posix_class`, `unclosed_group`, `unmatched_close_paren`, `invalid_group_name`, `duplicate_group_name`, `unclosed_char_class`, `invalid_char_range`, `dangling_quantifier`, `invalid_repeat_quantifier`, `repeat_quantifier_too_large`, `unrecognized_inline_flag`, `invalid_utf8`, `pattern_has_newline`, `recursion_depth_exceeded`, `instruction_limit_exceeded`, `multiline_window_exceeded`, `pattern_count_exceeded`, `pattern_bytes_exceeded`, `out_of_memory`).
+Structured error classification enum for `CompileDiagnostic` (`none`, `empty_pattern`, `unclosed_group`, `unmatched_close_paren`, `unclosed_char_class`, `invalid_char_range`, `dangling_quantifier`, `invalid_repeat_bounds`, `unclosed_repeat_braces`, `invalid_escape`, `unknown_unicode_property`, `unclosed_unicode_property`, `invalid_inline_flags`, `invalid_group_name`, `duplicate_group_name`, `invalid_posix_class`, `trailing_backslash`, `invalid_utf8`, `recursion_depth_exceeded`, `instruction_limit_exceeded`, `multiline_window_exceeded`, `pattern_has_newline`, `pattern_limit_exceeded`, `pattern_count_exceeded`, `pattern_bytes_exceeded`).
 
 ### CompileDiagnostic
 
 ```zig
 pub const CompileDiagnostic = struct {
+    err: ?Error = null,
     code: DiagnosticCode = .none,
     offset: usize = 0,
+    byte_offset: usize = 0,
     line: usize = 1,
     column: usize = 1,
     message: []const u8 = "",
@@ -872,7 +878,9 @@ Populated by `Regex.initDiagnostic` and `RegexSet.initDiagnostic` when compilati
 | Field | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `case` | `CaseMode` | `.sensitive` | Case folding mode |
-| `unicode_case` | `bool` | `true` | Enables BMP Unicode Simple Case Folding and UAX #29 word boundaries |
+| `unicode_case` | `bool` | `true` | Enables Unicode simple case folding for multi-byte UTF-8 codepoints when case-insensitive or smart-case is active |
+| `unicode_classes` | `bool` | `false` | When `true`, `\d`/`\w`/`\s` match full Unicode classes instead of ASCII-only (also togglable inline via `(?u)` / `(?-u)`) |
+| `unicode_word_boundary` | `bool` | `true` | When `true` (default), `\b`/`\B` use UTS #18 Unicode 16.0 word boundaries (`Alphabetic \| M \| Nd \| Pc \| Join_Control`); when `false`, ASCII `[0-9A-Za-z_]` (also togglable via `(?u)` / `(?-u)`) |
 | `multiline` | `bool` | `false` | Allows matches to span across `\n` within `max_multiline_window`, and makes `^`/`$` match line boundaries |
 | `dot_all` | `bool` | `false` | When `true` alongside `multiline`, allows `.` to match `\n` |
 | `max_inst` | `?usize` | `null` | Compiled NFA instruction cap (`null` uses default `8192`, unconstrained override up to `u32` max) |
@@ -984,29 +992,34 @@ Line numbers (`line_number`), byte columns (`column`), and UTF-16 code-unit colu
 ### Encoding
 
 ```zig
-pub const Encoding = enum { auto, none, utf8, utf16le, utf16be, gbk, latin1 };
+pub const Encoding = enum {
+    auto, none, utf8, utf16le, utf16be, gbk, latin1,
+    windows1252, gb18030, shift_jis, euc_jp, big5, euc_kr,
+    windows1251, utf32le, utf32be, detect,
+};
 ```
 
-- `auto` (default): Sniffs UTF-8, UTF-16LE, and UTF-16BE BOMs at the start of the stream. If no BOM is present and `SearchConfig.charset` is provided (supporting WHATWG labels and HTTP `Content-Type` headers such as `"gbk"`, `"gb2312"`, `"utf-8"`, `"utf-16le"`, `"iso-8859-1"`, `"text/plain; charset=gbk"`), transcodes into UTF-8 automatically.
-- `utf8`, `utf16le`, `utf16be`, `gbk`, `latin1`: Explicit input encoding.
+- `auto` (default): Sniffs UTF-8, UTF-16LE, UTF-16BE, UTF-32LE, and UTF-32BE BOMs at the start of the stream. If no BOM is present and `SearchConfig.charset` is provided (supporting WHATWG labels and HTTP `Content-Type` headers such as `"gbk"`, `"gb18030"`, `"shift_jis"`, `"utf-8"`, `"utf-16le"`, `"iso-8859-1"`, `"text/plain; charset=gbk"`), transcodes into UTF-8 automatically.
+- `detect`: Heuristic encoding auto-detection when no BOM or `charset` hint is supplied.
+- `utf8`, `utf16le`, `utf16be`, `utf32le`, `utf32be`, `gbk`, `gb18030`, `shift_jis`, `euc_jp`, `big5`, `euc_kr`, `latin1`, `windows1252`, `windows1251`: Explicit input encoding. GBK and UTF-16LE paths use SIMD bulk transcoding (direct UTF-8 GBK LUT + `@ctz` SIMD ASCII prefix scans and vectorized UTF-16LE decoding) with a zero-copy `Decoder` buffer and run-level `OffsetMap` tracking.
 - `none`: Disables BOM sniffing and transcoding.
 
 ### Compression
 
 ```zig
-pub const Compression = enum { none, auto, gzip, zstd, xz };
+pub const Compression = enum { none, auto, gzip, zstd, xz, zlib, deflate, lz4, bzip2, brotli };
 ```
 
-In-process streaming decompression mode:
+In-process streaming decompression mode (analogous to `-z` / `--search-zip`, operating directly in-process over streaming chunks without buffering entire decompressed files in RAM or spawning external tools):
 - `none` (default): No decompression.
-- `auto`: Detects Gzip (`1F 8B`), Zstd (`28 B5 2F FD`), and XZ (`FD 37 7A 58 5A 00`) magic headers automatically.
-- `gzip`, `zstd`, `xz`: Explicit format decompression.
+- `auto`: Detects Gzip (`1F 8B`), Zstd (`28 B5 2F FD`), XZ (`FD 37 7A 58 5A 00`), Bzip2 (`BZh[1-9]`), and LZ4 Frame (`04 22 4D 18`) magic headers automatically; uncompressed inputs pass through with zero extra buffering.
+- `gzip`, `zstd`, `xz`, `zlib`, `deflate`, `lz4`, `bzip2`, `brotli`: Explicit format decompression.
 
-Enforces both `max_decompressed_bytes` and `max_compression_ratio` (default `100:1`, caller-configurable) on every decompressed chunk to block Zip Bombs (`LimitHit.decompressed_bytes`). Corrupted compressed streams are handled gracefully as `SoftError.read_failed`.
+Enforces both `max_decompressed_bytes` and `max_compression_ratio` (default `100:1`, caller-configurable) on every decompressed chunk to block Zip Bombs (`LimitHit.decompressed_bytes`), while maintaining run-level `OffsetMap` anchors for `raw_offset` reporting. Corrupted compressed streams are handled gracefully as `SoftError.read_failed`.
 
 ### decompress
 
-Re-exports `src/codec/decompress.zig`, providing `Compression`, `OffsetMap`, `DecompressResult`, and `decompressSlice` for in-process bomb-safe streaming decompression and raw offset mapping.
+Re-exports `src/codec/decompress.zig`, providing `Compression`, `OffsetMap`, `DecompressResult`, and `decompressSlice` for in-process bomb-safe streaming decompression (`-z` equivalent) and raw offset mapping.
 
 ---
 
@@ -1179,7 +1192,8 @@ All multi-tenant budgets are configured via `SearchConfig` and enforced determin
 | `stream_offset` | `?u64` | `null` | `null` | Declares that `*std.Io.Reader` is already positioned at this absolute byte offset |
 | `line_filter` / `line_filter_ctx` | `?fn` / `?*anyopaque` | `null` | `null` | Synchronous pre-count / pre-quota predicate `(ctx, LineFilterCandidate) -> bool` evaluated strictly before `max_count`, `max_results`, `matched_lines`, `matches`, and context |
 | `invert` | `bool` | `false` | `false` | Emits lines that do not match |
-| `whole_word` | `bool` | `false` | `false` | Half-boundary word check (ASCII + Unicode word characters) |
+| `whole_word` | `bool` | `false` | `false` | Half-boundary whole-word check: verifies that the character immediately outside the match is not a word character (UTS #18 Unicode 16.0 word character when `whole_word_unicode = true`, or ASCII `[0-9A-Za-z_]` when `false`). Ignored when `whole_line = true`. |
+| `whole_word_unicode` | `bool` | `true` | `true` | When `true` (default), `whole_word` uses UTS #18 Unicode 16.0 word character classification (`Alphabetic \| M \| Nd \| Pc \| Join_Control`); when `false`, uses ASCII-only `[0-9A-Za-z_]` matching `rg -w --no-unicode`. |
 | `whole_line` | `bool` | `false` | `false` | Requires entire line content to match |
 | `multiline` | `bool` | `false` | `false` | Enables cross-line (`-U`) search semantics across line boundaries |
 | `max_multiline_window` | `?usize` | `null` | Matcher's window (`64 KiB` default) | Optional override for the maximum cross-line lookahead window in bytes |
@@ -1193,7 +1207,7 @@ All multi-tenant budgets are configured via `SearchConfig` and enforced determin
 | `before` / `after` | `?u32` | `null` | Default limit `10` (`max_context_lines`) | Asymmetric before/after context lines |
 | `max_context_lines` | `?u32` | `null` | Default `10` (caller-configurable) | Maximum allowed context lines |
 | `passthru` | `bool` | `false` | `false` | Emits all lines (`match` and `context`), bounded by `max_output_bytes` |
-| `replacement` | `?[]const u8` | `null` | `null` | Read-only replacement preview template (`$0`, `$&`, `$1`..`$9`, `$$`) |
+| `replacement` | `?[]const u8` | `null` | `null` | Read-only replacement preview template (`$0`, `$&`, `$1`..`$32`, `${1}`..`${32}`, `${name}`, `$$`) |
 | `max_count` | `?u64` | `null` | Unbounded | Per-source matched line limit (`Outcome.stopped`) |
 | `max_results` | `?u64` | `null` | Unbounded | Request-level matched line limit (populates `resume_at`) |
 | `resume_from` | `u64` | `0` | `0` | Searchable byte offset to start/resume scanning from |
@@ -1305,7 +1319,7 @@ Re-exports `src/walk/glob.zig`. Byte-oriented glob matcher supporting `*`, `?`, 
 
 ### walk_ignore
 
-Re-exports `src/walk/ignore.zig`. Parses and evaluates in-memory `.gitignore`, `.ignore`, and `.rgignore` rule sets (`parseLine`, `parseInto`, `parseTextsInto`, `parseLayerInto`, `build`, `isIgnored`) with fine-grained switches (`LayerSwitch`: `dot`, `vcs`, `exclude`, `case_insensitive`) without reading host environment variables or parent directories above the search root.
+Re-exports `src/walk/ignore.zig`. Parses and evaluates in-memory `.gitignore`, `.ignore`, and `.rgignore` rule sets (`parseLine`, `parseInto`, `parseTextsInto`, `parseLayerInto`, `build`, `isIgnored`) with fine-grained switches (`LayerSwitch`: `dot`, `vcs`, `exclude`, `case_insensitive`) without reading host environment variables or parent directories above the search root. Compound-extension rules (such as `*.gen.c` or `*.local.log`) are automatically routed to suffix matching instead of single-dot extension lookup, with dotfile extension matching and subdirectory wildcard `*` + `!negation` parity across nested layers.
 
 ### walk_deque
 
@@ -1317,7 +1331,7 @@ Re-exports `src/walk/file_id.zig`. Extracts device (`dev`) and inode (`ino`) ide
 
 ### walk_types
 
-Re-exports `src/walk/types.zig`. Maps file type names (e.g. `zig`, `rust`, `py`, `ts`) to glob patterns, supporting caller-injected custom type tables (`findInTable`, `expandTypesToGlobs`, `matchesWithTable`).
+Re-exports `src/walk/types.zig`. Maps **172 built-in file types** (strictly sorted for binary search and aligned with `ripgrep 16.0.0`, covering e.g. `ada` through `zstd`, `zig`, `rust`, `py`, `ts`, `cpp`, `dockerfile`, `lock`, `markdown`, `toml`) to glob patterns, supporting caller-injected custom type tables (`find`, `findInTable`, `expandTypesToGlobs`, `matches`, `matchesWithTable`).
 
 ### walk_list
 
@@ -1351,15 +1365,21 @@ Generic Chase-Lev work-stealing scheduler executing `initial_tasks` and recursiv
 
 ## C ABI (`include/webgrep.h`)
 
-`zig build` installs static (`libwebgrep.a`) and shared (`libwebgrep.so` / `.dylib`) libraries along with `include/webgrep.h`, exposing **52 C ABI functions** (`callconv(.c)` with `WEBGREP_API` DLL import/export macro support):
-- **Version & Defaults**: `webgrep_version`, `webgrep_find_options_default`, `webgrep_regex_options_default`, `webgrep_config_default`, `webgrep_tree_config_default`, `webgrep_probe_options_default`, `webgrep_bloom_config_default`
-- **Matchers & Scratch**: `webgrep_matcher_compile_literal`, `webgrep_matcher_compile_multi`, `webgrep_matcher_compile_regex`, `webgrep_matcher_compile_regex_set`, `webgrep_matcher_free`, `webgrep_scratch_new`, `webgrep_scratch_free`
-- **Direct Find, RegexSet, Captures & Named Groups**: `webgrep_find`, `webgrep_regex_set_matches`, `webgrep_find_captures`, `webgrep_matcher_group_index`
-- **Cancellation Tokens**: `webgrep_cancel_new`, `webgrep_cancel_trigger`, `webgrep_cancel_reset`, `webgrep_cancel_free`
-- **Slice, Streaming, Range, Reverse, Probe & Archive Search**: `webgrep_search_slice`, `webgrep_search_reader`, `webgrep_search_range`, `webgrep_search_reverse_slice`, `webgrep_search_reverse_at`, `webgrep_probe_line_slice`, `webgrep_probe_line_at`, `webgrep_search_archive_slice`, `webgrep_search_archive_reader`
-- **Pull-Mode Iterators**: `webgrep_pull_open_slice`, `webgrep_pull_open_reader`, `webgrep_pull_next`, `webgrep_pull_free`
-- **N-gram Bloom Filter**: `webgrep_bloom_new`, `webgrep_bloom_free`, `webgrep_bloom_add`, `webgrep_bloom_merge`, `webgrep_bloom_may_contain`, `webgrep_bloom_serialize`, `webgrep_bloom_deserialize`
-- **Seekable Zstd Table & Indexed Gzip**: `webgrep_zstd_seek_table_parse`, `webgrep_zstd_seek_table_free`, `webgrep_zstd_seek_table_uncompressed_size`, `webgrep_zstd_seek_table_read_at`, `webgrep_gzip_index_build`, `webgrep_gzip_index_free`, `webgrep_gzip_index_uncompressed_size`, `webgrep_gzip_index_serialize`, `webgrep_gzip_index_deserialize`, `webgrep_gzip_index_read_at`
+`zig build` installs zero-libc static (`libwebgrep.a`) and shared (`libwebgrep.so` / `.dylib`) libraries along with `include/webgrep.h` (`WEBGREP_VERSION_MAJOR = 0`, `WEBGREP_VERSION_MINOR = 10`, `WEBGREP_VERSION_PATCH = 0`, `WEBGREP_VERSION_STRING = "0.10.0"`, `webgrep_version()` returns `"0.10.0"`), exposing **59 C ABI functions** (`callconv(.c)` with `WEBGREP_API` DLL import/export macro support):
+- **Version & Defaults (7)**: `webgrep_version`, `webgrep_find_options_default`, `webgrep_regex_options_default`, `webgrep_config_default`, `webgrep_tree_config_default`, `webgrep_probe_options_default`, `webgrep_bloom_config_default`
+- **Matchers & Scratch (7)**: `webgrep_matcher_compile_literal`, `webgrep_matcher_compile_multi`, `webgrep_matcher_compile_regex`, `webgrep_matcher_compile_regex_set`, `webgrep_matcher_free`, `webgrep_scratch_new`, `webgrep_scratch_free`
+- **Direct Find, RegexSet, Captures & Named Groups (4)**: `webgrep_find`, `webgrep_regex_set_matches`, `webgrep_find_captures`, `webgrep_matcher_group_index`
+- **Cancellation Tokens (4)**: `webgrep_cancel_new`, `webgrep_cancel_trigger`, `webgrep_cancel_reset`, `webgrep_cancel_free`
+- **Slice, Streaming, Range, Reverse, Probe & Archive Search (9)**: `webgrep_search_slice`, `webgrep_search_reader`, `webgrep_search_range`, `webgrep_search_reverse_slice`, `webgrep_search_reverse_at`, `webgrep_probe_line_slice`, `webgrep_probe_line_at`, `webgrep_search_archive_slice`, `webgrep_search_archive_reader`
+- **Pull-Mode Iterators (4)**: `webgrep_pull_open_slice`, `webgrep_pull_open_reader`, `webgrep_pull_next`, `webgrep_pull_free`
+- **N-gram Bloom Filter (7)**: `webgrep_bloom_new`, `webgrep_bloom_free`, `webgrep_bloom_add`, `webgrep_bloom_merge`, `webgrep_bloom_may_contain`, `webgrep_bloom_serialize`, `webgrep_bloom_deserialize`
+- **Seekable Zstd Table & Indexed Gzip (10)**: `webgrep_zstd_seek_table_parse`, `webgrep_zstd_seek_table_free`, `webgrep_zstd_seek_table_uncompressed_size`, `webgrep_zstd_seek_table_read_at`, `webgrep_gzip_index_build`, `webgrep_gzip_index_free`, `webgrep_gzip_index_uncompressed_size`, `webgrep_gzip_index_serialize`, `webgrep_gzip_index_deserialize`, `webgrep_gzip_index_read_at`
+- **Flow Control & Stateless Resume Pagination (7)**: `webgrep_resume_state_new`, `webgrep_resume_state_free`, `webgrep_resume_state_reset`, `webgrep_resume_state_offset`, `webgrep_resume_state_is_paused`, `webgrep_search_slice_flow`, `webgrep_search_reader_flow`
+
+Key C ABI enumerations in `include/webgrep.h`:
+- `webgrep_whole_word_mode_t` (for `webgrep_config_t.whole_word`): `WEBGREP_WHOLE_WORD_OFF = 0`, `WEBGREP_WHOLE_WORD_UNICODE = 1` (UTS #18 Unicode 16.0 word boundaries, matching any non-zero/non-ASCII value for backward compatibility), `WEBGREP_WHOLE_WORD_ASCII = 2` (ASCII `[0-9A-Za-z_]`, matching `rg -w --no-unicode`).
+- `webgrep_flow_action_t` (for `webgrep_flow_t` in `webgrep_flow_line_cb`): `WEBGREP_FLOW_CONT = 0`, `WEBGREP_FLOW_STOP = 1`, `WEBGREP_FLOW_PAUSE = 2`, `WEBGREP_FLOW_SKIP_TO = 3`.
+- `webgrep_status_t`, `webgrep_case_mode_t`, `webgrep_match_mode_t`, `webgrep_binary_policy_t`, `webgrep_encoding_t` (17 codecs), `webgrep_compression_t` (10 codecs), `webgrep_archive_format_t` (8 formats), `webgrep_limit_hit_t`, `webgrep_line_number_mode_t`, and `webgrep_entry_kind_t`.
 
 ---
 

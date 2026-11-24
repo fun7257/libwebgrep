@@ -1,28 +1,23 @@
-# libwebgrep 架构演进里程碑
+# libwebgrep 架构演进里程碑与路线图
 
 [English](ROADMAP.md) | [简体中文](ROADMAP.zh-CN.md)
 
-`libwebgrep` 规划的全部功能与五层架构演进里程碑均已 100% 完成，并通过完整的单元测试、差分模糊测试（`zig build test` 与 `zig build fuzz`）及 `ReleaseFast` 微基准实测验证。
+`libwebgrep` 截至 **`v0.10.0`** 的全部功能、算法与架构演进里程碑均已 100% 完成，通过 **`1,027` 项单元/端到端/C ABI/差分模糊/OOM 审计测试**（`zig build test` 与 `zig build fuzz`），并在对标 `ripgrep 16.0.0` 的 93 项全量评测中达成 **`93/93 100% WIN`（总几何均值 `1.82x`）**。下一阶段里程碑为 **`v1.0.0`**，聚焦公共 API 冻结、C ABI 稳定性契约与长期维护就绪。
 
 ```mermaid
 flowchart TD
-    M0["里程碑 1：核心 SIMD 内核与流式检索器<br/>memchr / PackedPair / TwoWay / ByteSet / RarePair / Teddy / AhoCorasick<br/>超长行常数内存滑窗、有界上下文与多租户资源配额"] --> M1["里程碑 2：高价值查询语义扩展<br/>多模式列表解析 (Multi.initFromText)、有序流提前停止、<br/>全流直通高亮 (passthru)、只读替换预览 (replacement)"]
-    M1 --> M2["里程碑 3：线性时间正则引擎 + SIMD 预过滤<br/>无回溯 Thompson NFA / PikeVM、编译指令上限、<br/>前缀/内部/尾部/多分支 SIMD 预过滤、有界跨行窗口"]
-    M2 --> M3["里程碑 4：防爆流式解压与多编码扩展<br/>进程内 Gzip / Zstd / XZ 双重压缩炸弹防御、<br/>SIMD 加速 Unicode 大小写折叠、GBK / Latin-1 转码与 raw_offset 映射"]
-    M3 --> M4["里程碑 5：受控多源并发管线<br/>嵌套花括号 Glob 展开与上限、内存与分层 Ignore 规则、<br/>可注入文件类型表、受控工作窃取并发与流式事件输出"]
-    M4 --> M5["里程碑 6：五层人机协同架构重塑与差分模糊验证<br/>tables / codec / regex / search 模块化拆解、MatcherTraits 与 SinkTraits、<br/>Zig 0.17.1 Smith + 多随机种子差分模糊测试套件 (src/fuzz.zig)"]
-    M5 --> M6["里程碑 7 (v0.3.0)：混合惰性 DFA、RegexSet、真流式拉取、零落盘归档检索与 C ABI<br/>*const 无锁匹配器、pattern_id、Unicode 属性与 UAX #29 词边界、<br/>openReaderPull、Scratch 复用池、ArchiveTree/searchTree、零 libc C ABI"]
-    M6 --> M7["里程碑 8 (v0.4.0)：平台条件限定 SIMD/IO 深度优化与全场景反超 ripgrep<br/>3 字节稀有窗口 Teddy + evalRefine、确定化 DFA chain_len + 4 路并行验证、<br/>有界匹配器整块融合扫描、L2 感知 optimalBufferSize、15/15 冷热双线超越 rg 14.1.1"]
+    M1["里程碑 1–6 (v0.1.0–v0.2.0)<br/>核心 SIMD 内核、线性时间正则、流式编解码、<br/>五层无环架构重塑与差分模糊验证"] --> M7["里程碑 7 (v0.3.0)<br/>混合惰性 DFA、RegexSet、真流式拉取、<br/>零落盘 ArchiveTree 与 C ABI"]
+    M7 --> M8["里程碑 8 (v0.4.0–v0.7.0)<br/>运行时 CPUID 分发、跨行 -U 全链路加固、<br/>可配置配额、并行虚拟树与 52 函数 C ABI"]
+    M8 --> M9["里程碑 9 (v0.8.0–v0.9.0)<br/>8 种纯 Zig 流式解压、15+ 字符集编码、<br/>倒序尾部检索与单源有界内存并发引擎"]
+    M9 --> M10["里程碑 10 (v0.10.0 — 已完成)<br/>SetUnanchoredDfa/LazySetDfa、4 路 ILP AC、融合 Teddy、<br/>8 MiB 滑窗 mmap、UTS #18 词边界、172 类型、59 函数 C ABI、<br/>5 组差分模糊 + OOM 审计、93/93 全胜 rg 16.0.0"]
+    M10 --> M11["里程碑 11 (v1.0.0 — 规划中)<br/>公共 Zig API 与 C ABI 正式冻结、SemVer 稳定性契约、<br/>生产级发布打包与长期维护保障"]
 ```
 
-| 里程碑 | 核心方向 | 关键模块 | 状态 | 验证与性能亮点 |
-| :--- | :--- | :--- | :---: | :--- |
-| **里程碑 1** | **核心 SIMD 内核与多租户检索器** | `src/finder/*`, `src/search/*`, `src/sink.zig` | **已完成** | 24～62 GB/s SIMD 内核吞吐；零分配切片检索；单遍融合 NUL 二进制检测 |
-| **里程碑 2** | **高价值查询语义** | `src/finder/multi.zig`, `src/search/*`, `src/sink.zig` | **已完成** | `Multi.initFromText` 分配前配额校验；`stop_on_nonmatch`；`passthru`；只读 `$0`～`$9` `replacement` 预览 |
-| **里程碑 3** | **线性时间正则 + SIMD 预过滤** | `src/regex/*`, `src/search/*` | **已完成** | 最坏 $O(n)$ Thompson NFA；4096 指令硬顶；前缀/内部/尾部/多分支自动 SIMD 预过滤；有界跨行匹配 |
-| **里程碑 4** | **流式防爆解压与扩展字符集** | `src/codec/*`, `src/tables/*`, `src/finder/unicode_fold.zig` | **已完成** | 进程内 Gzip/Zstd/XZ 双重防爆保护；28.9 GB/s SIMD 加速 Unicode 大小写折叠；`comptime` 特化 UTF-16/GBK/Latin-1 转码与 `OffsetMap` |
-| **里程碑 5** | **受控多源并发管线** | `src/walk/*`, `src/parallel.zig` | **已完成** | `{a,{b,c}}` 嵌套花括号展开；纯文本与 `.gitignore`/`.ignore`/`.rgignore` 开关；`expandTypesToGlobs`；严格 `max_concurrency` |
-| **里程碑 6** | **五层人机协同架构与差分模糊测试** | `src/tables/*`, `src/codec/*`, `src/regex/*`, `src/search/*`, `src/fuzz.zig` | **已完成** | 严格五层无环架构拆解；`MatcherTraits` 与 `SinkTraits` 编译期扩展契约；Zig 0.17.1 `std.testing.fuzz` + 跨层差分模糊测试 |
-| **里程碑 7 (`v0.3.0`)** | **混合惰性 DFA、`RegexSet`、流式拉取、内存归档与 C ABI** | `src/regex/dfa.zig`, `src/regex/set.zig`, `src/codec/archive.zig`, `src/search/tree.zig`, `src/c_api.zig` | **已完成** | `*const` 无锁匹配器；`pattern_id`；`\p{...}` Unicode 属性与 UAX #29 `\b`/`\B`; `CompileDiagnostic`; `openReaderPull`; `Scratch` 池；零落盘 `ArchiveTree` & `searchTree`; C ABI（`include/webgrep.h`） |
-| **里程碑 8 (`v0.4.0`)** | **平台条件限定 SIMD/IO 深度优化与全场景超越 `ripgrep`** | `src/finder/packed_pair.zig`, `src/finder/teddy.zig`, `src/finder/pairs.zig`, `src/regex/dfa.zig`, `src/search/pipeline.zig`, `src/io/platform.zig` | **已完成** | 15/15 场景热缓存（`mincore=100%`，`1.01x～72.73x`）与冷盘（`mincore=0`，`1.09x～176.67x`）100% 全面超越 `ripgrep 14.1.1`；3 字节稀有窗口 `Teddy`；确定化 DFA `chain_len` + 4 路并行验证；`fuse_full_buf` 整块融合流扫描；L2 感知 `SearchConfig.optimalBufferSize` |
-
+| 里程碑 | 版本 | 核心方向 | 关键模块 | 状态 | 验证与性能亮点 |
+| :--- | :--- | :--- | :--- | :---: | :--- |
+| **里程碑 1–6** | `v0.1.0`–`v0.2.0` | **核心 SIMD 内核、线性时间正则、流式编解码与五层架构** | `src/finder/*`, `src/regex/*`, `src/codec/*`, `src/search/*`, `src/walk/*`, `src/fuzz.zig` | **已完成** | 四级 `Multi`（`ByteSet`/`RarePair`/`Teddy`/`AhoCorasick`）；$O(n)$ Thompson NFA；Gzip/Zstd/XZ 双重防爆；五层无环拆解；`MatcherTraits` 与 `SinkTraits` |
+| **里程碑 7** | `v0.3.0` | **混合惰性 DFA、`RegexSet`、流式拉取、内存归档与 C ABI** | `src/regex/dfa.zig`, `src/regex/set.zig`, `src/codec/archive.zig`, `src/search/tree.zig`, `src/c_api.zig` | **已完成** | `*const` 无锁匹配器；`pattern_id`；`\p{...}` Unicode 属性；`openReaderPull`；`Scratch` 池；零落盘 `ArchiveTree` & `searchTree`；零 `libc` C ABI |
+| **里程碑 8** | `v0.4.0`–`v0.7.0` | **运行时 CPUID 分发、跨行 `-U` 加固与可配置配额** | `src/io/cpuid.zig`, `src/io/platform.zig`, `src/search/pipeline.zig`, `src/search/config.zig`, `src/c_api_ext.zig` | **已完成** | `-Dteddy=runtime` 基线 `x86_64` 安全与 `s390x`/`wasm32-wasi` 兼容；调用方可配置上限；跨行 `-U` / `--multiline-dotall` 全链路对齐；恒定内存 `searchTarStream`；52 函数 C ABI |
+| **里程碑 9** | `v0.8.0`–`v0.9.0` | **全量纯 Zig 编解码器、倒序检索与单源并发引擎** | `src/codec/{lz4,bzip2,brotli,seekable}.zig`, `src/tables/legacy_encodings.zig`, `src/search/{reverse,parallel_source}.zig`, `src/scheduler.zig` | **已完成** | Zlib/Deflate/LZ4/Bzip2/Brotli 与 ZIP64/嵌套归档；15+ 编码与启发式检测；Unicode `\d`/`\w`/`\s`；带上下文的倒序尾部检索；有界内存单源并发引擎 |
+| **里程碑 10** | **`v0.10.0`** | **双层集合 DFA、4 路 ILP AC、滑窗 `mmap`、UTS #18 词边界与 93/93 全胜 `rg 16.0.0`** | `src/regex/{dfa,set,vm}.zig`, `src/finder/{aho,teddy,packed_pair,memchr}.zig`, `src/io/window_map.zig`, `src/parallel.zig`, `src/tables/unicode_prop_table.zig`, `src/walk/types.zig`, `src/fuzz.zig` | **已完成** | 对标 `ripgrep 16.0.0` **`93/93 100% WIN`**（总几何均值 `1.82x`；Core `1.31x`、Stress `1.89x`、`S15 --mmap` **`25.31 GB/s`**）；`SetUnanchoredDfa`/`LazySetDfa` 接入 `Regex` 与 `RegexSet`；4 路 ILP AC（`20.56 GB/s`）；融合 `Teddy` `findVerified` + Ghost-Byte 避让；零拷贝 8 MiB 滑窗 `mmap`；64B 对齐 `preadv`；SIMD GBK LUT/Variant H 与 UTF-16LE；UTS #18 Unicode 16.0 `prop_Word`；172 种内置文件类型；59 函数 C ABI；**`1,027`**（AVX2）/ **`1,013`**（`-Dteddy=off`）测试 + 5 组差分模糊测试与 OOM 注入审计 |
+| **里程碑 11** | **`v1.0.0`** | **API 冻结与长期稳定性发布** | `src/root.zig`, `include/webgrep.h`, `docs/API.md` | **规划中** | 正式冻结公共 Zig API 与 59 函数 C ABI 头文件/二进制兼容契约；建立 SemVer 稳定性保障、ABI 回归校验与长期维护策略 |

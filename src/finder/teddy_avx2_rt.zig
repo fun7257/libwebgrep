@@ -4,8 +4,6 @@
 //! confirmed OSXSAVE/YMM + AVX2 support. Keeps baseline binaries free of AVX2 instructions
 //! outside these functions while scanning 32 bytes per iteration on capable CPUs.
 
-const std = @import("std");
-
 /// Scans 32 bytes per step starting at `pos_in` while `pos <= limit` for fingerprint length 1,
 /// stopping at the first 32-byte window with any nibble-table match (or NUL byte when `watch_nul` is true).
 pub noinline fn skipMissesFp1(

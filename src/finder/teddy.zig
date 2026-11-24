@@ -833,11 +833,6 @@ pub const RuntimeAvx2Engine = if (builtin.cpu.arch == .x86_64 and build_options.
 else
     struct {};
 
-fn toMatch(best: ?Cand) ?matcher.Match {
-    const chosen = best orelse return null;
-    return .{ .start = chosen.start, .end = chosen.end, .pattern_id = chosen.id };
-}
-
 fn expandTable(comptime lanes: usize, comptime Vec: type, table: *const [16]u8) Vec {
     return std.simd.repeat(lanes, @as(@Vector(16, u8), table.*));
 }

@@ -99,55 +99,29 @@ inline fn writeFastNumberedBytesTo(out: *std.Io.Writer, num: u64, sep: u8, bytes
 
 fn writeSinkBytes(
     out: *std.Io.Writer,
-    prefix_path: ?[]const u8,
     line_numbers: bool,
     may_contain_nl: bool,
     bytes: []const u8,
     base_line_num: ?u64,
     sep: u8,
 ) bool {
-    if (prefix_path == null and !line_numbers) {
+    if (!line_numbers) {
         return writeFastBytesTo(out, bytes);
     }
     if (may_contain_nl and std.mem.findScalar(u8, bytes, '\n') != null) {
         var it = std.mem.splitScalar(u8, bytes, '\n');
         var idx: u64 = 0;
         while (it.next()) |sub| : (idx += 1) {
-            if (prefix_path) |p| {
-                out.writeAll(p) catch return false;
-                out.writeByte(sep) catch return false;
-                if (line_numbers) {
-                    if (base_line_num) |num| {
-                        out.print("{d}{c}", .{ num + idx, sep }) catch return false;
-                    }
-                }
-                if (!writeFastBytesTo(out, sub)) return false;
-            } else if (line_numbers) {
-                if (base_line_num) |num| {
-                    if (!writeFastNumberedBytesTo(out, num + idx, sep, sub)) return false;
-                } else {
-                    if (!writeFastBytesTo(out, sub)) return false;
-                }
+            if (base_line_num) |num| {
+                if (!writeFastNumberedBytesTo(out, num + idx, sep, sub)) return false;
             } else {
                 if (!writeFastBytesTo(out, sub)) return false;
             }
         }
         return true;
     }
-    if (prefix_path) |p| {
-        out.writeAll(p) catch return false;
-        out.writeByte(sep) catch return false;
-        if (line_numbers) {
-            if (base_line_num) |num| {
-                out.print("{d}{c}", .{ num, sep }) catch return false;
-            }
-        }
-        return writeFastBytesTo(out, bytes);
-    }
-    if (line_numbers) {
-        if (base_line_num) |num| {
-            return writeFastNumberedBytesTo(out, num, sep, bytes);
-        }
+    if (base_line_num) |num| {
+        return writeFastNumberedBytesTo(out, num, sep, bytes);
     }
     return writeFastBytesTo(out, bytes);
 }
@@ -155,12 +129,11 @@ fn writeSinkBytes(
 fn writeOnlyMatchingSpans(
     comptime with_replace: bool,
     out: *std.Io.Writer,
-    prefix_path: ?[]const u8,
     line_numbers: bool,
     multiline: bool,
     line: libwebgrep.Line,
 ) bool {
-    if (prefix_path == null and !line_numbers) {
+    if (!line_numbers) {
         for (line.matches) |sp| {
             const from = @min(sp.start, line.bytes.len);
             const to = @min(@max(sp.end, from), line.bytes.len);
@@ -181,15 +154,15 @@ fn writeOnlyMatchingSpans(
             (sp.replacement orelse line.bytes[from..to])
         else
             line.bytes[from..to];
-        const base_ln: ?u64 = if (line_numbers) blk: {
+        const base_ln: ?u64 = blk: {
             const n = line.number orelse break :blk null;
             if (multiline and from > prev_pos) {
                 nl_acc += internal.memchr.count(internal.memchr.native_width, line.bytes, prev_pos, from, '\n');
                 prev_pos = from;
             }
             break :blk n + nl_acc;
-        } else null;
-        if (!writeSinkBytes(out, prefix_path, line_numbers, if (with_replace) true else multiline, seg, base_ln, ':')) return false;
+        };
+        if (!writeSinkBytes(out, line_numbers, if (with_replace) true else multiline, seg, base_ln, ':')) return false;
     }
     return true;
 }
@@ -204,7 +177,6 @@ fn PrintSink(comptime mode: PrintMode) type {
 
             out: *std.Io.Writer,
             file_path: []const u8 = "",
-            prefix_path: ?[]const u8 = null,
             line_numbers: bool = false,
             multiline: bool = false,
             last_line_number: u64 = 0,
@@ -215,7 +187,7 @@ fn PrintSink(comptime mode: PrintMode) type {
             }
 
             pub inline fn canStreamSpans(self: *const @This()) bool {
-                return !self.line_numbers and self.prefix_path == null;
+                return !self.line_numbers;
             }
 
             pub inline fn matchedSpan(self: *@This(), bytes: []const u8) bool {
@@ -230,12 +202,12 @@ fn PrintSink(comptime mode: PrintMode) type {
                         self.last_line_offset = line.offset;
                     }
                 }
-                return writeOnlyMatchingSpans(false, self.out, self.prefix_path, self.line_numbers, self.multiline, line);
+                return writeOnlyMatchingSpans(false, self.out, self.line_numbers, self.multiline, line);
             }
 
             pub fn context(self: *@This(), line: libwebgrep.Line) bool {
                 if (line.binary_status == .detected) return false;
-                return writeSinkBytes(self.out, self.prefix_path, self.line_numbers, self.multiline, line.bytes, line.number, '-');
+                return writeSinkBytes(self.out, self.line_numbers, self.multiline, line.bytes, line.number, '-');
             }
 
             pub fn contextBreak(self: *@This()) bool {
@@ -259,7 +231,6 @@ fn PrintSink(comptime mode: PrintMode) type {
 
         out: *std.Io.Writer,
         file_path: []const u8 = "",
-        prefix_path: ?[]const u8 = null,
         line_numbers: bool = false,
         multiline: bool = false,
         last_line_number: u64 = 0,
@@ -274,16 +245,16 @@ fn PrintSink(comptime mode: PrintMode) type {
                 }
             }
             switch (mode) {
-                .line => return writeSinkBytes(self.out, self.prefix_path, self.line_numbers, self.multiline, line.bytes, line.number, ':'),
-                .replace => return writeSinkBytes(self.out, self.prefix_path, self.line_numbers, true, line.replaced orelse line.bytes, line.number, ':'),
-                .only_matching_replace => return writeOnlyMatchingSpans(true, self.out, self.prefix_path, self.line_numbers, self.multiline, line),
+                .line => return writeSinkBytes(self.out, self.line_numbers, self.multiline, line.bytes, line.number, ':'),
+                .replace => return writeSinkBytes(self.out, self.line_numbers, true, line.replaced orelse line.bytes, line.number, ':'),
+                .only_matching_replace => return writeOnlyMatchingSpans(true, self.out, self.line_numbers, self.multiline, line),
                 .only_matching => comptime unreachable,
             }
         }
 
         pub fn context(self: *@This(), line: libwebgrep.Line) bool {
             if (line.binary_status == .detected) return false;
-            return writeSinkBytes(self.out, self.prefix_path, self.line_numbers, self.multiline, line.bytes, line.number, '-');
+            return writeSinkBytes(self.out, self.line_numbers, self.multiline, line.bytes, line.number, '-');
         }
 
         pub fn contextBreak(self: *@This()) bool {
@@ -698,7 +669,6 @@ fn searchOneFile(
         var psink = PrintSink(.only_matching_replace){
             .out = stdout_writer,
             .file_path = path,
-            .prefix_path = null,
             .line_numbers = args.line_numbers,
             .multiline = args.multiline,
         };
@@ -708,7 +678,6 @@ fn searchOneFile(
         var psink = PrintSink(.only_matching){
             .out = stdout_writer,
             .file_path = path,
-            .prefix_path = null,
             .line_numbers = args.line_numbers,
             .multiline = args.multiline,
         };
@@ -718,7 +687,6 @@ fn searchOneFile(
         var psink = PrintSink(.replace){
             .out = stdout_writer,
             .file_path = path,
-            .prefix_path = null,
             .line_numbers = args.line_numbers,
             .multiline = args.multiline,
         };
@@ -728,7 +696,6 @@ fn searchOneFile(
         var psink = PrintSink(.line){
             .out = stdout_writer,
             .file_path = path,
-            .prefix_path = null,
             .line_numbers = args.line_numbers,
             .multiline = args.multiline,
         };

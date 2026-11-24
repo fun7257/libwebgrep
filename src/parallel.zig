@@ -108,8 +108,6 @@ const Shared = struct {
     many: ?*multi_mod.Multi = null,
     regex: ?*const regex_mod.Regex = null,
     regex_set: ?*const regex_set_mod.RegexSet = null,
-    column: bool,
-    use_separator: bool,
     stdout: *std.Io.Writer,
     write_output: bool = false,
     saw: *bool,
@@ -162,18 +160,6 @@ const Shared = struct {
         var buf: [192]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "{s}: {s}", .{ path, @errorName(err) }) catch path;
         log(self.search.log_ctx, msg);
-    }
-
-    fn addSearch(self: *Shared, result: searcher.Result, matches: u64, bytes: u64, printed: usize) void {
-        _ = self.searches.fetchAdd(1, .monotonic);
-        _ = self.bytes_searched.fetchAdd(bytes, .monotonic);
-        _ = self.bytes_printed.fetchAdd(printed, .monotonic);
-        _ = self.matched_lines.fetchAdd(result.matched_lines, .monotonic);
-        _ = self.matches.fetchAdd(matches, .monotonic);
-        if (result.matched_lines > 0) {
-            _ = self.searches_with_match.fetchAdd(1, .monotonic);
-            self.any_match.store(true, .release);
-        }
     }
 };
 
@@ -351,8 +337,6 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, req: Run) !Stats {
         .many = if (many) |*engine| engine else null,
         .regex = req.regex,
         .regex_set = req.regex_set,
-        .column = req.column,
-        .use_separator = req.use_separator and req.emit == .text,
         .stdout = req.stdout,
         .write_output = req.write_output,
         .saw = req.saw_output,

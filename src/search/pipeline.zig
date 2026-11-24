@@ -13,7 +13,6 @@ const encoding = @import("../codec/encoding.zig");
 const matcher_mod = @import("../matcher.zig");
 const memchr = @import("../finder/memchr.zig");
 const regex_mod = @import("../regex.zig");
-const sink_mod = @import("../sink.zig");
 const cfg_mod = @import("config.zig");
 const state_mod = @import("state.zig");
 const ring_mod = @import("context_ring.zig");
@@ -129,7 +128,6 @@ fn growAligned(
 }
 
 fn setDecoderRawMidStream(decoder: *encoding.Decoder, config: SearchConfig) void {
-    const saved_in = decoder.in;
     const saved_raw = decoder.raw_buf;
     const saved_max_in = decoder.max_in;
     const saved_map = decoder.offset_map;
@@ -138,7 +136,6 @@ fn setDecoderRawMidStream(decoder: *encoding.Decoder, config: SearchConfig) void
     } else {
         decoder.* = encoding.Decoder.initWithHint(config.encoding, config.charset);
     }
-    decoder.in = saved_in;
     decoder.raw_buf = saved_raw;
     decoder.max_in = saved_max_in;
     decoder.offset_map = saved_map;
@@ -2249,10 +2246,6 @@ pub const Upstream = struct {
     prefix_len: u8 = 0,
     prefix_pos: u8 = 0,
 };
-
-pub fn readRet(comptime readFn: anytype) type {
-    return @typeInfo(@TypeOf(readFn)).@"fn".return_type.?;
-}
 
 fn readRawOnce(comptime readFn: anytype, box: *Upstream, dest: []u8) anyerror!usize {
     if (box.config.read_at) |rat| {

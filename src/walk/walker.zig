@@ -169,14 +169,6 @@ pub const Session = struct {
         self.arena.deinit();
     }
 
-    pub fn prepareGlobs(self: *Session, io: std.Io, texts: []const []const u8) !void {
-        self.lock.lockUncancelable(io);
-        defer self.lock.unlock(io);
-        const arena = self.arena.allocator();
-        self.user_globs = try glob.compileGlobs(arena, texts, .{});
-        self.globs_prepared = true;
-    }
-
     pub fn prepareConfig(self: *Session, io: std.Io, config: Config) !void {
         self.lock.lockUncancelable(io);
         defer self.lock.unlock(io);

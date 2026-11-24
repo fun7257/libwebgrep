@@ -57,7 +57,6 @@ pub const Compiler = struct {
     extended: bool = false,
     ungreedy: bool = false,
     saw_extended: bool = false,
-    saw_ungreedy: bool = false,
     saw_literal_nl_pos: ?usize = null,
     diag: ?*CompileDiagnostic = null,
     pattern_index: ?usize = null,
@@ -770,7 +769,6 @@ pub const Compiler = struct {
                         if (new_i) self.saw_ignore_case = true;
                         if (new_m) self.saw_scoped_m = true;
                         if (new_x) self.saw_extended = true;
-                        if (new_u) self.saw_ungreedy = true;
                         const nop = try self.emit(.{ .jmp = 0 });
                         return .{ .start = nop, .end = nop };
                     }
@@ -795,7 +793,6 @@ pub const Compiler = struct {
                         if (new_i) self.saw_ignore_case = true;
                         if (new_m) self.saw_scoped_m = true;
                         if (new_x) self.saw_extended = true;
-                        if (new_u) self.saw_ungreedy = true;
                         self.depth += 1;
                         defer {
                             self.depth -= 1;

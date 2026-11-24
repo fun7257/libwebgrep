@@ -60,7 +60,6 @@ pub const PatternMeta = struct {
     inst_start: u32,
     inst_end: u32,
     min_before: u32 = 0,
-    is_exact: bool = false,
 };
 
 pub const RegexSet = struct {
@@ -202,7 +201,6 @@ pub const RegexSet = struct {
             compiler.extended = false;
             compiler.ungreedy = false;
             compiler.saw_extended = false;
-            compiler.saw_ungreedy = false;
             compiler.saw_literal_nl_pos = null;
             compiler.capture_count = 0;
             compiler.capture_positions = @splat(std.math.maxInt(usize));
@@ -535,10 +533,6 @@ pub const RegexSet = struct {
                 }
                 self.pf_next_mask = nm;
                 self.pf_has_next_mask = hnm;
-            }
-
-            if (all_exact) {
-                for (self.pat_meta) |*pm| pm.is_exact = true;
             }
         } else |_| {
             for (owned_prefixes) |s| self.allocator.free(s);

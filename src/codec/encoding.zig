@@ -428,30 +428,6 @@ pub fn convertAllocWithMapKnownLen(
     return buf;
 }
 
-pub fn convertScratchWithMap(
-    buf_alloc: std.mem.Allocator,
-    decode_buf: *[]u8,
-    map_alloc: std.mem.Allocator,
-    kind: Sniff,
-    input: []const u8,
-    raw_base: u64,
-    offset_map: ?*decompress.OffsetMap,
-) error{OutOfMemory}![]u8 {
-    const mode = sniffToCodedMode(kind) orelse {
-        if (decode_buf.len < input.len) {
-            if (decode_buf.len == 0) {
-                decode_buf.* = try buf_alloc.alloc(u8, input.len);
-            } else {
-                decode_buf.* = try buf_alloc.realloc(decode_buf.*, input.len);
-            }
-        }
-        if (input.len > 0) @memcpy(decode_buf.*[0..input.len], input);
-        return decode_buf.*[0..input.len];
-    };
-    const len = convertedLen(mode, input);
-    return convertScratchWithMapKnownLen(buf_alloc, decode_buf, map_alloc, kind, input, raw_base, offset_map, len);
-}
-
 pub fn convertScratchWithMapKnownLen(
     buf_alloc: std.mem.Allocator,
     decode_buf: *[]u8,
@@ -490,7 +466,6 @@ pub fn convertScratchWithMapKnownLen(
 pub const Decoder = struct {
     mode: Mode = .undecided,
     fallback_mode: Mode = .raw,
-    in: []u8 = &.{},
     in_len: usize = 0,
     in_i: usize = 0,
     out_hold: [4]u8 = undefined,
@@ -552,7 +527,6 @@ pub const Decoder = struct {
     }
 
     pub fn deinit(self: *Decoder, allocator: std.mem.Allocator) void {
-        if (self.in.len != 0) allocator.free(self.in);
         if (self.raw_buf.len != 0) allocator.free(self.raw_buf);
         self.* = .{};
     }

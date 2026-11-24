@@ -17,10 +17,8 @@ const memchr = @import("../finder/memchr.zig");
 const regex_mod = @import("../regex.zig");
 const matcher_mod = @import("../matcher.zig");
 const ring_mod = @import("context_ring.zig");
-const format_mod = @import("format.zig");
 const line_matcher_mod = @import("line_matcher.zig");
 const long_line_mod = @import("long_line.zig");
-const pipeline_mod = @import("pipeline.zig");
 
 const SearchConfig = cfg_mod.SearchConfig;
 const Event = cfg_mod.Event;
@@ -867,7 +865,6 @@ pub fn ReaderPull(comptime M: type) type {
         }
 
         fn resetDecoderMidStream(self: *Self) void {
-            const saved_in = self.decoder.in;
             const saved_raw = self.decoder.raw_buf;
             const saved_max_in = self.decoder.max_in;
             const saved_map = self.decoder.offset_map;
@@ -876,7 +873,6 @@ pub fn ReaderPull(comptime M: type) type {
             } else {
                 self.decoder = encoding_mod.Decoder.initWithHint(self.config.encoding, self.config.charset);
             }
-            self.decoder.in = saved_in;
             self.decoder.raw_buf = saved_raw;
             self.decoder.max_in = saved_max_in;
             self.decoder.offset_map = saved_map;

@@ -13,7 +13,6 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
-const matcher = @import("../matcher.zig");
 const memchr = @import("../finder/memchr.zig");
 const inst_mod = @import("inst.zig");
 const Inst = inst_mod.Inst;
@@ -1076,7 +1075,6 @@ pub const UnanchoredDfa = struct {
     start_maybe_off: u16 = 0,
     start_max_off: u16 = 0,
     match_start_off: u16 = 255,
-    verify_imm_off: u16 = 252,
     verify_del_off: u16 = 253,
     exact_imm_off: u16 = 254,
     exact_del_off: u16 = 255,
@@ -1706,7 +1704,6 @@ pub const UnanchoredDfa = struct {
         self.start_maybe_off = if (num_starts >= 3) 2 * stride else 0;
         self.start_max_off = (num_starts - 1) * stride;
         self.match_start_off = match_start_off;
-        self.verify_imm_off = verify_imm_off;
         self.verify_del_off = verify_del_off;
         self.exact_imm_off = exact_imm_off;
         self.exact_del_off = exact_del_off;
@@ -1815,12 +1812,6 @@ pub const UnanchoredDfa = struct {
                 return null;
             },
         }
-    }
-
-    pub inline fn skipStartBytes(self: *const UnanchoredDfa, haystack: []const u8, from: usize, limit: usize) ?usize {
-        return switch (self.start_skip) {
-            inline else => |_, tag| skipStartVec(tag, initSkipVecs(tag, self.start_skip), haystack, from, limit),
-        };
     }
 };
 
@@ -2428,7 +2419,6 @@ pub const SetUnanchoredDfa = struct {
     start_maybe_off: u32 = 0,
     start_max_off: u32 = 0,
     match_start_off: u32 = 255,
-    verify_imm_off: u32 = 252,
     verify_del_off: u32 = 253,
     exact_imm_off: u32 = 254,
     exact_del_off: u32 = 255,
@@ -3067,7 +3057,6 @@ pub const SetUnanchoredDfa = struct {
         self.start_maybe_off = if (num_starts >= 3) 2 * stride else 0;
         self.start_max_off = (num_starts - 1) * stride;
         self.match_start_off = match_start_off;
-        self.verify_imm_off = verify_imm_off;
         self.verify_del_off = verify_del_off;
         self.exact_imm_off = exact_imm_off;
         self.exact_del_off = exact_del_off;
@@ -3104,7 +3093,6 @@ pub const LazySetDfa = struct {
     state_map: DynStateMap = .{},
     ws: DynClosureWorkspace = .{},
     start_pcs: []u32 = &.{},
-    saved_src_pcs: std.ArrayList(u32) = .empty,
     tmp_next_pcs: std.ArrayList(u32) = .empty,
     tmp_resolved: DynResolvedBoundary = .{},
 
@@ -3224,7 +3212,6 @@ pub const LazySetDfa = struct {
     pub fn deinit(self: *LazySetDfa) void {
         self.tmp_resolved.deinit(self.allocator);
         self.tmp_next_pcs.deinit(self.allocator);
-        self.saved_src_pcs.deinit(self.allocator);
         self.ws.deinit(self.allocator);
         self.state_map.deinit(self.allocator);
         self.metas.deinit(self.allocator);

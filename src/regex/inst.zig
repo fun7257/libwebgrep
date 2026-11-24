@@ -349,13 +349,6 @@ pub inline fn decodeValidUtf8At(haystack: []const u8, pos: usize, limit: usize) 
     return .{ .cp = cp, .len = seq_len };
 }
 
-pub fn allowAnySpan(haystack: []const u8, start: usize, end: usize) bool {
-    _ = haystack;
-    _ = start;
-    _ = end;
-    return true;
-}
-
 pub fn allowExactLen(haystack: []const u8, start: usize, end: usize) bool {
     return start == 0 and end == haystack.len;
 }

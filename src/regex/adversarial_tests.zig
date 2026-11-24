@@ -7,7 +7,6 @@ const std = @import("std");
 const vm = @import("vm.zig");
 const set_mod = @import("set.zig");
 const inst_mod = @import("inst.zig");
-const dfa_mod = @import("dfa.zig");
 const Regex = vm.Regex;
 const RegexScratch = vm.RegexScratch;
 const RegexSet = set_mod.RegexSet;

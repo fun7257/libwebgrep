@@ -13,7 +13,6 @@ const sink_mod = @import("sink.zig");
 const searcher = @import("searcher.zig");
 const config_mod = @import("search/config.zig");
 const pull_mod = @import("search/pull.zig");
-const state_mod = @import("search/state.zig");
 const archive_mod = @import("codec/archive.zig");
 const decompress_mod = @import("codec/decompress.zig");
 const probe_mod = @import("probe.zig");

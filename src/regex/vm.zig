@@ -153,7 +153,6 @@ pub const Regex = struct {
     req_max_before: ?usize = null,
     /// When true, `haystack[hit.start - 1]` (and up to 3 bytes before `hit.start`) must match `req_prev_masks`.
     req_has_prev_mask: bool = false,
-    req_prev_mask: ByteSet = .{},
     req_prev_mask_len: u8 = 0,
     req_prev_masks: [3]ByteSet = .{ .{}, .{}, .{} },
     /// Optional k-byte suffix prefilter (`[prev_bytes..., req_literal_bytes[0]]`, k = 1..3)
@@ -6235,7 +6234,7 @@ fn byteSetForInst(inst: Inst, unicode_ranges: []const UnicodeRangeList, multilin
 
 /// Analyzes the compiled NFA subgraph preceding a unique required literal (`lit_start_pc..lit_end_pc`)
 /// to derive exact `\b<lit>\b` recognition, bounded `[req_min_before, req_max_before]` windows,
-/// 1-byte predecessor rejection (`req_prev_mask`), and backward-scan byte closure (`req_prefix_bytes_mask`).
+/// 1-byte predecessor rejection (`req_prev_masks`), and backward-scan byte closure (`req_prefix_bytes_mask`).
 fn analyzeRequiredLiteralContext(self: *Regex) void {
     const insts = self.insts;
     if (insts.len == 0 or insts.len > 256) return;
@@ -6514,7 +6513,7 @@ fn analyzeRequiredLiteralContext(self: *Regex) void {
         self.req_max_before = @intCast(max_dist[lit_start]);
     }
 
-    // 4. Collect `req_prev_mask` (immediate predecessor bytes when empty prefix is impossible) and
+    // 4. Collect `req_prev_masks` (immediate predecessor bytes when empty prefix is impossible) and
     //    `req_prefix_bytes_mask` (union of all bytes consumable on paths from `start_pc` to `lit_start`).
     var prev_mask = ByteSet{};
     var prefix_bytes = ByteSet{};
@@ -6619,7 +6618,6 @@ fn analyzeRequiredLiteralContext(self: *Regex) void {
 
     if (!zero_to_lit[self.start_pc] and any_prev and !byteSetIsAll(prev_mask) and self.req_min_before >= 1) {
         self.req_has_prev_mask = true;
-        self.req_prev_mask = prev_mask;
         self.req_prev_masks[0] = prev_mask;
         self.req_prev_mask_len = 1;
 

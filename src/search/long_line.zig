@@ -1,6 +1,6 @@
 //! [Module] search/long_line.zig
 //! [Layer] Layer 4 — Constant-Memory Sliding Window for Ultra-Long Lines
-//! [Role] Handles lines exceeding `max_line_len` without unbounded buffer growth (`beginLong`, `pumpLong`, `finishLong`),
+//! [Role] Handles lines exceeding `max_line_len` without unbounded buffer growth (`beginLong`, `pumpLong`, `finishLongWithBacking`),
 //!        preserving pattern overlap across sliding windows and capturing a bounded preview window around the first match.
 //! [Invariants]
 //!   1. Memory usage for arbitrarily long lines is strictly bounded by `buffer_size + max_line_len`.
@@ -94,11 +94,6 @@ pub fn compactBufAligned(buf: *[]u8, filled: *usize, drop: usize, state: *State,
     state.last_line_counted = if (state.last_line_counted >= drop) state.last_line_counted - drop else 0;
     state.remembered_until = if (state.remembered_until >= drop) state.remembered_until - drop else 0;
     state.abs_base += drop;
-}
-
-pub fn compactBuf(buf: []u8, filled: *usize, drop: usize, state: *State) void {
-    var slice = buf;
-    compactBufAligned(&slice, filled, drop, state, null);
 }
 
 pub fn noteLong(
@@ -243,10 +238,6 @@ fn slideLongWithBacking(buf: *[]u8, filled: *usize, matcher: anytype, state: *St
     filled.* = actual_keep;
     state.long_dropped += drop;
     state.abs_base += drop;
-}
-
-pub fn slideLong(buf: *[]u8, filled: *usize, matcher: anytype, state: *State, config: SearchConfig) void {
-    slideLongWithBacking(buf, filled, matcher, state, config, null);
 }
 
 pub fn emitHold(
@@ -412,21 +403,6 @@ fn finishLongWithBacking(
     return !state.stopped;
 }
 
-pub fn finishLong(
-    comptime S: type,
-    sink: *S,
-    buf: *[]u8,
-    filled: *usize,
-    hold: []const u8,
-    seen: []const bool,
-    state: *State,
-    config: SearchConfig,
-    content_in_buf: usize,
-    drop_buf: usize,
-) SliceError!bool {
-    return finishLongWithBacking(S, sink, buf, filled, hold, seen, state, config, content_in_buf, drop_buf, null);
-}
-
 fn beginLongWithMatchBacking(
     allocator: std.mem.Allocator,
     matcher: anytype,
@@ -463,20 +439,6 @@ fn beginLongWithMatchBacking(
     }
     try noteLong(allocator, matcher, bytes, hold, seen, state, config, false);
     slideLongWithBacking(buf, filled, matcher, state, config, backing);
-}
-
-pub fn beginLongWithMatch(
-    allocator: std.mem.Allocator,
-    matcher: anytype,
-    buf: *[]u8,
-    filled: *usize,
-    hold: *[]u8,
-    seen: *[]bool,
-    state: *State,
-    config: SearchConfig,
-    preset_match: ?matcher_mod.Match,
-) error{OutOfMemory}!void {
-    return beginLongWithMatchBacking(allocator, matcher, buf, filled, hold, seen, state, config, preset_match, null);
 }
 
 pub fn beginLong(

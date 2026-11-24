@@ -5,7 +5,7 @@
 //! [Invariants]
 //!   1. Prefilters are strictly conservative: every valid regex match must contain the prefilter candidate,
 //!      ensuring zero false negatives before NFA verification.
-//! [HotPath] Initialization-only (`extractLiterals` / `tryExtractAltLiterals` / `extractRequiredPrefix`).
+//! [HotPath] Initialization-only (`extractLiterals` / `tryExtractAltLiterals` / `extractSetLiterals`).
 
 const std = @import("std");
 const matcher = @import("../matcher.zig");
@@ -401,86 +401,6 @@ pub fn extractLiterals(self: anytype, pattern: []const u8, options: inst_mod.Reg
             try tryExtractLeadingAltPrefixes(self, pattern, find_opts);
         }
     }
-}
-
-/// Extracts a required literal prefix (starting at offset 0 of any match) if the pattern has no top-level alternation
-/// and begins with at least 1 required literal byte. Used by `RegexSet` to build a shared `Multi` SIMD prefilter.
-pub fn extractRequiredPrefix(allocator: std.mem.Allocator, pattern: []const u8, multiline: bool) !?[]u8 {
-    if (inst_mod.hasTopLevelAlt(pattern)) return null;
-    var prefix = std.ArrayList(u8).empty;
-    defer prefix.deinit(allocator);
-
-    var i: usize = 0;
-    // Allow leading `(?i)` / `(?m)` / `(?s)` / `(?U)` standalone flag group (bail out on `(?x)`)
-    if (pattern.len >= 4 and pattern[0] == '(' and pattern[1] == '?') {
-        var j: usize = 2;
-        var only_flags = false;
-        var has_neg = false;
-        while (j < pattern.len and (pattern[j] == 'i' or pattern[j] == 'm' or pattern[j] == 's' or pattern[j] == 'U' or pattern[j] == 'x' or pattern[j] == '-')) : (j += 1) {
-            only_flags = true;
-            if (pattern[j] == 'x') return null;
-            if (pattern[j] == '-') has_neg = true;
-        }
-        if (j < pattern.len and pattern[j] == ')' and only_flags and !has_neg) {
-            i = j + 1;
-        }
-    }
-
-    while (i < pattern.len) {
-        const c = pattern[i];
-        switch (c) {
-            '.', '^', '$', '[', '(', ')', '|' => break,
-            '*', '?' => {
-                popLastUtf8Codepoint(&prefix);
-                break;
-            },
-            '{' => {
-                // Check if `{0,...}` (optional) vs `{1,...}` (required at least once)
-                var j = i + 1;
-                var min_val: usize = 0;
-                var has_digit = false;
-                while (j < pattern.len and std.ascii.isDigit(pattern[j])) : (j += 1) {
-                    has_digit = true;
-                    min_val = min_val *| 10 +| (pattern[j] - '0');
-                }
-                if (!has_digit or min_val == 0) {
-                    popLastUtf8Codepoint(&prefix);
-                }
-                break;
-            },
-            '+' => break,
-            '\\' => {
-                if (i + 1 >= pattern.len) break;
-                const next_c = pattern[i + 1];
-                if (next_c == 'p' or next_c == 'P' or next_c == 'A' or next_c == 'z' or next_c == 'Z' or
-                    next_c == 'x' or next_c == 'u' or next_c == 'Q' or
-                    next_c == 'd' or next_c == 'D' or next_c == 'w' or next_c == 'W' or
-                    next_c == 's' or next_c == 'S' or next_c == 'b' or next_c == 'B' or next_c == '0')
-                {
-                    break;
-                }
-                const lit_b: u8 = switch (next_c) {
-                    'a' => 0x07,
-                    'f' => 0x0C,
-                    'v' => 0x0B,
-                    'n' => if (!multiline) break else '\n',
-                    'r' => '\r',
-                    't' => '\t',
-                    else => next_c,
-                };
-                try prefix.append(allocator, lit_b);
-                i += 2;
-            },
-            else => {
-                if (c == '\n' and !multiline) break;
-                const seq_len = utf8SeqLenAt(pattern, i, pattern.len);
-                try prefix.appendSlice(allocator, pattern[i .. i + seq_len]);
-                i += seq_len;
-            },
-        }
-    }
-    if (prefix.items.len == 0) return null;
-    return try allocator.dupe(u8, prefix.items);
 }
 
 pub fn tryExtractAltLiterals(self: anytype, pattern: []const u8, find_opts: matcher.FindOptions) !void {

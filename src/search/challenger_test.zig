@@ -11,10 +11,6 @@ const ignore_mod = @import("../walk/ignore.zig");
 const walker_mod = @import("../walk/walker.zig");
 const glob_mod = @import("../walk/glob.zig");
 const encoding_mod = @import("../codec/encoding.zig");
-const format_mod = @import("format.zig");
-const state_mod = @import("state.zig");
-const config_mod = @import("config.zig");
-const context_ring_mod = @import("context_ring.zig");
 const Span = sink_mod.Span;
 const Event = sink_mod.Event;
 

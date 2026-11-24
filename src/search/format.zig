@@ -374,28 +374,6 @@ pub fn sinkLineAction(
     return callSinkAction(S, name, sink, .{line});
 }
 
-pub fn sinkLine(
-    comptime S: type,
-    comptime name: []const u8,
-    sink: *S,
-    state: *State,
-    bytes: []const u8,
-    raw_buf: []const u8,
-    buf_offset: usize,
-    line_end: usize,
-    match_mode: matcher_mod.MatchMode,
-    span: ?Span,
-    matches: []Span,
-    offset: u64,
-    number: ?u64,
-    truncated: bool,
-    line_len: u64,
-    window_start: u64,
-    replacement: ?[]const u8,
-) bool {
-    return sinkLineAction(S, name, sink, state, bytes, raw_buf, buf_offset, line_end, match_mode, span, matches, offset, number, truncated, line_len, window_start, replacement) == .cont;
-}
-
 pub fn buildLine(
     state: *State,
     scratch: []u8,

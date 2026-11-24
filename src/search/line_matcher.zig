@@ -1,11 +1,11 @@
 //! [Module] search/line_matcher.zig
 //! [Layer] Layer 4 — Core Line Matching, Whole-Word/Line Verification, & Secondary Filtering
-//! [Role] Scans complete lines in a buffer (`matchBuffer`, `findLine`), fuses NUL binary detection when eligible,
+//! [Role] Scans complete lines in a buffer (`matchBuffer`, `findLineLimitOpts`), fuses NUL binary detection when eligible,
 //!        verifies whole-word/whole-line boundaries, applies `contains`/`excludes` filters, and drives context emission.
 //! [Invariants]
 //!   1. `buf` passed to `matchBuffer` contains only complete lines (or the final line at EOF).
 //!   2. Word-boundary and whole-line checks are evaluated before `invert_match` and secondary `contains`/`excludes` filters.
-//! [HotPath] `matchBuffer` -> `findLine` -> `nextMatch` -> `linePassesFilters`.
+//! [HotPath] `matchBuffer` -> `findLineLimitOpts` -> `nextMatch` -> `linePassesFilters`.
 
 const std = @import("std");
 const finder_mod = @import("../finder/finder.zig");
@@ -1063,14 +1063,6 @@ pub fn matchLineEnd(buf: []const u8, start: usize, hit: matcher_mod.Match, confi
     return lineEnd(buf, probe, config);
 }
 
-pub fn findLine(matcher: anytype, buf: []const u8, state: *State, config: SearchConfig) SliceError!?FoundLine {
-    return findLineLimitOpts(matcher, buf, state, buf.len, config, true);
-}
-
-pub fn findLineOpts(matcher: anytype, buf: []const u8, state: *State, config: SearchConfig, need_ls: bool) SliceError!?FoundLine {
-    return findLineLimitOpts(matcher, buf, state, buf.len, config, need_ls);
-}
-
 pub fn findLineLimitOpts(matcher: anytype, buf: []const u8, state: *State, limit: usize, config: SearchConfig, need_ls: bool) SliceError!?FoundLine {
     const allow_find_end = !need_ls and
         !effectiveMultiline(matcher, config) and
@@ -1373,20 +1365,6 @@ pub fn matchWholeLine(matcher: anytype, buf: []const u8, start: usize, end: usiz
         return .{ .start = start, .end = end, .pattern_id = found.pattern_id };
     }
     return null;
-}
-
-pub fn acceptsWholeLine(matcher: anytype, buf: []const u8, start: usize, end: usize) bool {
-    if (end < start or end > buf.len) return false;
-    const T = state_mod.MatcherType(@TypeOf(matcher));
-    if (@hasDecl(T, "acceptsSpan")) {
-        const FnInfo = @typeInfo(@TypeOf(@field(T, "acceptsSpan"))).@"fn";
-        return if (FnInfo.param_types.len == 3)
-            matcher.acceptsSpan(buf[start..end], .leftmost_first)
-        else
-            matcher.acceptsSpan(buf, start, end);
-    }
-    const found = matcher.find(buf[start..end], 0, .leftmost_first) orelse return false;
-    return found.start == 0 and found.end == end - start;
 }
 
 pub inline fn hasFilterUpper(s: []const u8) bool {

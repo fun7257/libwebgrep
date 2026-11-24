@@ -7360,6 +7360,400 @@ test "compiled replacement templates: literal, $$, $0/$&, $1..$32, and ${name}" 
     }
 }
 
+test "Fix A: chunked searchPrepared NUL quit parity across >512 KiB slices (switched_to_prepass & !canFuse)" {
+    const alloc = testing.allocator;
+    const line_hit = "2026-04-21 level=ERROR msg=something happened here\n";
+    const line_ok = "2026-04-21 level=INFO  msg=ordinary normal traffic\n";
+    var doc = std.ArrayList(u8).empty;
+    defer doc.deinit(alloc);
+
+    // Put 6 early hits so `shouldSwitchToPrepass` triggers (>4 hits inside first 32 KiB)
+    for (0..6) |_| try doc.appendSlice(alloc, line_hit);
+    // Fill past 700 KiB so remaining view > 512 KiB (exercises 256 KiB chunked path)
+    var expected_before_nul: u64 = 6;
+    var i: usize = 0;
+    while (doc.items.len < 620 * 1024) : (i += 1) {
+        if (i % 100 == 0) {
+            try doc.appendSlice(alloc, line_hit);
+            expected_before_nul += 1;
+        } else {
+            try doc.appendSlice(alloc, line_ok);
+        }
+    }
+    const nul_line_start = doc.items.len;
+    try doc.appendSlice(alloc, "2026-04-21 level=ERROR before_nul ");
+    const nul_pos: u64 = doc.items.len;
+    try doc.append(alloc, 0);
+    try doc.appendSlice(alloc, " after_nul\n");
+    try doc.appendSlice(alloc, line_hit);
+    try doc.appendSlice(alloc, line_hit);
+
+    var finder = try Finder.init("level=ERROR", .{});
+    const CountOnly = struct {};
+
+    // 1. switched_to_prepass path (canFuse=true, binary=.quit): stops at NUL line, skips NUL line & tail
+    {
+        var cs = CountOnly{};
+        const r_quit = try searchSlice(CountOnly, &cs, doc.items, "fix-a-quit", &finder, .{
+            .binary = .quit,
+        });
+        try testing.expectEqual(Outcome.binary_quit, r_quit.outcome);
+        try testing.expectEqual(@as(?u64, nul_pos), r_quit.nul_offset);
+        try testing.expectEqual(expected_before_nul, r_quit.matched_lines);
+        try testing.expectEqual(@as(u64, nul_line_start), r_quit.bytes_searched);
+    }
+
+    // 2. !canFuse path (whole_word=true, binary=.quit): exact same NUL quit semantics
+    {
+        var wfinder = try Finder.init("ERROR", .{});
+        var cs = CountOnly{};
+        const r_ww = try searchSlice(CountOnly, &cs, doc.items, "fix-a-ww", &wfinder, .{
+            .binary = .quit,
+            .whole_word = true,
+        });
+        try testing.expectEqual(Outcome.binary_quit, r_ww.outcome);
+        try testing.expectEqual(@as(?u64, nul_pos), r_ww.nul_offset);
+        try testing.expectEqual(expected_before_nul, r_ww.matched_lines);
+    }
+
+    // 3. Clean >700 KiB slice (no NUL): binary=.quit matches binary=.none identically
+    {
+        var clean = try alloc.dupe(u8, doc.items);
+        defer alloc.free(clean);
+        clean[@intCast(nul_pos)] = 'X';
+        var cs1 = CountOnly{};
+        var cs2 = CountOnly{};
+        const r_q = try searchSlice(CountOnly, &cs1, clean, "fix-a-clean-q", &finder, .{ .binary = .quit });
+        const r_n = try searchSlice(CountOnly, &cs2, clean, "fix-a-clean-n", &finder, .{ .binary = .none });
+        try testing.expectEqual(Outcome.complete, r_q.outcome);
+        try testing.expectEqual(r_n.matched_lines, r_q.matched_lines);
+        try testing.expectEqual(expected_before_nul + 3, r_q.matched_lines);
+
+        // 4. Streaming drive() with -a -c -F (`can_fast_count_no_nul` + 64B-aligned compaction)
+        var rdr = std.Io.Reader.fixed(clean);
+        var cs3 = CountOnly{};
+        const r_stream = try searchReader(CountOnly, alloc, &cs3, &rdr, "fix-s13b-stream", &finder, .{
+            .binary = .none,
+            .buffer_size = 64 * 1024,
+            .max_line_len = 64 * 1024,
+        });
+        try testing.expectEqual(Outcome.complete, r_stream.outcome);
+        try testing.expectEqual(r_n.matched_lines, r_stream.matched_lines);
+    }
+}
+
+test "Fix C: matchedSpan direct streaming parity with and without matched_span_skip_line_count" {
+    const alloc = testing.allocator;
+
+    const ExactSpanSink = struct {
+        alloc: std.mem.Allocator,
+        allow_stream: bool = true,
+        used_span: bool = false,
+        used_line: bool = false,
+        spans: std.ArrayList([]u8) = .empty,
+
+        pub fn deinit(self: *@This()) void {
+            for (self.spans.items) |s| self.alloc.free(s);
+            self.spans.deinit(self.alloc);
+        }
+
+        pub fn canStreamSpans(self: *const @This()) bool {
+            return self.allow_stream;
+        }
+
+        pub fn matchedSpan(self: *@This(), bytes: []const u8) bool {
+            self.used_span = true;
+            const dup = self.alloc.dupe(u8, bytes) catch return false;
+            self.spans.append(self.alloc, dup) catch return false;
+            return true;
+        }
+
+        pub fn matched(self: *@This(), line: Line) bool {
+            self.used_line = true;
+            for (line.matches) |sp| {
+                const dup = self.alloc.dupe(u8, line.bytes[sp.start..sp.end]) catch return false;
+                self.spans.append(self.alloc, dup) catch return false;
+            }
+            return true;
+        }
+    };
+
+    const SkipLineCountSpanSink = struct {
+        pub const matched_span_skip_line_count = true;
+        alloc: std.mem.Allocator,
+        spans: std.ArrayList([]u8) = .empty,
+
+        pub fn deinit(self: *@This()) void {
+            for (self.spans.items) |s| self.alloc.free(s);
+            self.spans.deinit(self.alloc);
+        }
+
+        pub fn canStreamSpans(_: *const @This()) bool {
+            return true;
+        }
+
+        pub fn matchedSpan(self: *@This(), bytes: []const u8) bool {
+            const dup = self.alloc.dupe(u8, bytes) catch return false;
+            self.spans.append(self.alloc, dup) catch return false;
+            return true;
+        }
+    };
+
+    const doc =
+        "one hit=11 and hit=22\n" ++
+        "no match here\n" ++
+        "crlf line hit=33\r\n" ++
+        "triple hit=44 hit=55 hit=66\n";
+    var re = try regex_mod.Regex.init(alloc, "hit=[0-9]+", .{});
+    defer re.deinit();
+
+    // Reference: fallback matched(Line) with canStreamSpans() == false
+    var ref_sink = ExactSpanSink{ .alloc = alloc, .allow_stream = false };
+    defer ref_sink.deinit();
+    const r_ref = try searchSlice(ExactSpanSink, &ref_sink, doc, "ref", &re, .{
+        .match_mode = .leftmost_first,
+        .binary = .none,
+    });
+    try testing.expect(ref_sink.used_line);
+    try testing.expect(!ref_sink.used_span);
+    try testing.expectEqual(@as(u64, 3), r_ref.matched_lines);
+    try testing.expectEqual(@as(u64, 6), r_ref.matches);
+
+    // 1. Exact library matchedSpan sink (without matched_span_skip_line_count)
+    var exact_sink = ExactSpanSink{ .alloc = alloc, .allow_stream = true };
+    defer exact_sink.deinit();
+    const r_exact = try searchSlice(ExactSpanSink, &exact_sink, doc, "exact", &re, .{
+        .match_mode = .leftmost_first,
+        .binary = .none,
+    });
+    try testing.expect(exact_sink.used_span);
+    try testing.expect(!exact_sink.used_line);
+    try testing.expectEqual(r_ref.matched_lines, r_exact.matched_lines);
+    try testing.expectEqual(r_ref.matches, r_exact.matches);
+    try testing.expectEqual(ref_sink.spans.items.len, exact_sink.spans.items.len);
+    for (ref_sink.spans.items, exact_sink.spans.items) |exp, got| {
+        try testing.expectEqualStrings(exp, got);
+    }
+
+    // 2. Skip-line-count matchedSpan sink (matched_span_skip_line_count = true)
+    var skip_sink = SkipLineCountSpanSink{ .alloc = alloc };
+    defer skip_sink.deinit();
+    const r_skip = try searchSlice(SkipLineCountSpanSink, &skip_sink, doc, "skip", &re, .{
+        .match_mode = .leftmost_first,
+        .binary = .none,
+    });
+    try testing.expectEqual(@as(u64, 1), r_skip.matched_lines);
+    try testing.expectEqual(r_ref.matches, r_skip.matches);
+    try testing.expectEqual(ref_sink.spans.items.len, skip_sink.spans.items.len);
+    for (ref_sink.spans.items, skip_sink.spans.items) |exp, got| {
+        try testing.expectEqualStrings(exp, got);
+    }
+
+    // 3. Streaming reader parity with small buffer
+    var rdr = std.Io.Reader.fixed(doc);
+    var stream_sink = ExactSpanSink{ .alloc = alloc, .allow_stream = true };
+    defer stream_sink.deinit();
+    const r_stream = try searchReader(ExactSpanSink, alloc, &stream_sink, &rdr, "stream", &re, .{
+        .match_mode = .leftmost_first,
+        .binary = .none,
+        .buffer_size = 32,
+        .max_line_len = 128,
+    });
+    try testing.expect(stream_sink.used_span);
+    try testing.expectEqual(r_ref.matched_lines, r_stream.matched_lines);
+    try testing.expectEqual(r_ref.matches, r_stream.matches);
+    try testing.expectEqual(ref_sink.spans.items.len, stream_sink.spans.items.len);
+    for (ref_sink.spans.items, stream_sink.spans.items) |exp, got| {
+        try testing.expectEqualStrings(exp, got);
+    }
+}
+
+test "Fix D: single-op and empty literal replacement fast paths" {
+    const alloc = testing.allocator;
+
+    const LiteralReplSink = struct {
+        pub const matched_raw_spans = true;
+        alloc: std.mem.Allocator,
+        replaced: std.ArrayList([]u8) = .empty,
+        span_repls: std.ArrayList([]u8) = .empty,
+
+        pub fn deinit(self: *@This()) void {
+            for (self.replaced.items) |s| self.alloc.free(s);
+            self.replaced.deinit(self.alloc);
+            for (self.span_repls.items) |s| self.alloc.free(s);
+            self.span_repls.deinit(self.alloc);
+        }
+
+        pub fn matched(self: *@This(), line: Line) bool {
+            if (line.replaced) |r| {
+                const dup = self.alloc.dupe(u8, r) catch return false;
+                self.replaced.append(self.alloc, dup) catch return false;
+            }
+            if (line.match) |m| {
+                if (m.replacement) |mr| {
+                    const dup = self.alloc.dupe(u8, mr) catch return false;
+                    self.span_repls.append(self.alloc, dup) catch return false;
+                }
+            }
+            return true;
+        }
+    };
+
+    var finder = try Finder.init("level=ERROR", .{});
+    const doc =
+        "2026 level=ERROR msg=a\n" ++
+        "level=ERROR at_start\n" ++
+        "at_end level=ERROR\n" ++
+        "two level=ERROR and level=ERROR here\n";
+
+    // 1. Single-op literal ("REDACTED")
+    {
+        var sink = LiteralReplSink{ .alloc = alloc };
+        defer sink.deinit();
+        const res = try searchSlice(LiteralReplSink, &sink, doc, "fix-d-lit", &finder, .{
+            .match_mode = .leftmost_first,
+            .replacement = "REDACTED",
+            .binary = .none,
+            .allocator = alloc,
+        });
+        try testing.expectEqual(@as(u64, 4), res.matched_lines);
+        try testing.expectEqualStrings("2026 REDACTED msg=a", sink.replaced.items[0]);
+        try testing.expectEqualStrings("REDACTED at_start", sink.replaced.items[1]);
+        try testing.expectEqualStrings("at_end REDACTED", sink.replaced.items[2]);
+        try testing.expectEqualStrings("two REDACTED and REDACTED here", sink.replaced.items[3]);
+        for (sink.span_repls.items) |sr| {
+            try testing.expectEqualStrings("REDACTED", sr);
+        }
+    }
+
+    // 2. Empty literal ("")
+    {
+        var sink = LiteralReplSink{ .alloc = alloc };
+        defer sink.deinit();
+        const res = try searchSlice(LiteralReplSink, &sink, doc, "fix-d-empty", &finder, .{
+            .match_mode = .leftmost_first,
+            .replacement = "",
+            .binary = .none,
+            .allocator = alloc,
+        });
+        try testing.expectEqual(@as(u64, 4), res.matched_lines);
+        try testing.expectEqualStrings("2026  msg=a", sink.replaced.items[0]);
+        try testing.expectEqualStrings(" at_start", sink.replaced.items[1]);
+        try testing.expectEqualStrings("at_end ", sink.replaced.items[2]);
+        try testing.expectEqualStrings("two  and  here", sink.replaced.items[3]);
+    }
+}
+
+test "Fix S15-A: 600 KiB long-line countParallelAt parity (zero, rare, boundary, multi-chunk dense, NUL quit)" {
+    const alloc = testing.allocator;
+    const MemRa = struct {
+        data: []const u8,
+        fn readAt(ctx: ?*anyopaque, offset: u64, dest: []u8) anyerror!usize {
+            const self: *const @This() = @ptrCast(@alignCast(ctx.?));
+            if (offset >= self.data.len) return 0;
+            const start: usize = @intCast(offset);
+            const n = @min(dest.len, self.data.len - start);
+            @memcpy(dest[0..n], self.data[start .. start + n]);
+            return n;
+        }
+        fn asRa(self: *@This()) searcher.RandomAccess {
+            return .{
+                .ctx = self,
+                .read_at = readAt,
+                .size = self.data.len,
+            };
+        }
+    };
+
+    const needle = "NEEDLE_TOKEN_99";
+    var finder = try Finder.init(needle, .{});
+    const opts = searcher.ParallelOptions{
+        .workers = 4,
+        .chunk_size = 256 * 1024,
+    };
+    const CountOnly = struct {};
+
+    // Build 3 lines of ~620 KiB each (~1.86 MiB total)
+    const line_len: usize = 620 * 1024;
+    const total_len: usize = line_len * 3;
+    const buf = try alloc.alloc(u8, total_len);
+    defer alloc.free(buf);
+    @memset(buf, 'a');
+    buf[line_len - 1] = '\n';
+    buf[2 * line_len - 1] = '\n';
+    buf[3 * line_len - 1] = '\n';
+
+    // 1. Zero hits on 620 KiB lines
+    {
+        var mra = MemRa{ .data = buf };
+        const par = try searcher.countParallelAt(alloc, testing.io, mra.asRa(), &finder, .{ .binary = .none }, opts);
+        try testing.expectEqual(@as(u64, 0), par.matched_lines);
+        try testing.expect(par.scanned_all);
+    }
+
+    // 2. Boundary-straddling hit across 256 KiB boundary + multi-chunk hits on the SAME 620 KiB line
+    //    (including chunk 0 hit, chunk 1 zero hits, chunk 2 hit on the SAME line!)
+    {
+        // Line 0: hit in chunk 0 (offset 100), NO hit in chunk 1, hit in chunk 2 (offset 530 KiB) -> 1 line!
+        @memcpy(buf[100 .. 100 + needle.len], needle);
+        @memcpy(buf[530 * 1024 .. 530 * 1024 + needle.len], needle);
+        // Line 1: hit straddling the 768 KiB (3 * 256 KiB) chunk boundary -> 1 line!
+        const bnd = 3 * 256 * 1024 - 5;
+        @memcpy(buf[bnd .. bnd + needle.len], needle);
+        // Line 2: dense hits across all chunks covering line 2 -> 1 line!
+        const l2 = 2 * line_len;
+        @memcpy(buf[l2 + 10 .. l2 + 10 + needle.len], needle);
+        @memcpy(buf[l2 + 260 * 1024 .. l2 + 260 * 1024 + needle.len], needle);
+        @memcpy(buf[l2 + 520 * 1024 .. l2 + 520 * 1024 + needle.len], needle);
+
+        var cs = CountOnly{};
+        const seq = try searchSlice(CountOnly, &cs, buf, "s15-seq", &finder, .{ .binary = .none });
+        var mra = MemRa{ .data = buf };
+        const par = try searcher.countParallelAt(alloc, testing.io, mra.asRa(), &finder, .{ .binary = .none }, opts);
+        try testing.expectEqual(@as(u64, 3), seq.matched_lines);
+        try testing.expectEqual(seq.matched_lines, par.matched_lines);
+        try testing.expectEqual(seq.matches, par.matches);
+
+        // Also test with binary=.quit (clean file)
+        const par_q = try searcher.countParallelAt(alloc, testing.io, mra.asRa(), &finder, .{ .binary = .quit }, opts);
+        try testing.expectEqual(seq.matched_lines, par_q.matched_lines);
+    }
+
+    // 3. Binary NUL on the SAME 620 KiB line in chunk 1 after a match in chunk 0 -> must undo line 0 count!
+    {
+        const nul_same_line: usize = 300 * 1024; // chunk 1, still inside line 0
+        buf[nul_same_line] = 0;
+        defer buf[nul_same_line] = 'a';
+
+        var cs = CountOnly{};
+        const seq = try searchSlice(CountOnly, &cs, buf, "s15-nul-same-seq", &finder, .{ .binary = .quit });
+        var mra = MemRa{ .data = buf };
+        const par = try searcher.countParallelAt(alloc, testing.io, mra.asRa(), &finder, .{ .binary = .quit }, opts);
+        try testing.expectEqual(Outcome.binary_quit, seq.outcome);
+        try testing.expectEqual(Outcome.binary_quit, par.outcome);
+        try testing.expectEqual(seq.nul_offset, par.nul_offset);
+        try testing.expectEqual(@as(u64, 0), seq.matched_lines);
+        try testing.expectEqual(seq.matched_lines, par.matched_lines);
+    }
+
+    // 4. Binary NUL on line 1 (after line 0 ended with '\n') -> line 0 stays counted (1), line 1 rejected!
+    {
+        const nul_next_line: usize = line_len + 200 * 1024; // inside line 1, after bnd? No, line_len=620K, 620K+200K=820K > bnd=768K-5!
+        buf[nul_next_line] = 0;
+        defer buf[nul_next_line] = 'a';
+
+        var cs = CountOnly{};
+        const seq = try searchSlice(CountOnly, &cs, buf, "s15-nul-next-seq", &finder, .{ .binary = .quit });
+        var mra = MemRa{ .data = buf };
+        const par = try searcher.countParallelAt(alloc, testing.io, mra.asRa(), &finder, .{ .binary = .quit }, opts);
+        try testing.expectEqual(Outcome.binary_quit, seq.outcome);
+        try testing.expectEqual(Outcome.binary_quit, par.outcome);
+        try testing.expectEqual(seq.nul_offset, par.nul_offset);
+        try testing.expectEqual(@as(u64, 1), seq.matched_lines);
+        try testing.expectEqual(seq.matched_lines, par.matched_lines);
+    }
+}
+
 test {
     _ = @import("challenger_test.zig");
 }

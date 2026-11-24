@@ -30,6 +30,7 @@ const width = cfg_mod.width;
 const validateBudgets = cfg_mod.validateBudgets;
 const decodeCap = cfg_mod.decodeCap;
 const beforeCount = cfg_mod.beforeCount;
+const afterCount = cfg_mod.afterCount;
 const beforeContextCapacity = cfg_mod.beforeContextCapacity;
 const bufferWindow = cfg_mod.bufferWindow;
 const watchesBinary = cfg_mod.watchesBinary;
@@ -71,9 +72,61 @@ const overDecompressed = state_mod.overDecompressed;
 const rememberBefore = ring_mod.rememberBefore;
 const matchBuffer = line_matcher_mod.matchBuffer;
 const longTail = long_line_mod.longTail;
-const pumpLong = long_line_mod.pumpLong;
-const makeRoom = long_line_mod.makeRoom;
-const compactBuf = long_line_mod.compactBuf;
+const pumpLongAligned = long_line_mod.pumpLongAligned;
+const makeRoomAligned = long_line_mod.makeRoomAligned;
+
+const align_slack: usize = 64;
+
+inline fn alignPad(storage_ptr: usize, raw_cursor: u64, remain: usize) usize {
+    const cursor_usize: usize = @truncate(raw_cursor);
+    return (cursor_usize -% storage_ptr -% remain) & 63;
+}
+
+inline fn realignSlice(buf_storage: []u8, buf: *[]u8, drop: usize, len: usize, raw_cursor: u64, slack: usize) usize {
+    const remain = len - drop;
+    if (slack == 0) {
+        if (remain > 0 and drop > 0) @memmove(buf.*[0..remain], buf.*[drop..len]);
+        return remain;
+    }
+    const usable_cap = buf_storage.len - slack;
+    const pad = alignPad(@intFromPtr(buf_storage.ptr), raw_cursor, remain);
+    const next_buf = buf_storage[pad .. pad + usable_cap];
+    if (remain > 0 and (drop > 0 or next_buf.ptr != buf.*.ptr)) {
+        @memmove(next_buf[0..remain], buf.*[drop..len]);
+    }
+    buf.* = next_buf;
+    return remain;
+}
+
+fn growAligned(
+    allocator: std.mem.Allocator,
+    buf_storage: *[]u8,
+    buf: *[]u8,
+    filled: usize,
+    limit: usize,
+    raw_cursor: u64,
+    slack: usize,
+) error{OutOfMemory}!bool {
+    const usable_cap = buf_storage.len - slack;
+    if (usable_cap >= limit) return false;
+    const doubled = if (usable_cap > limit / 2) limit else usable_cap * 2;
+    const next_usable = @min(limit, @max(doubled, usable_cap + 1));
+    if (next_usable <= usable_cap) return false;
+    const old_pad = @intFromPtr(buf.*.ptr) - @intFromPtr(buf_storage.ptr);
+    const next_storage = try allocator.realloc(buf_storage.*, next_usable + slack);
+    buf_storage.* = next_storage;
+    if (slack == 0) {
+        buf.* = next_storage;
+        return true;
+    }
+    const new_pad = alignPad(@intFromPtr(next_storage.ptr), raw_cursor, filled);
+    const next_buf = next_storage[new_pad .. new_pad + next_usable];
+    if (filled > 0 and new_pad != old_pad) {
+        @memmove(next_buf[0..filled], next_storage[old_pad .. old_pad + filled]);
+    }
+    buf.* = next_buf;
+    return true;
+}
 
 fn setDecoderRawMidStream(decoder: *encoding.Decoder, config: SearchConfig) void {
     const saved_in = decoder.in;
@@ -725,6 +778,90 @@ pub fn searchPrepared(
 
     var skip_match = false;
     if (watchesBinary(config)) {
+        const is_ml_prep = state_mod.effectiveMultiline(matcher, config);
+        if (config.binary == .quit and
+            (switched_to_prepass or !canFuse(matcher, config, &state)) and
+            view.len > state.pos and view.len - state.pos > 512 * 1024 and
+            !is_ml_prep and
+            !config.invert and
+            beforeCount(config) == 0 and
+            afterCount(config) == 0 and
+            !config.passthru and
+            !config.stop_on_nonmatch)
+        {
+            const chunk_target: usize = 256 * 1024;
+            const sep = cfg_mod.recordSep(config);
+            while (state.pos < view.len and !state.stopped) {
+                if (state.exceeded(config) or flagIsSet(config) or stopInMatch(&state, config) or !maybeProgress(S, sink, &state, config)) {
+                    if (state.exceeded(config)) state.need_close = true;
+                    state.stopped = true;
+                    break;
+                }
+                if (state.pending_skip_to != null) {
+                    _ = line_matcher_mod.applyInBufferSkip(view, view.len, &state, config);
+                    state.pending_skip_to = null;
+                    continue;
+                }
+                const chunk_start = state.pos;
+                const raw_end = @min(view.len, chunk_start + chunk_target);
+                const chunk_end = if (raw_end < view.len)
+                    (if (raw_end > chunk_start and view[raw_end - 1] == sep) raw_end else lineEnd(view, raw_end, config))
+                else
+                    view.len;
+                if (std.mem.findScalar(u8, view[chunk_start..chunk_end], 0)) |rel| {
+                    var cur_nul: ?usize = chunk_start + rel;
+                    while (cur_nul) |nul| {
+                        const safe_end = lineStart(view, nul, config);
+                        if (safe_end > state.pos) {
+                            if (!try matchBuffer(S, sink, matcher, view[0..safe_end], &state, config)) {
+                                if (state.pending_skip_to != null) {
+                                    _ = line_matcher_mod.applyInBufferSkip(view, view.len, &state, config);
+                                    state.pending_skip_to = null;
+                                } else {
+                                    state.stopped = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (state.pending_skip_to != null) {
+                            _ = line_matcher_mod.applyInBufferSkip(view, view.len, &state, config);
+                            state.pending_skip_to = null;
+                        }
+                        if (state.pos > nul) {
+                            if (state.pos < chunk_end) {
+                                cur_nul = std.mem.findScalarPos(u8, view[0..chunk_end], state.pos, 0);
+                                continue;
+                            }
+                            break;
+                        }
+                        noteBinary(&state, config, state.abs_base + nul);
+                        _ = callOpt(S, "binary", sink, .{state.nul_offset.?});
+                        state.stopped = true;
+                        if (state.hit_byte_cap) noteLimit(&state, .max_bytes);
+                        return finishSink(S, sink, &state, config);
+                    }
+                    if (state.stopped) break;
+                    if (state.pos >= chunk_end) continue;
+                }
+                if (!try matchBuffer(S, sink, matcher, view[0..chunk_end], &state, config)) {
+                    if (state.pending_skip_to != null) {
+                        _ = line_matcher_mod.applyInBufferSkip(view, view.len, &state, config);
+                        state.pending_skip_to = null;
+                        continue;
+                    }
+                    state.stopped = true;
+                    break;
+                }
+                if (state.pending_skip_to != null) {
+                    _ = line_matcher_mod.applyInBufferSkip(view, view.len, &state, config);
+                    state.pending_skip_to = null;
+                }
+            }
+            const consumed_c = (!state.stopped or state.pos >= view.len) and !state.output_blocked;
+            if (consumed_c and !state.hit_byte_cap and state.soft_error == null) state.scanned_all = true;
+            if (state.hit_byte_cap) noteLimit(&state, .max_bytes);
+            return finishSink(S, sink, &state, config);
+        }
         var nul_at: ?usize = null;
         if (switched_to_prepass) {
             nul_at = std.mem.findScalarPos(u8, view, state.pos, 0);
@@ -951,28 +1088,32 @@ pub fn drive(
     else
         bufferWindow(config);
     const cap0 = @max(initial, 1);
+    const slack: usize = if (cap0 >= 4096 and hold_limit >= 4096) align_slack else 0;
+    const raw_cap0 = cap0 + slack;
     const stream_slot: ?*[]u8 = if (config.scratch_pool) |sp|
         &sp.stream_buf
     else if (config.scratch) |slot|
         slot
     else
         null;
-    var buf: []u8 = undefined;
+    var buf_storage: []u8 = undefined;
     if (stream_slot) |slot| {
-        if (slot.len < cap0) {
-            slot.* = try stream_alloc.realloc(slot.*, cap0);
+        if (slot.len < raw_cap0) {
+            slot.* = try stream_alloc.realloc(slot.*, raw_cap0);
         }
-        buf = slot.*;
+        buf_storage = slot.*;
     } else {
-        buf = try stream_alloc.alloc(u8, cap0);
+        buf_storage = try stream_alloc.alloc(u8, raw_cap0);
     }
     defer {
         if (stream_slot) |slot| {
-            slot.* = buf;
+            slot.* = buf_storage;
         } else {
-            stream_alloc.free(buf);
+            stream_alloc.free(buf_storage);
         }
     }
+    const init_pad: usize = if (slack != 0) alignPad(@intFromPtr(buf_storage.ptr), config.stream_offset orelse 0, 0) else 0;
+    var buf: []u8 = buf_storage[init_pad .. init_pad + (buf_storage.len - slack)];
     var filled: usize = 0;
     var offset_map = decompress.OffsetMap{};
     defer offset_map.deinit(pool_alloc);
@@ -1173,6 +1314,7 @@ pub fn drive(
                 if (prev_n == 0) {
                     range_eof = true;
                 } else if (prev_b[0] != sep) {
+                    _ = realignSlice(buf_storage, &buf, 0, 0, upstream.raw_cursor, slack);
                     while (!stopForBudget(&state, config)) {
                         var max_align = buf.len;
                         if (range_end) |re_end| {
@@ -1205,20 +1347,24 @@ pub fn drive(
                         if (std.mem.findScalar(u8, buf[0..rn], sep)) |nl_rel| {
                             const drop = nl_rel + 1;
                             state.abs_base += drop;
-                            const rem = rn - drop;
-                            if (rem > 0) @memmove(buf[0..rem], buf[drop..rn]);
-                            filled = rem;
+                            filled = realignSlice(buf_storage, &buf, drop, rn, upstream.raw_cursor, slack);
                             break;
                         }
                         state.abs_base += rn;
+                        _ = realignSlice(buf_storage, &buf, 0, 0, upstream.raw_cursor, slack);
                     }
                     if (state.limit_hit != .none) return finishSink(S, sink, &state, config);
+                } else {
+                    _ = realignSlice(buf_storage, &buf, 0, 0, upstream.raw_cursor, slack);
                 }
+            } else {
+                _ = realignSlice(buf_storage, &buf, 0, 0, upstream.raw_cursor, slack);
             }
             if (state.is_range_search) state.range_base_offset = state.abs_base;
         } else if (upstream.raw_cursor == eff_start) {
             setDecoderRawMidStream(&decoder, config);
             state.abs_base = eff_start;
+            _ = realignSlice(buf_storage, &buf, 0, 0, upstream.raw_cursor, slack);
             if (align_start) {
                 while (!stopForBudget(&state, config)) {
                     var max_align = buf.len;
@@ -1252,12 +1398,11 @@ pub fn drive(
                     if (std.mem.findScalar(u8, buf[0..rn], sep)) |nl_rel| {
                         const drop = nl_rel + 1;
                         state.abs_base += drop;
-                        const rem = rn - drop;
-                        if (rem > 0) @memmove(buf[0..rem], buf[drop..rn]);
-                        filled = rem;
+                        filled = realignSlice(buf_storage, &buf, drop, rn, upstream.raw_cursor, slack);
                         break;
                     }
                     state.abs_base += rn;
+                    _ = realignSlice(buf_storage, &buf, 0, 0, upstream.raw_cursor, slack);
                 }
                 if (state.limit_hit != .none) return finishSink(S, sink, &state, config);
             }
@@ -1293,10 +1438,8 @@ pub fn drive(
                 if (cur_decoded + pulled_skip.n >= eff_start) {
                     const cut: usize = @intCast(eff_start - cur_decoded);
                     if (cut > 0) prev_b = buf[cut - 1];
-                    const rem = pulled_skip.n - cut;
-                    if (rem > 0) @memmove(buf[0..rem], buf[cut..pulled_skip.n]);
-                    filled = rem;
-                    if (state.is_range_search) state.bytes_read += rem;
+                    filled = realignSlice(buf_storage, &buf, cut, pulled_skip.n, upstream.raw_cursor, slack);
+                    if (state.is_range_search) state.bytes_read += filled;
                     cur_decoded = eff_start;
                     if (pulled_skip.eof and filled == 0) range_eof = true;
                     break;
@@ -1318,9 +1461,7 @@ pub fn drive(
                         filled;
                     if (std.mem.findScalar(u8, buf[0..check_len], sep)) |nl_rel| {
                         const drop = nl_rel + 1;
-                        const rem = filled - drop;
-                        if (rem > 0) @memmove(buf[0..rem], buf[drop..filled]);
-                        filled = rem;
+                        filled = realignSlice(buf_storage, &buf, drop, filled, upstream.raw_cursor, slack);
                         state.abs_base += drop;
                         break;
                     }
@@ -1334,6 +1475,7 @@ pub fn drive(
                     }
                     state.abs_base += filled;
                     filled = 0;
+                    _ = realignSlice(buf_storage, &buf, 0, 0, upstream.raw_cursor, slack);
                     if (stopForBudget(&state, config)) break;
                     var align_read: u64 = 0;
                     const p_al = decoder.pull(pool_alloc, struct {
@@ -1388,9 +1530,7 @@ pub fn drive(
                 if (skip_target <= cur_buf_end) {
                     const drop: usize = @intCast(skip_target - state.abs_base);
                     countLines(buf[0..filled], drop, &state, config);
-                    const rem = filled - drop;
-                    if (drop > 0 and rem > 0) @memmove(buf[0..rem], buf[drop..filled]);
-                    filled = rem;
+                    filled = realignSlice(buf_storage, &buf, drop, filled, upstream.raw_cursor, slack);
                     state.pos = 0;
                     state.last_line_visited = 0;
                     state.last_line_counted = 0;
@@ -1421,6 +1561,7 @@ pub fn drive(
                         setDecoderRawMidStream(&decoder, config);
                         upstream.raw_cursor = skip_target;
                         state.abs_base = skip_target;
+                        _ = realignSlice(buf_storage, &buf, 0, 0, upstream.raw_cursor, slack);
                     } else if (config.seek_input) |seek_fn| {
                         state.line_number = null;
                         state.resume_line = 0;
@@ -1433,8 +1574,10 @@ pub fn drive(
                         setDecoderRawMidStream(&decoder, config);
                         upstream.raw_cursor = skip_target;
                         state.abs_base = skip_target;
+                        _ = realignSlice(buf_storage, &buf, 0, 0, upstream.raw_cursor, slack);
                     } else {
                         var cur_off = cur_buf_end;
+                        _ = realignSlice(buf_storage, &buf, 0, 0, upstream.raw_cursor, slack);
                         while (cur_off < skip_target and !stopForBudget(&state, config)) {
                             var sk_bytes: u64 = 0;
                             const p_sk = decoder.pull(pool_alloc, struct {
@@ -1455,10 +1598,8 @@ pub fn drive(
                                 if (state.line_number) |ln| {
                                     state.line_number = ln + memchr.count(width, buf, 0, cut, sep);
                                 }
-                                const rem = p_sk.n - cut;
-                                if (rem > 0) @memmove(buf[0..rem], buf[cut..p_sk.n]);
-                                filled = rem;
-                                if (state.is_range_search) state.bytes_read += rem;
+                                filled = realignSlice(buf_storage, &buf, cut, p_sk.n, upstream.raw_cursor, slack);
+                                if (state.is_range_search) state.bytes_read += filled;
                                 cur_off = skip_target;
                                 if (p_sk.eof and filled == 0) range_eof = true;
                                 break;
@@ -1471,6 +1612,7 @@ pub fn drive(
                                 range_eof = true;
                                 break;
                             }
+                            _ = realignSlice(buf_storage, &buf, 0, 0, upstream.raw_cursor, slack);
                         }
                         if (state.soft_error != null or state.limit_hit != .none) break;
                         state.abs_base = cur_off;
@@ -1515,13 +1657,16 @@ pub fn drive(
             }
         }
         if (!range_eof and filled == buf.len) {
-            if (try state_mod.growWithLimit(stream_alloc, buf, hold_limit)) |next| {
-                buf = next;
-                if (stream_slot) |slot| slot.* = buf;
-            } else if (!try makeRoom(S, pool_alloc, sink, matcher, &buf, &filled, &hold, &seen, &state, config)) {
+            const backing: ?long_line_mod.BufBacking = if (slack != 0) .{
+                .storage = buf_storage,
+                .raw_cursor = upstream.raw_cursor,
+            } else null;
+            if (try growAligned(stream_alloc, &buf_storage, &buf, filled, hold_limit, upstream.raw_cursor, slack)) {
+                if (stream_slot) |slot| slot.* = buf_storage;
+            } else if (!try makeRoomAligned(S, pool_alloc, sink, matcher, &buf, &filled, &hold, &seen, &state, config, backing)) {
                 state.stopped = true;
                 break;
-            } else if (stream_slot) |slot| slot.* = buf;
+            }
             if (state.pending_skip_to != null) continue;
         }
         var chunk_at = filled;
@@ -1623,8 +1768,46 @@ pub fn drive(
             break;
         }
 
-        if (state.long_active or longTail(buf[0..filled], eof, config)) {
-            const cont = try pumpLong(
+        const exact_max = state_mod.exactMatcherMaxLen(matcher);
+        const can_fast_count_no_nul = (comptime !@hasDecl(S, "matched") and !@hasDecl(S, "context") and !@hasDecl(S, "contextBreak") and !@hasDecl(S, "context_break")) and
+            !watchesBinary(config) and
+            !config.null_data and
+            !is_ml and
+            !isStartAnchoredMatcher(matcher) and
+            exact_max != null and exact_max.? > 0 and
+            state.line_number == null and
+            !config.invert and
+            !config.whole_word and
+            !config.whole_line and
+            beforeCount(config) == 0 and
+            afterCount(config) == 0 and
+            !config.passthru and
+            !config.stop_on_nonmatch and
+            config.contains.len == 0 and
+            config.excludes.len == 0 and
+            config.contains_regexes.len == 0 and
+            config.excludes_regexes.len == 0 and
+            config.line_filter == null and
+            config.max_output_bytes == null and
+            config.max_queued_event_bytes == null and
+            config.resume_from == 0 and
+            !state.long_active;
+        var fast_no_nul_done = false;
+        var fast_no_nul_hit: ?matcher_mod.Match = null;
+        if (can_fast_count_no_nul and filled > state.pos) {
+            if (matcher.find(buf[0..filled], state.pos, config.match_mode)) |hit| {
+                fast_no_nul_hit = hit;
+            } else {
+                fast_no_nul_done = true;
+            }
+        }
+
+        if (!fast_no_nul_done and (state.long_active or longTail(buf[0..filled], eof, config))) {
+            const backing: ?long_line_mod.BufBacking = if (slack != 0) .{
+                .storage = buf_storage,
+                .raw_cursor = upstream.raw_cursor,
+            } else null;
+            const cont = try pumpLongAligned(
                 S,
                 pool_alloc,
                 sink,
@@ -1637,8 +1820,8 @@ pub fn drive(
                 eof,
                 &state,
                 config,
+                backing,
             );
-            if (stream_slot) |slot| slot.* = buf;
             if (!cont) {
                 if (state.pending_skip_to != null and !state.paused) continue;
                 state.stopped = true;
@@ -1650,11 +1833,11 @@ pub fn drive(
                 continue;
             }
             chunk_at = 0;
+            fast_no_nul_hit = null;
         }
 
-        const exact_max = state_mod.exactMatcherMaxLen(matcher);
         const can_fuse_chunk = canFuse(matcher, config, &state);
-        const fuse_full_buf = !is_ml and can_fuse_chunk and exact_max != null and exact_max.? > 0 and filled > state.pos;
+        const fuse_full_buf = !fast_no_nul_done and !is_ml and can_fuse_chunk and exact_max != null and exact_max.? > 0 and filled > state.pos;
         var search_end: usize = 0;
         var view_end: usize = 0;
         var skip_match = false;
@@ -1663,7 +1846,35 @@ pub fn drive(
 
         const no_more_reads = eof or state_mod.overBytes(&state, config) or state_mod.overDecompressed(&state, config);
         const saved_pos_before_fuse = state.pos;
-        if (fuse_full_buf) {
+        if (fast_no_nul_done) {
+            skip_match = true;
+            if (eof) {
+                search_end = filled;
+                view_end = filled;
+                state.pos = filled;
+            } else {
+                const keep_overlap = exact_max.? -| 1;
+                const cons = filled -| keep_overlap;
+                search_end = cons;
+                view_end = cons;
+                state.pos = cons;
+                fast_consumed = cons;
+            }
+        } else if (fast_no_nul_hit) |hit| {
+            search_end = if (eof) filled else lastComplete(buf[0..filled], config);
+            view_end = if (eof) filled else search_end;
+            if (hit.start < search_end) {
+                if (hit.end <= view_end) {
+                    state.setCachedMatch(buf[0..view_end], state.pos, hit);
+                }
+                if (config.progress_interval == null or config.progress_interval.? == 0) {
+                    state.pos = lineStart(buf[0..view_end], hit.start, config);
+                }
+            } else {
+                skip_match = true;
+                state.pos = view_end;
+            }
+        } else if (fuse_full_buf) {
             var nul_rel: ?usize = null;
             const found = if (comptime @hasDecl(state_mod.MatcherType(@TypeOf(matcher)), "findWatched"))
                 matcher.findWatched(buf[0..filled], state.pos, &nul_rel)
@@ -1945,11 +2156,7 @@ pub fn drive(
             search_end;
         rememberBefore(matcher, buf, &state, config, consumed);
         countLines(buf, consumed, &state, config);
-        const remain = filled - consumed;
-        if (consumed > 0 and remain > 0) {
-            @memmove(buf[0..remain], buf[consumed..filled]);
-        }
-        filled = remain;
+        filled = realignSlice(buf_storage, &buf, consumed, filled, upstream.raw_cursor, slack);
         state.pos = if (fast_next_pos) |fnp| fnp else if (state.pos >= consumed) state.pos - consumed else 0;
         state.last_line_visited = 0;
         state.last_line_counted = 0;

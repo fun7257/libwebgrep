@@ -694,6 +694,23 @@ inline fn expandCompiledOps(
     return written;
 }
 
+fn buildReplacedWithFallback(
+    state: *State,
+    scratch: []u8,
+    bytes: []const u8,
+    raw_buf: []const u8,
+    buf_offset: usize,
+    line_end: usize,
+    match_mode: matcher_mod.MatchMode,
+    matches: []Span,
+    match_out: *?Span,
+    repl: []const u8,
+) ?[]const u8 {
+    @branchHint(.cold);
+    const compiled = compileReplacement(repl, state.capture_regex);
+    return buildReplacedCompiled(state, scratch, bytes, raw_buf, buf_offset, line_end, match_mode, matches, match_out, repl, &compiled);
+}
+
 pub fn buildReplaced(
     state: *State,
     scratch: []u8,
@@ -706,13 +723,63 @@ pub fn buildReplaced(
     match_out: *?Span,
     repl: []const u8,
 ) ?[]const u8 {
-    const compiled = if (state.compiled_repl.mode != .none)
-        state.compiled_repl
-    else
-        compileReplacement(repl, state.capture_regex);
+    if (state.compiled_repl.mode != .none) {
+        return buildReplacedCompiled(state, scratch, bytes, raw_buf, buf_offset, line_end, match_mode, matches, match_out, repl, &state.compiled_repl);
+    }
+    return buildReplacedWithFallback(state, scratch, bytes, raw_buf, buf_offset, line_end, match_mode, matches, match_out, repl);
+}
 
+fn buildReplacedCompiled(
+    state: *State,
+    scratch: []u8,
+    bytes: []const u8,
+    raw_buf: []const u8,
+    buf_offset: usize,
+    line_end: usize,
+    match_mode: matcher_mod.MatchMode,
+    matches: []Span,
+    match_out: *?Span,
+    repl: []const u8,
+    compiled: *const state_mod.CompiledReplacement,
+) ?[]const u8 {
     if (!compiled.overflow and compiled.mode == .literal_only) {
         const ops = compiled.ops[0..compiled.len];
+        if (ops.len == 1 and matches.len == 1) {
+            const lit = ops[0].literal;
+            const from = @min(matches[0].start, bytes.len);
+            const to = @min(@max(matches[0].end, from), bytes.len);
+            const tail_len = bytes.len - to;
+            const need = from + lit.len + tail_len;
+            const dest = replaceDest(state, scratch, need) orelse return null;
+            if (from > 0) @memcpy(dest[0..from], bytes[0..from]);
+            if (lit.len > 0) @memcpy(dest[from .. from + lit.len], lit);
+            if (tail_len > 0) @memcpy(dest[from + lit.len .. need], bytes[to..]);
+            const rep_slice = dest[from .. from + lit.len];
+            matches[0].replacement = rep_slice;
+            if (match_out.*) |*m| {
+                if (m.start == matches[0].start and m.end == matches[0].end) {
+                    m.replacement = rep_slice;
+                }
+            }
+            return dest[0..need];
+        }
+        if (ops.len == 0 and matches.len == 1) {
+            const from = @min(matches[0].start, bytes.len);
+            const to = @min(@max(matches[0].end, from), bytes.len);
+            const tail_len = bytes.len - to;
+            const need = from + tail_len;
+            const dest = replaceDest(state, scratch, need) orelse return null;
+            if (from > 0) @memcpy(dest[0..from], bytes[0..from]);
+            if (tail_len > 0) @memcpy(dest[from..need], bytes[to..]);
+            const rep_slice = dest[from..from];
+            matches[0].replacement = rep_slice;
+            if (match_out.*) |*m| {
+                if (m.start == matches[0].start and m.end == matches[0].end) {
+                    m.replacement = rep_slice;
+                }
+            }
+            return dest[0..need];
+        }
         var lit_len: usize = 0;
         for (ops) |op| {
             lit_len += op.literal.len;
@@ -917,6 +984,23 @@ pub fn buildReplaced(
     return dest[0..out];
 }
 
+fn buildOnlyMatchingReplacementsWithFallback(
+    state: *State,
+    scratch: []u8,
+    bytes: []const u8,
+    raw_buf: []const u8,
+    buf_offset: usize,
+    line_end: usize,
+    match_mode: matcher_mod.MatchMode,
+    matches: []Span,
+    match_out: *?Span,
+    repl: []const u8,
+) void {
+    @branchHint(.cold);
+    const compiled = compileReplacement(repl, state.capture_regex);
+    buildOnlyMatchingReplacementsCompiled(state, scratch, bytes, raw_buf, buf_offset, line_end, match_mode, matches, match_out, repl, &compiled);
+}
+
 fn buildOnlyMatchingReplacements(
     state: *State,
     scratch: []u8,
@@ -930,11 +1014,26 @@ fn buildOnlyMatchingReplacements(
     repl: []const u8,
 ) void {
     if (matches.len == 0) return;
-    const compiled = if (state.compiled_repl.mode != .none)
-        state.compiled_repl
-    else
-        compileReplacement(repl, state.capture_regex);
+    if (state.compiled_repl.mode != .none) {
+        buildOnlyMatchingReplacementsCompiled(state, scratch, bytes, raw_buf, buf_offset, line_end, match_mode, matches, match_out, repl, &state.compiled_repl);
+        return;
+    }
+    buildOnlyMatchingReplacementsWithFallback(state, scratch, bytes, raw_buf, buf_offset, line_end, match_mode, matches, match_out, repl);
+}
 
+fn buildOnlyMatchingReplacementsCompiled(
+    state: *State,
+    scratch: []u8,
+    bytes: []const u8,
+    raw_buf: []const u8,
+    buf_offset: usize,
+    line_end: usize,
+    match_mode: matcher_mod.MatchMode,
+    matches: []Span,
+    match_out: *?Span,
+    repl: []const u8,
+    compiled: *const state_mod.CompiledReplacement,
+) void {
     if (!compiled.overflow and compiled.mode == .literal_only) {
         const ops = compiled.ops[0..compiled.len];
         if (ops.len == 0) {

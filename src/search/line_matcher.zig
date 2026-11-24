@@ -286,6 +286,174 @@ fn canUseFindEnd(comptime S: type, matcher: anytype, config: SearchConfig, need_
         config.excludes_regexes.len == 0;
 }
 
+fn canUseStreamSpans(
+    comptime S: type,
+    sink: *S,
+    matcher: anytype,
+    state: *const State,
+    config: SearchConfig,
+    limit: usize,
+    buf_len: usize,
+) bool {
+    if (comptime !(@hasDecl(S, "matchedSpan") and @hasDecl(S, "canStreamSpans"))) return false;
+    if (!sink.canStreamSpans()) return false;
+    return limit >= buf_len and
+        !state.is_pure_empty and
+        !effectiveMultiline(matcher, config) and
+        !config.invert and
+        !config.whole_line and
+        !config.null_data and
+        beforeCount(config) == 0 and
+        afterCount(config) == 0 and
+        state.after_left == 0 and
+        config.max_count == null and
+        config.max_results == null and
+        !config.exists and
+        !config.files_without_match and
+        !config.passthru and
+        !config.stop_on_nonmatch and
+        config.contains.len == 0 and
+        config.excludes.len == 0 and
+        config.contains_regexes.len == 0 and
+        config.excludes_regexes.len == 0 and
+        config.line_filter == null and
+        (config.max_line_len == 0 or
+            state.from_reader or
+            (buf_len -| state.pos) <= config.max_line_len or
+            config.max_line_len >= SearchConfig.default_max_line_len) and
+        config.max_output_bytes == null and
+        config.max_queued_event_bytes == null and
+        config.resume_from == 0 and
+        config.replacement == null and
+        config.binary != .report and
+        state.line_number == null and
+        (config.progress_interval == null or config.progress_interval.? == 0);
+}
+
+fn streamSpans(
+    comptime S: type,
+    sink: *S,
+    matcher: anytype,
+    buf: []const u8,
+    effective_limit: usize,
+    state: *State,
+    config: SearchConfig,
+) bool {
+    const start_pos = state.pos;
+    if (start_pos >= effective_limit) return !state.stopped;
+
+    const skip_line_count = comptime (@hasDecl(S, "matched_span_skip_line_count") and S.matched_span_skip_line_count);
+    const has_abort = config.stop != null or config.cancel != null or state.deadline_armed;
+    const whole_word = config.whole_word;
+    const mode = config.match_mode;
+
+    var pos = start_pos;
+    var matches_delta: u64 = 0;
+    var matched_lines_delta: u64 = 0;
+    var have_prev_line = false;
+    var last_span_end: usize = start_pos;
+    var aborted = false;
+
+    var use_cached = true;
+    while (pos < effective_limit) {
+        if (has_abort) {
+            if (state_mod.flagIsSet(config)) {
+                state.stopped = true;
+                aborted = true;
+                break;
+            }
+            if (stopInMatch(state, config)) {
+                aborted = true;
+                break;
+            }
+        }
+        const hit_opt: ?matcher_mod.Match = blk: {
+            if (use_cached) {
+                use_cached = false;
+                if (state.getCachedMatch(buf, pos)) |cached| {
+                    break :blk cached;
+                }
+            }
+            if (whole_word) {
+                break :blk nextMatch(matcher, buf, pos, config);
+            }
+            break :blk matcher.find(buf, pos, mode);
+        };
+        const hit = hit_opt orelse break;
+        if (hit.start >= effective_limit or hit.start < pos) break;
+
+        var span_end = @min(hit.end, effective_limit);
+        var next_pos: usize = undefined;
+        if (span_end == hit.start) {
+            // Zero-width match: match `gatherSpans` semantics on line boundaries and CRLF.
+            const at_eol = hit.start == effective_limit or
+                buf[hit.start] == '\n' or
+                (buf[hit.start] == '\r' and hit.start + 1 < effective_limit and buf[hit.start + 1] == '\n');
+            const prev_is_content = hit.start > 0 and buf[hit.start - 1] != '\n';
+            if (at_eol and prev_is_content) {
+                if (hit.start + 1 < effective_limit and buf[hit.start] == '\r' and buf[hit.start + 1] == '\n') {
+                    pos = hit.start + 2;
+                } else if (hit.start < effective_limit and buf[hit.start] == '\n') {
+                    pos = hit.start + 1;
+                } else {
+                    break;
+                }
+                continue;
+            }
+            if (hit.start + 1 < effective_limit and buf[hit.start] == '\r' and buf[hit.start + 1] == '\n') {
+                next_pos = hit.start + 2;
+            } else {
+                next_pos = hit.start + 1;
+            }
+        } else {
+            if (buf[span_end - 1] == '\r' and span_end < effective_limit and buf[span_end] == '\n') {
+                span_end -= 1;
+                if (span_end == hit.start) {
+                    pos = hit.end;
+                    continue;
+                }
+            }
+            next_pos = hit.end;
+        }
+
+        if (!skip_line_count) {
+            if (!have_prev_line or std.mem.findScalar(u8, buf[last_span_end..hit.start], '\n') != null) {
+                matched_lines_delta += 1;
+                have_prev_line = true;
+            }
+            last_span_end = span_end;
+        }
+        matches_delta += 1;
+        if (!sink.matchedSpan(buf[hit.start..span_end])) {
+            state.stopped = true;
+            aborted = true;
+            pos = next_pos;
+            break;
+        }
+        pos = next_pos;
+    }
+
+    if (matches_delta > 0) {
+        state.matches += matches_delta;
+        if (skip_line_count) {
+            if (state.matched_lines == 0) state.matched_lines = 1;
+            state.limit_count += 1;
+            state.results_out += 1;
+        } else {
+            state.matched_lines += matched_lines_delta;
+            state.limit_count += matched_lines_delta;
+            state.results_out += matched_lines_delta;
+        }
+        state.has_sunk = true;
+        state.last_abs_end = state.abs_base + @as(u64, if (aborted) pos else effective_limit);
+    }
+    const scan_end = if (aborted) pos else effective_limit;
+    state.pos = scan_end;
+    state.last_line_visited = scan_end;
+    state.remembered_until = @max(state.remembered_until, scan_end);
+    return !state.stopped;
+}
+
 pub fn matchBufferWithLimit(
     comptime S: type,
     sink: *S,
@@ -299,6 +467,20 @@ pub fn matchBufferWithLimit(
     const need_ls = needLineStart(S, state, config);
     const allow_find_end = canUseFindEnd(S, matcher, config, need_ls);
     var effective_limit = @min(limit, buf.len);
+    if (comptime @hasDecl(S, "matchedSpan") and @hasDecl(S, "canStreamSpans")) {
+        if (canUseStreamSpans(S, sink, matcher, state, config, limit, buf.len)) {
+            if (state.stopped) return false;
+            if (state_mod.flagIsSet(config)) {
+                state.stopped = true;
+                return false;
+            }
+            if (stopInMatch(state, config)) return false;
+            if (state.pending_skip_to != null) {
+                if (!applyInBufferSkip(buf, effective_limit, state, config)) return false;
+            }
+            return streamSpans(S, sink, matcher, buf, effective_limit, state, config);
+        }
+    }
     if (config.invert and canBulkInvertCount(S, matcher, state, config, limit, buf.len)) {
         if (state.stopped) return false;
         if (state_mod.flagIsSet(config)) {

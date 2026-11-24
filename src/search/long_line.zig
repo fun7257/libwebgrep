@@ -66,16 +66,39 @@ pub fn ensureHold(allocator: std.mem.Allocator, hold: *[]u8, n: usize) error{Out
     hold.* = try allocator.realloc(hold.*, n);
 }
 
-pub fn compactBuf(buf: []u8, filled: *usize, drop: usize, state: *State) void {
+pub const BufBacking = struct {
+    storage: []u8,
+    raw_cursor: u64,
+};
+
+inline fn alignPad(storage_ptr: usize, raw_cursor: u64, remain: usize) usize {
+    const cursor_usize: usize = @truncate(raw_cursor);
+    return (cursor_usize -% storage_ptr -% remain) & 63;
+}
+
+pub fn compactBufAligned(buf: *[]u8, filled: *usize, drop: usize, state: *State, backing: ?BufBacking) void {
     if (drop == 0 or drop > filled.*) return;
     const remain = filled.* - drop;
-    if (remain > 0) @memmove(buf[0..remain], buf[drop..filled.*]);
+    if (backing) |b| {
+        const usable_cap = b.storage.len - 64;
+        const pad = alignPad(@intFromPtr(b.storage.ptr), b.raw_cursor, remain);
+        const next_buf = b.storage[pad .. pad + usable_cap];
+        if (remain > 0) @memmove(next_buf[0..remain], buf.*[drop..filled.*]);
+        buf.* = next_buf;
+    } else {
+        if (remain > 0) @memmove(buf.*[0..remain], buf.*[drop..filled.*]);
+    }
     filled.* = remain;
     state.pos = if (state.pos >= drop) state.pos - drop else 0;
     state.last_line_visited = if (state.last_line_visited >= drop) state.last_line_visited - drop else 0;
     state.last_line_counted = if (state.last_line_counted >= drop) state.last_line_counted - drop else 0;
     state.remembered_until = if (state.remembered_until >= drop) state.remembered_until - drop else 0;
     state.abs_base += drop;
+}
+
+pub fn compactBuf(buf: []u8, filled: *usize, drop: usize, state: *State) void {
+    var slice = buf;
+    compactBufAligned(&slice, filled, drop, state, null);
 }
 
 pub fn noteLong(
@@ -192,7 +215,7 @@ pub fn savePrefix(
     state.long_hold_kind = 1;
 }
 
-pub fn slideLong(buf: *[]u8, filled: *usize, matcher: anytype, state: *State, config: SearchConfig) void {
+fn slideLongWithBacking(buf: *[]u8, filled: *usize, matcher: anytype, state: *State, config: SearchConfig, backing: ?BufBacking) void {
     const keep = overlapKeep(matcher, config);
     if (filled.* <= keep) return;
     var drop = filled.* - keep;
@@ -208,10 +231,22 @@ pub fn slideLong(buf: *[]u8, filled: *usize, matcher: anytype, state: *State, co
         const nls = memchr.count(width, buf.*[0..drop], 0, drop, recordSep(config));
         state.line_number = ln + nls;
     }
-    @memmove(buf.*[0..actual_keep], buf.*[drop..filled.*]);
+    if (backing) |b| {
+        const usable_cap = b.storage.len - 64;
+        const pad = alignPad(@intFromPtr(b.storage.ptr), b.raw_cursor, actual_keep);
+        const next_buf = b.storage[pad .. pad + usable_cap];
+        if (actual_keep > 0) @memmove(next_buf[0..actual_keep], buf.*[drop..filled.*]);
+        buf.* = next_buf;
+    } else {
+        if (actual_keep > 0) @memmove(buf.*[0..actual_keep], buf.*[drop..filled.*]);
+    }
     filled.* = actual_keep;
     state.long_dropped += drop;
     state.abs_base += drop;
+}
+
+pub fn slideLong(buf: *[]u8, filled: *usize, matcher: anytype, state: *State, config: SearchConfig) void {
+    slideLongWithBacking(buf, filled, matcher, state, config, null);
 }
 
 pub fn emitHold(
@@ -277,7 +312,7 @@ pub fn emitHold(
     return keep and !state.paused;
 }
 
-pub fn finishLong(
+fn finishLongWithBacking(
     comptime S: type,
     sink: *S,
     buf: *[]u8,
@@ -288,6 +323,7 @@ pub fn finishLong(
     config: SearchConfig,
     content_in_buf: usize,
     drop_buf: usize,
+    backing: ?BufBacking,
 ) SliceError!bool {
     state.long_line_len = state.long_dropped + content_in_buf;
     const filters_ok = !state.long_excluded and containsDone(seen, config);
@@ -324,7 +360,7 @@ pub fn finishLong(
             if (!try emitRing(S, sink, buf.*, state, config)) {
                 if (state.pending_skip_to != null) {
                     countLines(buf.*, clamped_drop, state, config);
-                    compactBuf(buf.*, filled, clamped_drop, state);
+                    compactBufAligned(buf, filled, clamped_drop, state, backing);
                     state.pos = 0;
                     state.last_line_visited = 0;
                     state.remembered_until = 0;
@@ -365,7 +401,7 @@ pub fn finishLong(
         state.ring.pushBytes(raw, preview, state.long_origin, end_abs, state.long_number);
     }
     countLines(buf.*, clamped_drop, state, config);
-    compactBuf(buf.*, filled, clamped_drop, state);
+    compactBufAligned(buf, filled, clamped_drop, state, backing);
     state.pos = 0;
     state.last_line_visited = 0;
     state.remembered_until = 0;
@@ -376,7 +412,22 @@ pub fn finishLong(
     return !state.stopped;
 }
 
-pub fn beginLongWithMatch(
+pub fn finishLong(
+    comptime S: type,
+    sink: *S,
+    buf: *[]u8,
+    filled: *usize,
+    hold: []const u8,
+    seen: []const bool,
+    state: *State,
+    config: SearchConfig,
+    content_in_buf: usize,
+    drop_buf: usize,
+) SliceError!bool {
+    return finishLongWithBacking(S, sink, buf, filled, hold, seen, state, config, content_in_buf, drop_buf, null);
+}
+
+fn beginLongWithMatchBacking(
     allocator: std.mem.Allocator,
     matcher: anytype,
     buf: *[]u8,
@@ -386,6 +437,7 @@ pub fn beginLongWithMatch(
     state: *State,
     config: SearchConfig,
     preset_match: ?matcher_mod.Match,
+    backing: ?BufBacking,
 ) error{OutOfMemory}!void {
     state.long_active = true;
     state.long_origin = state.abs_base;
@@ -410,7 +462,21 @@ pub fn beginLongWithMatch(
         try savePrefix(allocator, bytes, hold, state, config);
     }
     try noteLong(allocator, matcher, bytes, hold, seen, state, config, false);
-    slideLong(buf, filled, matcher, state, config);
+    slideLongWithBacking(buf, filled, matcher, state, config, backing);
+}
+
+pub fn beginLongWithMatch(
+    allocator: std.mem.Allocator,
+    matcher: anytype,
+    buf: *[]u8,
+    filled: *usize,
+    hold: *[]u8,
+    seen: *[]bool,
+    state: *State,
+    config: SearchConfig,
+    preset_match: ?matcher_mod.Match,
+) error{OutOfMemory}!void {
+    return beginLongWithMatchBacking(allocator, matcher, buf, filled, hold, seen, state, config, preset_match, null);
 }
 
 pub fn beginLong(
@@ -423,7 +489,7 @@ pub fn beginLong(
     state: *State,
     config: SearchConfig,
 ) error{OutOfMemory}!void {
-    return beginLongWithMatch(allocator, matcher, buf, filled, hold, seen, state, config, null);
+    return beginLongWithMatchBacking(allocator, matcher, buf, filled, hold, seen, state, config, null, null);
 }
 
 fn transitionToLong(
@@ -438,6 +504,7 @@ fn transitionToLong(
     seen: *[]bool,
     state: *State,
     config: SearchConfig,
+    backing: ?BufBacking,
 ) ReadError!bool {
     var search_end = initial_search_end;
     if (search_end > 0) {
@@ -448,7 +515,7 @@ fn transitionToLong(
             }
             rememberBefore(matcher, buf.*, state, config, search_end);
             countLines(buf.*, search_end, state, config);
-            compactBuf(buf.*, filled, search_end, state);
+            compactBufAligned(buf, filled, search_end, state, backing);
         } else {
             const ml_win = state_mod.effectiveMultilineWindow(matcher, config);
             const safe_ce = state_mod.lineStart(buf.*[0..search_end], search_end -| ml_win, config);
@@ -461,7 +528,7 @@ fn transitionToLong(
                 if (drop > 0) {
                     rememberBefore(matcher, buf.*, state, config, drop);
                     countLines(buf.*, drop, state, config);
-                    compactBuf(buf.*, filled, drop, state);
+                    compactBufAligned(buf, filled, drop, state, backing);
                     search_end = lastComplete(buf.*[0..filled.*], config);
                     if (filled.* - search_end <= config.max_line_len) return !state.stopped;
                 }
@@ -476,7 +543,7 @@ fn transitionToLong(
                     }
                     rememberBefore(matcher, buf.*, state, config, search_end);
                     countLines(buf.*, search_end, state, config);
-                    compactBuf(buf.*, filled, search_end, state);
+                    compactBufAligned(buf, filled, search_end, state, backing);
                     break;
                 }
                 const hit = m_opt.?;
@@ -511,14 +578,14 @@ fn transitionToLong(
                     if (ls > 0) {
                         rememberBefore(matcher, buf.*, state, config, ls);
                         countLines(buf.*, ls, state, config);
-                        compactBuf(buf.*, filled, ls, state);
+                        compactBufAligned(buf, filled, ls, state, backing);
                     }
                     const shifted = matcher_mod.Match{
                         .start = hit.start - ls,
                         .end = hit.end - ls,
                         .pattern_id = hit.pattern_id,
                     };
-                    try beginLongWithMatch(allocator, matcher, buf, filled, hold, seen, state, config, shifted);
+                    try beginLongWithMatchBacking(allocator, matcher, buf, filled, hold, seen, state, config, shifted, backing);
                     bridged = true;
                     break;
                 }
@@ -533,13 +600,70 @@ fn transitionToLong(
                     }
                     rememberBefore(matcher, buf.*, state, config, rem_se);
                     countLines(buf.*, rem_se, state, config);
-                    compactBuf(buf.*, filled, rem_se, state);
+                    compactBufAligned(buf, filled, rem_se, state, backing);
                 }
             }
         }
     }
-    try beginLong(allocator, matcher, buf, filled, hold, seen, state, config);
+    try beginLongWithMatchBacking(allocator, matcher, buf, filled, hold, seen, state, config, null, backing);
     return !state.stopped;
+}
+
+fn makeRoomWithBacking(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    sink: *S,
+    matcher: anytype,
+    buf: *[]u8,
+    filled: *usize,
+    hold: *[]u8,
+    seen: *[]bool,
+    state: *State,
+    config: SearchConfig,
+    backing: ?BufBacking,
+) ReadError!bool {
+    if (state.long_active) {
+        const before = filled.*;
+        slideLongWithBacking(buf, filled, matcher, state, config, backing);
+        return filled.* < buf.len and filled.* < before;
+    }
+    const end = lastComplete(buf.*[0..filled.*], config);
+    if (end > 0) {
+        if (!state_mod.effectiveMultiline(matcher, config)) {
+            if (!try matchBuffer(S, sink, matcher, buf.*[0..end], state, config)) {
+                if (state.pending_skip_to != null) return true;
+                return false;
+            }
+            rememberBefore(matcher, buf.*, state, config, end);
+            countLines(buf.*, end, state, config);
+            compactBufAligned(buf, filled, end, state, backing);
+            return filled.* < buf.len;
+        }
+        const ml_win = state_mod.effectiveMultilineWindow(matcher, config);
+        const safe_ce = state_mod.lineStart(buf.*[0..end], end -| ml_win, config);
+        if (safe_ce > 0) {
+            if (!try line_matcher_mod.matchBufferWithLimit(S, sink, matcher, buf.*[0..filled.*], safe_ce, true, state, config)) {
+                if (state.pending_skip_to != null) return true;
+                return false;
+            }
+            const drop = state.pos;
+            if (drop > 0) {
+                rememberBefore(matcher, buf.*, state, config, drop);
+                countLines(buf.*, drop, state, config);
+                compactBufAligned(buf, filled, drop, state, backing);
+                return filled.* < buf.len;
+            }
+        }
+        if (filled.* - end > config.max_line_len) {
+            if (!try transitionToLong(S, allocator, sink, matcher, buf, filled, end, hold, seen, state, config, backing)) return false;
+            return filled.* < buf.len;
+        }
+    }
+    if (filled.* > config.max_line_len) {
+        try beginLongWithMatchBacking(allocator, matcher, buf, filled, hold, seen, state, config, null, backing);
+        return filled.* < buf.len;
+    }
+    return false;
 }
 
 pub fn makeRoom(
@@ -554,51 +678,26 @@ pub fn makeRoom(
     state: *State,
     config: SearchConfig,
 ) ReadError!bool {
-    if (state.long_active) {
-        const before = filled.*;
-        slideLong(buf, filled, matcher, state, config);
-        return filled.* < buf.len and filled.* < before;
-    }
-    const end = lastComplete(buf.*[0..filled.*], config);
-    if (end > 0) {
-        if (!state_mod.effectiveMultiline(matcher, config)) {
-            if (!try matchBuffer(S, sink, matcher, buf.*[0..end], state, config)) {
-                if (state.pending_skip_to != null) return true;
-                return false;
-            }
-            rememberBefore(matcher, buf.*, state, config, end);
-            countLines(buf.*, end, state, config);
-            compactBuf(buf.*, filled, end, state);
-            return filled.* < buf.len;
-        }
-        const ml_win = state_mod.effectiveMultilineWindow(matcher, config);
-        const safe_ce = state_mod.lineStart(buf.*[0..end], end -| ml_win, config);
-        if (safe_ce > 0) {
-            if (!try line_matcher_mod.matchBufferWithLimit(S, sink, matcher, buf.*[0..filled.*], safe_ce, true, state, config)) {
-                if (state.pending_skip_to != null) return true;
-                return false;
-            }
-            const drop = state.pos;
-            if (drop > 0) {
-                rememberBefore(matcher, buf.*, state, config, drop);
-                countLines(buf.*, drop, state, config);
-                compactBuf(buf.*, filled, drop, state);
-                return filled.* < buf.len;
-            }
-        }
-        if (filled.* - end > config.max_line_len) {
-            if (!try transitionToLong(S, allocator, sink, matcher, buf, filled, end, hold, seen, state, config)) return false;
-            return filled.* < buf.len;
-        }
-    }
-    if (filled.* > config.max_line_len) {
-        try beginLong(allocator, matcher, buf, filled, hold, seen, state, config);
-        return filled.* < buf.len;
-    }
-    return false;
+    return makeRoomWithBacking(S, allocator, sink, matcher, buf, filled, hold, seen, state, config, null);
 }
 
-pub fn pumpLong(
+pub fn makeRoomAligned(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    sink: *S,
+    matcher: anytype,
+    buf: *[]u8,
+    filled: *usize,
+    hold: *[]u8,
+    seen: *[]bool,
+    state: *State,
+    config: SearchConfig,
+    backing: ?BufBacking,
+) ReadError!bool {
+    return makeRoomWithBacking(S, allocator, sink, matcher, buf, filled, hold, seen, state, config, backing);
+}
+
+fn pumpLongWithBacking(
     comptime S: type,
     allocator: std.mem.Allocator,
     sink: *S,
@@ -611,6 +710,7 @@ pub fn pumpLong(
     eof: bool,
     state: *State,
     config: SearchConfig,
+    backing: ?BufBacking,
 ) ReadError!bool {
     if (stopInMatch(state, config)) return false;
     if (watchesBinary(config) and state.nul_offset == null and new_at < filled.*) {
@@ -623,7 +723,7 @@ pub fn pumpLong(
                         var content_len = nl;
                         if (!config.null_data and nl > 0 and buf.*[nl - 1] == '\r') content_len = nl - 1;
                         try noteLong(allocator, matcher, buf.*[0..content_len], hold, seen, state, config, true);
-                        if (!try finishLong(S, sink, buf, filled, hold.*, seen.*, state, config, content_len, nl + 1)) return false;
+                        if (!try finishLongWithBacking(S, sink, buf, filled, hold.*, seen.*, state, config, content_len, nl + 1, backing)) return false;
                         const rem_nul = nul_idx - (nl + 1);
                         const safe_end = state_mod.lineStart(buf.*[0..rem_nul], rem_nul, config);
                         if (safe_end > state.pos) {
@@ -649,21 +749,56 @@ pub fn pumpLong(
         if (eof) return true;
         const search_end = lastComplete(buf.*[0..filled.*], config);
         if (filled.* - search_end <= config.max_line_len) return true;
-        return transitionToLong(S, allocator, sink, matcher, buf, filled, search_end, hold, seen, state, config);
+        return transitionToLong(S, allocator, sink, matcher, buf, filled, search_end, hold, seen, state, config, backing);
     }
     const sep = recordSep(config);
     if (std.mem.findScalar(u8, buf.*[0..filled.*], sep)) |nl| {
         var content_len = nl;
         if (!config.null_data and nl > 0 and buf.*[nl - 1] == '\r') content_len = nl - 1;
         try noteLong(allocator, matcher, buf.*[0..content_len], hold, seen, state, config, true);
-        return finishLong(S, sink, buf, filled, hold.*, seen.*, state, config, content_len, nl + 1);
+        return finishLongWithBacking(S, sink, buf, filled, hold.*, seen.*, state, config, content_len, nl + 1, backing);
     }
     if (eof) {
         try noteLong(allocator, matcher, buf.*[0..filled.*], hold, seen, state, config, true);
-        return finishLong(S, sink, buf, filled, hold.*, seen.*, state, config, filled.*, filled.*);
+        return finishLongWithBacking(S, sink, buf, filled, hold.*, seen.*, state, config, filled.*, filled.*, backing);
     }
     try noteLong(allocator, matcher, buf.*[0..filled.*], hold, seen, state, config, false);
-    if (filled.* > config.max_line_len) slideLong(buf, filled, matcher, state, config);
+    if (filled.* > config.max_line_len) slideLongWithBacking(buf, filled, matcher, state, config, backing);
     return !state.stopped;
+}
+
+pub fn pumpLong(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    sink: *S,
+    matcher: anytype,
+    buf: *[]u8,
+    filled: *usize,
+    hold: *[]u8,
+    seen: *[]bool,
+    new_at: usize,
+    eof: bool,
+    state: *State,
+    config: SearchConfig,
+) ReadError!bool {
+    return pumpLongWithBacking(S, allocator, sink, matcher, buf, filled, hold, seen, new_at, eof, state, config, null);
+}
+
+pub fn pumpLongAligned(
+    comptime S: type,
+    allocator: std.mem.Allocator,
+    sink: *S,
+    matcher: anytype,
+    buf: *[]u8,
+    filled: *usize,
+    hold: *[]u8,
+    seen: *[]bool,
+    new_at: usize,
+    eof: bool,
+    state: *State,
+    config: SearchConfig,
+    backing: ?BufBacking,
+) ReadError!bool {
+    return pumpLongWithBacking(S, allocator, sink, matcher, buf, filled, hold, seen, new_at, eof, state, config, backing);
 }
 

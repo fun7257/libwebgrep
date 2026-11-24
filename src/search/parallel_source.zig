@@ -9,7 +9,7 @@
 //!   1. Sink callbacks run only on the calling thread, in ascending byte order, never interleaved.
 //!   2. Memory is bounded: at most `max_inflight` chunks are scanned ahead of the in-order emitter, recorded
 //!      events never exceed `max_buffered_bytes`, and each RandomAccess worker holds one chunk buffer
-//!      (`chunk_size + 256 KiB`). Slice inputs are borrowed and never copied.
+//!      (`chunk_size + 1 MiB + 64B` slack). Slice inputs are borrowed and never copied.
 //!   3. Global limits (`max_count`, `max_results`, `exists`, `max_output_bytes`, `max_queued_event_bytes`) and
 //!      sink flow (`stop`, `pause`, `skip_to`) are applied during in-order replay with the same helpers the
 //!      sequential engine uses. Chunk tails the replay cannot reproduce exactly (NUL bytes, recording overflow,
@@ -52,9 +52,16 @@ pub const default_max_buffered_bytes: usize = 4 * 1024 * 1024;
 /// Hard cap on concurrent scanners (including the calling thread).
 pub const max_workers_hard_cap: u32 = 64;
 /// Extra bytes a RandomAccess worker buffer may hold beyond `chunk_size` for lines that straddle a chunk end.
-const ra_overhang: usize = 256 * 1024;
+const ra_overhang: usize = 1024 * 1024;
 /// Extra bytes speculatively read past `nom_e` in a single `pread` so chunk boundary alignment stays in-memory.
 const ra_probe_overhang: usize = 4 * 1024;
+/// Alignment slack ensuring `(dst_ptr - file_offset) % 64 == 0` on every `pread`, eliminating 4K-aliasing stalls.
+const ra_align_slack: usize = 64;
+
+inline fn alignPad(raw_ptr: usize, file_off: u64) usize {
+    const off_usize: usize = @truncate(file_off);
+    return (off_usize -% raw_ptr) & 63;
+}
 
 /// Tuning knobs for intra-source parallel search.
 pub const ParallelOptions = struct {
@@ -213,6 +220,10 @@ const Slot = struct {
     overflow: bool = false,
     overflow_offset: u64 = 0,
     overflow_number: ?u64 = null,
+    /// Fixed-chunk count-mode flags for cross-chunk long-line deduplication and NUL rollback.
+    head_hit_open: bool = false,
+    tail_hit_open: bool = false,
+    nul_before_sep: bool = false,
     /// Slot-owned read buffer for RandomAccess match mode so recorded lines borrow zero-copy.
     buf: []u8 = &.{},
     recs: std.ArrayList(Rec) = .empty,
@@ -241,6 +252,9 @@ const Slot = struct {
         self.overflow = false;
         self.overflow_offset = 0;
         self.overflow_number = null;
+        self.head_hit_open = false;
+        self.tail_hit_open = false;
+        self.nul_before_sep = false;
         self.recs.clearRetainingCapacity();
         self.arena.clearRetainingCapacity();
         self.spans.clearRetainingCapacity();
@@ -501,6 +515,7 @@ fn Run(comptime B: type, comptime MT: type) type {
         buf_cap: usize,
         numbering: bool,
         sep: u8,
+        fixed_count_overlap: ?usize,
         mu: std.Io.Mutex = .init,
         cv: std.Io.Condition = .init,
         next_chunk: usize = 0,
@@ -622,11 +637,13 @@ fn Run(comptime B: type, comptime MT: type) type {
         }
 
         fn alignRaFrom(self: *Self, ra: RandomAccess, from: u64) anyerror!u64 {
-            var probe: [16 * 1024]u8 = undefined;
+            var probe_raw: [64 * 1024 + ra_align_slack]u8 = undefined;
             var cur = from;
             while (cur < self.ve) {
-                const want: usize = @intCast(@min(@as(u64, probe.len), self.ve - cur));
-                const got = try ra.readAtFull(cur, probe[0..want]);
+                const want: usize = @intCast(@min(@as(u64, 64 * 1024), self.ve - cur));
+                const pad = alignPad(@intFromPtr(&probe_raw), cur);
+                const probe = probe_raw[pad .. pad + want];
+                const got = try ra.readAtFull(cur, probe);
                 _ = self.total_read.fetchAdd(got, .monotonic);
                 if (got == 0) return self.ve;
                 if (std.mem.findScalar(u8, probe[0..got], self.sep)) |i| return cur + i + 1;
@@ -644,17 +661,41 @@ fn Run(comptime B: type, comptime MT: type) type {
             return .{ a, @max(a, b) };
         }
 
+        fn hasSep(self: *Self, a: u64, b: u64) anyerror!bool {
+            if (b <= a) return false;
+            switch (self.input) {
+                .slice => |hay| return std.mem.findScalar(u8, hay[@intCast(a)..@intCast(b)], self.sep) != null,
+                .ra => |ra| {
+                    var probe_raw: [64 * 1024 + ra_align_slack]u8 = undefined;
+                    var cur = a;
+                    while (cur < b) {
+                        const want: usize = @intCast(@min(@as(u64, 64 * 1024), b - cur));
+                        const pad = alignPad(@intFromPtr(&probe_raw), cur);
+                        const probe = probe_raw[pad .. pad + want];
+                        const got = try ra.readAtFull(cur, probe);
+                        _ = self.total_read.fetchAdd(got, .monotonic);
+                        if (got == 0) break;
+                        if (std.mem.findScalar(u8, probe[0..got], self.sep) != null) return true;
+                        cur += got;
+                    }
+                    return false;
+                },
+            }
+        }
+
         fn countSeps(self: *Self, a: u64, b: u64) anyerror!u64 {
             if (b <= a) return 0;
             switch (self.input) {
                 .slice => |hay| return memchr.count(width, hay, @intCast(a), @intCast(b), self.sep),
                 .ra => |ra| {
-                    var probe: [16 * 1024]u8 = undefined;
+                    var probe_raw: [64 * 1024 + ra_align_slack]u8 = undefined;
                     var cur = a;
                     var n: u64 = 0;
                     while (cur < b) {
-                        const want: usize = @intCast(@min(@as(u64, probe.len), b - cur));
-                        const got = try ra.readAtFull(cur, probe[0..want]);
+                        const want: usize = @intCast(@min(@as(u64, 64 * 1024), b - cur));
+                        const pad = alignPad(@intFromPtr(&probe_raw), cur);
+                        const probe = probe_raw[pad .. pad + want];
+                        const got = try ra.readAtFull(cur, probe);
                         _ = self.total_read.fetchAdd(got, .monotonic);
                         if (got == 0) break;
                         n += memchr.count(width, probe[0..got], 0, got, self.sep);
@@ -667,11 +708,130 @@ fn Run(comptime B: type, comptime MT: type) type {
 
         // ---------------- scanning ----------------
 
+        fn scanFixedChunkCount(self: *Self, slot: *Slot, data: []const u8, owned_len: usize) void {
+            if (self.abort.load(.acquire)) return;
+            const watch_nul = cfg_mod.watchesBinary(self.wcfg);
+            var nul_in_owned: ?usize = null;
+            var first_hit: ?matcher_mod.Match = null;
+            const dummy_state = State{};
+            const can_fuse = watch_nul and state_mod.canFuse(self.matcher, self.wcfg, &dummy_state);
+
+            if (can_fuse) {
+                var nul_rel: ?usize = null;
+                const found = if (comptime @hasDecl(state_mod.MatcherType(MT), "findWatched"))
+                    self.matcher.findWatched(data, 0, &nul_rel)
+                else
+                    unreachable;
+                if (nul_rel) |nr| {
+                    if (nr < owned_len) {
+                        nul_in_owned = nr;
+                    } else {
+                        // NUL is in overlap tail (belongs to next chunk); scan owned without NUL watch.
+                        first_hit = self.matcher.find(data, 0, .earliest);
+                    }
+                } else {
+                    if (found) |h| {
+                        if (h.start < owned_len) {
+                            if (std.mem.findScalar(u8, data[h.start..owned_len], 0)) |rel| {
+                                nul_in_owned = h.start + rel;
+                            } else {
+                                first_hit = h;
+                            }
+                        }
+                    } else {
+                        slot.result = .{ .scanned_all = true, .bytes_searched = @as(u64, owned_len) };
+                        return;
+                    }
+                }
+            } else {
+                if (watch_nul) {
+                    nul_in_owned = std.mem.findScalar(u8, data[0..owned_len], 0);
+                }
+                if (nul_in_owned == null) {
+                    const found = self.matcher.find(data, 0, .earliest);
+                    if (found == null or found.?.start >= owned_len) {
+                        slot.result = .{ .scanned_all = true, .bytes_searched = @as(u64, owned_len) };
+                        return;
+                    }
+                    first_hit = found;
+                }
+            }
+
+            var scan_owned = owned_len;
+            if (nul_in_owned) |nr| {
+                if (memchr.findLast(width, data, 0, nr, self.sep)) |nl| {
+                    scan_owned = nl + 1;
+                    slot.nul_before_sep = false;
+                } else {
+                    scan_owned = 0;
+                    slot.nul_before_sep = true;
+                }
+            }
+
+            const match_buf = if (nul_in_owned) |nr| data[0..nr] else data;
+            var pos: usize = 0;
+            var matched_lines: u64 = 0;
+            var first_hit_pos: ?usize = null;
+            var last_hit_closed = false;
+            var have_first_cached = (nul_in_owned == null and first_hit != null);
+            while (pos < scan_owned) {
+                const hit = if (have_first_cached) blk: {
+                    have_first_cached = false;
+                    break :blk first_hit.?;
+                } else (self.matcher.find(match_buf, pos, .earliest) orelse break);
+                if (hit.start >= scan_owned) break;
+                if (first_hit_pos == null) first_hit_pos = hit.start;
+                matched_lines += 1;
+                const probe = @min(hit.end, scan_owned);
+                if (probe < scan_owned) {
+                    if (std.mem.findScalarPos(u8, data[0..scan_owned], probe, self.sep)) |nl| {
+                        pos = nl + 1;
+                        last_hit_closed = true;
+                        continue;
+                    }
+                }
+                last_hit_closed = false;
+                break;
+            }
+
+            if (first_hit_pos) |fh| {
+                slot.head_hit_open = (std.mem.findScalar(u8, data[0..fh], self.sep) == null);
+                slot.tail_hit_open = (matched_lines > 0 and !last_hit_closed);
+            }
+            if (nul_in_owned) |nr| {
+                slot.result = .{
+                    .scanned_all = false,
+                    .matched_lines = matched_lines,
+                    .matches = matched_lines,
+                    .nul_offset = @as(u64, nr),
+                    .bytes_searched = @as(u64, scan_owned),
+                };
+            } else {
+                slot.result = .{
+                    .scanned_all = true,
+                    .matched_lines = matched_lines,
+                    .matches = matched_lines,
+                    .bytes_searched = @as(u64, owned_len),
+                };
+            }
+        }
+
         fn scanChunk(self: *Self, w: *Worker, k: usize) void {
             const slot = &self.slots[k % self.window];
             slot.reset();
             switch (self.input) {
                 .slice => |hay| {
+                    if (self.fixed_count_overlap) |overlap| {
+                        const nom_s = self.vs + @as(u64, k) * self.chunk;
+                        const nom_e = @min(self.ve, nom_s + self.chunk);
+                        const last = k + 1 == self.n_chunks;
+                        const read_hi: u64 = if (last) self.ve else @min(self.ve, nom_e + @as(u64, overlap));
+                        slot.start = nom_s;
+                        slot.end = nom_e;
+                        if (nom_s >= nom_e) return;
+                        self.scanFixedChunkCount(slot, hay[@intCast(nom_s)..@intCast(read_hi)], @intCast(nom_e - nom_s));
+                        return;
+                    }
                     const ab = self.sliceBounds(hay, k);
                     slot.start = ab[0];
                     slot.end = ab[1];
@@ -683,22 +843,50 @@ fn Run(comptime B: type, comptime MT: type) type {
             }
         }
 
-        /// Reads `[nom_s - 1, nom_e + ra_probe_overhang)` in a single `pread` and aligns both
+        /// Reads `[nom_s - 1, nom_e + ra_probe_overhang)` in a single 64B-aligned `pread` and aligns both
         /// record boundaries in memory; falls back to `alignRaFrom` only for lines > 4 KiB
         /// straddling a boundary. In match mode reads directly into `slot.buf` for zero-copy borrow.
         fn scanChunkRa(self: *Self, w: *Worker, slot: *Slot, ra: RandomAccess, k: usize) void {
             const nom_s = self.vs + @as(u64, k) * self.chunk;
             const nom_e = @min(self.ve, nom_s + self.chunk);
             const last = k + 1 == self.n_chunks;
+
+            if (self.fixed_count_overlap) |overlap| {
+                const read_hi: u64 = if (last) self.ve else @min(self.ve, nom_e + @as(u64, overlap));
+                const want: usize = @intCast(read_hi - nom_s);
+                slot.start = nom_s;
+                slot.end = nom_e;
+                if (nom_s >= nom_e) return;
+                const raw_buf = w.ensureBuf(self.allocator, want + ra_align_slack) catch {
+                    slot.err = error.OutOfMemory;
+                    return;
+                };
+                const pad = alignPad(@intFromPtr(raw_buf.ptr), nom_s);
+                const buf = raw_buf[pad .. pad + want];
+                const got = ra.readAtFull(nom_s, buf) catch {
+                    slot.read_failed = true;
+                    return;
+                };
+                _ = self.total_read.fetchAdd(got, .monotonic);
+                if (got != want) {
+                    slot.read_failed = true;
+                    return;
+                }
+                self.scanFixedChunkCount(slot, buf, @intCast(nom_e - nom_s));
+                return;
+            }
+
             const read_lo: u64 = if (k == 0) self.vs else nom_s - 1;
             const read_hi: u64 = if (last) self.ve else @min(self.ve, nom_e + ra_probe_overhang);
             const want: usize = @intCast(read_hi - read_lo);
 
-            const buf = (if (count_mode) w.ensureBuf(self.allocator, want) else slot.ensureBuf(self.allocator, want)) catch {
+            const raw_buf = (if (count_mode) w.ensureBuf(self.allocator, want + ra_align_slack) else slot.ensureBuf(self.allocator, want + ra_align_slack)) catch {
                 slot.err = error.OutOfMemory;
                 return;
             };
-            const got = ra.readAtFull(read_lo, buf[0..want]) catch {
+            const pad = alignPad(@intFromPtr(raw_buf.ptr), read_lo);
+            const buf = raw_buf[pad .. pad + want];
+            const got = ra.readAtFull(read_lo, buf) catch {
                 slot.read_failed = true;
                 return;
             };
@@ -767,11 +955,13 @@ fn Run(comptime B: type, comptime MT: type) type {
                 slot.oversized = true;
                 return;
             }
-            const full_buf = (if (count_mode) w.ensureBuf(self.allocator, len) else slot.ensureBuf(self.allocator, len)) catch {
+            const raw_full = (if (count_mode) w.ensureBuf(self.allocator, len + ra_align_slack) else slot.ensureBuf(self.allocator, len + ra_align_slack)) catch {
                 slot.err = error.OutOfMemory;
                 return;
             };
-            const full_got = ra.readAtFull(a, full_buf[0..len]) catch {
+            const full_pad = alignPad(@intFromPtr(raw_full.ptr), a);
+            const full_buf = raw_full[full_pad .. full_pad + len];
+            const full_got = ra.readAtFull(a, full_buf) catch {
                 slot.read_failed = true;
                 return;
             };
@@ -781,9 +971,9 @@ fn Run(comptime B: type, comptime MT: type) type {
                 return;
             }
             if (count_mode) {
-                self.scanData(w, slot, full_buf[0..len], null, .none);
+                self.scanData(w, slot, full_buf, null, .none);
             } else {
-                self.scanData(w, slot, full_buf[0..len], slot.buf, .slot);
+                self.scanData(w, slot, full_buf, slot.buf, .slot);
             }
         }
 
@@ -977,8 +1167,10 @@ fn Run(comptime B: type, comptime MT: type) type {
                 .ra => |ra| blk: {
                     const len: usize = @intCast(end - start);
                     if (len <= self.buf_cap) {
-                        const buf = try ew.ensureBuf(self.allocator, len);
-                        const got = ra.readAtFull(start, buf[0..len]) catch |err| {
+                        const raw_buf = try ew.ensureBuf(self.allocator, len + ra_align_slack);
+                        const pad = alignPad(@intFromPtr(raw_buf.ptr), start);
+                        const buf = raw_buf[pad .. pad + len];
+                        const got = ra.readAtFull(start, buf) catch |err| {
                             state_mod.logDetail(self.config, G.label, err);
                             G.soft_error = .read_failed;
                             G.stopped = true;
@@ -990,7 +1182,7 @@ fn Run(comptime B: type, comptime MT: type) type {
                             G.stopped = true;
                             return .stop;
                         }
-                        break :blk try sequentialSlice(DS, &ds, buf[0..len], "", self.matcher, cfg);
+                        break :blk try sequentialSlice(DS, &ds, buf, "", self.matcher, cfg);
                     }
                     ds.shift = 0;
                     rel_shift = 0;
@@ -1050,7 +1242,74 @@ fn Run(comptime B: type, comptime MT: type) type {
             return null;
         }
 
-        fn processChunk(self: *Self, sink: *B, G: *State, slot: *Slot, line_base: ?u64, ew: *Worker) ReadError!?Term {
+        fn processChunk(self: *Self, sink: *B, G: *State, slot: *Slot, line_base: ?u64, ew: *Worker, open_matched_line: *bool) ReadError!?Term {
+            if (self.fixed_count_overlap != null) {
+                if (slot.read_failed) {
+                    G.soft_error = .read_failed;
+                    G.stopped = true;
+                    return .stop;
+                }
+                if (slot.err) |e| {
+                    if (e == error.OutOfMemory) return error.OutOfMemory;
+                    G.soft_error = .read_failed;
+                    G.stopped = true;
+                    return .stop;
+                }
+                if (state_mod.flagIsSet(self.config)) {
+                    G.stopped = true;
+                    return .stop;
+                }
+                if (state_mod.stopInMatch(G, self.config)) return .stop;
+                if (slot.start >= slot.end) {
+                    G.pos = @intCast(slot.end - self.vs);
+                    return null;
+                }
+                const r = slot.result;
+                if (!r.scanned_all and r.nul_offset == null) {
+                    G.stopped = true;
+                    return .stop;
+                }
+                var add_lines = r.matched_lines;
+                if (open_matched_line.*) {
+                    if (add_lines > 0) {
+                        if (slot.head_hit_open) add_lines -= 1;
+                        open_matched_line.* = slot.tail_hit_open;
+                    } else if (r.nul_offset != null) {
+                        if (slot.nul_before_sep) {
+                            G.matched_lines -= 1;
+                            G.matches -= 1;
+                            G.limit_count -= 1;
+                            G.results_out -= 1;
+                        }
+                        open_matched_line.* = false;
+                    } else {
+                        const found_sep = self.hasSep(slot.start, slot.end) catch {
+                            G.soft_error = .read_failed;
+                            G.stopped = true;
+                            return .stop;
+                        };
+                        if (found_sep) open_matched_line.* = false;
+                    }
+                } else if (add_lines > 0) {
+                    open_matched_line.* = slot.tail_hit_open;
+                }
+                G.matched_lines += add_lines;
+                G.matches += add_lines;
+                G.limit_count += add_lines;
+                G.results_out += add_lines;
+                if (r.nul_offset) |n| {
+                    const safe_abs = if (slot.nul_before_sep)
+                        (self.recordStart(self.vs, slot.start) catch slot.start)
+                    else
+                        slot.start + r.bytes_searched;
+                    G.pos = @intCast(safe_abs - self.vs);
+                    state_mod.noteBinary(G, self.config, slot.start + n);
+                    _ = state_mod.callOpt(B, "binary", sink, .{G.nul_offset.?});
+                    return .nul;
+                }
+                G.pos = @intCast(slot.end - self.vs);
+                return null;
+            }
             if (slot.read_failed) {
                 // Recompute the geometry on the calling thread; a persistent failure becomes a soft error.
                 const ab = self.bounds(slot.chunk) catch |err| {
@@ -1194,12 +1453,14 @@ fn Run(comptime B: type, comptime MT: type) type {
                     return @as(u64, i) + 1;
                 },
                 .ra => |ra| {
-                    var probe: [16 * 1024]u8 = undefined;
+                    var probe_raw: [64 * 1024 + ra_align_slack]u8 = undefined;
                     var cur = t;
                     while (cur > lo) {
-                        const want: usize = @intCast(@min(@as(u64, probe.len), cur - lo));
+                        const want: usize = @intCast(@min(@as(u64, 64 * 1024), cur - lo));
                         const from = cur - want;
-                        const got = try ra.readAtFull(from, probe[0..want]);
+                        const pad = alignPad(@intFromPtr(&probe_raw), from);
+                        const probe = probe_raw[pad .. pad + want];
+                        const got = try ra.readAtFull(from, probe);
                         _ = self.total_read.fetchAdd(got, .monotonic);
                         if (got != want) return error.ReadFailed;
                         if (memchr.findLast(width, probe[0..got], 0, got, self.sep)) |i| return from + i + 1;
@@ -1276,11 +1537,13 @@ fn raAlign(ra: RandomAccess, pos: u64, size: u64, sep: u8) anyerror!u64 {
     var one: [1]u8 = undefined;
     if (try ra.readAtFull(pos - 1, &one) == 0) return size;
     if (one[0] == sep) return pos;
-    var probe: [16 * 1024]u8 = undefined;
+    var probe_raw: [64 * 1024 + ra_align_slack]u8 = undefined;
     var cur = pos;
     while (cur < size) {
-        const want: usize = @intCast(@min(@as(u64, probe.len), size - cur));
-        const got = try ra.readAtFull(cur, probe[0..want]);
+        const want: usize = @intCast(@min(@as(u64, 64 * 1024), size - cur));
+        const pad = alignPad(@intFromPtr(&probe_raw), cur);
+        const probe = probe_raw[pad .. pad + want];
+        const got = try ra.readAtFull(cur, probe);
         if (got == 0) return size;
         if (std.mem.findScalar(u8, probe[0..got], sep)) |i| return cur + i + 1;
         cur += got;
@@ -1381,6 +1644,19 @@ fn tryParallel(
         allocator.free(slots);
     }
 
+    const fixed_count_overlap: ?usize = blk: {
+        if (!R.count_mode) break :blk null;
+        if (numbering) break :blk null;
+        if (config.whole_word or config.whole_line or config.invert or config.null_data) break :blk null;
+        if (config.max_count != null or config.max_results != null or config.exists) break :blk null;
+        if (config.max_output_bytes != null or config.max_queued_event_bytes != null) break :blk null;
+        if (config.contains.len != 0 or config.excludes.len != 0 or config.contains_regexes.len != 0 or config.excludes_regexes.len != 0) break :blk null;
+        if (config.line_filter != null) break :blk null;
+        const exact_max = state_mod.exactMatcherMaxLen(matcher) orelse break :blk null;
+        if (exact_max == 0 or @as(u64, exact_max) > chunk) break :blk null;
+        break :blk exact_max - 1;
+    };
+
     var run = R{
         .allocator = allocator,
         .io = io,
@@ -1398,6 +1674,7 @@ fn tryParallel(
         .buf_cap = @intCast(chunk + ra_overhang),
         .numbering = numbering,
         .sep = sep,
+        .fixed_count_overlap = fixed_count_overlap,
     };
     run.wcfg.stop = &run.abort;
     defer run.span_tmp.deinit(allocator);
@@ -1431,6 +1708,7 @@ fn tryParallel(
     }
     if (state_mod.rejectEmptyResults(&G, config)) return finish(&run, sink, &G);
     if (state_mod.stopForBudget(&G, config)) return finish(&run, sink, &G);
+    if (G.pending_skip_to != null) run.fixed_count_overlap = null;
 
     var group: std.Io.Group = .init;
     {
@@ -1446,11 +1724,12 @@ fn tryParallel(
     }
 
     var line_base: ?u64 = G.line_number;
+    var open_matched_line = false;
     var term: ?Term = null;
     var k: usize = 0;
     while (k < n_chunks) : (k += 1) {
         const slot = run.waitChunk(k, &ew);
-        const t = run.processChunk(sink, &G, slot, line_base, &ew) catch |err| {
+        const t = run.processChunk(sink, &G, slot, line_base, &ew, &open_matched_line) catch |err| {
             run.release(k);
             return err;
         };

@@ -161,8 +161,10 @@ pub const RegexSet = struct {
         var frag_starts = try allocator.alloc(u32, patterns.len);
         defer allocator.free(frag_starts);
 
+        var transferred = false;
+
         const pat_meta = try allocator.alloc(PatternMeta, patterns.len);
-        errdefer allocator.free(pat_meta);
+        errdefer if (!transferred) allocator.free(pat_meta);
 
         var any_multiline = options.multiline;
         var all_anchored = true;
@@ -260,14 +262,16 @@ pub const RegexSet = struct {
         }
 
         const insts = try compiler.insts.toOwnedSlice(allocator);
-        errdefer allocator.free(insts);
+        errdefer if (!transferred) allocator.free(insts);
 
         const unicode_ranges = try compiler.unicode_ranges.toOwnedSlice(allocator);
         errdefer {
-            for (unicode_ranges) |item| {
-                if (item.owned) allocator.free(item.ranges);
+            if (!transferred) {
+                for (unicode_ranges) |item| {
+                    if (item.owned) allocator.free(item.ranges);
+                }
+                allocator.free(unicode_ranges);
             }
-            allocator.free(unicode_ranges);
         }
 
         const all_same_case = !any_inline_case_change and (any_ignore_case == all_ignore_case);
@@ -286,6 +290,7 @@ pub const RegexSet = struct {
             .max_multiline_window = options.max_multiline_window,
             .max_dfa_states = options.max_dfa_states,
         };
+        transferred = true;
         errdefer self.deinit();
 
         try self.tryBuildMultiPrefilter(patterns, any_ignore_case, all_same_case, any_saw_extended, options);
@@ -395,6 +400,7 @@ pub const RegexSet = struct {
                     .kind = item.kind,
                     .min_before = item.min_before,
                 };
+                errdefer entry.owners.deinit(self.allocator);
                 try entry.owners.append(self.allocator, item.pat_id);
                 try uniques.append(self.allocator, entry);
             }

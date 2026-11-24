@@ -43,6 +43,10 @@ pub const StackDfa = dfa_mod.StackDfa;
 pub const HeapDfa = dfa_mod.HeapDfa;
 pub const UnanchoredDfa = dfa_mod.UnanchoredDfa;
 
+const ByteClasses = dfa_mod.ByteClasses;
+const SetUnanchoredDfa = dfa_mod.SetUnanchoredDfa;
+const LazySetDfa = dfa_mod.LazySetDfa;
+
 const Thread = inst_mod.Thread;
 const Compiler = compiler_mod.Compiler;
 const hasLiteralUpper = inst_mod.hasLiteralUpper;
@@ -186,6 +190,10 @@ pub const Regex = struct {
     precomputed_dfa: ?*HeapDfa = null,
     /// Pre-determinized unanchored Phase-1 DFA for zero-literal patterns (`prefilter == null and alt_prefilter == null`).
     unanchored_dfa: ?*UnanchoredDfa = null,
+    /// Pre-determinization byte equivalence classes for complex literal-less regexes exceeding `UnanchoredDfa`'s cap.
+    set_byte_classes: ?*ByteClasses = null,
+    /// Tier A AOT multi-table Unanchored DFA (up to 512 KiB / 4096 states) for complex literal-less regexes.
+    set_unanchored_dfa: ?*SetUnanchoredDfa = null,
     has_lazy: bool = false,
     has_alt: bool = false,
     saw_extended: bool = false,
@@ -287,15 +295,19 @@ pub const Regex = struct {
             return error.RegexTooLarge;
         }
 
+        var owns_self = false;
+
         const insts = try compiler.insts.toOwnedSlice(allocator);
-        errdefer allocator.free(insts);
+        errdefer if (!owns_self) allocator.free(insts);
 
         const unicode_ranges = try compiler.unicode_ranges.toOwnedSlice(allocator);
         errdefer {
-            for (unicode_ranges) |item| {
-                if (item.owned) allocator.free(item.ranges);
+            if (!owns_self) {
+                for (unicode_ranges) |item| {
+                    if (item.owned) allocator.free(item.ranges);
+                }
+                allocator.free(unicode_ranges);
             }
-            allocator.free(unicode_ranges);
         }
 
         var self = Regex{
@@ -317,6 +329,7 @@ pub const Regex = struct {
             .saw_extended = compiler.saw_extended,
             .max_newlines = computeMaxNewlines(insts, unicode_ranges, root_frag.start, effective_ml),
         };
+        owns_self = true;
         errdefer self.deinit();
 
         for (compiler.capture_names[0..compiler.capture_count], 0..) |name, idx| {
@@ -447,6 +460,26 @@ pub const Regex = struct {
                 }
             } else |_| {}
         }
+        if (self.prefilter == null and self.alt_prefilter == null and self.unanchored_dfa == null and
+            !self.anchored_start and self.insts.len > 0 and
+            options.max_dfa_states >= UnanchoredDfa.max_non_match_states and
+            !isZeroLenOrEmptyStart(self.insts, self.start_pc))
+        {
+            if (allocator.create(ByteClasses)) |bc| {
+                bc.* = ByteClasses.compute(self.insts, self.unicode_ranges, self.multiline);
+                self.set_byte_classes = bc;
+
+                if (allocator.create(SetUnanchoredDfa)) |sudfa| {
+                    sudfa.* = .{};
+                    if (sudfa.determinize(allocator, self.insts, self.unicode_ranges, bc, self.start_pc, self.multiline)) {
+                        self.set_unanchored_dfa = sudfa;
+                    } else {
+                        sudfa.deinit(allocator);
+                        allocator.destroy(sudfa);
+                    }
+                } else |_| {}
+            } else |_| {}
+        }
         if (!self.req_is_exact and !self.req_is_prefix and self.req_literal_bytes.len >= 1 and (!self.ignore_case or !self.unicode_case)) {
             analyzeRequiredLiteralContext(&self);
         }
@@ -458,6 +491,11 @@ pub const Regex = struct {
             if (name.len != 0) self.allocator.free(name);
         }
         if (self.cap_plan) |cp| self.allocator.destroy(cp);
+        if (self.set_unanchored_dfa) |sud| {
+            sud.deinit(self.allocator);
+            self.allocator.destroy(sud);
+        }
+        if (self.set_byte_classes) |sbc| self.allocator.destroy(sbc);
         if (self.unanchored_dfa) |ud| {
             ud.deinit(self.allocator);
             self.allocator.destroy(ud);
@@ -644,6 +682,20 @@ pub const Regex = struct {
                 var unused_nul: ?usize = null;
                 return self.runUnanchoredDfaEnd(udfa, haystack, start, haystack.len, steps, false, &unused_nul);
             }
+        } else if (mode == .earliest and !self.multiline) {
+            if (self.set_unanchored_dfa) |sudfa| {
+                if (sudfa.has_exact_match) {
+                    const steps: ?*usize = if (comptime builtin.is_test) @constCast(&self.steps) else null;
+                    var unused_nul: ?usize = null;
+                    return self.runSetUnanchoredDfaEnd(sudfa, haystack, start, haystack.len, steps, false, &unused_nul);
+                }
+            } else if (self.set_byte_classes) |bc| {
+                if (haystack.len - start >= 16_384) {
+                    const steps: ?*usize = if (comptime builtin.is_test) @constCast(&self.steps) else null;
+                    var unused_nul: ?usize = null;
+                    return self.runLazySetDfaEnd(bc, haystack, start, haystack.len, steps, false, &unused_nul);
+                }
+            }
         }
         const m = self.find(haystack, start, mode) orelse return null;
         return m.end;
@@ -658,6 +710,18 @@ pub const Regex = struct {
                 if (mode == .earliest and !self.multiline and udfa.has_exact_match) {
                     const steps: ?*usize = if (comptime builtin.is_test) @constCast(&self.steps) else null;
                     return self.runUnanchoredDfaEnd(udfa, haystack, start, haystack.len, steps, true, nul);
+                }
+            } else if (mode == .earliest and !self.multiline) {
+                if (self.set_unanchored_dfa) |sudfa| {
+                    if (sudfa.has_exact_match) {
+                        const steps: ?*usize = if (comptime builtin.is_test) @constCast(&self.steps) else null;
+                        return self.runSetUnanchoredDfaEnd(sudfa, haystack, start, haystack.len, steps, true, nul);
+                    }
+                } else if (self.set_byte_classes) |bc| {
+                    if (haystack.len - start >= 16_384) {
+                        const steps: ?*usize = if (comptime builtin.is_test) @constCast(&self.steps) else null;
+                        return self.runLazySetDfaEnd(bc, haystack, start, haystack.len, steps, true, nul);
+                    }
                 }
             }
         }
@@ -1164,6 +1228,16 @@ pub const Regex = struct {
         if (self.unanchored_dfa) |udfa| {
             var unused_nul: ?usize = null;
             return self.runUnanchoredDfa(udfa, haystack, start, limit, mode, steps, scratch, false, &unused_nul);
+        }
+        if (self.set_unanchored_dfa) |sudfa| {
+            var unused_nul: ?usize = null;
+            return self.runSetUnanchoredDfa(sudfa, haystack, start, limit, mode, steps, scratch, false, &unused_nul);
+        }
+        if (self.set_byte_classes) |bc| {
+            if (limit - start >= 16_384) {
+                var unused_nul: ?usize = null;
+                return self.runLazySetDfa(bc, haystack, start, limit, mode, steps, scratch, false, &unused_nul);
+            }
         }
         if (scratch) |sc| {
             if (sc.ensureDfa()) |heap_dfa| {
@@ -1679,6 +1753,917 @@ pub const Regex = struct {
             if (nul_found) |z| {
                 nul.* = z;
             }
+        }
+        return null;
+    }
+
+    fn isZeroLenOrEmptyStart(insts: []const Inst, start_pc: u32) bool {
+        if (insts.len == 0 or insts.len > 8192 or start_pc >= insts.len) return false;
+        var visited: [128]u64 = @splat(0);
+        var stack: [512]u32 = undefined;
+        var sp: usize = 0;
+        stack[0] = start_pc;
+        sp = 1;
+        var saw_consuming = false;
+
+        while (sp > 0) {
+            sp -= 1;
+            const pc = stack[sp];
+            if (pc >= insts.len) return false;
+            const word = pc >> 6;
+            const bit = @as(u64, 1) << @as(u6, @intCast(pc & 63));
+            if ((visited[word] & bit) != 0) continue;
+            visited[word] |= bit;
+
+            switch (insts[pc]) {
+                .jmp => |target| {
+                    if (sp >= stack.len) return false;
+                    stack[sp] = target;
+                    sp += 1;
+                },
+                .split => |s| {
+                    if (sp + 2 > stack.len) return false;
+                    stack[sp] = s.out2;
+                    stack[sp + 1] = s.out1;
+                    sp += 2;
+                },
+                .save => |sv| {
+                    if (sp >= stack.len) return false;
+                    stack[sp] = sv.out;
+                    sp += 1;
+                },
+                .assert => |as| {
+                    if (sp >= stack.len) return false;
+                    stack[sp] = as.out;
+                    sp += 1;
+                },
+                .match, .match_id => return true,
+                .byte, .any, .any_cont, .class, .unicode_class => {
+                    saw_consuming = true;
+                },
+            }
+        }
+        return !saw_consuming;
+    }
+
+    // ========================================================================
+    // Complex Literal-Less Regex Tier A (`SetUnanchoredDfa`) & Tier B (`LazySetDfa`)
+    // ========================================================================
+
+    fn scanSetUnanchoredChunk(
+        comptime TableT: type,
+        comptime skip_tag: dfa_mod.StartSkipTag,
+        comptime track_active: bool,
+        dfa: *const SetUnanchoredDfa,
+        trans: [*]const TableT,
+        haystack: []const u8,
+        pos_ptr: *usize,
+        chunk_limit: usize,
+        state_ptr: *u32,
+        active_since_ptr: *usize,
+        local_steps: *usize,
+    ) void {
+        const classes = &dfa.classes;
+        const start_max = dfa.start_max_off;
+        const match_start = dfa.match_start_off;
+        const vecs = UnanchoredDfa.initSkipVecs(skip_tag, dfa.start_skip);
+
+        var pos = pos_ptr.*;
+        var s = state_ptr.*;
+        var active_since = active_since_ptr.*;
+
+        while (pos < chunk_limit) {
+            if (s <= start_max) {
+                var sc: usize = 0;
+                while (sc < 4 and pos < chunk_limit) : (sc += 1) {
+                    const ns: u32 = trans[s + classes[haystack[pos]]];
+                    if (comptime builtin.is_test) local_steps.* += 1;
+                    if (ns > start_max) {
+                        if (comptime track_active) active_since = pos;
+                        s = ns;
+                        pos += 1;
+                        break;
+                    }
+                    s = ns;
+                    pos += 1;
+                }
+                if (s >= match_start) break;
+                if (s <= start_max) {
+                    if (pos >= chunk_limit) break;
+                    if (comptime skip_tag != .none) {
+                        if (chunk_limit - pos >= memchr.native_width) {
+                            if (UnanchoredDfa.skipStartVec(skip_tag, vecs, haystack, pos, chunk_limit)) |next_pos| {
+                                if (comptime builtin.is_test) local_steps.* += next_pos - pos;
+                                if (next_pos > pos) {
+                                    s = dfa.startStateForByte(haystack[next_pos - 1]);
+                                    pos = next_pos;
+                                }
+                                const ns: u32 = trans[s + classes[haystack[pos]]];
+                                if (comptime builtin.is_test) local_steps.* += 1;
+                                if (ns > start_max) {
+                                    if (comptime track_active) active_since = pos;
+                                }
+                                s = ns;
+                                pos += 1;
+                                if (s >= match_start) break;
+                                if (s <= start_max) continue;
+                            } else {
+                                if (comptime builtin.is_test) local_steps.* += chunk_limit - pos;
+                                if (chunk_limit > pos) {
+                                    s = dfa.startStateForByte(haystack[chunk_limit - 1]);
+                                    pos = chunk_limit;
+                                }
+                                break;
+                            }
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+            }
+
+            // Active non-start state: 4x unrolled compact ByteClasses + pre-scaled table loop
+            while (pos + 4 <= chunk_limit) {
+                const s1: u32 = trans[s + classes[haystack[pos]]];
+                if (s1 >= match_start) {
+                    if (comptime builtin.is_test) local_steps.* += 1;
+                    s = s1;
+                    pos += 1;
+                    break;
+                }
+                if (comptime track_active) {
+                    if (s1 <= start_max) active_since = pos + 1;
+                }
+                const s2: u32 = trans[s1 + classes[haystack[pos + 1]]];
+                if (s2 >= match_start) {
+                    if (comptime builtin.is_test) local_steps.* += 2;
+                    s = s2;
+                    pos += 2;
+                    break;
+                }
+                if (comptime track_active) {
+                    if (s2 <= start_max) active_since = pos + 2;
+                }
+                const s3: u32 = trans[s2 + classes[haystack[pos + 2]]];
+                if (s3 >= match_start) {
+                    if (comptime builtin.is_test) local_steps.* += 3;
+                    s = s3;
+                    pos += 3;
+                    break;
+                }
+                if (comptime track_active) {
+                    if (s3 <= start_max) active_since = pos + 3;
+                }
+                const s4: u32 = trans[s3 + classes[haystack[pos + 3]]];
+                if (comptime builtin.is_test) local_steps.* += 4;
+                s = s4;
+                pos += 4;
+                if (comptime track_active) {
+                    if (s <= start_max) active_since = pos;
+                }
+                if (s >= match_start or s <= start_max) break;
+            }
+            if (s >= match_start) break;
+            if (s <= start_max) continue;
+
+            while (pos < chunk_limit) {
+                s = trans[s + classes[haystack[pos]]];
+                if (comptime builtin.is_test) local_steps.* += 1;
+                pos += 1;
+                if (s >= match_start) break;
+                if (s <= start_max) {
+                    if (comptime track_active) active_since = pos;
+                    break;
+                }
+            }
+            if (s >= match_start) break;
+        }
+
+        pos_ptr.* = pos;
+        state_ptr.* = s;
+        active_since_ptr.* = active_since;
+    }
+
+    inline fn dispatchScanSetUnanchored(
+        comptime track_active: bool,
+        dfa: *const SetUnanchoredDfa,
+        haystack: []const u8,
+        pos_ptr: *usize,
+        chunk_limit: usize,
+        state_ptr: *u32,
+        active_since_ptr: *usize,
+        local_steps: *usize,
+    ) void {
+        switch (dfa.table_kind) {
+            .u8_tbl => {
+                const trans: [*]const u8 = &dfa.trans_u8;
+                switch (dfa.start_skip) {
+                    inline else => |_, tag| scanSetUnanchoredChunk(u8, tag, track_active, dfa, trans, haystack, pos_ptr, chunk_limit, state_ptr, active_since_ptr, local_steps),
+                }
+            },
+            .u16_tbl => {
+                const trans: [*]const u16 = dfa.trans_u16.ptr;
+                switch (dfa.start_skip) {
+                    inline else => |_, tag| scanSetUnanchoredChunk(u16, tag, track_active, dfa, trans, haystack, pos_ptr, chunk_limit, state_ptr, active_since_ptr, local_steps),
+                }
+            },
+            .u32_tbl => {
+                const trans: [*]const u32 = dfa.trans_u32.ptr;
+                switch (dfa.start_skip) {
+                    inline else => |_, tag| scanSetUnanchoredChunk(u32, tag, track_active, dfa, trans, haystack, pos_ptr, chunk_limit, state_ptr, active_since_ptr, local_steps),
+                }
+            },
+        }
+    }
+
+    fn runSetUnanchoredDfaEnd(
+        self: *const Regex,
+        dfa: *const SetUnanchoredDfa,
+        haystack: []const u8,
+        start: usize,
+        limit: usize,
+        steps: ?*usize,
+        comptime watch_nul: bool,
+        nul: *?usize,
+    ) ?usize {
+        if (start > limit) return null;
+        const match_start = dfa.match_start_off;
+
+        var scan_limit: usize = limit;
+        var nul_checked_to: usize = start;
+        var nul_found: ?usize = null;
+
+        var pos: usize = start;
+        var search_floor: usize = start;
+        var unused_active: usize = start;
+        var s: u32 = dfa.startStateAt(haystack, start);
+        var cached_win_end: usize = std.math.maxInt(usize);
+        var cached_line_start: usize = start;
+
+        var local_steps: usize = 0;
+        defer if (comptime builtin.is_test) {
+            if (steps) |st| {
+                if (local_steps > 0) _ = @atomicRmw(usize, st, .Add, local_steps, .monotonic);
+            }
+        };
+
+        while (pos < scan_limit) {
+            if (watch_nul and pos >= nul_checked_to) {
+                const check_end = @min(scan_limit, pos + 32768);
+                if (memchr.find(memchr.native_width, haystack[0..check_end], pos, 0)) |z| {
+                    nul_found = z;
+                    scan_limit = z;
+                    nul_checked_to = z;
+                    if (pos >= scan_limit) break;
+                } else {
+                    nul_checked_to = check_end;
+                }
+            }
+            const chunk_limit = if (watch_nul) @min(scan_limit, nul_checked_to) else scan_limit;
+
+            dispatchScanSetUnanchored(false, dfa, haystack, &pos, chunk_limit, &s, &unused_active, &local_steps);
+
+            if (s < match_start) continue;
+
+            // Exact match fast path: 0 PikeVM calls, 0 windowLimit, 0 lineStartAt!
+            if (s == dfa.exact_del_off) return pos - 1;
+            if (s == dfa.exact_imm_off) return pos;
+
+            // Rare verify_match fallback (non-ASCII / ambiguous `\b` candidate)
+            const cand_end: usize = if (s == dfa.verify_del_off) pos - 1 else pos;
+            const probe_pos: usize = if (cand_end > 0) cand_end - 1 else 0;
+            if (cached_win_end == std.math.maxInt(usize) or probe_pos > cached_win_end) {
+                cached_win_end = self.windowLimit(haystack, probe_pos);
+                cached_line_start = @max(search_floor, lineStartAt(haystack, probe_pos));
+            }
+            var win_end = @min(scan_limit, cached_win_end);
+            if (watch_nul and win_end > nul_checked_to) {
+                if (memchr.find(memchr.native_width, haystack[0..win_end], nul_checked_to, 0)) |z| {
+                    nul_found = z;
+                    scan_limit = z;
+                    win_end = z;
+                    nul_checked_to = z;
+                } else {
+                    nul_checked_to = win_end;
+                }
+            }
+            const line_start = @max(search_floor, cached_line_start);
+            const start_hi = if (cand_end > 0) cand_end - 1 else 0;
+            if (cand_end > 0 and line_start <= start_hi) {
+                if (self.runRangeAllowed(haystack, line_start, start_hi, win_end, .earliest, AllowAny{}, steps, null)) |m| {
+                    if (m.end > cand_end + 1) {
+                        const earlier_lim = @min(m.end, win_end);
+                        if (cand_end < earlier_lim) {
+                            if (self.runRangeAllowed(haystack, cand_end, earlier_lim, earlier_lim, .earliest, AllowAny{}, steps, null)) |m2| {
+                                if (m2.end < m.end) return m2.end;
+                            }
+                        }
+                    }
+                    return m.end;
+                }
+            }
+            search_floor = cand_end;
+            pos = cand_end;
+            s = dfa.startStateAt(haystack, cand_end);
+        }
+
+        if (s < match_start and pos > search_floor and dfa.eoi_kind.len != 0) {
+            const eoi = dfa.eoi_kind[@intCast(s / dfa.stride)];
+            if (eoi == .exact) return pos;
+            if (eoi == .verify) {
+                const probe_pos = pos - 1;
+                const line_start = @max(search_floor, lineStartAt(haystack, probe_pos));
+                if (line_start <= probe_pos) {
+                    if (self.runRangeAllowed(haystack, line_start, probe_pos, pos, .earliest, AllowAny{}, steps, null)) |m| {
+                        return m.end;
+                    }
+                }
+            }
+        }
+
+        if (watch_nul) {
+            if (nul_found) |z| nul.* = z;
+        }
+        return null;
+    }
+
+    fn runSetUnanchoredDfa(
+        self: *const Regex,
+        dfa: *const SetUnanchoredDfa,
+        haystack: []const u8,
+        start: usize,
+        limit: usize,
+        mode: MatchMode,
+        steps: ?*usize,
+        scratch: ?*RegexScratch,
+        comptime watch_nul: bool,
+        nul: *?usize,
+    ) ?Match {
+        if (start > limit) return null;
+        const match_start = dfa.match_start_off;
+
+        var scan_limit: usize = limit;
+        var nul_checked_to: usize = start;
+        var nul_found: ?usize = null;
+
+        var pos: usize = start;
+        var search_floor: usize = start;
+        var active_since: usize = start;
+        var s: u32 = dfa.startStateAt(haystack, start);
+        var cached_win_end: usize = std.math.maxInt(usize);
+        var cached_line_start: usize = start;
+
+        var local_steps: usize = 0;
+        defer if (comptime builtin.is_test) {
+            if (steps) |st| {
+                if (local_steps > 0) _ = @atomicRmw(usize, st, .Add, local_steps, .monotonic);
+            }
+        };
+
+        while (pos < scan_limit) {
+            if (watch_nul and pos >= nul_checked_to) {
+                const check_end = @min(scan_limit, pos + 32768);
+                if (memchr.find(memchr.native_width, haystack[0..check_end], pos, 0)) |z| {
+                    nul_found = z;
+                    scan_limit = z;
+                    nul_checked_to = z;
+                    if (pos >= scan_limit) break;
+                } else {
+                    nul_checked_to = check_end;
+                }
+            }
+            const chunk_limit = if (watch_nul) @min(scan_limit, nul_checked_to) else scan_limit;
+
+            dispatchScanSetUnanchored(true, dfa, haystack, &pos, chunk_limit, &s, &active_since, &local_steps);
+
+            if (s < match_start) continue;
+
+            const is_delayed = (s == dfa.verify_del_off or s == dfa.exact_del_off);
+            const cand_end: usize = if (is_delayed) pos - 1 else pos;
+            const probe_pos: usize = if (cand_end > 0) cand_end - 1 else 0;
+
+            if (!self.multiline) {
+                if (cached_win_end == std.math.maxInt(usize) or probe_pos > cached_win_end) {
+                    cached_win_end = self.windowLimit(haystack, probe_pos);
+                    cached_line_start = @max(search_floor, lineStartAt(haystack, probe_pos));
+                }
+                var win_end = @min(scan_limit, cached_win_end);
+                if (watch_nul and win_end > nul_checked_to) {
+                    if (memchr.find(memchr.native_width, haystack[0..win_end], nul_checked_to, 0)) |z| {
+                        nul_found = z;
+                        scan_limit = z;
+                        win_end = z;
+                        nul_checked_to = z;
+                    } else {
+                        nul_checked_to = win_end;
+                    }
+                }
+                const line_start = @max(search_floor, cached_line_start);
+
+                if (dfa.start_reentrant) {
+                    if (self.runRangeAllowed(haystack, line_start, win_end, win_end, mode, AllowAny{}, steps, scratch)) |m| {
+                        return m;
+                    }
+                    if (win_end >= scan_limit) {
+                        pos = scan_limit;
+                        break;
+                    }
+                    pos = win_end + 1;
+                    if (watch_nul and pos > nul_checked_to) nul_checked_to = pos;
+                    search_floor = pos;
+                    active_since = pos;
+                    s = dfa.startStateAt(haystack, pos);
+                    continue;
+                }
+
+                const search_lo = @max(line_start, active_since);
+                const start_hi = probe_pos;
+                if (cand_end > 0 and search_lo <= start_hi) {
+                    if (self.runRangeAllowed(haystack, search_lo, start_hi, win_end, mode, AllowAny{}, steps, scratch)) |m| {
+                        if (mode == .earliest and m.end > cand_end + 1) {
+                            const earlier_lim = @min(m.end, win_end);
+                            if (cand_end < earlier_lim) {
+                                if (self.runRangeAllowed(haystack, cand_end, earlier_lim, earlier_lim, .earliest, AllowAny{}, steps, scratch)) |m2| {
+                                    if (m2.end < m.end or (m2.end == m.end and m2.start < m.start)) {
+                                        return m2;
+                                    }
+                                }
+                            }
+                        }
+                        return m;
+                    }
+                }
+                search_floor = cand_end;
+                active_since = cand_end;
+                pos = cand_end;
+                s = dfa.startStateAt(haystack, cand_end);
+            } else {
+                const search_lo = blk: {
+                    var lo = @max(search_floor, cand_end -| self.max_multiline_window);
+                    if (!dfa.start_reentrant) lo = @max(lo, active_since);
+                    break :blk lo;
+                };
+                const raw_verify_limit = @min(scan_limit, probe_pos +| self.max_multiline_window);
+                if (watch_nul and raw_verify_limit > nul_checked_to) {
+                    if (memchr.find(memchr.native_width, haystack[0..raw_verify_limit], nul_checked_to, 0)) |z| {
+                        nul_found = z;
+                        scan_limit = z;
+                        nul_checked_to = z;
+                    } else {
+                        nul_checked_to = raw_verify_limit;
+                    }
+                }
+                const eff_verify_limit = @min(raw_verify_limit, scan_limit);
+                const start_hi = probe_pos;
+                if (cand_end > 0 and search_lo <= start_hi) {
+                    if (self.runRangeAllowed(haystack, search_lo, start_hi, eff_verify_limit, mode, AllowAny{}, steps, scratch)) |m| {
+                        if (mode == .earliest and m.end > cand_end + 1) {
+                            const earlier_lim = @min(m.end, eff_verify_limit);
+                            if (cand_end < earlier_lim) {
+                                if (self.runRangeAllowed(haystack, cand_end, earlier_lim, earlier_lim, .earliest, AllowAny{}, steps, scratch)) |m2| {
+                                    if (m2.end < m.end or (m2.end == m.end and m2.start < m.start)) {
+                                        return m2;
+                                    }
+                                }
+                            }
+                        }
+                        return m;
+                    }
+                }
+                search_floor = cand_end;
+                active_since = cand_end;
+                pos = cand_end;
+                s = dfa.startStateAt(haystack, cand_end);
+            }
+        }
+
+        if (s < match_start and pos > search_floor and dfa.eoi_kind.len != 0) {
+            const eoi = dfa.eoi_kind[@intCast(s / dfa.stride)];
+            if (eoi != .none) {
+                const probe_pos = pos - 1;
+                const line_start = @max(search_floor, lineStartAt(haystack, probe_pos));
+                const search_lo = if (dfa.start_reentrant) line_start else @max(line_start, active_since);
+                if (search_lo <= probe_pos) {
+                    if (self.runRangeAllowed(haystack, search_lo, probe_pos, pos, mode, AllowAny{}, steps, scratch)) |m| {
+                        return m;
+                    }
+                }
+            }
+        }
+
+        if (watch_nul) {
+            if (nul_found) |z| nul.* = z;
+        }
+        return null;
+    }
+
+    fn findWatchedFallback(
+        self: *const Regex,
+        haystack: []const u8,
+        start: usize,
+        limit: usize,
+        steps: ?*usize,
+        scratch: ?*RegexScratch,
+        nul: *?usize,
+    ) ?Match {
+        const hit = self.runRangeAllowed(haystack, start, limit, limit, .earliest, AllowAny{}, steps, scratch);
+        const check_lim = if (hit) |m| @min(limit, @max(start, m.end)) else limit;
+        if (start < check_lim) {
+            if (memchr.find(memchr.native_width, haystack[0..check_lim], start, 0)) |at| {
+                nul.* = at;
+                return null;
+            }
+        }
+        return hit;
+    }
+
+    fn runLazySetDfaEnd(
+        self: *const Regex,
+        bc: *const ByteClasses,
+        haystack: []const u8,
+        start: usize,
+        limit: usize,
+        steps: ?*usize,
+        comptime watch_nul: bool,
+        nul: *?usize,
+    ) ?usize {
+        var lazy = LazySetDfa.init(
+            self.allocator,
+            self.insts,
+            self.unicode_ranges,
+            bc,
+            self.start_pc,
+            self.multiline,
+            null,
+            LazySetDfa.default_max_flushes,
+        ) orelse {
+            if (watch_nul) {
+                const m = self.findWatchedFallback(haystack, start, limit, steps, null, nul) orelse return null;
+                return m.end;
+            }
+            const m = self.runRangeAllowed(haystack, start, limit, limit, .earliest, AllowAny{}, steps, null) orelse return null;
+            return m.end;
+        };
+        defer lazy.deinit();
+
+        var scan_limit: usize = limit;
+        var nul_checked_to: usize = start;
+        var nul_found: ?usize = null;
+
+        var pos: usize = start;
+        var search_floor: usize = start;
+        var s: u16 = lazy.startStateAt(haystack, start);
+        var cached_win_end: usize = std.math.maxInt(usize);
+        var cached_line_start: usize = start;
+
+        var local_steps: usize = 0;
+        defer if (comptime builtin.is_test) {
+            if (steps) |st| {
+                if (local_steps > 0) _ = @atomicRmw(usize, st, .Add, local_steps, .monotonic);
+            }
+        };
+
+        while (pos < scan_limit) {
+            if (watch_nul and pos >= nul_checked_to) {
+                const check_end = @min(scan_limit, pos + 32768);
+                if (memchr.find(memchr.native_width, haystack[0..check_end], pos, 0)) |z| {
+                    nul_found = z;
+                    scan_limit = z;
+                    nul_checked_to = z;
+                    if (pos >= scan_limit) break;
+                } else {
+                    nul_checked_to = check_end;
+                }
+            }
+            const chunk_limit = if (watch_nul) @min(scan_limit, nul_checked_to) else scan_limit;
+            const stride: usize = lazy.stride;
+            const classes = &lazy.classes;
+            const trans = lazy.trans;
+
+            while (pos < chunk_limit) {
+                const ns = trans[@as(usize, s) * stride + classes[haystack[pos]]];
+                if (comptime builtin.is_test) local_steps += 1;
+                if (ns < LazySetDfa.sentinel_min) {
+                    s = ns;
+                    pos += 1;
+                    continue;
+                }
+                const stepped = if (ns == LazySetDfa.unknown_trans) lazy.step(s, haystack[pos]) else ns;
+                if (stepped < LazySetDfa.sentinel_min) {
+                    s = stepped;
+                    pos += 1;
+                    continue;
+                }
+                s = stepped;
+                pos += 1;
+                break;
+            }
+
+            if (s < LazySetDfa.sentinel_min) continue;
+
+            if (s == LazySetDfa.bailout_trans) {
+                const resume_from = if (!self.multiline)
+                    @max(search_floor, lineStartAt(haystack, if (pos > 0) pos - 1 else 0))
+                else
+                    @max(search_floor, pos -| self.max_multiline_window);
+                if (watch_nul) {
+                    const m = self.findWatchedFallback(haystack, resume_from, scan_limit, steps, null, nul);
+                    if (m) |mm| return mm.end;
+                    if (nul.* == null) {
+                        if (nul_found) |z| nul.* = z;
+                    }
+                    return null;
+                }
+                const m = self.runRangeAllowed(haystack, resume_from, scan_limit, scan_limit, .earliest, AllowAny{}, steps, null) orelse return null;
+                return m.end;
+            }
+
+            if (s == LazySetDfa.exact_del) return pos - 1;
+            if (s == LazySetDfa.exact_imm) return pos;
+
+            const cand_end: usize = if (s == LazySetDfa.verify_del) pos - 1 else pos;
+            const probe_pos: usize = if (cand_end > 0) cand_end - 1 else 0;
+            if (cached_win_end == std.math.maxInt(usize) or probe_pos > cached_win_end) {
+                cached_win_end = self.windowLimit(haystack, probe_pos);
+                cached_line_start = @max(search_floor, lineStartAt(haystack, probe_pos));
+            }
+            var win_end = @min(scan_limit, cached_win_end);
+            if (watch_nul and win_end > nul_checked_to) {
+                if (memchr.find(memchr.native_width, haystack[0..win_end], nul_checked_to, 0)) |z| {
+                    nul_found = z;
+                    scan_limit = z;
+                    win_end = z;
+                    nul_checked_to = z;
+                } else {
+                    nul_checked_to = win_end;
+                }
+            }
+            const line_start = @max(search_floor, cached_line_start);
+            const start_hi = if (cand_end > 0) cand_end - 1 else 0;
+            if (cand_end > 0 and line_start <= start_hi) {
+                if (self.runRangeAllowed(haystack, line_start, start_hi, win_end, .earliest, AllowAny{}, steps, null)) |m| {
+                    if (m.end > cand_end + 1) {
+                        const earlier_lim = @min(m.end, win_end);
+                        if (cand_end < earlier_lim) {
+                            if (self.runRangeAllowed(haystack, cand_end, earlier_lim, earlier_lim, .earliest, AllowAny{}, steps, null)) |m2| {
+                                if (m2.end < m.end) return m2.end;
+                            }
+                        }
+                    }
+                    return m.end;
+                }
+            }
+            search_floor = cand_end;
+            pos = cand_end;
+            s = lazy.startStateAt(haystack, cand_end);
+        }
+
+        if (s < LazySetDfa.sentinel_min and pos > search_floor) {
+            const eoi = lazy.eoiKind(s);
+            if (eoi == .exact) return pos;
+            if (eoi == .verify) {
+                const probe_pos = pos - 1;
+                const line_start = @max(search_floor, lineStartAt(haystack, probe_pos));
+                if (line_start <= probe_pos) {
+                    if (self.runRangeAllowed(haystack, line_start, probe_pos, pos, .earliest, AllowAny{}, steps, null)) |m| {
+                        return m.end;
+                    }
+                }
+            }
+        }
+
+        if (watch_nul) {
+            if (nul_found) |z| nul.* = z;
+        }
+        return null;
+    }
+
+    fn runLazySetDfa(
+        self: *const Regex,
+        bc: *const ByteClasses,
+        haystack: []const u8,
+        start: usize,
+        limit: usize,
+        mode: MatchMode,
+        steps: ?*usize,
+        scratch: ?*RegexScratch,
+        comptime watch_nul: bool,
+        nul: *?usize,
+    ) ?Match {
+        var lazy = LazySetDfa.init(
+            self.allocator,
+            self.insts,
+            self.unicode_ranges,
+            bc,
+            self.start_pc,
+            self.multiline,
+            null,
+            LazySetDfa.default_max_flushes,
+        ) orelse {
+            if (watch_nul) return self.findWatchedFallback(haystack, start, limit, steps, scratch, nul);
+            return self.runRangeAllowed(haystack, start, limit, limit, mode, AllowAny{}, steps, scratch);
+        };
+        defer lazy.deinit();
+
+        var scan_limit: usize = limit;
+        var nul_checked_to: usize = start;
+        var nul_found: ?usize = null;
+
+        var pos: usize = start;
+        var search_floor: usize = start;
+        var active_since: usize = start;
+        var s: u16 = lazy.startStateAt(haystack, start);
+        var cached_win_end: usize = std.math.maxInt(usize);
+        var cached_line_start: usize = start;
+
+        var local_steps: usize = 0;
+        defer if (comptime builtin.is_test) {
+            if (steps) |st| {
+                if (local_steps > 0) _ = @atomicRmw(usize, st, .Add, local_steps, .monotonic);
+            }
+        };
+
+        while (pos < scan_limit) {
+            if (watch_nul and pos >= nul_checked_to) {
+                const check_end = @min(scan_limit, pos + 32768);
+                if (memchr.find(memchr.native_width, haystack[0..check_end], pos, 0)) |z| {
+                    nul_found = z;
+                    scan_limit = z;
+                    nul_checked_to = z;
+                    if (pos >= scan_limit) break;
+                } else {
+                    nul_checked_to = check_end;
+                }
+            }
+            const chunk_limit = if (watch_nul) @min(scan_limit, nul_checked_to) else scan_limit;
+            const stride: usize = lazy.stride;
+            const num_starts: u16 = lazy.num_starts;
+            const classes = &lazy.classes;
+            const trans = lazy.trans;
+
+            while (pos < chunk_limit) {
+                const ns = trans[@as(usize, s) * stride + classes[haystack[pos]]];
+                if (comptime builtin.is_test) local_steps += 1;
+                if (ns < LazySetDfa.sentinel_min) {
+                    if (s < num_starts and ns >= num_starts) {
+                        active_since = pos;
+                    } else if (ns < num_starts) {
+                        active_since = pos + 1;
+                    }
+                    s = ns;
+                    pos += 1;
+                    continue;
+                }
+                const stepped = if (ns == LazySetDfa.unknown_trans) lazy.step(s, haystack[pos]) else ns;
+                if (stepped < LazySetDfa.sentinel_min) {
+                    if (s < num_starts and stepped >= num_starts) {
+                        active_since = pos;
+                    } else if (stepped < num_starts) {
+                        active_since = pos + 1;
+                    }
+                    s = stepped;
+                    pos += 1;
+                    continue;
+                }
+                s = stepped;
+                pos += 1;
+                break;
+            }
+
+            if (s < LazySetDfa.sentinel_min) continue;
+
+            if (s == LazySetDfa.bailout_trans) {
+                const resume_from = if (!self.multiline)
+                    @max(search_floor, lineStartAt(haystack, if (pos > 0) pos - 1 else 0))
+                else
+                    @max(search_floor, pos -| self.max_multiline_window);
+                if (watch_nul) {
+                    const m = self.findWatchedFallback(haystack, resume_from, scan_limit, steps, scratch, nul);
+                    if (m == null and nul.* == null) {
+                        if (nul_found) |z| nul.* = z;
+                    }
+                    return m;
+                }
+                return self.runRangeAllowed(haystack, resume_from, scan_limit, scan_limit, mode, AllowAny{}, steps, scratch);
+            }
+
+            const is_delayed = (s == LazySetDfa.verify_del or s == LazySetDfa.exact_del);
+            const cand_end: usize = if (is_delayed) pos - 1 else pos;
+            const probe_pos: usize = if (cand_end > 0) cand_end - 1 else 0;
+
+            if (!self.multiline) {
+                if (cached_win_end == std.math.maxInt(usize) or probe_pos > cached_win_end) {
+                    cached_win_end = self.windowLimit(haystack, probe_pos);
+                    cached_line_start = @max(search_floor, lineStartAt(haystack, probe_pos));
+                }
+                var win_end = @min(scan_limit, cached_win_end);
+                if (watch_nul and win_end > nul_checked_to) {
+                    if (memchr.find(memchr.native_width, haystack[0..win_end], nul_checked_to, 0)) |z| {
+                        nul_found = z;
+                        scan_limit = z;
+                        win_end = z;
+                        nul_checked_to = z;
+                    } else {
+                        nul_checked_to = win_end;
+                    }
+                }
+                const line_start = @max(search_floor, cached_line_start);
+
+                if (lazy.start_reentrant) {
+                    if (self.runRangeAllowed(haystack, line_start, win_end, win_end, mode, AllowAny{}, steps, scratch)) |m| {
+                        return m;
+                    }
+                    if (win_end >= scan_limit) {
+                        pos = scan_limit;
+                        break;
+                    }
+                    pos = win_end + 1;
+                    if (watch_nul and pos > nul_checked_to) nul_checked_to = pos;
+                    search_floor = pos;
+                    active_since = pos;
+                    s = lazy.startStateAt(haystack, pos);
+                    continue;
+                }
+
+                const search_lo = @max(line_start, active_since);
+                const start_hi = probe_pos;
+                if (cand_end > 0 and search_lo <= start_hi) {
+                    if (self.runRangeAllowed(haystack, search_lo, start_hi, win_end, mode, AllowAny{}, steps, scratch)) |m| {
+                        if (mode == .earliest and m.end > cand_end + 1) {
+                            const earlier_lim = @min(m.end, win_end);
+                            if (cand_end < earlier_lim) {
+                                if (self.runRangeAllowed(haystack, cand_end, earlier_lim, earlier_lim, .earliest, AllowAny{}, steps, scratch)) |m2| {
+                                    if (m2.end < m.end or (m2.end == m.end and m2.start < m.start)) {
+                                        return m2;
+                                    }
+                                }
+                            }
+                        }
+                        return m;
+                    }
+                }
+                search_floor = cand_end;
+                active_since = cand_end;
+                pos = cand_end;
+                s = lazy.startStateAt(haystack, cand_end);
+            } else {
+                const search_lo = blk: {
+                    var lo = @max(search_floor, cand_end -| self.max_multiline_window);
+                    if (!lazy.start_reentrant) lo = @max(lo, active_since);
+                    break :blk lo;
+                };
+                const raw_verify_limit = @min(scan_limit, probe_pos +| self.max_multiline_window);
+                if (watch_nul and raw_verify_limit > nul_checked_to) {
+                    if (memchr.find(memchr.native_width, haystack[0..raw_verify_limit], nul_checked_to, 0)) |z| {
+                        nul_found = z;
+                        scan_limit = z;
+                        nul_checked_to = z;
+                    } else {
+                        nul_checked_to = raw_verify_limit;
+                    }
+                }
+                const eff_verify_limit = @min(raw_verify_limit, scan_limit);
+                const start_hi = probe_pos;
+                if (cand_end > 0 and search_lo <= start_hi) {
+                    if (self.runRangeAllowed(haystack, search_lo, start_hi, eff_verify_limit, mode, AllowAny{}, steps, scratch)) |m| {
+                        if (mode == .earliest and m.end > cand_end + 1) {
+                            const earlier_lim = @min(m.end, eff_verify_limit);
+                            if (cand_end < earlier_lim) {
+                                if (self.runRangeAllowed(haystack, cand_end, earlier_lim, earlier_lim, .earliest, AllowAny{}, steps, scratch)) |m2| {
+                                    if (m2.end < m.end or (m2.end == m.end and m2.start < m.start)) {
+                                        return m2;
+                                    }
+                                }
+                            }
+                        }
+                        return m;
+                    }
+                }
+                search_floor = cand_end;
+                active_since = cand_end;
+                pos = cand_end;
+                s = lazy.startStateAt(haystack, cand_end);
+            }
+        }
+
+        if (s < LazySetDfa.sentinel_min and pos > search_floor) {
+            const eoi = lazy.eoiKind(s);
+            if (eoi != .none) {
+                const probe_pos = pos - 1;
+                const line_start = @max(search_floor, lineStartAt(haystack, probe_pos));
+                const search_lo = if (lazy.start_reentrant) line_start else @max(line_start, active_since);
+                if (search_lo <= probe_pos) {
+                    if (self.runRangeAllowed(haystack, search_lo, probe_pos, pos, mode, AllowAny{}, steps, scratch)) |m| {
+                        return m;
+                    }
+                }
+            }
+        }
+
+        if (watch_nul) {
+            if (nul_found) |z| nul.* = z;
         }
         return null;
     }
@@ -3000,6 +3985,14 @@ pub const Regex = struct {
             }
             if (self.unanchored_dfa) |udfa| {
                 return self.runUnanchoredDfa(udfa, haystack, start, haystack.len, .earliest, null, null, true, nul);
+            }
+            if (self.set_unanchored_dfa) |sudfa| {
+                return self.runSetUnanchoredDfa(sudfa, haystack, start, haystack.len, .earliest, null, null, true, nul);
+            }
+            if (self.set_byte_classes) |bc| {
+                if (haystack.len - start >= 16_384) {
+                    return self.runLazySetDfa(bc, haystack, start, haystack.len, .earliest, null, null, true, nul);
+                }
             }
         }
         const hit = self.find(haystack, start, .earliest);

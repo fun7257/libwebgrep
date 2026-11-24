@@ -1558,3 +1558,325 @@ test "P0-3 contract: dfa.isExactOnAsciiAnyInsts allows .any and rejects .assert 
     defer re_neg.deinit();
     try std.testing.expect(!dfa_mod.isExactOnAsciiAnyInsts(re_neg.insts));
 }
+
+test "Regex >300-inst literal-less Tier A SetUnanchoredDfa (Unicode & ASCII \\b, NULs, PikeVM parity)" {
+    const alloc = std.testing.allocator;
+    const pat =
+        "\\b(?:" ++
+        "[a-z]{6,10}_[0-9]{4,7}|" ++
+        "[A-Z]{5,9}-[0-9]{4,7}|" ++
+        "[0-9]{4,7}:[0-9]{4,7}|" ++
+        "[a-z]{5,9}=[0-9]{4,7}|" ++
+        "[A-Z]{4,8}#[0-9]{4,7}|" ++
+        "[a-z]{5,9}/[0-9]{4,7}|" ++
+        "[0-9]{4,7}\\.[0-9]{4,7}|" ++
+        "[A-Z]{4,8}\\+[0-9]{4,7}|" ++
+        "[a-z]{5,9}@[0-9]{4,7}|" ++
+        "[0-9]{4,7}%[a-z]{4,7}|" ++
+        "[A-Z]{4,8}_[A-Z]{4,8}|" ++
+        "[a-z]{5,9}:[a-z]{5,9}" ++
+        ")\\b";
+
+    // Test both Unicode `\b` (default) and ASCII `\b` (`unicode_word_boundary = false`)
+    for ([_]bool{ true, false }) |unicode_wb| {
+        var re = try Regex.init(alloc, pat, .{ .unicode_word_boundary = unicode_wb });
+        defer re.deinit();
+        var re_ref = try Regex.init(alloc, pat, .{ .unicode_word_boundary = unicode_wb, .max_dfa_states = 0 });
+        defer re_ref.deinit();
+
+        try std.testing.expect(re.insts.len > 300);
+        try std.testing.expect(re.prefilter == null);
+        try std.testing.expect(re.alt_prefilter == null);
+        try std.testing.expect(re.unanchored_dfa == null);
+        try std.testing.expect(re.set_byte_classes != null);
+        try std.testing.expect(re.set_unanchored_dfa != null);
+        try std.testing.expect(re.set_unanchored_dfa.?.has_exact_match);
+        try std.testing.expect(re_ref.unanchored_dfa == null);
+        try std.testing.expect(re_ref.set_unanchored_dfa == null);
+        try std.testing.expect(re_ref.set_byte_classes == null);
+
+        const cases = [_][]const u8{
+            "no matches on this line at all 12345 xyz\n",
+            "xworker_12345x  worker_12345  ALPHA-98765\n",
+            "你worker_12345  。worker_12345  code=9876\n",
+            "leading 1234:5678",
+            "boundary_at_eoi 2026.9999",
+            "你alpha=12345\n",
+        };
+
+        for (cases) |hay| {
+            for ([_]inst_mod.MatchMode{ .earliest, .leftmost_first }) |mode| {
+                const got = re.find(hay, 0, mode);
+                const exp = re_ref.find(hay, 0, mode);
+                try std.testing.expectEqual(exp, got);
+
+                const got_end = re.findEnd(hay, 0, mode);
+                const exp_end = if (exp) |m| m.end else null;
+                try std.testing.expectEqual(exp_end, got_end);
+            }
+
+            var nul_got: ?usize = null;
+            var nul_exp: ?usize = null;
+            const mw = re.findWatched(hay, 0, &nul_got);
+            const mw_ref = re_ref.findWatched(hay, 0, &nul_exp);
+            try std.testing.expectEqual(mw_ref, mw);
+            try std.testing.expectEqual(nul_exp, nul_got);
+
+            var nule_got: ?usize = null;
+            var nule_exp: ?usize = null;
+            const mew = re.findEndWatched(hay, 0, .earliest, &nule_got);
+            const mew_ref = re_ref.findEndWatched(hay, 0, .earliest, &nule_exp);
+            try std.testing.expectEqual(mew_ref, mew);
+            try std.testing.expectEqual(nule_exp, nule_got);
+        }
+
+        // Verify exact Unicode vs ASCII `\b` semantics on CJK-adjacent token
+        const cjk_hay = "你alpha=12345\n";
+        if (unicode_wb) {
+            try std.testing.expect(re.find(cjk_hay, 0, .earliest) == null);
+            try std.testing.expect(re.findEnd(cjk_hay, 0, .earliest) == null);
+        } else {
+            const mc = re.find(cjk_hay, 0, .earliest) orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("alpha=12345", cjk_hay[mc.start..mc.end]);
+            try std.testing.expectEqual(@as(?usize, mc.end), re.findEnd(cjk_hay, 0, .earliest));
+        }
+
+        // Large 40 KiB buffer crossing the 32 KiB periodic NUL-check boundary
+        const buf = try alloc.alloc(u8, 40 * 1024);
+        defer alloc.free(buf);
+        @memset(buf, ' ');
+        const hit_pos: usize = 36 * 1024 + 17;
+        const token = "server_8080";
+        @memcpy(buf[hit_pos..][0..token.len], token);
+
+        // 1. Clean match past 32 KiB
+        const m_clean = re.find(buf, 0, .earliest) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(re_ref.find(buf, 0, .earliest), @as(?inst_mod.Match, m_clean));
+        try std.testing.expectEqual(@as(?usize, m_clean.end), re.findEnd(buf, 0, .earliest));
+        var n_clean: ?usize = null;
+        try std.testing.expectEqual(@as(?inst_mod.Match, m_clean), re.findWatched(buf, 0, &n_clean));
+        try std.testing.expect(n_clean == null);
+        var ne_clean: ?usize = null;
+        try std.testing.expectEqual(@as(?usize, m_clean.end), re.findEndWatched(buf, 0, .earliest, &ne_clean));
+        try std.testing.expect(ne_clean == null);
+
+        // 2. NUL strictly after match.end -> match succeeds, nul == null
+        buf[m_clean.end + 3] = 0;
+        var n_after: ?usize = null;
+        try std.testing.expectEqual(@as(?inst_mod.Match, m_clean), re.findWatched(buf, 0, &n_after));
+        try std.testing.expect(n_after == null);
+        var ne_after: ?usize = null;
+        try std.testing.expectEqual(@as(?usize, m_clean.end), re.findEndWatched(buf, 0, .earliest, &ne_after));
+        try std.testing.expect(ne_after == null);
+        buf[m_clean.end + 3] = ' ';
+
+        // 3. NUL right at match.end -> match succeeds, nul == null
+        buf[m_clean.end] = 0;
+        var n_at_end: ?usize = null;
+        try std.testing.expectEqual(@as(?inst_mod.Match, m_clean), re.findWatched(buf, 0, &n_at_end));
+        try std.testing.expect(n_at_end == null);
+        var ne_at_end: ?usize = null;
+        try std.testing.expectEqual(@as(?usize, m_clean.end), re.findEndWatched(buf, 0, .earliest, &ne_at_end));
+        try std.testing.expect(ne_at_end == null);
+        buf[m_clean.end] = ' ';
+
+        // 4. NUL inside match -> null with exact NUL offset
+        const nul_in_pos = hit_pos + 5;
+        const saved_in = buf[nul_in_pos];
+        buf[nul_in_pos] = 0;
+        var n_in: ?usize = null;
+        try std.testing.expect(re.findWatched(buf, 0, &n_in) == null);
+        try std.testing.expectEqual(@as(?usize, nul_in_pos), n_in);
+        var ne_in: ?usize = null;
+        try std.testing.expect(re.findEndWatched(buf, 0, .earliest, &ne_in) == null);
+        try std.testing.expectEqual(@as(?usize, nul_in_pos), ne_in);
+        buf[nul_in_pos] = saved_in;
+
+        // 5. NUL strictly before match -> null with exact NUL offset
+        const nul_before_pos: usize = 33 * 1024 + 9;
+        buf[nul_before_pos] = 0;
+        var n_before: ?usize = null;
+        try std.testing.expect(re.findWatched(buf, 0, &n_before) == null);
+        try std.testing.expectEqual(@as(?usize, nul_before_pos), n_before);
+        var ne_before: ?usize = null;
+        try std.testing.expect(re.findEndWatched(buf, 0, .earliest, &ne_before) == null);
+        try std.testing.expectEqual(@as(?usize, nul_before_pos), ne_before);
+    }
+}
+
+test "Regex >300-inst literal-less Tier B LazySetDfa (>=16 KiB, flush/bailout, ASCII & Unicode \\b, NULs, PikeVM parity)" {
+    const alloc = std.testing.allocator;
+    // `[a-z][a-z0-9]{13}` creates >= 2^13 unanchored DFA states, exceeding Tier A's 4096-state cap,
+    // while total NFA exceeds 300 instructions -> exercises stack-scoped Tier B LazySetDfa!
+    const pat =
+        "(?:" ++
+        "[a-z][a-z0-9]{13}[0-9]{2}|" ++
+        "[A-Z][A-Z0-9]{13}[0-9]{2}|" ++
+        "[a-z]{5,12}_[0-9]{4,8}|" ++
+        "[0-9]{4,8}:[0-9]{4,8}|" ++
+        "[a-f0-9]{8,12}-[a-f0-9]{4,8}|" ++
+        "[A-Z]{4,8}-[0-9]{4,8}|" ++
+        "[a-z]{4,8}=[0-9]{4,8}|" ++
+        "[0-9]{3,6}\\.[0-9]{3,6}|" ++
+        "[a-z]{5,9}/[0-9]{3,6}|" ++
+        "[A-Z]{4,8}#[0-9]{3,6}|" ++
+        "[a-z]{4,8}@[0-9]{3,6}|" ++
+        "[0-9]{3,6}%[a-z]{3,6}|" ++
+        "[a-z]{6,10}_[a-z]{6,10}|" ++
+        "[A-Z]{5,9}\\+[0-9]{3,6}" ++
+        ")\\b";
+
+    for ([_]bool{ true, false }) |unicode_wb| {
+        var re = try Regex.init(alloc, pat, .{ .unicode_word_boundary = unicode_wb });
+        defer re.deinit();
+        var re_ref = try Regex.init(alloc, pat, .{ .unicode_word_boundary = unicode_wb, .max_dfa_states = 0 });
+        defer re_ref.deinit();
+
+        try std.testing.expect(re.insts.len > 300);
+        try std.testing.expect(re.prefilter == null);
+        try std.testing.expect(re.alt_prefilter == null);
+        try std.testing.expect(re.unanchored_dfa == null);
+        try std.testing.expect(re.set_unanchored_dfa == null);
+        try std.testing.expect(re.set_byte_classes != null);
+
+        // 1. >= 16 KiB buffer (40 KiB) exercising LazySetDfa exact & verify paths + 32 KiB NUL chunking
+        const buf = try alloc.alloc(u8, 40 * 1024);
+        defer alloc.free(buf);
+        @memset(buf, ' ');
+
+        // Place a CJK-followed false-boundary candidate before the real match to exercise Unicode vs ASCII `\b`
+        const cjk_pos: usize = 35 * 1024;
+        const cjk_tok = "code=1234你";
+        @memcpy(buf[cjk_pos..][0..cjk_tok.len], cjk_tok);
+
+        const hit_pos: usize = 37 * 1024 + 5;
+        const real_tok = "worker_9001";
+        @memcpy(buf[hit_pos..][0..real_tok.len], real_tok);
+
+        for ([_]inst_mod.MatchMode{ .earliest, .leftmost_first }) |mode| {
+            const got = re.find(buf, 0, mode);
+            const exp = re_ref.find(buf, 0, mode);
+            try std.testing.expectEqual(exp, got);
+            try std.testing.expectEqual(if (exp) |m| m.end else null, re.findEnd(buf, 0, mode));
+        }
+
+        const exp_e = re_ref.find(buf, 0, .earliest) orelse return error.TestUnexpectedResult;
+        if (unicode_wb) {
+            try std.testing.expectEqual(hit_pos, exp_e.start);
+        } else {
+            try std.testing.expectEqual(cjk_pos, exp_e.start);
+        }
+
+        // Clean findWatched & findEndWatched
+        var n0: ?usize = null;
+        try std.testing.expectEqual(@as(?inst_mod.Match, exp_e), re.findWatched(buf, 0, &n0));
+        try std.testing.expect(n0 == null);
+        var ne0: ?usize = null;
+        try std.testing.expectEqual(@as(?usize, exp_e.end), re.findEndWatched(buf, 0, .earliest, &ne0));
+        try std.testing.expect(ne0 == null);
+
+        // NUL after match
+        buf[exp_e.end + 4] = 0;
+        var n_after: ?usize = null;
+        try std.testing.expectEqual(@as(?inst_mod.Match, exp_e), re.findWatched(buf, 0, &n_after));
+        try std.testing.expect(n_after == null);
+        var ne_after: ?usize = null;
+        try std.testing.expectEqual(@as(?usize, exp_e.end), re.findEndWatched(buf, 0, .earliest, &ne_after));
+        try std.testing.expect(ne_after == null);
+        buf[exp_e.end + 4] = ' ';
+
+        // NUL right at match.end -> succeeds with nul == null
+        const saved_at_end = buf[exp_e.end];
+        buf[exp_e.end] = 0;
+        var n_at_end: ?usize = null;
+        var n_at_end_ref: ?usize = null;
+        try std.testing.expectEqual(re_ref.findWatched(buf, 0, &n_at_end_ref), re.findWatched(buf, 0, &n_at_end));
+        try std.testing.expectEqual(n_at_end_ref, n_at_end);
+        var ne_at_end: ?usize = null;
+        try std.testing.expectEqual(@as(?usize, exp_e.end), re.findEndWatched(buf, 0, .earliest, &ne_at_end));
+        try std.testing.expect(ne_at_end == null);
+        buf[exp_e.end] = saved_at_end;
+
+        // NUL inside match -> null with exact NUL offset
+        const nul_in = exp_e.start + 3;
+        const saved_in = buf[nul_in];
+        buf[nul_in] = 0;
+        var n_in: ?usize = null;
+        try std.testing.expect(re.findWatched(buf, 0, &n_in) == null);
+        try std.testing.expectEqual(@as(?usize, nul_in), n_in);
+        var ne_in: ?usize = null;
+        try std.testing.expect(re.findEndWatched(buf, 0, .earliest, &ne_in) == null);
+        try std.testing.expectEqual(@as(?usize, nul_in), ne_in);
+        buf[nul_in] = saved_in;
+
+        // NUL strictly before match -> null with exact NUL offset
+        const nul_before: usize = 33 * 1024 + 11;
+        buf[nul_before] = 0;
+        var n_before: ?usize = null;
+        try std.testing.expect(re.findWatched(buf, 0, &n_before) == null);
+        try std.testing.expectEqual(@as(?usize, nul_before), n_before);
+        var ne_before: ?usize = null;
+        try std.testing.expect(re.findEndWatched(buf, 0, .earliest, &ne_before) == null);
+        try std.testing.expectEqual(@as(?usize, nul_before), ne_before);
+        buf[nul_before] = ' ';
+
+        // 2. EOI match at the very end of a >= 16 KiB buffer (tests `lazy.eoiKind`)
+        const eoi_buf = try alloc.alloc(u8, 20 * 1024);
+        defer alloc.free(eoi_buf);
+        @memset(eoi_buf, ' ');
+        const eoi_tok = "1234.5678";
+        @memcpy(eoi_buf[eoi_buf.len - eoi_tok.len ..], eoi_tok);
+        const exp_eoi = re_ref.find(eoi_buf, 0, .earliest) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(?inst_mod.Match, exp_eoi), re.find(eoi_buf, 0, .earliest));
+        try std.testing.expectEqual(@as(?usize, exp_eoi.end), re.findEnd(eoi_buf, 0, .earliest));
+        var n_eoi: ?usize = null;
+        try std.testing.expectEqual(@as(?usize, exp_eoi.end), re.findEndWatched(eoi_buf, 0, .earliest, &n_eoi));
+        try std.testing.expect(n_eoi == null);
+
+        // 3. Thrashing buffer forcing LazySetDfa flush limit -> graceful PikeVM bailout with NUL checks
+        const thrash = try alloc.alloc(u8, 24 * 1024);
+        defer alloc.free(thrash);
+        var prng = std.Random.DefaultPrng.init(0x5eed1234);
+        const rnd = prng.random();
+        for (thrash) |*b| {
+            // Mix of lowercase letters & digits without spaces/boundaries to explode LazySetDfa states
+            const v = rnd.uintLessThan(u8, 36);
+            b.* = if (v < 26) 'a' + v else '0' + (v - 26);
+        }
+        // Break lines periodically so PikeVM stays fast and avoid accidental matches before target
+        var li: usize = 64;
+        while (li < thrash.len) : (li += 64) {
+            thrash[li] = '\n';
+            // Ensure no 16-char match on decoy lines by breaking every 10 chars with ';'
+            if (li >= 54) thrash[li - 54] = ';';
+            if (li >= 40) thrash[li - 40] = ';';
+            if (li >= 26) thrash[li - 26] = ';';
+            if (li >= 12) thrash[li - 12] = ';';
+        }
+        const t_pos: usize = 22 * 1024 + 4;
+        const t_tok = " alpha=9876 ";
+        @memcpy(thrash[t_pos..][0..t_tok.len], t_tok);
+
+        const exp_t = re_ref.find(thrash, 0, .earliest);
+        try std.testing.expectEqual(exp_t, re.find(thrash, 0, .earliest));
+        try std.testing.expectEqual(if (exp_t) |m| m.end else null, re.findEnd(thrash, 0, .earliest));
+        var nt: ?usize = null;
+        var nt_ref: ?usize = null;
+        try std.testing.expectEqual(re_ref.findWatched(thrash, 0, &nt_ref), re.findWatched(thrash, 0, &nt));
+        try std.testing.expectEqual(nt_ref, nt);
+        var net: ?usize = null;
+        var net_ref: ?usize = null;
+        try std.testing.expectEqual(re_ref.findEndWatched(thrash, 0, .earliest, &net_ref), re.findEndWatched(thrash, 0, .earliest, &net));
+        try std.testing.expectEqual(net_ref, net);
+
+        // NUL before match in thrashing buffer -> null with exact NUL offset
+        const thrash_nul: usize = 18 * 1024 + 7;
+        thrash[thrash_nul] = 0;
+        var nt2: ?usize = null;
+        try std.testing.expect(re.findWatched(thrash, 0, &nt2) == null);
+        try std.testing.expectEqual(@as(?usize, thrash_nul), nt2);
+        var net2: ?usize = null;
+        try std.testing.expect(re.findEndWatched(thrash, 0, .earliest, &net2) == null);
+        try std.testing.expectEqual(@as(?usize, thrash_nul), net2);
+    }
+}

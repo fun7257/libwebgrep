@@ -2770,7 +2770,6 @@ pub const SetUnanchoredDfa = struct {
             total_transitions += @intCast(init_classes);
 
             const src_meta = metas.items[q_head];
-            const src_pcs = pc_pool.items[src_meta.pc_off .. src_meta.pc_off + src_meta.pc_len];
 
             const row_start = raw_trans.items.len;
             raw_trans.resize(allocator, row_start + init_classes) catch return false;
@@ -2786,6 +2785,7 @@ pub const SetUnanchoredDfa = struct {
                 var next_is_match = false;
                 const next_og = ws.beginOut();
 
+                const src_pcs = pc_pool.items[src_meta.pc_off .. src_meta.pc_off + src_meta.pc_len];
                 for (src_pcs) |pc| {
                     if (stepInstOnByte(insts[pc], unicode_ranges, byte, true)) |target_pc| {
                         if (!ws.addClosure(allocator, insts, target_pc, true, next_og, &next_pcs, &next_is_match, max_closure_work)) return false;
@@ -3142,7 +3142,8 @@ pub const LazySetDfa = struct {
         if (cap_u16 < 4) return null;
 
         var ws = DynClosureWorkspace.init(allocator, insts.len) catch return null;
-        errdefer ws.deinit(allocator);
+        var transferred = false;
+        defer if (!transferred) ws.deinit(allocator);
 
         // Reject zero-length matches / empty start closure
         var zero_pcs = std.ArrayList(u32).empty;
@@ -3181,15 +3182,16 @@ pub const LazySetDfa = struct {
         sortAndDedupU32(&start_list);
 
         const start_pcs = allocator.dupe(u32, start_list.items) catch return null;
-        errdefer allocator.free(start_pcs);
+        defer if (!transferred) allocator.free(start_pcs);
 
         const trans = allocator.alloc(u16, @as(usize, cap_u16) * @as(usize, stride)) catch return null;
-        errdefer allocator.free(trans);
+        defer if (!transferred) allocator.free(trans);
 
         const eoi_cache = allocator.alloc(u8, cap_u16) catch return null;
-        errdefer allocator.free(eoi_cache);
+        defer if (!transferred) allocator.free(eoi_cache);
 
         const state_map = DynStateMap.init(allocator, @min(@as(usize, cap_u16), 256)) catch return null;
+        transferred = true;
 
         var self = LazySetDfa{
             .allocator = allocator,

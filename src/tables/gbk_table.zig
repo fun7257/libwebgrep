@@ -1265,3 +1265,34 @@ pub const table = [23940]u16{
     0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD,
     0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD,
 };
+
+/// Direct `[(b1 - 0x81) << 8 | b2]` -> packed LE UTF-8 lookup table (126 KiB `.rodata`).
+/// Valid `b2` (`0x40..0xFE`, `b2 != 0x7F`) packs `(utf8_len << 24) | (u2 << 16) | (u1 << 8) | u0`.
+/// Invalid `b2` entries are `0` (unambiguous since `utf8_len` is always `1..3`).
+pub const utf8_direct: [126 * 256]u32 = blk: {
+    @setEvalBranchQuota(500_000);
+    var out: [126 * 256]u32 = @splat(0);
+    for (0..126) |row| {
+        const row_base = row * 190;
+        const out_base = row << 8;
+        for (0x40..0xFF) |b2| {
+            if (b2 == 0x7F) continue;
+            const trail_idx = if (b2 > 0x7F) b2 - 0x41 else b2 - 0x40;
+            const raw_cp: u16 = table[row_base + trail_idx];
+            const cp: u16 = if (raw_cp >= 0xD800 and raw_cp <= 0xDFFF) 0xFFFD else raw_cp;
+            const packed_utf8: u32 = if (cp >= 0x0800)
+                (@as(u32, 3) << 24) |
+                    (@as(u32, 0x80 | (cp & 0x3F)) << 16) |
+                    (@as(u32, 0x80 | ((cp >> 6) & 0x3F)) << 8) |
+                    @as(u32, 0xE0 | (cp >> 12))
+            else if (cp >= 0x0080)
+                (@as(u32, 2) << 24) |
+                    (@as(u32, 0x80 | (cp & 0x3F)) << 8) |
+                    @as(u32, 0xC0 | (cp >> 6))
+            else
+                (@as(u32, 1) << 24) | @as(u32, cp);
+            out[out_base | b2] = packed_utf8;
+        }
+    }
+    break :blk out;
+};

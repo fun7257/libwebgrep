@@ -3057,7 +3057,8 @@ test "replacement preview does not mutate input and matches span replacement tex
         replaced_copy: [64]u8 = undefined,
         replaced_len: usize = 0,
         span_count: usize = 0,
-        first_repl: []const u8 = "",
+        first_repl_copy: [32]u8 = undefined,
+        first_repl_len: usize = 0,
         raw_ref: []const u8 = "",
 
         pub fn event(self: *@This(), ev: Event) bool {
@@ -3067,7 +3068,12 @@ test "replacement preview does not mutate input and matches span replacement tex
                     self.raw_ref = line.bytes;
                     self.span_count = line.matches.len;
                     if (line.matches.len > 0) {
-                        self.first_repl = line.matches[0].replacement orelse "";
+                        if (line.matches[0].replacement) |r| {
+                            @memcpy(self.first_repl_copy[0..r.len], r);
+                            self.first_repl_len = r.len;
+                        } else {
+                            self.first_repl_len = 0;
+                        }
                     }
                     if (line.replaced) |r| {
                         @memcpy(self.replaced_copy[0..r.len], r);
@@ -3092,7 +3098,7 @@ test "replacement preview does not mutate input and matches span replacement tex
     try testing.expectEqualStrings("hello foo and foo!\n", &input_buf);
     try testing.expectEqualStrings("hello foo and foo!", sink.raw_ref);
     try testing.expectEqual(@as(usize, 2), sink.span_count);
-    try testing.expectEqualStrings("BAR_BAZ", sink.first_repl);
+    try testing.expectEqualStrings("BAR_BAZ", sink.first_repl_copy[0..sink.first_repl_len]);
     try testing.expectEqualStrings("hello BAR_BAZ and BAR_BAZ!", sink.replaced_copy[0..sink.replaced_len]);
 }
 

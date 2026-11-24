@@ -685,3 +685,21 @@ test "Finder MaskedPair exact SIMD fast path for single-bit-maskable Unicode cas
     try std.testing.expectEqual(@as(usize, 140), hit2.start);
     try std.testing.expect(nul_at == null);
 }
+
+test "Finder ignore_case with non-letter anchor and findWatched NUL handling" {
+    const f = try Finder.init("[ERROR]", .{ .case = .insensitive, .unicode_case = false });
+    var buf: [200]u8 = @splat(' ');
+    @memcpy(buf[15..22], "{ERROR]");
+    @memcpy(buf[140..147], "[eRrOr]");
+
+    var nul: ?usize = null;
+    const hit = f.findWatched(&buf, 0, &nul).?;
+    try std.testing.expectEqual(@as(usize, 140), hit.start);
+    try std.testing.expectEqual(@as(usize, 147), hit.end);
+    try std.testing.expect(nul == null);
+
+    buf[135] = 0;
+    nul = null;
+    try std.testing.expect(f.findWatched(&buf, 0, &nul) == null);
+    try std.testing.expectEqual(@as(?usize, 135), nul);
+}

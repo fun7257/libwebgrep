@@ -1,11 +1,8 @@
 //! Single-byte search.
 //!
-//! `find` delegates directly to `std.mem.findScalarPos`. At the time of that decision,
-//! custom SIMD measured 55.8 GB/s vs. std's 54.6 GB/s (~2% difference); later microbenchmarks
-//! are recorded in `BENCHMARKS.md`.
-//! `findEither` (two distinct bytes), reverse search, and byte counting still use custom `@Vector`
-//! loops because std's `findScalarLast` is scalar and std's `countScalar` regresses 21-36% in-cache
-//! due to per-vector horizontal reductions vs. our 63-batch `u8` accumulator.
+//! `find`, `findEither`, `findLast`, `findAny`, and `findSepOrNul` use custom `@Vector` loops
+//! with `@ctz`/`@clz` on bitcast lane masks (little-endian) to avoid horizontal reduction trees.
+//! Byte counting uses a 63-batch `u8` accumulator to avoid per-vector horizontal reductions.
 //!
 //! `nibbleMask` compresses 16-byte `0xFF`/`0x00` flags into a 64-bit nibble mask for Teddy on NEON.
 
@@ -20,17 +17,122 @@ pub const native_width: comptime_int = blk: {
 };
 
 /// Finds the first occurrence of `needle` in `haystack[start..]`.
-/// `width` is kept only for call-site symmetry with `findEither`; delegates to std.
 pub fn find(comptime width: comptime_int, haystack: []const u8, start: usize, needle: u8) ?usize {
     comptime checkWidth(width);
-    return std.mem.findScalarPos(u8, haystack, start, needle);
+    if (start >= haystack.len) return null;
+
+    const V = @Vector(width, u8);
+    const vn: V = @splat(needle);
+    var i: usize = start;
+    const n = haystack.len;
+    if (n - i >= width) {
+        // Probe one vector first so short line-end scans resolve in a single load.
+        {
+            const block: V = haystack[i..][0..width].*;
+            const hit = block == vn;
+            if (comptime builtin.cpu.arch.endian() == .little) {
+                const MaskInt = @Int(.unsigned, width);
+                const bits: MaskInt = @bitCast(hit);
+                if (bits != 0) return i + @as(usize, @ctz(bits));
+            } else if (@reduce(.Or, hit)) {
+                return i + @as(usize, std.simd.firstTrue(hit).?);
+            }
+            i += width;
+        }
+        const stride = width * 4;
+        while (n - i >= stride) {
+            var hits: [4]@Vector(width, bool) = undefined;
+            inline for (0..4) |k| {
+                const block: V = haystack[i + k * width ..][0..width].*;
+                hits[k] = block == vn;
+            }
+            if (@reduce(.Or, (hits[0] | hits[1]) | (hits[2] | hits[3]))) {
+                @branchHint(.unlikely);
+                inline for (0..4) |k| {
+                    if (comptime builtin.cpu.arch.endian() == .little) {
+                        const MaskInt = @Int(.unsigned, width);
+                        const bits: MaskInt = @bitCast(hits[k]);
+                        if (bits != 0) return i + k * width + @as(usize, @ctz(bits));
+                    } else if (@reduce(.Or, hits[k])) {
+                        return i + k * width + @as(usize, std.simd.firstTrue(hits[k]).?);
+                    }
+                }
+            }
+            i += stride;
+        }
+        while (n - i >= width) {
+            const block: V = haystack[i..][0..width].*;
+            const hit = block == vn;
+            if (comptime builtin.cpu.arch.endian() == .little) {
+                const MaskInt = @Int(.unsigned, width);
+                const bits: MaskInt = @bitCast(hit);
+                if (bits != 0) return i + @as(usize, @ctz(bits));
+            } else if (@reduce(.Or, hit)) {
+                return i + @as(usize, std.simd.firstTrue(hit).?);
+            }
+            i += width;
+        }
+    }
+    while (i < n) : (i += 1) {
+        if (haystack[i] == needle) return i;
+    }
+    return null;
+}
+
+pub const SepOrNul = struct { pos: ?usize, is_nul: bool };
+
+/// Finds the earliest occurrence of `sep` or NUL (`0`) in `haystack[start..]`
+/// in a single SIMD `vpcmpeqb` + `vpor` pass. If both occur in the same vector,
+/// returns the earliest position and `is_nul = (haystack[pos] == 0)`.
+/// When `sep == 0`, returns `is_nul = true` whenever found.
+pub inline fn findSepOrNul(comptime width: usize, haystack: []const u8, start: usize, sep: u8) SepOrNul {
+    const w: comptime_int = switch (width) {
+        16 => 16,
+        32 => 32,
+        64 => 64,
+        else => @compileError("memchr width must be 16, 32, or 64"),
+    };
+    if (start >= haystack.len) return .{ .pos = null, .is_nul = false };
+    if (sep == 0) {
+        const p = find(w, haystack, start, 0);
+        return .{ .pos = p, .is_nul = (p != null) };
+    }
+
+    const V = @Vector(w, u8);
+    const vsep: V = @splat(sep);
+    const vzero: V = @splat(0);
+    var i: usize = start;
+    const n = haystack.len;
+    while (n - i >= w) {
+        const block: V = haystack[i..][0..w].*;
+        const hit = (block == vsep) | (block == vzero);
+        if (comptime builtin.cpu.arch.endian() == .little) {
+            const MaskInt = @Int(.unsigned, w);
+            const bits: MaskInt = @bitCast(hit);
+            if (bits != 0) {
+                const pos = i + @as(usize, @ctz(bits));
+                return .{ .pos = pos, .is_nul = (haystack[pos] == 0) };
+            }
+        } else if (@reduce(.Or, hit)) {
+            const pos = i + @as(usize, std.simd.firstTrue(hit).?);
+            return .{ .pos = pos, .is_nul = (haystack[pos] == 0) };
+        }
+        i += w;
+    }
+    while (i < n) : (i += 1) {
+        const b = haystack[i];
+        if (b == sep or b == 0) {
+            return .{ .pos = i, .is_nul = (b == 0) };
+        }
+    }
+    return .{ .pos = null, .is_nul = false };
 }
 
 /// Finds the first byte equal to `a` or `b`. Equivalent to `find` when `a == b`.
 pub fn findEither(comptime width: comptime_int, haystack: []const u8, start: usize, a: u8, b: u8) ?usize {
     comptime checkWidth(width);
     if (start >= haystack.len) return null;
-    if (a == b) return std.mem.findScalarPos(u8, haystack, start, a);
+    if (a == b) return find(width, haystack, start, a);
 
     const V = @Vector(width, u8);
     const va: V = @splat(a);
@@ -38,6 +140,18 @@ pub fn findEither(comptime width: comptime_int, haystack: []const u8, start: usi
     var i: usize = start;
     const n = haystack.len;
     if (n - i >= width) {
+        {
+            const block: V = haystack[i..][0..width].*;
+            const hit = (block == va) | (block == vb);
+            if (comptime builtin.cpu.arch.endian() == .little) {
+                const MaskInt = @Int(.unsigned, width);
+                const bits: MaskInt = @bitCast(hit);
+                if (bits != 0) return i + @as(usize, @ctz(bits));
+            } else if (@reduce(.Or, hit)) {
+                return i + @as(usize, std.simd.firstTrue(hit).?);
+            }
+            i += width;
+        }
         const stride = width * 4;
         while (n - i >= stride) {
             var hits: [4]@Vector(width, bool) = undefined;
@@ -48,7 +162,11 @@ pub fn findEither(comptime width: comptime_int, haystack: []const u8, start: usi
             if (@reduce(.Or, (hits[0] | hits[1]) | (hits[2] | hits[3]))) {
                 @branchHint(.unlikely);
                 inline for (0..4) |k| {
-                    if (@reduce(.Or, hits[k])) {
+                    if (comptime builtin.cpu.arch.endian() == .little) {
+                        const MaskInt = @Int(.unsigned, width);
+                        const bits: MaskInt = @bitCast(hits[k]);
+                        if (bits != 0) return i + k * width + @as(usize, @ctz(bits));
+                    } else if (@reduce(.Or, hits[k])) {
                         return i + k * width + @as(usize, std.simd.firstTrue(hits[k]).?);
                     }
                 }
@@ -58,8 +176,11 @@ pub fn findEither(comptime width: comptime_int, haystack: []const u8, start: usi
         while (n - i >= width) {
             const block: V = haystack[i..][0..width].*;
             const hit = (block == va) | (block == vb);
-            if (@reduce(.Or, hit)) {
-                @branchHint(.unlikely);
+            if (comptime builtin.cpu.arch.endian() == .little) {
+                const MaskInt = @Int(.unsigned, width);
+                const bits: MaskInt = @bitCast(hit);
+                if (bits != 0) return i + @as(usize, @ctz(bits));
+            } else if (@reduce(.Or, hit)) {
                 return i + @as(usize, std.simd.firstTrue(hit).?);
             }
             i += width;
@@ -74,10 +195,20 @@ pub fn findLast(comptime width: comptime_int, haystack: []const u8, start: usize
     const limit = @min(end, haystack.len);
     if (start >= limit) return null;
 
+    const V = @Vector(width, u8);
+    const vn: V = @splat(needle);
     var i: usize = limit;
-    while (i >= width and i - width >= start) {
+    while (i - start >= width) {
         const at = i - width;
-        if (lastIn(width, haystack[at..][0..width].*, needle)) |rel| return at + rel;
+        const block: V = haystack[at..][0..width].*;
+        const cmp = block == vn;
+        if (comptime builtin.cpu.arch.endian() == .little) {
+            const MaskInt = @Int(.unsigned, width);
+            const bits: MaskInt = @bitCast(cmp);
+            if (bits != 0) return at + (width - 1 - @as(usize, @clz(bits)));
+        } else if (@reduce(.Or, cmp)) {
+            return at + @as(usize, std.simd.lastTrue(cmp).?);
+        }
         i = at;
     }
     while (i > start) {
@@ -230,7 +361,13 @@ fn firstAny(comptime width: comptime_int, block: @Vector(width, u8), comptime n:
     inline for (1..n) |k| {
         hits = hits | (block == @as(@Vector(width, u8), @splat(bytes[k])));
     }
-    return std.simd.firstTrue(hits).?;
+    if (comptime builtin.cpu.arch.endian() == .little) {
+        const MaskInt = @Int(.unsigned, width);
+        const bits: MaskInt = @bitCast(hits);
+        return @as(usize, @ctz(bits));
+    } else {
+        return @as(usize, std.simd.firstTrue(hits).?);
+    }
 }
 
 fn scalarEither(haystack: []const u8, start: usize, end: usize, a: u8, b: u8) ?usize {
@@ -238,15 +375,6 @@ fn scalarEither(haystack: []const u8, start: usize, end: usize, a: u8, b: u8) ?u
     while (i < end) : (i += 1) {
         const c = haystack[i];
         if (c == a or c == b) return i;
-    }
-    return null;
-}
-
-fn lastIn(comptime width: comptime_int, block: @Vector(width, u8), needle: u8) ?usize {
-    const cmp = block == @as(@Vector(width, u8), @splat(needle));
-    if (@reduce(.Or, cmp)) {
-        @branchHint(.unlikely);
-        return @as(usize, std.simd.lastTrue(cmp).?);
     }
     return null;
 }
@@ -375,6 +503,71 @@ test "matches scalar and std.mem.findScalarPos" {
             }
             try std.testing.expectEqual(last, findLast(w, &buf, start, end, needle));
         }
+    }
+}
+
+test "findSepOrNul: NUL vs newline ordering, same vector, tail bytes, and sep==0" {
+    @setEvalBranchQuota(10_000);
+    inline for (.{ 16, 32, 64 }) |w| {
+        // Empty and out-of-bounds start
+        try std.testing.expectEqual(SepOrNul{ .pos = null, .is_nul = false }, findSepOrNul(w, "", 0, '\n'));
+        try std.testing.expectEqual(SepOrNul{ .pos = null, .is_nul = false }, findSepOrNul(w, "abc", 3, '\n'));
+        try std.testing.expectEqual(SepOrNul{ .pos = null, .is_nul = false }, findSepOrNul(w, "abc", 5, '\n'));
+
+        // Same 32B vector: NUL precedes '\n'
+        var buf: [160]u8 = @splat('x');
+        buf[5] = 0;
+        buf[12] = '\n';
+        try std.testing.expectEqual(SepOrNul{ .pos = 5, .is_nul = true }, findSepOrNul(w, &buf, 0, '\n'));
+        try std.testing.expectEqual(SepOrNul{ .pos = 12, .is_nul = false }, findSepOrNul(w, &buf, 6, '\n'));
+
+        // Same 32B vector: '\n' precedes NUL
+        @memset(&buf, 'x');
+        buf[5] = '\n';
+        buf[12] = 0;
+        try std.testing.expectEqual(SepOrNul{ .pos = 5, .is_nul = false }, findSepOrNul(w, &buf, 0, '\n'));
+        try std.testing.expectEqual(SepOrNul{ .pos = 12, .is_nul = true }, findSepOrNul(w, &buf, 6, '\n'));
+
+        // Adjacent bytes inside same vector at lane boundaries
+        @memset(&buf, 'x');
+        buf[30] = 0;
+        buf[31] = '\n';
+        try std.testing.expectEqual(SepOrNul{ .pos = 30, .is_nul = true }, findSepOrNul(w, &buf, 0, '\n'));
+        buf[30] = '\n';
+        buf[31] = 0;
+        try std.testing.expectEqual(SepOrNul{ .pos = 30, .is_nul = false }, findSepOrNul(w, &buf, 0, '\n'));
+
+        // Across vector boundaries: NUL in later vector vs '\n' in later vector
+        @memset(&buf, 'x');
+        buf[75] = 0;
+        buf[120] = '\n';
+        try std.testing.expectEqual(SepOrNul{ .pos = 75, .is_nul = true }, findSepOrNul(w, &buf, 0, '\n'));
+        buf[75] = '\n';
+        buf[120] = 0;
+        try std.testing.expectEqual(SepOrNul{ .pos = 75, .is_nul = false }, findSepOrNul(w, &buf, 0, '\n'));
+
+        // Tail bytes (< width)
+        var tail_buf: [73]u8 = @splat('y');
+        tail_buf[68] = 0;
+        tail_buf[71] = '\n';
+        try std.testing.expectEqual(SepOrNul{ .pos = 68, .is_nul = true }, findSepOrNul(w, &tail_buf, 0, '\n'));
+        tail_buf[68] = '\n';
+        tail_buf[71] = 0;
+        try std.testing.expectEqual(SepOrNul{ .pos = 68, .is_nul = false }, findSepOrNul(w, &tail_buf, 0, '\n'));
+        try std.testing.expectEqual(SepOrNul{ .pos = 71, .is_nul = true }, findSepOrNul(w, &tail_buf, 69, '\n'));
+        try std.testing.expectEqual(SepOrNul{ .pos = null, .is_nul = false }, findSepOrNul(w, &tail_buf, 72, '\n'));
+
+        // Short slice (< 16 bytes)
+        try std.testing.expectEqual(SepOrNul{ .pos = 2, .is_nul = true }, findSepOrNul(w, "ab\x00c\nd", 0, '\n'));
+        try std.testing.expectEqual(SepOrNul{ .pos = 2, .is_nul = false }, findSepOrNul(w, "ab\nc\x00d", 0, '\n'));
+        try std.testing.expectEqual(SepOrNul{ .pos = null, .is_nul = false }, findSepOrNul(w, "abcdef", 0, '\n'));
+
+        // sep == 0 returns is_nul = true when found, false when absent
+        @memset(&buf, 'z');
+        try std.testing.expectEqual(SepOrNul{ .pos = null, .is_nul = false }, findSepOrNul(w, &buf, 0, 0));
+        buf[45] = 0;
+        try std.testing.expectEqual(SepOrNul{ .pos = 45, .is_nul = true }, findSepOrNul(w, &buf, 0, 0));
+        try std.testing.expectEqual(SepOrNul{ .pos = 2, .is_nul = true }, findSepOrNul(w, "ab\x00cd", 0, 0));
     }
 }
 

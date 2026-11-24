@@ -69,6 +69,10 @@ pub fn EngineFor(comptime kind: IsaKind) type {
     return struct {
         const Self = @This();
         const ScanStatus = enum { cont, done, aborted, found_nul };
+        const WindowPick = struct {
+            off: usize,
+            score: u32,
+        };
 
         patterns: []const []const u8,
         ignore_case: bool,
@@ -90,16 +94,43 @@ pub fn EngineFor(comptime kind: IsaKind) type {
             const fingerprint: u8 = @intCast(@min(min_len, max_fp));
             var group: Group = std.mem.zeroes(Group);
             var bucket_pats: [num_buckets]u32 = @splat(0);
+            var bucket_cnt: [num_buckets]u8 = @splat(0);
+            var bucket_bytes: [num_buckets][max_fp][8]u8 = undefined;
+            var bucket_byte_len: [num_buckets][max_fp]u8 = @splat(@splat(0));
             var pat_offsets: [max_patterns]u32 = @splat(0);
             var max_offset: usize = 0;
             var min_tail_len: usize = std.math.maxInt(usize);
 
             for (patterns, 0..) |pat, id| {
-                const bucket: u3 = @intCast(id % num_buckets);
+                var min_cnt: u8 = std.math.maxInt(u8);
+                for (bucket_cnt) |c| min_cnt = @min(min_cnt, c);
+
+                var best_bucket: u3 = 0;
+                var best_off: usize = 0;
+                var best_score: u32 = std.math.maxInt(u32);
+                for (0..num_buckets) |b_usize| {
+                    if (bucket_cnt[b_usize] != min_cnt) continue;
+                    const pick = pickWindowOffset(
+                        pat,
+                        fingerprint,
+                        ignore_case,
+                        &group,
+                        &bucket_bytes[b_usize],
+                        &bucket_byte_len[b_usize],
+                    );
+                    if (pick.score < best_score) {
+                        best_score = pick.score;
+                        best_bucket = @intCast(b_usize);
+                        best_off = pick.off;
+                    }
+                }
+
+                const bucket = best_bucket;
+                const off = best_off;
                 const bit: u8 = @as(u8, 1) << bucket;
                 bucket_pats[bucket] |= @as(u32, 1) << @intCast(id);
+                bucket_cnt[bucket] += 1;
 
-                const off = pickWindowOffset(pat, fingerprint, ignore_case, &group);
                 pat_offsets[id] = @intCast(off);
                 max_offset = @max(max_offset, off);
                 min_tail_len = @min(min_tail_len, pat.len - off);
@@ -107,9 +138,17 @@ pub fn EngineFor(comptime kind: IsaKind) type {
                 for (0..fingerprint) |k| {
                     const b = pat[off + k];
                     const forms = if (ignore_case) ascii.caseVariants(b) else [2]u8{ b, b };
-                    for (forms) |byte| {
-                        group.lo[k][byte & 0x0f] |= bit;
-                        group.hi[k][byte >> 4] |= bit;
+                    group.lo[k][forms[0] & 0x0f] |= bit;
+                    group.hi[k][forms[0] >> 4] |= bit;
+                    const idx0 = bucket_byte_len[bucket][k];
+                    bucket_bytes[bucket][k][idx0] = forms[0];
+                    bucket_byte_len[bucket][k] = idx0 + 1;
+                    if (forms[1] != forms[0]) {
+                        group.lo[k][forms[1] & 0x0f] |= bit;
+                        group.hi[k][forms[1] >> 4] |= bit;
+                        const idx1 = bucket_byte_len[bucket][k];
+                        bucket_bytes[bucket][k][idx1] = forms[1];
+                        bucket_byte_len[bucket][k] = idx1 + 1;
                     }
                 }
             }
@@ -131,8 +170,9 @@ pub fn EngineFor(comptime kind: IsaKind) type {
             fingerprint: u8,
             ignore_case: bool,
             group: *const Group,
-        ) usize {
-            if (pat.len <= fingerprint) return 0;
+            b_bytes: *const [max_fp][8]u8,
+            b_lens: *const [max_fp]u8,
+        ) WindowPick {
             const max_scan = @min(pat.len - fingerprint + 1, 64);
             var best_off: usize = 0;
             var best_score: u32 = std.math.maxInt(u32);
@@ -151,6 +191,35 @@ pub fn EngineFor(comptime kind: IsaKind) type {
                     score += r * weight;
                     if (b == '=' or b == ':') score += 220;
                     if ((group.lo[k][b & 0x0f] & group.hi[k][b >> 4]) != 0) score += 45;
+
+                    const prev_len = b_lens[k];
+                    if (prev_len > 0) {
+                        const prevs = b_bytes[k][0..prev_len];
+                        if (ignore_case and forms[0] != forms[1]) {
+                            for (prevs) |prev| {
+                                inline for (forms) |ch| {
+                                    if (prev == ch) {
+                                        score += 180;
+                                    } else {
+                                        const g1: u8 = (prev & 0xF0) | (ch & 0x0F);
+                                        const g2: u8 = (ch & 0xF0) | (prev & 0x0F);
+                                        score += (@as(u32, frequency.default_rank[g1]) + @as(u32, frequency.default_rank[g2])) / 2;
+                                    }
+                                }
+                            }
+                        } else {
+                            const ch = b;
+                            for (prevs) |prev| {
+                                if (prev == ch) {
+                                    score += 180;
+                                } else {
+                                    const g1: u8 = (prev & 0xF0) | (ch & 0x0F);
+                                    const g2: u8 = (ch & 0xF0) | (prev & 0x0F);
+                                    score += (@as(u32, frequency.default_rank[g1]) + @as(u32, frequency.default_rank[g2])) / 2;
+                                }
+                            }
+                        }
+                    }
                 }
                 if (fingerprint >= 2 and ascii.eq(w[0], w[1], ignore_case)) score += 140;
                 if (fingerprint >= 3) {
@@ -162,13 +231,15 @@ pub fn EngineFor(comptime kind: IsaKind) type {
                     if (fingerprint >= 3 and std.ascii.isDigit(w[2])) {
                         score += 160;
                     }
+                } else if (fingerprint >= 3 and std.ascii.isDigit(w[1]) and std.ascii.isDigit(w[2])) {
+                    score += 200;
                 }
                 if (score < best_score) {
                     best_score = score;
                     best_off = off;
                 }
             }
-            return best_off;
+            return .{ .off = best_off, .score = best_score };
         }
 
         pub fn deinit(self: *Self) void {
@@ -356,7 +427,7 @@ pub fn EngineFor(comptime kind: IsaKind) type {
                         }
                         pos += lanes;
                     } else {
-                        const c_status = self.confirm(Verifier, haystack, pos, start, mode, &best, aborted_ptr, null, verifier);
+                        const c_status = self.confirmTail(Verifier, haystack, pos, start, mode, &best, aborted_ptr, verifier);
                         if (c_status != .cont) {
                             status = c_status;
                             break;
@@ -572,7 +643,7 @@ pub fn EngineFor(comptime kind: IsaKind) type {
             return acc;
         }
 
-        fn scanVec(
+        noinline fn scanVec(
             self: *const Self,
             comptime Verifier: type,
             haystack: []const u8,
@@ -584,6 +655,7 @@ pub fn EngineFor(comptime kind: IsaKind) type {
             acc: Vec,
             verifier: Verifier,
         ) ScanStatus {
+            const acc_bytes: [lanes]u8 = acc;
             if (comptime builtin.cpu.arch.endian() == .little) {
                 const MaskInt = @Int(.unsigned, lanes);
                 const zero: Vec = @splat(0);
@@ -592,7 +664,7 @@ pub fn EngineFor(comptime kind: IsaKind) type {
                     @branchHint(.unlikely);
                     const lane: usize = @ctz(bits);
                     bits &= bits - 1;
-                    const st = self.confirmLane(Verifier, haystack, pos, start, lane, mode, best, aborted_at, laneByte(lanes, Vec, acc, lane), verifier);
+                    const st = self.confirmLane(Verifier, haystack, pos, start, lane, mode, best, aborted_at, laneByte(lanes, &acc_bytes, lane), verifier);
                     if (st != .cont) return st;
                 }
                 return .cont;
@@ -603,7 +675,7 @@ pub fn EngineFor(comptime kind: IsaKind) type {
                     const lane = @ctz(bits) / 4;
                     const shift: u6 = @intCast(lane * 4);
                     bits &= ~(@as(u64, 0xF) << shift);
-                    const st = self.confirmLane(Verifier, haystack, pos, start, lane, mode, best, aborted_at, laneByte(lanes, Vec, acc, lane), verifier);
+                    const st = self.confirmLane(Verifier, haystack, pos, start, lane, mode, best, aborted_at, laneByte(lanes, &acc_bytes, lane), verifier);
                     if (st != .cont) return st;
                 }
                 return .cont;
@@ -617,7 +689,7 @@ pub fn EngineFor(comptime kind: IsaKind) type {
                         const lane = half * 16 + @ctz(bits) / 4;
                         const shift: u6 = @intCast((@ctz(bits) / 4) * 4);
                         bits &= ~(@as(u64, 0xF) << shift);
-                        const st = self.confirmLane(Verifier, haystack, pos, start, lane, mode, best, aborted_at, laneByte(lanes, Vec, acc, lane), verifier);
+                        const st = self.confirmLane(Verifier, haystack, pos, start, lane, mode, best, aborted_at, laneByte(lanes, &acc_bytes, lane), verifier);
                         if (st != .cont) return st;
                     }
                 }
@@ -625,7 +697,7 @@ pub fn EngineFor(comptime kind: IsaKind) type {
             }
         }
 
-        fn confirmLane(
+        inline fn confirmLane(
             self: *const Self,
             comptime Verifier: type,
             haystack: []const u8,
@@ -641,11 +713,10 @@ pub fn EngineFor(comptime kind: IsaKind) type {
             const at = pos + lane;
             if (at >= haystack.len) return .cont;
             if (best.* != null and self.done(Verifier, best.*, at, mode)) return .done;
-            return self.confirm(Verifier, haystack, at, start, mode, best, aborted_at, bucket_mask, verifier);
+            return self.confirm(Verifier, true, haystack, at, start, mode, best, aborted_at, bucket_mask, verifier);
         }
 
-        /// Checks all patterns when `bucket_mask` is null (used for tail bytes); otherwise verifies only patterns in set buckets.
-        fn confirm(
+        noinline fn confirmTail(
             self: *const Self,
             comptime Verifier: type,
             haystack: []const u8,
@@ -654,12 +725,28 @@ pub fn EngineFor(comptime kind: IsaKind) type {
             mode: matcher.MatchMode,
             best: *?Cand,
             aborted_at: if (Verifier == void) void else *usize,
-            bucket_mask: ?u8,
+            verifier: Verifier,
+        ) ScanStatus {
+            return self.confirm(Verifier, false, haystack, at, start, mode, best, aborted_at, {}, verifier);
+        }
+
+        /// Checks all patterns when `has_mask` is false (used for tail bytes); otherwise verifies only patterns in set buckets.
+        inline fn confirm(
+            self: *const Self,
+            comptime Verifier: type,
+            comptime has_mask: bool,
+            haystack: []const u8,
+            at: usize,
+            start: usize,
+            mode: matcher.MatchMode,
+            best: *?Cand,
+            aborted_at: if (Verifier == void) void else *usize,
+            bucket_mask: if (has_mask) u8 else void,
             verifier: Verifier,
         ) ScanStatus {
             var pat_bits: u32 = 0;
-            if (bucket_mask) |bmask| {
-                var b = bmask;
+            if (comptime has_mask) {
+                var b = bucket_mask;
                 while (b != 0) {
                     const bucket = @ctz(b);
                     b &= b - 1;
@@ -761,9 +848,8 @@ fn nonzero16(block: @Vector(16, u8)) u64 {
     return memchr.nibbleMask(flags);
 }
 
-fn laneByte(comptime lanes: usize, comptime Vec: type, acc: Vec, lane: usize) u8 {
-    const bytes: [lanes]u8 = acc;
-    return bytes[lane];
+inline fn laneByte(comptime lanes: usize, acc_bytes: *const [lanes]u8, lane: usize) u8 {
+    return acc_bytes[lane];
 }
 
 inline fn nibbleVec(comptime isa: type, comptime Vec: type, lo_v: Vec, hi_v: Vec, bytes: Vec) Vec {
@@ -1092,4 +1178,35 @@ test "findVerifiedWatchingNul handles NUL before, inside, after match, on abort,
     var nul7: ?usize = null;
     try std.testing.expect(engine.findVerifiedWatchingNul(&buf6, 0, .leftmost_first, &nul7, ExtendBy6{}) == .none);
     try std.testing.expectEqual(@as(?usize, 625), nul7);
+}
+
+test "bucket-aware ghost-byte avoidance and balanced fill on 16 patterns" {
+    const pats = [_][]const u8{
+        "ALPHA_101",  "BRAVO_202",  "CHARLIE_37", "DELTA_44",
+        "ECHO_5059",  "FOXTROT_66", "GOLF_707",   "HOTEL_808",
+        "INDIA_9093", "JULIET_100", "KILO_1111",  "LIMA_12128",
+        "MIKE_1313",  "NOVEMBER_14", "OSCAR_1510", "PAPA_1616",
+    };
+    const engine = Engine.init(&pats, false);
+    // Every bucket must hold exactly 2 patterns (balanced fill).
+    for (engine.bucket_pats) |mask| {
+        try std.testing.expectEqual(@as(u6, 2), @popCount(mask));
+    }
+    // Verify no fp3 ghost-byte hit on "DEB" (e.g. level=DEBUG)
+    const deb = "DEB";
+    const m0 = engine.group.lo[0][deb[0] & 0x0f] & engine.group.hi[0][deb[0] >> 4];
+    const m1 = engine.group.lo[1][deb[1] & 0x0f] & engine.group.hi[1][deb[1] >> 4];
+    const m2 = engine.group.lo[2][deb[2] & 0x0f] & engine.group.hi[2][deb[2] >> 4];
+    try std.testing.expectEqual(@as(u8, 0), m0 & m1 & m2);
+
+    // Every pattern must still be found accurately.
+    var hay: [256]u8 = @splat(' ');
+    for (pats, 0..) |pat, id| {
+        @memset(&hay, ' ');
+        @memcpy(hay[70 .. 70 + pat.len], pat);
+        const hit = engine.find(&hay, 0, .leftmost_first).?;
+        try std.testing.expectEqual(@as(usize, 70), hit.start);
+        try std.testing.expectEqual(@as(usize, 70 + pat.len), hit.end);
+        try std.testing.expectEqual(@as(u32, @intCast(id)), hit.pattern_id.?);
+    }
 }

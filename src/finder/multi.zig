@@ -352,6 +352,14 @@ pub const Multi = struct {
         };
     }
 
+    pub inline fn isTeddy(self: *const Multi) bool {
+        if (comptime !teddy_on) return false;
+        return switch (self.kind) {
+            .teddy, .teddy_ssse3, .teddy_avx2_rt => true,
+            else => false,
+        };
+    }
+
     pub fn resetStats(self: *const Multi) void {
         _ = self;
     }

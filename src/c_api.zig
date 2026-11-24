@@ -815,7 +815,7 @@ pub fn populateCSummary(out_summary: ?*webgrep_summary_t, res: sink_mod.Result, 
 // ============================================================================
 
 pub export fn webgrep_version() callconv(.c) [*:0]const u8 {
-    return "0.10.0";
+    return "0.10.1";
 }
 
 pub export fn webgrep_find_options_default() callconv(.c) webgrep_find_options_t {
@@ -1406,7 +1406,7 @@ comptime {
 
 test "c_api: version and options default" {
     const ver = std.mem.span(webgrep_version());
-    try std.testing.expectEqualStrings("0.10.0", ver);
+    try std.testing.expectEqualStrings("0.10.1", ver);
 
     const fopts = webgrep_find_options_default();
     try std.testing.expectEqual(@as(c_int, 0), fopts.case_mode);

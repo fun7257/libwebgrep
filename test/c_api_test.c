@@ -1,6 +1,6 @@
 /**
  * @file c_api_test.c
- * @brief Comprehensive C ABI and FFI verification suite for libwebgrep v0.10.0.
+ * @brief Comprehensive C ABI and FFI verification suite for libwebgrep v0.10.1.
  *
  * Exercises all 52 exported C ABI functions, adversarial streaming reader callbacks,
  * corrupt and path-traversal archives, NULL/boundary pointer checks, 1,000 allocation/free
@@ -367,7 +367,7 @@ int main(void) {
     /* 1. webgrep_version() */
     const char *ver = webgrep_version();
     assert(ver != NULL);
-    assert(strcmp(ver, "0.10.0") == 0);
+    assert(strcmp(ver, "0.10.1") == 0);
     printf("[1/16] webgrep_version(): PASS (version=\"%s\")\n", ver);
 
     /* 2. *_default() option & config functions */

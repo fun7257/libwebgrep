@@ -2,7 +2,7 @@
 
 [English](API.md) | [简体中文](API.zh-CN.md)
 
-This document is the complete reference for **libwebgrep v0.10.0** (Zig `0.17.1`, zero-libc, 59 exported C ABI functions) covering all public declarations exported by `src/root.zig` and `include/webgrep.h`. Importing the module as `@import("libwebgrep")` gives access to every type, function, and submodule documented below.
+This document is the complete reference for **libwebgrep v0.10.1** (Zig `0.17.1`, zero-libc, 59 exported C ABI functions) covering all public declarations exported by `src/root.zig` and `include/webgrep.h`. Importing the module as `@import("libwebgrep")` gives access to every type, function, and submodule documented below.
 
 `libwebgrep` searches byte streams and in-memory slices provided by the caller. Entry points that allocate or perform I/O accept an explicit `std.mem.Allocator` and `std.Io`. Pure in-memory slice search requires neither. The library holds no mutable global state.
 
@@ -1365,7 +1365,7 @@ Generic Chase-Lev work-stealing scheduler executing `initial_tasks` and recursiv
 
 ## C ABI (`include/webgrep.h`)
 
-`zig build` installs zero-libc static (`libwebgrep.a`) and shared (`libwebgrep.so` / `.dylib`) libraries along with `include/webgrep.h` (`WEBGREP_VERSION_MAJOR = 0`, `WEBGREP_VERSION_MINOR = 10`, `WEBGREP_VERSION_PATCH = 0`, `WEBGREP_VERSION_STRING = "0.10.0"`, `webgrep_version()` returns `"0.10.0"`), exposing **59 C ABI functions** (`callconv(.c)` with `WEBGREP_API` DLL import/export macro support):
+`zig build` installs zero-libc static (`libwebgrep.a`) and shared (`libwebgrep.so` / `.dylib`) libraries along with `include/webgrep.h` (`WEBGREP_VERSION_MAJOR = 0`, `WEBGREP_VERSION_MINOR = 10`, `WEBGREP_VERSION_PATCH = 1`, `WEBGREP_VERSION_STRING = "0.10.1"`, `webgrep_version()` returns `"0.10.1"`), exposing **59 C ABI functions** (`callconv(.c)` with `WEBGREP_API` DLL import/export macro support):
 - **Version & Defaults (7)**: `webgrep_version`, `webgrep_find_options_default`, `webgrep_regex_options_default`, `webgrep_config_default`, `webgrep_tree_config_default`, `webgrep_probe_options_default`, `webgrep_bloom_config_default`
 - **Matchers & Scratch (7)**: `webgrep_matcher_compile_literal`, `webgrep_matcher_compile_multi`, `webgrep_matcher_compile_regex`, `webgrep_matcher_compile_regex_set`, `webgrep_matcher_free`, `webgrep_scratch_new`, `webgrep_scratch_free`
 - **Direct Find, RegexSet, Captures & Named Groups (4)**: `webgrep_find`, `webgrep_regex_set_matches`, `webgrep_find_captures`, `webgrep_matcher_group_index`

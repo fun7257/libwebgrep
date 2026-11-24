@@ -403,85 +403,120 @@ pub fn BoundedDfa(comptime max_states_cap: u16) type {
             var curr_state: u16 = start_state_id;
             if (earliest and self.is_match[curr_state]) return prefix_offset;
             var last_match: ?usize = if (self.is_match[curr_state]) prefix_offset else null;
+            if (!self.has_loop_exits) {
+                var idx: usize = 0;
+                while (idx < rem.len) {
+                    const clen: usize = self.chain_len[curr_state];
+                    if (clen >= 2) {
+                        if (!self.matchLinearChain(rem, idx, curr_state, clen)) break;
+                        curr_state = @intCast(@as(usize, curr_state) + clen);
+                        idx += clen;
+                        if (self.is_match[curr_state]) {
+                            if (earliest or self.is_terminal[curr_state]) return prefix_offset + idx;
+                            last_match = prefix_offset + idx;
+                        }
+                        continue;
+                    }
+                    curr_state = self.trans[curr_state][rem[idx]];
+                    idx += 1;
+                    if (curr_state == dead_state) break;
+                    if (self.is_match[curr_state]) {
+                        if (earliest) return prefix_offset + idx;
+                        last_match = prefix_offset + idx;
+                    }
+                }
+                return last_match;
+            }
+            return self.matchPrefixDeterminizedWithLoopExits(rem, curr_state, prefix_offset, earliest, last_match);
+        }
+
+        inline fn matchLinearChain(
+            self: *const Self,
+            rem: []const u8,
+            idx: usize,
+            curr_state: u16,
+            clen: usize,
+        ) bool {
+            if (idx + clen > rem.len) return false;
+            const p = rem[idx..][0..clen];
+            const base_s: usize = curr_state;
+            const u_span = self.chain_uniform_span[curr_state];
+            if (u_span != 0xFF) {
+                const u_lo = self.chain_uniform_lo[curr_state];
+                if ((p[clen - 1] -% u_lo) > u_span or (p[clen - 2] -% u_lo) > u_span) {
+                    return false;
+                }
+                for (p[0 .. clen - 2]) |ch| {
+                    if ((ch -% u_lo) > u_span) return false;
+                }
+                return true;
+            } else {
+                if (self.trans[base_s + clen - 1][p[clen - 1]] == dead_state or
+                    self.trans[base_s + clen - 2][p[clen - 2]] == dead_state)
+                {
+                    return false;
+                }
+                var k: usize = 0;
+                const limit4 = (clen - 2) & ~@as(usize, 3);
+                while (k < limit4) : (k += 4) {
+                    const t0 = self.trans[base_s + k][p[k]];
+                    const t1 = self.trans[base_s + k + 1][p[k + 1]];
+                    const t2 = self.trans[base_s + k + 2][p[k + 2]];
+                    const t3 = self.trans[base_s + k + 3][p[k + 3]];
+                    if ((t0 == dead_state) or (t1 == dead_state) or (t2 == dead_state) or (t3 == dead_state)) {
+                        return false;
+                    }
+                }
+                while (k < clen - 2) : (k += 1) {
+                    if (self.trans[base_s + k][p[k]] == dead_state) return false;
+                }
+                return true;
+            }
+        }
+
+        noinline fn matchPrefixDeterminizedWithLoopExits(
+            self: *const Self,
+            rem: []const u8,
+            start_state_id: u16,
+            prefix_offset: usize,
+            earliest: bool,
+            init_last_match: ?usize,
+        ) ?usize {
+            var curr_state: u16 = start_state_id;
+            var last_match: ?usize = init_last_match;
             var idx: usize = 0;
             while (idx < rem.len) {
-                if (self.has_loop_exits) {
-                    const lex = self.loop_exit_count[curr_state];
-                    if (lex != 0) {
-                        const eb = self.loop_exit_bytes[curr_state];
-                        const next_pos = if (lex == 1)
-                            memchr.find(memchr.native_width, rem, idx, eb[0])
-                        else
-                            memchr.findEither(memchr.native_width, rem, idx, eb[0], eb[1]);
-                        if (next_pos) |at| {
-                            idx = at;
-                            if (self.is_match[curr_state]) {
-                                last_match = prefix_offset + idx;
-                            }
-                            curr_state = self.trans[curr_state][rem[idx]];
-                            idx += 1;
-                            if (curr_state == dead_state) break;
-                            if (self.is_match[curr_state]) {
-                                if (earliest) return prefix_offset + idx;
-                                last_match = prefix_offset + idx;
-                            }
-                            continue;
-                        } else {
-                            if (self.is_match[curr_state]) {
-                                last_match = prefix_offset + rem.len;
-                            }
-                            break;
+                const lex = self.loop_exit_count[curr_state];
+                if (lex != 0) {
+                    const eb = self.loop_exit_bytes[curr_state];
+                    const next_pos = if (lex == 1)
+                        memchr.find(memchr.native_width, rem, idx, eb[0])
+                    else
+                        memchr.findEither(memchr.native_width, rem, idx, eb[0], eb[1]);
+                    if (next_pos) |at| {
+                        idx = at;
+                        if (self.is_match[curr_state]) {
+                            last_match = prefix_offset + idx;
                         }
+                        curr_state = self.trans[curr_state][rem[idx]];
+                        idx += 1;
+                        if (curr_state == dead_state) break;
+                        if (self.is_match[curr_state]) {
+                            if (earliest) return prefix_offset + idx;
+                            last_match = prefix_offset + idx;
+                        }
+                        continue;
+                    } else {
+                        if (self.is_match[curr_state]) {
+                            last_match = prefix_offset + rem.len;
+                        }
+                        break;
                     }
                 }
                 const clen: usize = self.chain_len[curr_state];
                 if (clen >= 2) {
-                    if (idx + clen > rem.len) break;
-                    const p = rem[idx..][0..clen];
-                    const base_s: usize = curr_state;
-                    const u_span = self.chain_uniform_span[curr_state];
-                    if (u_span != 0xFF) {
-                        const u_lo = self.chain_uniform_lo[curr_state];
-                        if ((p[clen - 1] -% u_lo) > u_span or (p[clen - 2] -% u_lo) > u_span) {
-                            break;
-                        }
-                        var dead = false;
-                        for (p[0 .. clen - 2]) |ch| {
-                            if ((ch -% u_lo) > u_span) {
-                                dead = true;
-                                break;
-                            }
-                        }
-                        if (dead) break;
-                    } else {
-                        if (self.trans[base_s + clen - 1][p[clen - 1]] == dead_state or
-                            self.trans[base_s + clen - 2][p[clen - 2]] == dead_state)
-                        {
-                            break;
-                        }
-                        var k: usize = 0;
-                        const limit4 = (clen - 2) & ~@as(usize, 3);
-                        var dead = false;
-                        while (k < limit4) : (k += 4) {
-                            const t0 = self.trans[base_s + k][p[k]];
-                            const t1 = self.trans[base_s + k + 1][p[k + 1]];
-                            const t2 = self.trans[base_s + k + 2][p[k + 2]];
-                            const t3 = self.trans[base_s + k + 3][p[k + 3]];
-                            if ((t0 == dead_state) or (t1 == dead_state) or (t2 == dead_state) or (t3 == dead_state)) {
-                                dead = true;
-                                break;
-                            }
-                        }
-                        if (dead) break;
-                        while (k < clen - 2) : (k += 1) {
-                            if (self.trans[base_s + k][p[k]] == dead_state) {
-                                dead = true;
-                                break;
-                            }
-                        }
-                        if (dead) break;
-                    }
-                    curr_state = @intCast(base_s + clen);
+                    if (!self.matchLinearChain(rem, idx, curr_state, clen)) break;
+                    curr_state = @intCast(@as(usize, curr_state) + clen);
                     idx += clen;
                     if (self.is_match[curr_state]) {
                         if (earliest or self.is_terminal[curr_state]) return prefix_offset + idx;

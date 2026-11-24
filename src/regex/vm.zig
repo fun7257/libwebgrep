@@ -1807,7 +1807,7 @@ pub const Regex = struct {
     ) ?Match {
         var scan_pos = start_pos;
         var chunk_size: usize = 64 * 1024;
-        const max_chunk_size: usize = 256 * 1024;
+        const max_chunk_size: usize = 128 * 1024;
         const max_lit_len = if (self.ignore_case and self.unicode_case) self.req_literal_bytes.len *| 3 else self.req_literal_bytes.len;
         const overlap = max_lit_len -| 1;
 
@@ -1857,7 +1857,7 @@ pub const Regex = struct {
     ) ?Match {
         var scan_pos = start_pos;
         var chunk_size: usize = 64 * 1024;
-        const max_chunk_size: usize = 256 * 1024;
+        const max_chunk_size: usize = 128 * 1024;
         const overlap = p0 -| 1;
 
         while (scan_pos <= haystack.len) {
@@ -1916,7 +1916,7 @@ pub const Regex = struct {
     ) ?Match {
         var scan_pos = start_pos;
         var chunk_size: usize = 64 * 1024;
-        const max_chunk_size: usize = 256 * 1024;
+        const max_chunk_size: usize = 128 * 1024;
         const max_lit_len = if (self.ignore_case and self.unicode_case) self.req_literal_bytes.len *| 3 else self.req_literal_bytes.len;
         const overlap = max_lit_len -| 1;
         const exact_for_mode = self.dfa_is_exact and !self.has_alt;
@@ -2082,7 +2082,7 @@ pub const Regex = struct {
         var scan_pos = start_pos;
         var min_start = start_min_start;
         var chunk_size: usize = 64 * 1024;
-        const max_chunk_size: usize = 256 * 1024;
+        const max_chunk_size: usize = 128 * 1024;
         const max_lit_len = if (self.ignore_case and self.unicode_case) self.req_literal_bytes.len *| 3 else self.req_literal_bytes.len;
         const overlap = (max_lit_len -| 1) + @as(usize, if (self.byte_ctx_prefilter != null) 1 else 0);
         const exact_for_mode = self.dfa_is_exact and !self.has_alt;
@@ -2250,7 +2250,7 @@ pub const Regex = struct {
     ) ?Match {
         var scan_pos = start_pos;
         var chunk_size: usize = 64 * 1024;
-        const max_chunk_size: usize = 256 * 1024;
+        const max_chunk_size: usize = 128 * 1024;
         const overlap = max_ap_len -| 1;
 
         while (scan_pos <= haystack.len) {
@@ -2320,7 +2320,7 @@ pub const Regex = struct {
         var scan_pos = start_pos;
         var min_start = start_min_start;
         var chunk_size: usize = 64 * 1024;
-        const max_chunk_size: usize = 256 * 1024;
+        const max_chunk_size: usize = 128 * 1024;
         const overlap = max_ap_len -| 1;
         var cached_win_end: usize = std.math.maxInt(usize);
 
@@ -2897,28 +2897,53 @@ pub const Regex = struct {
                 var cached_win_end: usize = std.math.maxInt(usize);
                 if (self.alt_is_prefix) {
                     if (self.precomputed_dfa) |dfa| {
+                        const is_teddy = ap.isTeddy();
                         const step = if (dfa.stops_on_crlf) blk: {
-                            var verifier = AltDfaVerifier(true, true, false){
-                                .regex = self,
-                                .dfa = dfa,
-                                .full_haystack = haystack,
-                                .mode = .earliest,
-                                .steps = null,
-                                .scratch = null,
-                                .orig_start = start,
-                            };
-                            break :blk ap.findVerifiedWatched(haystack, pos, .leftmost_first, nul, &verifier);
+                            if (is_teddy) {
+                                var verifier = AltDfaVerifier(true, false, false){
+                                    .regex = self,
+                                    .dfa = dfa,
+                                    .full_haystack = haystack,
+                                    .mode = .earliest,
+                                    .steps = null,
+                                    .scratch = null,
+                                };
+                                break :blk ap.findVerifiedWatched(haystack, pos, .leftmost_first, nul, &verifier);
+                            } else {
+                                var verifier = AltDfaVerifier(true, true, false){
+                                    .regex = self,
+                                    .dfa = dfa,
+                                    .full_haystack = haystack,
+                                    .mode = .earliest,
+                                    .steps = null,
+                                    .scratch = null,
+                                    .orig_start = start,
+                                };
+                                break :blk ap.findVerifiedWatched(haystack, pos, .leftmost_first, nul, &verifier);
+                            }
                         } else blk: {
-                            var verifier = AltDfaVerifier(false, true, false){
-                                .regex = self,
-                                .dfa = dfa,
-                                .full_haystack = haystack,
-                                .mode = .earliest,
-                                .steps = null,
-                                .scratch = null,
-                                .orig_start = start,
-                            };
-                            break :blk ap.findVerifiedWatched(haystack, pos, .leftmost_first, nul, &verifier);
+                            if (is_teddy) {
+                                var verifier = AltDfaVerifier(false, false, false){
+                                    .regex = self,
+                                    .dfa = dfa,
+                                    .full_haystack = haystack,
+                                    .mode = .earliest,
+                                    .steps = null,
+                                    .scratch = null,
+                                };
+                                break :blk ap.findVerifiedWatched(haystack, pos, .leftmost_first, nul, &verifier);
+                            } else {
+                                var verifier = AltDfaVerifier(false, true, false){
+                                    .regex = self,
+                                    .dfa = dfa,
+                                    .full_haystack = haystack,
+                                    .mode = .earliest,
+                                    .steps = null,
+                                    .scratch = null,
+                                    .orig_start = start,
+                                };
+                                break :blk ap.findVerifiedWatched(haystack, pos, .leftmost_first, nul, &verifier);
+                            }
                         };
                         return switch (step) {
                             .match => |vm| checkWatchedMatch(haystack, vm.start, Match{

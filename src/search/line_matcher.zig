@@ -8,6 +8,7 @@
 //! [HotPath] `matchBuffer` -> `findLine` -> `nextMatch` -> `linePassesFilters`.
 
 const std = @import("std");
+const finder_mod = @import("../finder/finder.zig");
 const matcher_mod = @import("../matcher.zig");
 const memchr = @import("../finder/memchr.zig");
 const unicode_fold = @import("../finder/unicode_fold.zig");
@@ -29,7 +30,6 @@ const noteBinary = state_mod.noteBinary;
 const callOpt = state_mod.callOpt;
 const maybeProgress = state_mod.maybeProgress;
 const lineStart = state_mod.lineStart;
-const lineEnd = state_mod.lineEnd;
 const nextLine = state_mod.nextLine;
 const contentEnd = state_mod.contentEnd;
 const isMultilineMatcher = state_mod.isMultilineMatcher;
@@ -42,6 +42,14 @@ const emitRing = ring_mod.emitRing;
 const emitRingFrom = ring_mod.emitRingFrom;
 const sinkMatched = format_mod.sinkMatched;
 const sinkContext = format_mod.sinkContext;
+
+pub inline fn fastLineEnd(buf: []const u8, from: usize, config: SearchConfig) usize {
+    if (from >= buf.len) return buf.len;
+    if (memchr.find(memchr.native_width, buf, from, cfg_mod.recordSep(config))) |i| return i + 1;
+    return buf.len;
+}
+
+const lineEnd = fastLineEnd;
 
 pub fn needLineStart(comptime S: type, state: *const State, config: SearchConfig) bool {
     if (comptime @hasDecl(S, "matched") or @hasDecl(S, "context") or @hasDecl(S, "context_break")) return true;
@@ -187,7 +195,7 @@ fn bulkInvertCount(
             else
                 @max(hit.end, pos);
             pos = if (probe < effective_limit)
-                (if (std.mem.findScalarPos(u8, buf[0..effective_limit], probe, '\n')) |nl| nl + 1 else effective_limit)
+                (if (memchr.find(memchr.native_width, buf[0..effective_limit], probe, '\n')) |nl| nl + 1 else effective_limit)
             else
                 effective_limit;
         }
@@ -210,7 +218,7 @@ fn bulkInvertCount(
             if (probe >= effective_limit) break;
             matched += 1;
             pos = if (probe < effective_limit)
-                (if (std.mem.findScalarPos(u8, buf[0..effective_limit], probe, '\n')) |nl| nl + 1 else effective_limit)
+                (if (memchr.find(memchr.native_width, buf[0..effective_limit], probe, '\n')) |nl| nl + 1 else effective_limit)
             else
                 effective_limit;
         }
@@ -235,7 +243,7 @@ fn bulkInvertCount(
             else
                 @max(hit.end, pos);
             pos = if (probe < effective_limit)
-                (if (std.mem.findScalarPos(u8, buf[0..effective_limit], probe, '\n')) |nl| nl + 1 else effective_limit)
+                (if (memchr.find(memchr.native_width, buf[0..effective_limit], probe, '\n')) |nl| nl + 1 else effective_limit)
             else
                 effective_limit;
         }
@@ -454,6 +462,370 @@ fn streamSpans(
     return !state.stopped;
 }
 
+pub inline fn isCountSinkType(comptime S: type) bool {
+    return !@hasDecl(S, "matched") and !@hasDecl(S, "context") and !@hasDecl(S, "contextBreak") and !@hasDecl(S, "context_break");
+}
+
+pub inline fn isFastLineSinkType(comptime S: type) bool {
+    return @hasDecl(S, "matched") and @hasDecl(S, "matched_fast_line") and S.matched_fast_line;
+}
+
+pub inline fn isFinderFastEligibleType(comptime S: type, comptime M: type) bool {
+    return state_mod.MatcherType(M) == finder_mod.Finder and (isCountSinkType(S) or isFastLineSinkType(S));
+}
+
+pub fn canUseFinderFast(
+    comptime S: type,
+    matcher: anytype,
+    state: *const State,
+    config: SearchConfig,
+) bool {
+    if (comptime !isFinderFastEligibleType(S, @TypeOf(matcher))) return false;
+    return matcher.pattern.len > 0 and
+        !state.is_pure_empty and
+        !state.long_active and
+        !effectiveMultiline(matcher, config) and
+        !config.invert and
+        !config.whole_word and
+        !config.whole_line and
+        !config.null_data and
+        beforeCount(config) == 0 and
+        afterCount(config) == 0 and
+        state.after_left == 0 and
+        config.contains.len == 0 and
+        config.excludes.len == 0 and
+        config.contains_regexes.len == 0 and
+        config.excludes_regexes.len == 0 and
+        config.line_filter == null and
+        config.replacement == null and
+        config.max_count == null and
+        config.max_results == null and
+        !config.exists and
+        !config.files_without_match and
+        !config.passthru and
+        !config.stop_on_nonmatch and
+        config.max_output_bytes == null and
+        config.max_queued_event_bytes == null and
+        config.resume_from == 0 and
+        config.binary != .report and
+        (config.progress_interval == null or config.progress_interval.? == 0) and
+        std.mem.findScalar(u8, matcher.pattern, 0) == null;
+}
+
+inline fn boundedLineStart(buf: []const u8, pos: usize, at: usize, config: SearchConfig) usize {
+    if (at > pos) {
+        if (memchr.findLast(memchr.native_width, buf, pos, at, '\n')) |nl| return nl + 1;
+    }
+    if (pos == 0 or buf[pos - 1] == '\n') return pos;
+    return lineStart(buf, pos, config);
+}
+
+noinline fn handleFinderFastNul(
+    comptime S: type,
+    comptime is_count: bool,
+    comptime track_ln: bool,
+    sink: *S,
+    buf: []const u8,
+    pos: usize,
+    scan_at: usize,
+    nul_idx: usize,
+    matched_delta: u64,
+    last_matched_end: usize,
+    ln: u64,
+    counted_pos: usize,
+    state: *State,
+    config: SearchConfig,
+) bool {
+    @branchHint(.cold);
+    const safe_end = boundedLineStart(buf, pos, scan_at, config);
+    if (matched_delta > 0) {
+        state.matched_lines += matched_delta;
+        state.matches += matched_delta;
+        state.limit_count += matched_delta;
+        state.results_out += matched_delta;
+        state.has_sunk = true;
+        state.last_abs_end = state.abs_base + @as(u64, last_matched_end);
+        state.remembered_until = @max(state.remembered_until, last_matched_end);
+        if (comptime is_count) {
+            if (state.line_number != null) state_mod.countLines(buf, last_matched_end, state, config);
+        }
+    }
+    if (comptime track_ln) {
+        state.line_number = ln;
+        state.last_line_counted = counted_pos;
+    }
+    state.pos = safe_end;
+    state.last_line_visited = @max(state.last_line_visited, safe_end);
+    noteBinary(state, config, state.abs_base + @as(u64, nul_idx));
+    _ = callOpt(S, "binary", sink, .{state.nul_offset.?});
+    state.stopped = true;
+    return false;
+}
+
+pub fn scanFinderFast(
+    comptime S: type,
+    comptime watch_nul: bool,
+    sink: *S,
+    matcher: anytype,
+    buf: []const u8,
+    state: *State,
+    config: SearchConfig,
+) SliceError!bool {
+    if (comptime !isFinderFastEligibleType(S, @TypeOf(matcher))) unreachable;
+    const is_count = comptime isCountSinkType(S);
+    if (comptime is_count) {
+        return scanFinderFastLoop(S, watch_nul, true, false, sink, matcher, buf, state, config);
+    }
+    if (state.line_number != null) {
+        return scanFinderFastLoop(S, watch_nul, false, true, sink, matcher, buf, state, config);
+    }
+    return scanFinderFastLoop(S, watch_nul, false, false, sink, matcher, buf, state, config);
+}
+
+fn scanFinderFastLoop(
+    comptime S: type,
+    comptime watch_nul: bool,
+    comptime is_count: bool,
+    comptime track_ln: bool,
+    sink: *S,
+    matcher: anytype,
+    buf: []const u8,
+    state: *State,
+    config: SearchConfig,
+) SliceError!bool {
+    const start_pos = state.pos;
+    if (start_pos >= buf.len) {
+        if (config.stop != null or config.cancel != null or state.deadline_armed) {
+            if (state_mod.flagIsSet(config)) {
+                state.stopped = true;
+                return false;
+            }
+            if (stopInMatch(state, config)) return false;
+        }
+        return !state.stopped;
+    }
+
+    const has_abort = config.stop != null or config.cancel != null or state.deadline_armed;
+    var pos = start_pos;
+    var matched_delta: u64 = 0;
+    var last_matched_end: usize = start_pos;
+    var aborted = false;
+    var ln: u64 = if (comptime track_ln) state.line_number.? else 0;
+    var counted_pos: usize = if (comptime track_ln) state.last_line_counted else 0;
+    var use_cached = !watch_nul;
+
+    while (pos < buf.len) {
+        if (has_abort) {
+            if (state_mod.flagIsSet(config)) {
+                state.stopped = true;
+                aborted = true;
+                break;
+            }
+            if (stopInMatch(state, config)) {
+                aborted = true;
+                break;
+            }
+        }
+
+        const hit: matcher_mod.Match = if (comptime watch_nul) blk: {
+            var nul_pos: ?usize = null;
+            if (matcher.findWatched(buf, pos, &nul_pos)) |m| {
+                break :blk m;
+            }
+            if (nul_pos) |z| {
+                @branchHint(.cold);
+                return handleFinderFastNul(S, is_count, track_ln, sink, buf, pos, z, z, matched_delta, last_matched_end, ln, counted_pos, state, config);
+            }
+            break;
+        } else blk: {
+            if (use_cached) {
+                use_cached = false;
+                if (state.getCachedMatch(buf, pos)) |cached| {
+                    break :blk cached orelse break;
+                }
+            }
+            break :blk matcher.find(buf, pos, .earliest) orelse break;
+        };
+
+        if (hit.start < pos or hit.start >= buf.len) break;
+
+        const line_end: usize = if (comptime watch_nul) blk: {
+            const tail = memchr.findSepOrNul(memchr.native_width, buf, hit.end, '\n');
+            if (tail.is_nul) {
+                @branchHint(.cold);
+                const z = tail.pos orelse hit.end;
+                return handleFinderFastNul(S, is_count, track_ln, sink, buf, pos, hit.start, z, matched_delta, last_matched_end, ln, counted_pos, state, config);
+            }
+            break :blk if (tail.pos) |p| p + 1 else buf.len;
+        } else blk: {
+            break :blk if (memchr.find(memchr.native_width, buf, hit.end, '\n')) |p| p + 1 else buf.len;
+        };
+
+        if (comptime is_count) {
+            matched_delta += 1;
+            last_matched_end = line_end;
+            pos = line_end;
+        } else {
+            const ls = boundedLineStart(buf, pos, hit.start, config);
+            var ce = line_end;
+            if (ce > ls and buf[ce - 1] == '\n') ce -= 1;
+            if (ce > ls and buf[ce - 1] == '\r') ce -= 1;
+
+            if (config.max_line_len > 0 and ce - ls > config.max_line_len) {
+                @branchHint(.unlikely);
+                if (matched_delta > 0) {
+                    state.matched_lines += matched_delta;
+                    state.matches += matched_delta;
+                    state.limit_count += matched_delta;
+                    state.results_out += matched_delta;
+                    state.has_sunk = true;
+                    state.last_line_visited = last_matched_end;
+                    state.last_abs_end = state.abs_base + @as(u64, last_matched_end);
+                    state.remembered_until = @max(state.remembered_until, last_matched_end);
+                    matched_delta = 0;
+                }
+                if (comptime track_ln) {
+                    state.line_number = ln;
+                    state.last_line_counted = counted_pos;
+                }
+                state.limit_count += 1;
+                state.pos = line_end;
+                const known = BufMatch{ .start = hit.start, .end = hit.end, .pattern_id = hit.pattern_id };
+                const keep = try sinkMatched(S, sink, matcher, buf, .{ .start = ls, .end = line_end }, known, state, config);
+                if (comptime track_ln) {
+                    ln = state.line_number orelse 0;
+                    counted_pos = state.last_line_counted;
+                }
+                if (!keep) return false;
+                if (state.pending_skip_to != null) {
+                    if (!applyInBufferSkip(buf, buf.len, state, config)) return false;
+                    pos = state.pos;
+                    if (comptime track_ln) {
+                        ln = state.line_number orelse 0;
+                        counted_pos = state.last_line_counted;
+                    }
+                    continue;
+                }
+                pos = line_end;
+                continue;
+            }
+
+            if (comptime track_ln) {
+                if (ls > counted_pos) {
+                    ln += memchr.count(memchr.native_width, buf, counted_pos, ls, '\n');
+                }
+                counted_pos = ls;
+            }
+
+            const bytes = buf[ls..ce];
+            const line_abs = state.abs_base + @as(u64, ls);
+            const ms = @min(hit.start, ce);
+            const me = @max(ms, @min(hit.end, ce));
+            const fast_line = cfg_mod.Line{
+                .bytes = bytes,
+                .text = bytes,
+                .raw = bytes,
+                .replaced = null,
+                .offset = line_abs,
+                .raw_offset = line_abs,
+                .number = if (comptime track_ln) ln else null,
+                .match = .{
+                    .start = ms - ls,
+                    .end = me - ls,
+                    .pattern_id = hit.pattern_id,
+                },
+                .matches = &.{},
+                .column = null,
+                .u16_column = null,
+                .binary_status = state.binary_status,
+                .truncated = false,
+                .line_len = ce - ls,
+                .window_start = 0,
+            };
+            const action = state_mod.callSinkAction(S, "matched", sink, .{fast_line});
+            matched_delta += 1;
+            last_matched_end = line_end;
+            if (comptime track_ln) {
+                if (line_end > ls and buf[line_end - 1] == '\n') ln += 1;
+                counted_pos = line_end;
+            }
+            if (action != .cont) {
+                @branchHint(.unlikely);
+                const line_end_abs = state.abs_base + @as(u64, line_end);
+                state.matched_lines += matched_delta;
+                state.matches += matched_delta;
+                state.limit_count += matched_delta;
+                state.results_out += matched_delta;
+                state.has_sunk = true;
+                state.last_line_visited = line_end;
+                state.last_abs_end = line_end_abs;
+                state.remembered_until = @max(state.remembered_until, line_end);
+                state.pos = line_end;
+                matched_delta = 0;
+                if (comptime track_ln) {
+                    state.line_number = ln;
+                    state.last_line_counted = counted_pos;
+                }
+                switch (action) {
+                    .cont => unreachable,
+                    .skip_to => |target| {
+                        if (target > line_end_abs) {
+                            state.after_left = 0;
+                            state.ring.clear();
+                            state.pending_skip_to = target;
+                            if (!applyInBufferSkip(buf, buf.len, state, config)) return false;
+                            pos = state.pos;
+                            if (comptime track_ln) {
+                                ln = state.line_number orelse 0;
+                                counted_pos = state.last_line_counted;
+                            }
+                            continue;
+                        }
+                    },
+                    .pause => {
+                        state.paused = true;
+                        state.resume_at = line_end_abs;
+                        state.resume_line = if (comptime track_ln) ln else 0;
+                        state.stopped = true;
+                        return false;
+                    },
+                    .stop => {
+                        state.stopped = true;
+                        return false;
+                    },
+                }
+            }
+            pos = line_end;
+        }
+    }
+
+    if (matched_delta > 0) {
+        state.matched_lines += matched_delta;
+        state.matches += matched_delta;
+        state.limit_count += matched_delta;
+        state.results_out += matched_delta;
+        state.has_sunk = true;
+        state.last_line_visited = last_matched_end;
+        state.last_abs_end = state.abs_base + @as(u64, last_matched_end);
+        state.remembered_until = @max(state.remembered_until, last_matched_end);
+        if (comptime is_count) {
+            if (state.line_number != null) state_mod.countLines(buf, last_matched_end, state, config);
+        }
+    }
+    if (comptime track_ln) {
+        state.line_number = ln;
+        state.last_line_counted = counted_pos;
+    }
+    const scan_end = if (aborted) pos else buf.len;
+    state.pos = scan_end;
+    if (!aborted and has_abort) {
+        if (state_mod.flagIsSet(config) or stopInMatch(state, config)) {
+            state.stopped = true;
+        }
+    }
+    return !state.stopped;
+}
+
 pub fn matchBufferWithLimit(
     comptime S: type,
     sink: *S,
@@ -479,6 +851,20 @@ pub fn matchBufferWithLimit(
                 if (!applyInBufferSkip(buf, effective_limit, state, config)) return false;
             }
             return streamSpans(S, sink, matcher, buf, effective_limit, state, config);
+        }
+    }
+    if (comptime isFinderFastEligibleType(S, @TypeOf(matcher))) {
+        if (limit >= buf.len and canUseFinderFast(S, matcher, state, config)) {
+            if (state.stopped) return false;
+            if (state_mod.flagIsSet(config)) {
+                state.stopped = true;
+                return false;
+            }
+            if (stopInMatch(state, config)) return false;
+            if (state.pending_skip_to != null) {
+                if (!applyInBufferSkip(buf, effective_limit, state, config)) return false;
+            }
+            return scanFinderFast(S, false, sink, matcher, buf, state, config);
         }
     }
     if (config.invert and canBulkInvertCount(S, matcher, state, config, limit, buf.len)) {

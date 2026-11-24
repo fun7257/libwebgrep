@@ -7754,6 +7754,325 @@ test "Fix S15-A: 600 KiB long-line countParallelAt parity (zero, rare, boundary,
     }
 }
 
+test "scanFinderFast: CountSink watch_nul true/false, case-insensitive, NUL placement edge cases (slice & reader)" {
+    const CountOnly = struct {
+        nul: ?u64 = null,
+        pub fn binary(self: *@This(), offset: u64) bool {
+            self.nul = offset;
+            return true;
+        }
+    };
+    const BareCount = struct {};
+
+    const cases = [_]struct {
+        name: []const u8,
+        pattern: []const u8,
+        case_mode: matcher_mod.CaseMode,
+        input: []const u8,
+        policy: BinaryPolicy,
+        want_outcome: Outcome,
+        want_lines: u64,
+        want_nul: ?u64,
+    }{
+        .{
+            .name = "clean multi-line sensitive quit",
+            .pattern = "ERROR",
+            .case_mode = .sensitive,
+            .input = "ok1\nERROR line 2\nERROR line 3\nok4\nERROR tail",
+            .policy = .quit,
+            .want_outcome = .complete,
+            .want_lines = 3,
+            .want_nul = null,
+        },
+        .{
+            .name = "clean multi-line sensitive none",
+            .pattern = "ERROR",
+            .case_mode = .sensitive,
+            .input = "ok1\nERROR line 2\nERROR line 3\nok4\nERROR tail",
+            .policy = .none,
+            .want_outcome = .complete,
+            .want_lines = 3,
+            .want_nul = null,
+        },
+        .{
+            .name = "case-insensitive dense CRLF",
+            .pattern = "error",
+            .case_mode = .insensitive,
+            .input = "a\r\nERROR 1\r\nErRoR 2\r\ninfo\r\nerror 3\r\n",
+            .policy = .quit,
+            .want_outcome = .complete,
+            .want_lines = 3,
+            .want_nul = null,
+        },
+        .{
+            .name = "NUL before first match",
+            .pattern = "MATCH",
+            .case_mode = .sensitive,
+            .input = "hello\x00world\nMATCH line\n",
+            .policy = .quit,
+            .want_outcome = .binary_quit,
+            .want_lines = 0,
+            .want_nul = 5,
+        },
+        .{
+            .name = "NUL between matches on non-matching line",
+            .pattern = "MATCH",
+            .case_mode = .sensitive,
+            .input = "first MATCH\nmiddle \x00 bin\nthird MATCH\n",
+            .policy = .quit,
+            .want_outcome = .binary_quit,
+            .want_lines = 1,
+            .want_nul = 19,
+        },
+        .{
+            .name = "NUL on same line AFTER match before newline must NOT count that line",
+            .pattern = "MATCH",
+            .case_mode = .sensitive,
+            .input = "ok MATCH\nline MATCH middle \x00 tail\nMATCH after\n",
+            .policy = .quit,
+            .want_outcome = .binary_quit,
+            .want_lines = 1,
+            .want_nul = 27,
+        },
+        .{
+            .name = "NUL on same line AFTER match with binary none still counts all",
+            .pattern = "MATCH",
+            .case_mode = .sensitive,
+            .input = "ok MATCH\nline MATCH middle \x00 tail\nMATCH after\n",
+            .policy = .none,
+            .want_outcome = .complete,
+            .want_lines = 3,
+            .want_nul = null,
+        },
+        .{
+            .name = "NUL on same line BEFORE match must NOT count that line",
+            .pattern = "MATCH",
+            .case_mode = .sensitive,
+            .input = "ok MATCH\npre \x00 MATCH\nMATCH after\n",
+            .policy = .quit,
+            .want_outcome = .binary_quit,
+            .want_lines = 1,
+            .want_nul = 13,
+        },
+        .{
+            .name = "NUL on last line without newline after match",
+            .pattern = "MATCH",
+            .case_mode = .sensitive,
+            .input = "ok MATCH\nMATCH\x00tail",
+            .policy = .quit,
+            .want_outcome = .binary_quit,
+            .want_lines = 1,
+            .want_nul = 14,
+        },
+        .{
+            .name = "NUL on last line without newline no match",
+            .pattern = "MATCH",
+            .case_mode = .sensitive,
+            .input = "ok MATCH\ntrailing\x00no_nl",
+            .policy = .quit,
+            .want_outcome = .binary_quit,
+            .want_lines = 1,
+            .want_nul = 17,
+        },
+        .{
+            .name = "case-insensitive NUL on same line after match",
+            .pattern = "WarnTag",
+            .case_mode = .insensitive,
+            .input = "one warntag\ntwo WARNTAG after\x00end\nthree warntag\n",
+            .policy = .quit,
+            .want_outcome = .binary_quit,
+            .want_lines = 1,
+            .want_nul = 29,
+        },
+    };
+
+    for (cases) |tc| {
+        var finder = try Finder.init(tc.pattern, .{ .case = tc.case_mode });
+        // 1. Slice path (`searchPrepared`) with BareCount and CountOnly (with binary callback)
+        {
+            var bare_sink = BareCount{};
+            const res = try searchSlice(BareCount, &bare_sink, tc.input, tc.name, &finder, .{ .binary = tc.policy });
+            try testing.expectEqual(tc.want_outcome, res.outcome);
+            try testing.expectEqual(tc.want_lines, res.matched_lines);
+            try testing.expectEqual(tc.want_lines, res.matches);
+            try testing.expectEqual(tc.want_nul, res.nul_offset);
+
+            var co = CountOnly{};
+            const res2 = try searchSlice(CountOnly, &co, tc.input, tc.name, &finder, .{ .binary = tc.policy });
+            try testing.expectEqual(tc.want_outcome, res2.outcome);
+            try testing.expectEqual(tc.want_lines, res2.matched_lines);
+            try testing.expectEqual(tc.want_nul, res2.nul_offset);
+            try testing.expectEqual(tc.want_nul, co.nul);
+        }
+        // 2. Reader path (`drive`) with both normal and tiny (24B) buffer sizes
+        inline for (.{ @as(usize, 4096), @as(usize, 24) }) |bsz| {
+            var reader = std.Io.Reader.fixed(tc.input);
+            var co = CountOnly{};
+            const res = try searchReader(CountOnly, testing.allocator, &co, &reader, tc.name, &finder, .{
+                .binary = tc.policy,
+                .buffer_size = bsz,
+            });
+            try testing.expectEqual(tc.want_outcome, res.outcome);
+            try testing.expectEqual(tc.want_lines, res.matched_lines);
+            try testing.expectEqual(tc.want_lines, res.matches);
+            try testing.expectEqual(tc.want_nul, res.nul_offset);
+            try testing.expectEqual(tc.want_nul, co.nul);
+        }
+    }
+}
+
+test "scanFinderFast: matched_fast_line with/without line_numbers, CRLF, case-insensitive, NUL, max_line_len fallback" {
+    const FastLineRec = struct {
+        pub const matched_fast_line = true;
+
+        out: std.ArrayList(u8) = .empty,
+        matches: u64 = 0,
+        nul: ?u64 = null,
+        saw_truncated: bool = false,
+        trunc_line_len: u64 = 0,
+        trunc_bytes_len: usize = 0,
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            self.out.deinit(alloc);
+        }
+
+        pub fn matched(self: *@This(), line: Line) bool {
+            self.matches += 1;
+            if (line.truncated) {
+                self.saw_truncated = true;
+                self.trunc_line_len = line.line_len;
+                self.trunc_bytes_len = line.bytes.len;
+            }
+            if (line.number) |n| {
+                var tmp: [32]u8 = undefined;
+                const s = std.fmt.bufPrint(&tmp, "{d}:", .{n}) catch unreachable;
+                self.out.appendSlice(testing.allocator, s) catch unreachable;
+            }
+            self.out.appendSlice(testing.allocator, line.bytes) catch unreachable;
+            self.out.append(testing.allocator, '\n') catch unreachable;
+            return true;
+        }
+
+        pub fn binary(self: *@This(), offset: u64) bool {
+            self.nul = offset;
+            return true;
+        }
+    };
+
+    // 1. Differential test: FastLineRec vs regular Rec across line_numbers & binary policies, slice & reader
+    const corpus =
+        "MATCH at col0\r\n" ++
+        "plain line 2\n" ++
+        "third match here\r\n" ++
+        "fourth MATCH consecutive\n" ++
+        "skip 5\n" ++
+        "skip 6\r\n" ++
+        "seventh MaTcH mid\n" ++
+        "eighth match before \x00 nul on same line\n" ++
+        "ninth MATCH after nul\n";
+
+    inline for (.{ matcher_mod.CaseMode.sensitive, matcher_mod.CaseMode.insensitive }) |cm| {
+        var finder = try Finder.init("MATCH", .{ .case = cm });
+        inline for (.{ BinaryPolicy.quit, BinaryPolicy.none }) |policy| {
+            inline for (.{ false, true }) |with_ln| {
+                const cfg = SearchConfig{
+                    .binary = policy,
+                    .line_numbers = with_ln,
+                };
+                var ref = Rec{};
+                defer ref.deinit(testing.allocator);
+                const ref_res = try searchSlice(Rec, &ref, corpus, "ref", &finder, cfg);
+
+                var fast_s = FastLineRec{};
+                defer fast_s.deinit(testing.allocator);
+                const fast_res = try searchSlice(FastLineRec, &fast_s, corpus, "fast-slice", &finder, cfg);
+
+                try testing.expectEqual(ref_res.outcome, fast_res.outcome);
+                try testing.expectEqual(ref_res.matched_lines, fast_res.matched_lines);
+                try testing.expectEqual(ref_res.nul_offset, fast_res.nul_offset);
+                try testing.expectEqualStrings(ref.text.items, fast_s.out.items);
+
+                // Reader path with small buffer to span multiple chunks & partial lines
+                var reader = std.Io.Reader.fixed(corpus);
+                var fast_r = FastLineRec{};
+                defer fast_r.deinit(testing.allocator);
+                var r_cfg = cfg;
+                r_cfg.buffer_size = 32;
+                const fast_r_res = try searchReader(FastLineRec, testing.allocator, &fast_r, &reader, "fast-reader", &finder, r_cfg);
+
+                try testing.expectEqual(ref_res.outcome, fast_r_res.outcome);
+                try testing.expectEqual(ref_res.matched_lines, fast_r_res.matched_lines);
+                try testing.expectEqual(ref_res.nul_offset, fast_r_res.nul_offset);
+                try testing.expectEqualStrings(ref.text.items, fast_r.out.items);
+            }
+        }
+    }
+
+    // 2. NUL on last line without trailing newline
+    {
+        var finder = try Finder.init("TOK", .{});
+        const data = "a\nTOK1\r\nb\nTOK2\x00end";
+        var fast = FastLineRec{};
+        defer fast.deinit(testing.allocator);
+        const res = try searchSlice(FastLineRec, &fast, data, "last-nul", &finder, .{
+            .binary = .quit,
+            .line_numbers = true,
+        });
+        try testing.expectEqual(Outcome.binary_quit, res.outcome);
+        try testing.expectEqual(@as(u64, 1), res.matched_lines);
+        try testing.expectEqual(@as(?u64, 14), res.nul_offset);
+        try testing.expectEqualStrings("2:TOK1\n", fast.out.items);
+    }
+
+    // 3. Line > max_line_len truncation fallback + subsequent normal line keeps exact line_number
+    {
+        var finder = try Finder.init("HIT", .{});
+        const overlong = "a\n" ++ "xxxxxxxxxxHITyyyyyyyyyyyyyyyyyyyy\n" ++ "c\n" ++ "ok HIT\n";
+        inline for (.{ BinaryPolicy.quit, BinaryPolicy.none }) |policy| {
+            var fast = FastLineRec{};
+            defer fast.deinit(testing.allocator);
+            const res = try searchSlice(FastLineRec, &fast, overlong, "trunc", &finder, .{
+                .binary = policy,
+                .line_numbers = true,
+                .max_line_len = 16,
+            });
+            try testing.expectEqual(Outcome.complete, res.outcome);
+            try testing.expectEqual(@as(u64, 2), res.matched_lines);
+            try testing.expect(fast.saw_truncated);
+            try testing.expectEqual(@as(u64, 33), fast.trunc_line_len);
+            try testing.expectEqual(@as(usize, 16), fast.trunc_bytes_len);
+
+            var ref = Rec{};
+            defer ref.deinit(testing.allocator);
+            _ = try searchSlice(Rec, &ref, overlong, "trunc-ref", &finder, .{
+                .binary = policy,
+                .line_numbers = true,
+                .max_line_len = 16,
+            });
+            try testing.expectEqualStrings(ref.text.items, fast.out.items);
+        }
+    }
+
+    // 4. Reader path: NUL in incomplete trailing line stops immediately on that chunk
+    {
+        var finder = try Finder.init("NEEDLE", .{});
+        const data = "line1 NEEDLE\nline2 ok\npartial line with \x00 nul before newline";
+        var reader = std.Io.Reader.fixed(data);
+        var fast = FastLineRec{};
+        defer fast.deinit(testing.allocator);
+        const res = try searchReader(FastLineRec, testing.allocator, &fast, &reader, "partial-nul", &finder, .{
+            .binary = .quit,
+            .line_numbers = true,
+            .buffer_size = 48,
+        });
+        try testing.expectEqual(Outcome.binary_quit, res.outcome);
+        try testing.expectEqual(@as(u64, 1), res.matched_lines);
+        try testing.expectEqual(@as(?u64, 40), res.nul_offset);
+        try testing.expectEqual(@as(?u64, 40), fast.nul);
+        try testing.expectEqualStrings("1:line1 NEEDLE\n", fast.out.items);
+    }
+}
+
 test {
     _ = @import("challenger_test.zig");
 }

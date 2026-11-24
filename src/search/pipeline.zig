@@ -38,7 +38,7 @@ const effectiveAllocator = cfg_mod.effectiveAllocator;
 const State = state_mod.State;
 const resetStats = state_mod.resetStats;
 const lineStart = state_mod.lineStart;
-const lineEnd = state_mod.lineEnd;
+const lineEnd = line_matcher_mod.fastLineEnd;
 const armClock = state_mod.armClock;
 const restoreCounters = state_mod.restoreCounters;
 const finishSink = state_mod.finishSink;
@@ -406,7 +406,7 @@ inline fn shouldSwitchToPrepass(
     if (config.max_count != null or config.max_results != null or config.exists) return false;
     if (fused_hits < 4) return false;
     return (pos <= initial_pos +| (32 * 1024) and view_len > pos +| (64 * 1024)) or
-        (pos <= initial_pos +| (512 * 1024) and view_len > pos +| (2 * 1024 * 1024));
+        (pos <= initial_pos +| (64 * 1024) and view_len > pos +| (256 * 1024));
 }
 
 pub fn searchPrepared(
@@ -512,6 +512,26 @@ pub fn searchPrepared(
     if (state.pending_skip_to != null) {
         _ = line_matcher_mod.applyInBufferSkip(view, view.len, &state, config);
         state.pending_skip_to = null;
+    }
+
+    if (comptime line_matcher_mod.isFinderFastEligibleType(S, @TypeOf(matcher))) {
+        if (line_matcher_mod.canUseFinderFast(S, matcher, &state, config)) {
+            const keep = if (watchesBinary(config))
+                try line_matcher_mod.scanFinderFast(S, true, sink, matcher, view, &state, config)
+            else
+                try line_matcher_mod.scanFinderFast(S, false, sink, matcher, view, &state, config);
+            if (!keep) {
+                if (state.pending_skip_to != null) {
+                    state.pending_skip_to = null;
+                } else {
+                    state.stopped = true;
+                }
+            }
+            const consumed_f = state.nul_offset == null and (!state.stopped or state.pos >= view.len) and !state.output_blocked;
+            if (consumed_f and !state.hit_byte_cap and state.soft_error == null) state.scanned_all = true;
+            if (state.hit_byte_cap) noteLimit(&state, .max_bytes);
+            return finishSink(S, sink, &state, config);
+        }
     }
 
     var switched_to_prepass = false;
@@ -789,7 +809,7 @@ pub fn searchPrepared(
             !config.passthru and
             !config.stop_on_nonmatch)
         {
-            const chunk_target: usize = 256 * 1024;
+            const chunk_target: usize = 128 * 1024;
             const sep = cfg_mod.recordSep(config);
             while (state.pos < view.len and !state.stopped) {
                 if (state.exceeded(config) or flagIsSet(config) or stopInMatch(&state, config) or !maybeProgress(S, sink, &state, config)) {
@@ -1511,8 +1531,10 @@ pub fn drive(
         }
     }
 
+    var checked_incomplete_nul: usize = 0;
     while (!state.stopped) {
         if (state.pending_skip_to) |skip_target| {
+            checked_incomplete_nul = 0;
             state.pending_skip_to = null;
             state.after_left = 0;
             state.ring.clear();
@@ -1666,6 +1688,8 @@ pub fn drive(
             } else if (!try makeRoomAligned(S, pool_alloc, sink, matcher, &buf, &filled, &hold, &seen, &state, config, backing)) {
                 state.stopped = true;
                 break;
+            } else {
+                checked_incomplete_nul = 0;
             }
             if (state.pending_skip_to != null) continue;
         }
@@ -1834,6 +1858,7 @@ pub fn drive(
             }
             chunk_at = 0;
             fast_no_nul_hit = null;
+            checked_incomplete_nul = 0;
         }
 
         const can_fuse_chunk = canFuse(matcher, config, &state);
@@ -1846,7 +1871,49 @@ pub fn drive(
 
         const no_more_reads = eof or state_mod.overBytes(&state, config) or state_mod.overDecompressed(&state, config);
         const saved_pos_before_fuse = state.pos;
-        if (fast_no_nul_done) {
+        var finder_fast_handled = false;
+        if (comptime line_matcher_mod.isFinderFastEligibleType(S, @TypeOf(matcher))) {
+            if (watchesBinary(config) and line_matcher_mod.canUseFinderFast(S, matcher, &state, config)) {
+                finder_fast_handled = true;
+                search_end = if (eof) filled else lastComplete(buf[0..filled], config);
+                view_end = search_end;
+                skip_match = true;
+                if (search_end > state.pos) {
+                    if (!try line_matcher_mod.scanFinderFast(S, true, sink, matcher, buf[0..search_end], &state, config)) {
+                        if (state.pending_skip_to != null and !state.paused) {
+                            checked_incomplete_nul = 0;
+                            continue;
+                        }
+                        if (state.nul_offset != null) {
+                            filled = state.pos;
+                        } else if (eof and state.pos >= view_end and !state.output_blocked and !state.paused) {
+                            state.scanned_all = true;
+                        }
+                        state.stopped = true;
+                        break;
+                    }
+                }
+                if (!eof and search_end < filled) {
+                    const tail_from = @max(search_end, checked_incomplete_nul);
+                    if (tail_from < filled) {
+                        if (memchr.find(width, buf[0..filled], tail_from, 0)) |nul_idx| {
+                            noteBinary(&state, config, state.abs_base + @as(u64, nul_idx));
+                            _ = callOpt(S, "binary", sink, .{state.nul_offset.?});
+                            filled = search_end;
+                            state.pos = search_end;
+                            state.stopped = true;
+                            break;
+                        }
+                    }
+                    checked_incomplete_nul = filled - search_end;
+                } else {
+                    checked_incomplete_nul = 0;
+                }
+            }
+        }
+        if (finder_fast_handled) {
+            // Single-pass Finder fast loop already scanned [0..search_end] and verified trailing partial line NUL-free.
+        } else if (fast_no_nul_done) {
             skip_match = true;
             if (eof) {
                 search_end = filled;

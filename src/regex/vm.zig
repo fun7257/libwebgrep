@@ -140,6 +140,9 @@ pub const Regex = struct {
     req_word_bounded: bool = false,
     /// True when `req_word_bounded` uses ASCII `\b` (`.ascii_word_boundary`) rather than Unicode `\b`.
     req_word_bounded_ascii: bool = false,
+    /// Precomputed word-class of the first and last character of `req_literal_bytes` when `req_word_bounded` is true.
+    req_wb_first_word: bool = false,
+    req_wb_last_word: bool = false,
     /// Minimum bytes required before `req_literal_bytes` (derived from compiled NFA graph).
     req_min_before: usize = 0,
     /// Bounded maximum bytes before `req_literal_bytes`, or `null` when a prefix cycle exists.
@@ -187,6 +190,9 @@ pub const Regex = struct {
     has_alt: bool = false,
     saw_extended: bool = false,
     dfa_is_exact: bool = false,
+    /// True when `dfa_is_exact` and every accepting state in `precomputed_dfa` is terminal (no outgoing transitions),
+    /// guaranteeing a unique exact match length from any start position across `.earliest` and `.leftmost_first`.
+    dfa_all_matches_terminal: bool = false,
     /// True when `precomputed_dfa` produces exact match spans whenever the matched slice is pure ASCII.
     dfa_exact_on_ascii: bool = false,
     /// True when `precomputed_dfa` (including `.any`) produces exact match spans on pure ASCII slices
@@ -360,6 +366,16 @@ pub const Regex = struct {
                 if (heap_dfa.determinize(self.insts, self.unicode_ranges, self.start_pc, self.multiline)) {
                     self.precomputed_dfa = heap_dfa;
                     self.dfa_is_exact = !self.has_lazy and dfa_mod.isExactInsts(self.insts);
+                    if (self.dfa_is_exact) {
+                        var all_term = true;
+                        for (0..heap_dfa.num_states) |st| {
+                            if (heap_dfa.is_match[st] and !heap_dfa.is_terminal[st]) {
+                                all_term = false;
+                                break;
+                            }
+                        }
+                        self.dfa_all_matches_terminal = all_term;
+                    }
                     self.dfa_exact_on_ascii = !self.has_lazy and dfa_mod.isExactOnAsciiInsts(self.insts);
                     self.dfa_exact_on_ascii_any = !self.has_lazy and dfa_mod.isExactOnAsciiAnyInsts(self.insts);
                     if (self.dfa_exact_on_ascii_any) {
@@ -552,14 +568,61 @@ pub const Regex = struct {
         return false;
     }
 
+    inline fn isWordBoundedHit(self: *const Regex, haystack: []const u8, hit: Match) bool {
+        if (self.req_word_bounded_ascii) {
+            const left_w = hit.start > 0 and unicode_fold.isAsciiWordByte(haystack[hit.start - 1]);
+            const right_w = hit.end < haystack.len and unicode_fold.isAsciiWordByte(haystack[hit.end]);
+            return left_w != self.req_wb_first_word and right_w != self.req_wb_last_word;
+        }
+        const left_w = unicode_fold.isWordBefore(haystack, hit.start);
+        const right_w = unicode_fold.isWordAt(haystack, hit.end);
+        return left_w != self.req_wb_first_word and right_w != self.req_wb_last_word;
+    }
+
+    fn findWordBounded(self: *const Regex, pf: *const Finder, haystack: []const u8, start: usize) ?Match {
+        if (start > haystack.len) return null;
+        var pos = start;
+        const shift = self.req_prefix_shift;
+        const first_w = self.req_wb_first_word;
+        const last_w = self.req_wb_last_word;
+        if (self.req_word_bounded_ascii) {
+            while (pos <= haystack.len) {
+                const hit = pf.findReadOnly(haystack, pos, .earliest) orelse return null;
+                const left_w = hit.start > 0 and unicode_fold.isAsciiWordByte(haystack[hit.start - 1]);
+                const right_w = hit.end < haystack.len and unicode_fold.isAsciiWordByte(haystack[hit.end]);
+                if (left_w != first_w and right_w != last_w) return hit;
+                pos = hit.start + shift;
+            }
+            return null;
+        }
+        while (pos <= haystack.len) {
+            const hit = pf.findReadOnly(haystack, pos, .earliest) orelse return null;
+            const left_w = unicode_fold.isWordBefore(haystack, hit.start);
+            const right_w = unicode_fold.isWordAt(haystack, hit.end);
+            if (left_w != first_w and right_w != last_w) return hit;
+            pos = hit.start + shift;
+        }
+        return null;
+    }
+
     /// Thread-safe, lock-free search over `haystack`. Accepts `*const Regex` (and `*Regex` via auto-coercion).
     pub fn find(self: *const Regex, haystack: []const u8, start: usize, mode: MatchMode) ?Match {
+        if (self.req_word_bounded) {
+            if (self.prefilter) |*pf| {
+                return self.findWordBounded(pf, haystack, start);
+            }
+        }
         const steps: ?*usize = if (comptime builtin.is_test) @constCast(&self.steps) else null;
         return self.findInternal(haystack, start, mode, steps, null);
     }
 
     /// Alias for `find` on `*const Regex`.
     pub fn findReadOnly(self: *const Regex, haystack: []const u8, start: usize, mode: MatchMode) ?Match {
+        if (self.req_word_bounded) {
+            if (self.prefilter) |*pf| {
+                return self.findWordBounded(pf, haystack, start);
+            }
+        }
         return self.findInternal(haystack, start, mode, null, null);
     }
 
@@ -569,6 +632,12 @@ pub const Regex = struct {
     pub fn findEnd(self: *const Regex, haystack: []const u8, start: usize, mode: MatchMode) ?usize {
         if (start > haystack.len) return null;
         if (self.anchored_start and start > 0) return null;
+        if (self.req_word_bounded) {
+            if (self.prefilter) |*pf| {
+                const hit = self.findWordBounded(pf, haystack, start) orelse return null;
+                return hit.end;
+            }
+        }
         if (self.unanchored_dfa) |udfa| {
             if (mode == .earliest and !self.multiline and udfa.has_exact_match) {
                 const steps: ?*usize = if (comptime builtin.is_test) @constCast(&self.steps) else null;
@@ -604,6 +673,11 @@ pub const Regex = struct {
         mode: MatchMode,
         scratch: *RegexScratch,
     ) ?Match {
+        if (self.req_word_bounded) {
+            if (self.prefilter) |*pf| {
+                return self.findWordBounded(pf, haystack, start);
+            }
+        }
         _ = scratch.ensureDfa() catch {};
         const steps: ?*usize = if (comptime builtin.is_test) @constCast(&self.steps) else null;
         return self.findInternal(haystack, start, mode, steps, scratch);
@@ -637,7 +711,7 @@ pub const Regex = struct {
         return self.extractCaptures(haystack, m);
     }
 
-    fn findInternal(
+    noinline fn findInternal(
         self: *const Regex,
         haystack: []const u8,
         start: usize,
@@ -658,16 +732,7 @@ pub const Regex = struct {
         // Fast path 1b: the entire regex is strictly `\b<literal>\b` (Unicode or ASCII)
         if (self.req_word_bounded) {
             if (self.prefilter) |*pf| {
-                const wb_kind: AssertKind = if (self.req_word_bounded_ascii) .ascii_word_boundary else .word_boundary;
-                var pos = start;
-                while (pos <= haystack.len) {
-                    const hit = pf.findReadOnly(haystack, pos, .earliest) orelse return null;
-                    if (checkAssert(wb_kind, haystack, hit.start) and checkAssert(wb_kind, haystack, hit.end)) {
-                        return hit;
-                    }
-                    pos = hit.start + self.req_prefix_shift;
-                }
-                return null;
+                return self.findWordBounded(pf, haystack, start);
             }
         }
 
@@ -1132,7 +1197,10 @@ pub const Regex = struct {
                 const s0: u16 = if (can_skip) self.regex.alt_dfa_prefix_state[pat_id] else dfa_mod.start_state;
                 const p0: usize = if (can_skip) self.regex.alt_dfa_prefix_len[pat_id] else 0;
                 if (comptime stops_on_crlf) {
-                    if (self.dfa.matchPrefixDeterminized(haystack[pat_start..], s0, p0, true) != null) {
+                    if (self.dfa.matchPrefixDeterminized(haystack[pat_start..], s0, p0, true)) |match_len| {
+                        if (self.regex.dfa_all_matches_terminal and (!self.regex.multiline or match_len <= self.regex.max_multiline_window)) {
+                            return .{ .accept = pat_start + match_len };
+                        }
                         const win_end = if (!self.regex.multiline and self.cached_win_end != std.math.maxInt(usize) and
                             pat_start >= self.cached_win_start and pat_start <= self.cached_win_end)
                             self.cached_win_end
@@ -1156,7 +1224,10 @@ pub const Regex = struct {
                         self.cached_win_end = w;
                         break :blk w;
                     };
-                    if (self.dfa.matchPrefixDeterminized(haystack[pat_start..win_end], s0, p0, true) != null) {
+                    if (self.dfa.matchPrefixDeterminized(haystack[pat_start..win_end], s0, p0, true)) |match_len| {
+                        if (self.regex.dfa_all_matches_terminal) {
+                            return .{ .accept = pat_start + match_len };
+                        }
                         if (self.regex.runRangeAllowed(haystack, pat_start, pat_start, win_end, self.mode, AllowAny{}, self.steps, self.scratch)) |m| {
                             return .{ .accept = m.end };
                         }
@@ -1749,11 +1820,10 @@ pub const Regex = struct {
             const pf_slice = haystack[0..prefilter_end];
 
             var pos = scan_pos;
-            const wb_kind: AssertKind = if (self.req_word_bounded_ascii) .ascii_word_boundary else .word_boundary;
             while (pos < eff_end) {
                 const hit = pf.findReadOnly(pf_slice, pos, .earliest) orelse break;
                 if (hit.start >= eff_end) break;
-                if (checkAssert(wb_kind, haystack, hit.start) and checkAssert(wb_kind, haystack, hit.end)) {
+                if (self.isWordBoundedHit(haystack, hit)) {
                     if (has_nul) {
                         if (hit.end <= eff_end) return hit;
                         nul.* = eff_end;
@@ -2312,12 +2382,11 @@ pub const Regex = struct {
             }
             if (self.req_word_bounded) {
                 if (self.prefilter) |*pf| {
-                    const wb_kind: AssertKind = if (self.req_word_bounded_ascii) .ascii_word_boundary else .word_boundary;
                     var pos = start;
                     var rejects: usize = 0;
                     while (pos <= haystack.len) {
                         const hit = pf.findWatched(haystack, pos, nul) orelse return null;
-                        if (checkAssert(wb_kind, haystack, hit.start) and checkAssert(wb_kind, haystack, hit.end)) {
+                        if (self.isWordBoundedHit(haystack, hit)) {
                             return hit;
                         }
                         const next_pos = hit.start + self.req_prefix_shift;
@@ -5168,6 +5237,14 @@ fn analyzeRequiredLiteralContext(self: *Regex) void {
             if (!self.multiline or max_len <= self.max_multiline_window) {
                 self.req_word_bounded = true;
                 self.req_word_bounded_ascii = is_ascii_wb;
+                const lit = self.req_literal_bytes;
+                if (is_ascii_wb) {
+                    self.req_wb_first_word = unicode_fold.isAsciiWordByte(lit[0]);
+                    self.req_wb_last_word = unicode_fold.isAsciiWordByte(lit[lit.len - 1]);
+                } else {
+                    self.req_wb_first_word = unicode_fold.isWordAt(lit, 0);
+                    self.req_wb_last_word = unicode_fold.isWordBefore(lit, lit.len);
+                }
                 return;
             }
         }

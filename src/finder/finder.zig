@@ -309,7 +309,7 @@ pub const Finder = struct {
         _ = self;
     }
 
-    fn findUnicodePrefiltered(self: *const Finder, haystack: []const u8, start: usize, nul_opt: ?*?usize) ?matcher.Match {
+    noinline fn findUnicodePrefiltered(self: *const Finder, haystack: []const u8, start: usize, nul_opt: ?*?usize) ?matcher.Match {
         const pair = &self.kind.pair;
         const sub_len = self.unicode_ascii_len;
         if (self.unicode_ascii_off == 0) {
@@ -401,16 +401,24 @@ pub const Finder = struct {
         return null;
     }
 
-    fn findPair(self: *const Finder, haystack: []const u8, start: usize) ?matcher.Match {
+    inline fn findPair(self: *const Finder, haystack: []const u8, start: usize) ?matcher.Match {
         const pair = &self.kind.pair;
         const m = pair.pattern.len;
         if (m > haystack.len or start > haystack.len - m) return null;
 
         // Short patterns have a constant-factor linear worst case, so they never switch to scalar Two-Way.
         // Long patterns switch only when the caller lowers the threshold below 1 and the prefilter fails to make progress.
+        if (m <= packed_pair.owns_search_max_len or self.fp_threshold >= 1) {
+            const at = pair.find(memchr.native_width, haystack, start, null) orelse return null;
+            return .{ .start = at, .end = at + m, .pattern_id = null };
+        }
+        return self.findPairGuarded(haystack, start, m);
+    }
+
+    noinline fn findPairGuarded(self: *const Finder, haystack: []const u8, start: usize, m: usize) ?matcher.Match {
+        const pair = &self.kind.pair;
         var guard: packed_pair.Guard = .{};
-        const watch = m > packed_pair.owns_search_max_len and self.fp_threshold < 1;
-        const at = pair.find(memchr.native_width, haystack, start, if (watch) &guard else null);
+        const at = pair.find(memchr.native_width, haystack, start, &guard);
         if (at) |pos| {
             return .{ .start = pos, .end = pos + m, .pattern_id = null };
         }
@@ -421,7 +429,7 @@ pub const Finder = struct {
         return null;
     }
 
-    fn findPairWatched(self: *const Finder, haystack: []const u8, start: usize, nul: *?usize) ?matcher.Match {
+    inline fn findPairWatched(self: *const Finder, haystack: []const u8, start: usize, nul: *?usize) ?matcher.Match {
         const pair = &self.kind.pair;
         const m = pair.pattern.len;
         if (m > haystack.len or start > haystack.len - m) {
@@ -431,9 +439,22 @@ pub const Finder = struct {
             return null;
         }
 
+        if (m <= packed_pair.owns_search_max_len or self.fp_threshold >= 1) {
+            const at = pair.findWatchingNul(memchr.native_width, haystack, start, null, nul);
+            if (nul.* != null) {
+                @branchHint(.cold);
+                return null;
+            }
+            const pos = at orelse return null;
+            return .{ .start = pos, .end = pos + m, .pattern_id = null };
+        }
+        return self.findPairWatchedGuarded(haystack, start, m, nul);
+    }
+
+    noinline fn findPairWatchedGuarded(self: *const Finder, haystack: []const u8, start: usize, m: usize, nul: *?usize) ?matcher.Match {
+        const pair = &self.kind.pair;
         var guard: packed_pair.Guard = .{};
-        const watch = m > packed_pair.owns_search_max_len and self.fp_threshold < 1;
-        const at = pair.findWatchingNul(memchr.native_width, haystack, start, if (watch) &guard else null, nul);
+        const at = pair.findWatchingNul(memchr.native_width, haystack, start, &guard, nul);
         if (nul.* != null) {
             @branchHint(.cold);
             return null;
@@ -456,7 +477,7 @@ pub const Finder = struct {
         return null;
     }
 
-    fn findLinear(self: *const Finder, haystack: []const u8, start: usize, m: usize) ?matcher.Match {
+    noinline fn findLinear(self: *const Finder, haystack: []const u8, start: usize, m: usize) ?matcher.Match {
         const at = self.two_way.find(haystack, start) orelse return null;
         return .{ .start = at, .end = at + m, .pattern_id = null };
     }

@@ -443,11 +443,11 @@ pub fn lineStartAt(haystack: []const u8, pos: usize) usize {
     return 0;
 }
 
-pub fn isWordChar(b: u8) bool {
+pub inline fn isWordChar(b: u8) bool {
     return unicode_fold.isAsciiWordByte(b);
 }
 
-pub fn checkAssert(kind: AssertKind, haystack: []const u8, pos: usize) bool {
+pub inline fn checkAssert(kind: AssertKind, haystack: []const u8, pos: usize) bool {
     return switch (kind) {
         .start_line => pos == 0 or (pos <= haystack.len and haystack[pos - 1] == '\n'),
         .end_line => pos == haystack.len or haystack[pos] == '\n' or (pos + 1 < haystack.len and haystack[pos] == '\r' and haystack[pos + 1] == '\n'),

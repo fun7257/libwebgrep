@@ -111,8 +111,8 @@ pub const PackedPair = struct {
     /// Finds the start of the next full match in `haystack[start..]`.
     /// When `guard` is non-null and the pattern is longer than `owns_search_max_len`, stops if the prefilter
     /// advances too slowly and records the resume offset for Two-Way in `guard`.
-    pub fn find(
-        self: PackedPair,
+    pub inline fn find(
+        self: *const PackedPair,
         comptime width: comptime_int,
         haystack: []const u8,
         start: usize,
@@ -122,7 +122,7 @@ pub const PackedPair = struct {
     }
 
     pub fn findWithWidth(
-        self: PackedPair,
+        self: *const PackedPair,
         comptime width: comptime_int,
         haystack: []const u8,
         start: usize,
@@ -134,8 +134,8 @@ pub const PackedPair = struct {
     /// Same as `find`, while also checking already-loaded vectors for NUL bytes.
     /// If a NUL is seen before a match completes, writes its offset to `nul_out` and returns null so the caller can apply its binary policy.
     /// When returning a match, guarantees no NUL precedes or lies within the matched span; bytes after the match are checked by the caller.
-    pub fn findWatchingNul(
-        self: PackedPair,
+    pub inline fn findWatchingNul(
+        self: *const PackedPair,
         comptime width: comptime_int,
         haystack: []const u8,
         start: usize,
@@ -146,7 +146,7 @@ pub const PackedPair = struct {
     }
 
     pub fn findWatchingNulWithWidth(
-        self: PackedPair,
+        self: *const PackedPair,
         comptime width: comptime_int,
         haystack: []const u8,
         start: usize,
@@ -156,8 +156,8 @@ pub const PackedPair = struct {
         return self.findWatchingNul(width, haystack, start, guard, nul_out);
     }
 
-    fn findInner(
-        self: PackedPair,
+    inline fn findInner(
+        self: *const PackedPair,
         comptime width: comptime_int,
         haystack: []const u8,
         start: usize,
@@ -175,16 +175,33 @@ pub const PackedPair = struct {
         }
         const last = haystack.len - m;
         // Case folding, guard accounting, and NUL watching are specialized outside the loop so the miss loop contains only loads, comparisons, and reductions.
+        // Keep the case-sensitive unwatched loop inline so `Finder.findPair` avoids a nested call and stack frame;
+        // outline fold/guarded variants so they never inflate the hot frame.
         if (self.ignore_case) {
-            if (guard) |g| return self.findLoop(width, haystack, start, last, true, true, watch_nul, g, nul_out);
-            return self.findLoop(width, haystack, start, last, true, false, watch_nul, undefined, nul_out);
+            if (guard) |g| return self.findLoopOutOfLine(width, haystack, start, last, true, true, watch_nul, g, nul_out);
+            return self.findLoopOutOfLine(width, haystack, start, last, true, false, watch_nul, undefined, nul_out);
         }
-        if (guard) |g| return self.findLoop(width, haystack, start, last, false, true, watch_nul, g, nul_out);
+        if (guard) |g| return self.findLoopOutOfLine(width, haystack, start, last, false, true, watch_nul, g, nul_out);
         return self.findLoop(width, haystack, start, last, false, false, watch_nul, undefined, nul_out);
     }
 
-    fn findLoop(
-        self: PackedPair,
+    noinline fn findLoopOutOfLine(
+        self: *const PackedPair,
+        comptime width: comptime_int,
+        haystack: []const u8,
+        start: usize,
+        last: usize,
+        comptime fold: bool,
+        comptime watched: bool,
+        comptime watch_nul: bool,
+        guard: *Guard,
+        nul_out: *?usize,
+    ) ?usize {
+        return self.findLoop(width, haystack, start, last, fold, watched, watch_nul, guard, nul_out);
+    }
+
+    inline fn findLoop(
+        self: *const PackedPair,
         comptime width: comptime_int,
         haystack: []const u8,
         start: usize,
@@ -204,6 +221,47 @@ pub const PackedPair = struct {
         }
         var origin = start;
         var previous = start;
+
+        // Probe a single `width`-byte vector at `origin = start` before entering the 4-vector (128B) unrolled loop.
+        // Dense hits in the first 32 bytes resolve in 2 vector loads + inline confirm instead of preloading 8 vectors.
+        if (origin <= last and origin + max_index + width <= haystack.len) {
+            const first_mask = hotMask(self, width, haystack, origin, fold, watch_nul);
+            if (comptime builtin.cpu.arch.endian() == .little) {
+                const MaskInt = @Int(.unsigned, width);
+                const bits: MaskInt = @bitCast(first_mask);
+                if (bits != 0) {
+                    if (!watch_nul and !watched and !fold and self.pattern.len <= owns_search_max_len) {
+                        var m_bits = bits;
+                        while (m_bits != 0) : (m_bits &= m_bits - 1) {
+                            const rel: usize = @ctz(m_bits);
+                            const at = origin + rel;
+                            if (at > last) break;
+                            if (confirmFast(self, haystack, at, false)) return at;
+                        }
+                    } else {
+                        const rel = @call(
+                            .never_inline,
+                            takeHitMask,
+                            .{ self, width, haystack, origin, last, bits, &previous, fold, watched, watch_nul, guard, nul_out },
+                        );
+                        if (watch_nul and nul_out.* != null) return null;
+                        if (rel) |found| return origin + found;
+                        if (watched and guard.gave_up) return null;
+                    }
+                }
+            } else if (@reduce(.Or, first_mask)) {
+                const rel = @call(
+                    .never_inline,
+                    takeHit,
+                    .{ self, width, haystack, origin, last, &previous, fold, watched, watch_nul, guard, nul_out },
+                );
+                if (watch_nul and nul_out.* != null) return null;
+                if (rel) |found| return origin + found;
+                if (watched and guard.gave_up) return null;
+            }
+            origin += width;
+        }
+
         // Advance 4 vectors per iteration and OR their masks into a single reduction, cutting reduction and branch instructions by 75%.
         const stride = width * 4;
         while (origin <= last and origin + max_index + stride <= haystack.len) {
@@ -213,24 +271,81 @@ pub const PackedPair = struct {
             }
             if (@reduce(.Or, (masks[0] | masks[1]) | (masks[2] | masks[3]))) {
                 @branchHint(.unlikely);
-                inline for (0..4) |k| {
-                    if (@reduce(.Or, masks[k])) {
-                        const at = origin + k * width;
-                        const rel = @call(
-                            .never_inline,
-                            takeHit,
-                            .{ self, width, haystack, at, last, &previous, fold, watched, watch_nul, guard, nul_out },
-                        );
-                        if (watch_nul and nul_out.* != null) return null;
-                        if (rel) |found| return at + found;
-                        if (watched and guard.gave_up) return null;
+                if (comptime builtin.cpu.arch.endian() == .little) {
+                    const MaskInt = @Int(.unsigned, width);
+                    const bit_arr = [4]MaskInt{
+                        @bitCast(masks[0]),
+                        @bitCast(masks[1]),
+                        @bitCast(masks[2]),
+                        @bitCast(masks[3]),
+                    };
+                    for (bit_arr, 0..) |bits, k| {
+                        if (bits == 0) continue;
+                        const at_origin = origin + k * width;
+                        if (!watch_nul and !watched and !fold and self.pattern.len <= owns_search_max_len) {
+                            var m_bits = bits;
+                            while (m_bits != 0) : (m_bits &= m_bits - 1) {
+                                const rel: usize = @ctz(m_bits);
+                                const at = at_origin + rel;
+                                if (at > last) break;
+                                if (confirmFast(self, haystack, at, false)) return at;
+                            }
+                        } else {
+                            const rel = @call(
+                                .never_inline,
+                                takeHitMask,
+                                .{ self, width, haystack, at_origin, last, bits, &previous, fold, watched, watch_nul, guard, nul_out },
+                            );
+                            if (watch_nul and nul_out.* != null) return null;
+                            if (rel) |found| return at_origin + found;
+                            if (watched and guard.gave_up) return null;
+                        }
+                    }
+                } else {
+                    inline for (0..4) |k| {
+                        if (@reduce(.Or, masks[k])) {
+                            const at = origin + k * width;
+                            const rel = @call(
+                                .never_inline,
+                                takeHit,
+                                .{ self, width, haystack, at, last, &previous, fold, watched, watch_nul, guard, nul_out },
+                            );
+                            if (watch_nul and nul_out.* != null) return null;
+                            if (rel) |found| return at + found;
+                            if (watched and guard.gave_up) return null;
+                        }
                     }
                 }
             }
             origin += stride;
         }
         while (origin <= last and origin + max_index + width <= haystack.len) {
-            if (@reduce(.Or, hotMask(self, width, haystack, origin, fold, watch_nul))) {
+            const vec_mask = hotMask(self, width, haystack, origin, fold, watch_nul);
+            if (comptime builtin.cpu.arch.endian() == .little) {
+                const MaskInt = @Int(.unsigned, width);
+                const bits: MaskInt = @bitCast(vec_mask);
+                if (bits != 0) {
+                    @branchHint(.unlikely);
+                    if (!watch_nul and !watched and !fold and self.pattern.len <= owns_search_max_len) {
+                        var m_bits = bits;
+                        while (m_bits != 0) : (m_bits &= m_bits - 1) {
+                            const rel: usize = @ctz(m_bits);
+                            const at = origin + rel;
+                            if (at > last) break;
+                            if (confirmFast(self, haystack, at, false)) return at;
+                        }
+                    } else {
+                        const rel = @call(
+                            .never_inline,
+                            takeHitMask,
+                            .{ self, width, haystack, origin, last, bits, &previous, fold, watched, watch_nul, guard, nul_out },
+                        );
+                        if (watch_nul and nul_out.* != null) return null;
+                        if (rel) |found| return origin + found;
+                        if (watched and guard.gave_up) return null;
+                    }
+                }
+            } else if (@reduce(.Or, vec_mask)) {
                 @branchHint(.unlikely);
                 const rel = @call(
                     .never_inline,
@@ -586,10 +701,44 @@ pub const MaskedPair = struct {
     }
 };
 
-fn confirm(self: PackedPair, haystack: []const u8, origin: usize) bool {
+inline fn confirmFast(self: *const PackedPair, haystack: []const u8, origin: usize, comptime fold: bool) bool {
     const pat = self.pattern;
-    const window = haystack[origin..][0..pat.len];
-    return if (self.ignore_case) std.ascii.eqlIgnoreCase(pat, window) else std.mem.eql(u8, pat, window);
+    const m = pat.len;
+    const win = haystack[origin..][0..m];
+    if (fold) return std.ascii.eqlIgnoreCase(pat, win);
+    if (m <= owns_search_max_len) {
+        if (m >= 16) {
+            const V16 = @Vector(16, u8);
+            const a0: V16 = pat[0..16].*;
+            const b0: V16 = win[0..16].*;
+            const a1: V16 = pat[m - 16 ..][0..16].*;
+            const b1: V16 = win[m - 16 ..][0..16].*;
+            return @reduce(.Or, (a0 ^ b0) | (a1 ^ b1)) == 0;
+        }
+        if (m >= 8) {
+            const a0: u64 = @bitCast(pat[0..8].*);
+            const b0: u64 = @bitCast(win[0..8].*);
+            const a1: u64 = @bitCast(pat[m - 8 ..][0..8].*);
+            const b1: u64 = @bitCast(win[m - 8 ..][0..8].*);
+            return ((a0 ^ b0) | (a1 ^ b1)) == 0;
+        }
+        if (m >= 4) {
+            const a0: u32 = @bitCast(pat[0..4].*);
+            const b0: u32 = @bitCast(win[0..4].*);
+            const a1: u32 = @bitCast(pat[m - 4 ..][0..4].*);
+            const b1: u32 = @bitCast(win[m - 4 ..][0..4].*);
+            return ((a0 ^ b0) | (a1 ^ b1)) == 0;
+        }
+        if (m >= 2) {
+            const a0: u16 = @bitCast(pat[0..2].*);
+            const b0: u16 = @bitCast(win[0..2].*);
+            const a1: u16 = @bitCast(pat[m - 2 ..][0..2].*);
+            const b1: u16 = @bitCast(win[m - 2 ..][0..2].*);
+            return ((a0 ^ b0) | (a1 ^ b1)) == 0;
+        }
+        return m == 0 or pat[0] == win[0];
+    }
+    return std.mem.eql(u8, pat, win);
 }
 
 inline fn byteMask(comptime width: comptime_int, block: @Vector(width, u8), byte: u8, comptime fold: bool) @Vector(width, bool) {
@@ -603,7 +752,7 @@ inline fn byteMask(comptime width: comptime_int, block: @Vector(width, u8), byte
 /// Hit mask for both anchor bytes in this window. When `watch_nul` is enabled, ORs in the NUL mask from the covering vector.
 /// The covering vector is the anchor at the smaller offset, which is already in a register and requires no extra load.
 inline fn hotMask(
-    self: PackedPair,
+    self: *const PackedPair,
     comptime width: comptime_int,
     haystack: []const u8,
     origin: usize,
@@ -624,9 +773,88 @@ fn noteNul(haystack: []const u8, base: usize, nul_out: *?usize) bool {
     return true;
 }
 
-/// Returns the match start relative to `origin`. Outlined so verification logic stays out of the hot loop.
+/// Little-endian out-of-line verification path consuming the already-computed `MaskInt` bitmask
+/// instead of reloading `left`/`right` (and avoiding `b3`/`b4` loads for short patterns).
+fn takeHitMask(
+    self: *const PackedPair,
+    comptime width: comptime_int,
+    haystack: []const u8,
+    origin: usize,
+    last: usize,
+    raw_mask: @Int(.unsigned, width),
+    previous: *usize,
+    comptime fold: bool,
+    comptime watched: bool,
+    comptime watch_nul: bool,
+    guard: *Guard,
+    nul_out: *?usize,
+) ?usize {
+    const MaskInt = @Int(.unsigned, width);
+    const cover_index = @min(self.anchor_index, self.other_index);
+    var mask: MaskInt = raw_mask;
+    if (watch_nul and watched) {
+        // When both guard accounting and NUL watching are active, separate true pair hits from NUL bits
+        // so NUL-only positions are never counted as prefilter false positives.
+        const left: @Vector(width, u8) = haystack[origin + self.anchor_index ..][0..width].*;
+        const right: @Vector(width, u8) = haystack[origin + self.other_index ..][0..width].*;
+        var hits = byteMask(width, left, self.anchor, fold) & byteMask(width, right, self.other, fold);
+        if (self.pattern.len >= 4) {
+            const b3: @Vector(width, u8) = haystack[origin + self.third_index ..][0..width].*;
+            const b4: @Vector(width, u8) = haystack[origin + self.fourth_index ..][0..width].*;
+            hits = hits & byteMask(width, b3, self.third, fold) & byteMask(width, b4, self.fourth, fold);
+        }
+        mask = @bitCast(hits);
+    } else if (!watch_nul and (watched or self.pattern.len > owns_search_max_len) and self.pattern.len >= 4) {
+        // Long patterns refine the precomputed 2-byte mask with third & fourth rare bytes without reloading anchor/other.
+        const b3: @Vector(width, u8) = haystack[origin + self.third_index ..][0..width].*;
+        const b4: @Vector(width, u8) = haystack[origin + self.fourth_index ..][0..width].*;
+        const extra: MaskInt = @bitCast(byteMask(width, b3, self.third, fold) & byteMask(width, b4, self.fourth, fold));
+        mask &= extra;
+    }
+
+    while (mask != 0) : (mask &= mask - 1) {
+        const rel: usize = @ctz(mask);
+        const at = origin + rel;
+        if (at > last) break;
+        if (confirmFast(self, haystack, at, fold)) {
+            if (watch_nul) {
+                const check_start = @min(haystack.len, origin + cover_index);
+                const check_end = @min(haystack.len, @max(check_start, at + self.pattern.len));
+                if (noteNul(haystack[check_start..check_end], check_start, nul_out)) return null;
+            }
+            return rel;
+        }
+        if (!watched) continue;
+        guard.noteMiss(at, previous.*);
+        previous.* = at + 1;
+        if (guard.gave_up) {
+            if (watch_nul) {
+                const block: @Vector(width, u8) = haystack[origin + cover_index ..][0..width].*;
+                const zeros = block == @as(@Vector(width, u8), @splat(0));
+                const zmask: MaskInt = @bitCast(zeros);
+                if (zmask != 0) {
+                    nul_out.* = origin + cover_index + @as(usize, @ctz(zmask));
+                }
+            }
+            return null;
+        }
+    }
+
+    if (watch_nul) {
+        const block: @Vector(width, u8) = haystack[origin + cover_index ..][0..width].*;
+        const zeros = block == @as(@Vector(width, u8), @splat(0));
+        const zmask: MaskInt = @bitCast(zeros);
+        if (zmask != 0) {
+            nul_out.* = origin + cover_index + @as(usize, @ctz(zmask));
+            return null;
+        }
+    }
+    return null;
+}
+
+/// Returns the match start relative to `origin`. Outlined fallback for big-endian targets.
 fn takeHit(
-    self: PackedPair,
+    self: *const PackedPair,
     comptime width: comptime_int,
     haystack: []const u8,
     origin: usize,
@@ -648,85 +876,45 @@ fn takeHit(
         hits = hits & byteMask(width, b3, self.third, fold) & byteMask(width, b4, self.fourth, fold);
     }
 
-    if (comptime builtin.cpu.arch.endian() == .little) {
-        // Little-endian bitmask extraction (`vpmovmskb` + `tzcnt` + `blsr` on x86_64 AVX2, optimal bit-scan on aarch64).
-        const MaskInt = @Int(.unsigned, width);
-        var mask: MaskInt = @bitCast(hits);
-        while (mask != 0) : (mask &= mask - 1) {
-            const rel: usize = @ctz(mask);
-            const at = origin + rel;
-            if (at > last) continue;
-            if (confirm(self, haystack, at)) {
-                if (watch_nul) {
-                    const check_start = @min(haystack.len, origin + cover_index);
-                    const check_end = @min(haystack.len, @max(check_start, at + self.pattern.len));
-                    if (noteNul(haystack[check_start..check_end], check_start, nul_out)) return null;
-                }
-                return rel;
+    const Index = std.simd.VectorIndex(@TypeOf(hits));
+    const indices = comptime std.simd.iota(Index, width);
+    while (std.simd.firstTrue(hits)) |rel| {
+        hits = @select(
+            bool,
+            indices == @as(@Vector(width, Index), @splat(rel)),
+            @as(@Vector(width, bool), @splat(false)),
+            hits,
+        );
+        const at = origin + @as(usize, rel);
+        if (at > last) continue;
+        if (confirmFast(self, haystack, at, fold)) {
+            if (watch_nul) {
+                const check_start = @min(haystack.len, origin + cover_index);
+                const check_end = @min(haystack.len, @max(check_start, at + self.pattern.len));
+                if (noteNul(haystack[check_start..check_end], check_start, nul_out)) return null;
             }
-            if (!watched) continue;
-            guard.noteMiss(at, previous.*);
-            previous.* = at + 1;
-            if (guard.gave_up) {
-                if (watch_nul) {
-                    const block: @Vector(width, u8) = haystack[origin + cover_index ..][0..width].*;
-                    const zeros = block == @as(@Vector(width, u8), @splat(0));
-                    const zmask: MaskInt = @bitCast(zeros);
-                    if (zmask != 0) {
-                        nul_out.* = origin + cover_index + @as(usize, @ctz(zmask));
-                    }
-                }
-                return null;
-            }
+            return @as(usize, rel);
         }
-    } else {
-        const Index = std.simd.VectorIndex(@TypeOf(hits));
-        const indices = comptime std.simd.iota(Index, width);
-        while (std.simd.firstTrue(hits)) |rel| {
-            hits = @select(
-                bool,
-                indices == @as(@Vector(width, Index), @splat(rel)),
-                @as(@Vector(width, bool), @splat(false)),
-                hits,
-            );
-            const at = origin + @as(usize, rel);
-            if (at > last) continue;
-            if (confirm(self, haystack, at)) {
-                if (watch_nul) {
-                    const check_start = @min(haystack.len, origin + cover_index);
-                    const check_end = @min(haystack.len, @max(check_start, at + self.pattern.len));
-                    if (noteNul(haystack[check_start..check_end], check_start, nul_out)) return null;
+        if (!watched) continue;
+        guard.noteMiss(at, previous.*);
+        previous.* = at + 1;
+        if (guard.gave_up) {
+            if (watch_nul) {
+                const block: @Vector(width, u8) = haystack[origin + cover_index ..][0..width].*;
+                const zeros = block == @as(@Vector(width, u8), @splat(0));
+                if (@reduce(.Or, zeros)) {
+                    const zrel = std.simd.firstTrue(zeros).?;
+                    nul_out.* = origin + cover_index + @as(usize, zrel);
                 }
-                return @as(usize, rel);
             }
-            if (!watched) continue;
-            guard.noteMiss(at, previous.*);
-            previous.* = at + 1;
-            if (guard.gave_up) {
-                if (watch_nul) {
-                    const block: @Vector(width, u8) = haystack[origin + cover_index ..][0..width].*;
-                    const zeros = block == @as(@Vector(width, u8), @splat(0));
-                    if (@reduce(.Or, zeros)) {
-                        const zrel = std.simd.firstTrue(zeros).?;
-                        nul_out.* = origin + cover_index + @as(usize, zrel);
-                    }
-                }
-                return null;
-            }
+            return null;
         }
     }
 
     if (watch_nul) {
         const block: @Vector(width, u8) = haystack[origin + cover_index ..][0..width].*;
         const zeros = block == @as(@Vector(width, u8), @splat(0));
-        if (comptime builtin.cpu.arch.endian() == .little) {
-            const MaskInt = @Int(.unsigned, width);
-            const zmask: MaskInt = @bitCast(zeros);
-            if (zmask != 0) {
-                nul_out.* = origin + cover_index + @as(usize, @ctz(zmask));
-                return null;
-            }
-        } else if (@reduce(.Or, zeros)) {
+        if (@reduce(.Or, zeros)) {
             const zrel = std.simd.firstTrue(zeros).?;
             nul_out.* = origin + cover_index + @as(usize, zrel);
             return null;
@@ -736,7 +924,7 @@ fn takeHit(
 }
 
 inline fn scalarFrom(
-    self: PackedPair,
+    self: *const PackedPair,
     haystack: []const u8,
     origin: usize,
     last: usize,
@@ -751,7 +939,7 @@ inline fn scalarFrom(
         const other_byte = haystack[i + self.other_index];
         if (!ascii.eq(anchor_byte, self.anchor, fold)) continue;
         if (!ascii.eq(other_byte, self.other, fold)) continue;
-        if (confirm(self, haystack, i)) return i;
+        if (confirmFast(self, haystack, i, fold)) return i;
         if (!watched) continue;
         guard.noteMiss(i, previous.*);
         previous.* = i + 1;

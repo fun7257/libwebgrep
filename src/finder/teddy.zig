@@ -157,6 +157,12 @@ pub fn EngineFor(comptime kind: IsaKind) type {
                     if (ascii.eq(w[1], w[2], ignore_case)) score += 100;
                     if (ascii.eq(w[0], w[2], ignore_case)) score += 35;
                 }
+                if (fingerprint >= 2 and std.ascii.isDigit(w[0]) and std.ascii.isDigit(w[1])) {
+                    score += 220;
+                    if (fingerprint >= 3 and std.ascii.isDigit(w[2])) {
+                        score += 160;
+                    }
+                }
                 if (score < best_score) {
                     best_score = score;
                     best_off = off;
@@ -414,12 +420,83 @@ pub fn EngineFor(comptime kind: IsaKind) type {
             const fast_extra: usize = fp - 1;
             const zero: Vec = @splat(0);
             var pos = pos_ref.*;
-            defer pos_ref.* = pos;
+            var nul_checked = nul_checked_ref.*;
+            var local_best = best.*;
+            defer {
+                pos_ref.* = pos;
+                if (watch_nul) nul_checked_ref.* = nul_checked;
+                best.* = local_best;
+            }
 
+            // Phase 1: fast inner loop while no candidate match has been accepted yet (`local_best == null`).
+            // Eliminates per-128B stack reload of `best.*` and `nul_checked_ref.*`.
+            if (local_best == null) {
+                while (pos + stride + fast_extra <= haystack.len) {
+                    var accs: [4]Vec = undefined;
+                    var min_b: Vec = @splat(1);
+                    inline for (0..4) |w| {
+                        const at = pos + w * lanes;
+                        const b0: Vec = haystack[at..][0..lanes].*;
+                        var acc = nibbleVec(isa, Vec, lo_tab[0], hi_tab[0], b0);
+                        if (comptime fp > 1) {
+                            const b1: Vec = haystack[at + 1 ..][0..lanes].*;
+                            acc &= nibbleVec(isa, Vec, lo_tab[1], hi_tab[1], b1);
+                        }
+                        if (comptime inline_fp3) {
+                            const b2: Vec = haystack[at + 2 ..][0..lanes].*;
+                            acc &= nibbleVec(isa, Vec, lo_tab[2], hi_tab[2], b2);
+                        }
+                        accs[w] = acc;
+                        if (watch_nul) {
+                            min_b = if (w == 0) b0 else @min(min_b, b0);
+                        }
+                    }
+                    const combined = (accs[0] | accs[1]) | (accs[2] | accs[3]);
+                    const nul_mask: Vec = if (watch_nul)
+                        @select(u8, min_b == zero, @as(Vec, @splat(0xFF)), zero)
+                    else
+                        zero;
+                    const check_v = if (watch_nul) combined | nul_mask else combined;
+                    if (@reduce(.Or, check_v) == 0) {
+                        @branchHint(.likely);
+                        pos += stride;
+                        if (watch_nul) nul_checked = pos;
+                        continue;
+                    }
+                    const block_has_nul = watch_nul and @reduce(.Or, nul_mask) != 0;
+                    if (watch_nul and !block_has_nul) {
+                        nul_checked = pos + stride;
+                    }
+                    inline for (0..4) |w| {
+                        const at = pos + w * lanes;
+                        if (local_best != null and self.done(Verifier, local_best, at, mode)) return .done;
+                        if (@reduce(.Or, accs[w]) != 0) {
+                            const acc = if (comptime inline_fp3)
+                                accs[w]
+                            else
+                                evalRefine(fp, accs[w], haystack, at, lo_tab, hi_tab);
+                            if (@reduce(.Or, acc) != 0) {
+                                const vec_status = self.scanVec(Verifier, haystack, at, start, mode, &local_best, aborted_at, acc, verifier);
+                                if (vec_status != .cont) return vec_status;
+                            }
+                        }
+                    }
+                    if (watch_nul and local_best == null and block_has_nul) {
+                        if (memchr.find(lanes, haystack[0 .. pos + stride], nul_checked, 0)) |nul_at| {
+                            nul_out.* = nul_at;
+                            return .found_nul;
+                        }
+                        nul_checked = pos + stride;
+                    }
+                    pos += stride;
+                    if (local_best != null) break;
+                }
+            }
+
+            // Phase 2: drain remaining window once `local_best != null` until `done()` fires.
             while (pos + stride + fast_extra <= haystack.len) {
-                if (best.* != null and self.done(Verifier, best.*, pos, mode)) return .done;
+                if (self.done(Verifier, local_best, pos, mode)) return .done;
                 var accs: [4]Vec = undefined;
-                var min_b: Vec = @splat(1);
                 inline for (0..4) |w| {
                     const at = pos + w * lanes;
                     const b0: Vec = haystack[at..][0..lanes].*;
@@ -433,45 +510,25 @@ pub fn EngineFor(comptime kind: IsaKind) type {
                         acc &= nibbleVec(isa, Vec, lo_tab[2], hi_tab[2], b2);
                     }
                     accs[w] = acc;
-                    if (watch_nul) {
-                        min_b = if (w == 0) b0 else @min(min_b, b0);
-                    }
                 }
                 const combined = (accs[0] | accs[1]) | (accs[2] | accs[3]);
-                const nul_mask: Vec = if (watch_nul)
-                    @select(u8, min_b == zero, @as(Vec, @splat(0xFF)), zero)
-                else
-                    zero;
-                const check_v = if (watch_nul) combined | nul_mask else combined;
-                if (@reduce(.Or, check_v) == 0) {
+                if (@reduce(.Or, combined) == 0) {
                     pos += stride;
-                    if (watch_nul and best.* == null) nul_checked_ref.* = pos;
                     continue;
-                }
-                const block_has_nul = watch_nul and @reduce(.Or, nul_mask) != 0;
-                if (watch_nul and best.* == null and !block_has_nul) {
-                    nul_checked_ref.* = pos + stride;
                 }
                 inline for (0..4) |w| {
                     const at = pos + w * lanes;
-                    if (best.* != null and self.done(Verifier, best.*, at, mode)) return .done;
+                    if (self.done(Verifier, local_best, at, mode)) return .done;
                     if (@reduce(.Or, accs[w]) != 0) {
                         const acc = if (comptime inline_fp3)
                             accs[w]
                         else
                             evalRefine(fp, accs[w], haystack, at, lo_tab, hi_tab);
                         if (@reduce(.Or, acc) != 0) {
-                            const vec_status = self.scanVec(Verifier, haystack, at, start, mode, best, aborted_at, acc, verifier);
+                            const vec_status = self.scanVec(Verifier, haystack, at, start, mode, &local_best, aborted_at, acc, verifier);
                             if (vec_status != .cont) return vec_status;
                         }
                     }
-                }
-                if (watch_nul and best.* == null and block_has_nul) {
-                    if (memchr.find(lanes, haystack[0 .. pos + stride], nul_checked_ref.*, 0)) |nul_at| {
-                        nul_out.* = nul_at;
-                        return .found_nul;
-                    }
-                    nul_checked_ref.* = pos + stride;
                 }
                 pos += stride;
             }
@@ -723,10 +780,38 @@ fn loadAt(comptime lanes: usize, comptime Vec: type, haystack: []const u8, at: u
     return tmp;
 }
 
-fn matchesAt(pat: []const u8, haystack: []const u8, at: usize, ignore: bool) bool {
-    if (at > haystack.len or pat.len > haystack.len - at) return false;
-    const slice = haystack[at..][0..pat.len];
-    return if (ignore) std.ascii.eqlIgnoreCase(pat, slice) else std.mem.eql(u8, pat, slice);
+inline fn matchesAt(pat: []const u8, haystack: []const u8, at: usize, ignore: bool) bool {
+    const m = pat.len;
+    if (at > haystack.len or m > haystack.len - at) return false;
+    const slice = haystack[at..][0..m];
+    if (!ignore) {
+        if (m <= 16) {
+            if (m >= 8) {
+                const a0: u64 = @bitCast(pat[0..8].*);
+                const b0: u64 = @bitCast(slice[0..8].*);
+                const a1: u64 = @bitCast(pat[m - 8 ..][0..8].*);
+                const b1: u64 = @bitCast(slice[m - 8 ..][0..8].*);
+                return ((a0 ^ b0) | (a1 ^ b1)) == 0;
+            }
+            if (m >= 4) {
+                const a0: u32 = @bitCast(pat[0..4].*);
+                const b0: u32 = @bitCast(slice[0..4].*);
+                const a1: u32 = @bitCast(pat[m - 4 ..][0..4].*);
+                const b1: u32 = @bitCast(slice[m - 4 ..][0..4].*);
+                return ((a0 ^ b0) | (a1 ^ b1)) == 0;
+            }
+            if (m >= 2) {
+                const a0: u16 = @bitCast(pat[0..2].*);
+                const b0: u16 = @bitCast(slice[0..2].*);
+                const a1: u16 = @bitCast(pat[m - 2 ..][0..2].*);
+                const b1: u16 = @bitCast(slice[m - 2 ..][0..2].*);
+                return ((a0 ^ b0) | (a1 ^ b1)) == 0;
+            }
+            return m == 0 or pat[0] == slice[0];
+        }
+        return std.mem.eql(u8, pat, slice);
+    }
+    return std.ascii.eqlIgnoreCase(pat, slice);
 }
 
 fn preferLeftmost(a: Cand, b: Cand) bool {

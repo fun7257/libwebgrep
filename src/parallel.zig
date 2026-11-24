@@ -16,6 +16,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const decompress = @import("codec/decompress.zig");
 const platform = @import("io/platform.zig");
+pub const window_map = @import("io/window_map.zig");
 const deque = @import("walk/deque.zig");
 const finder_mod = @import("finder/finder.zig");
 const matcher = @import("matcher.zig");
@@ -892,6 +893,12 @@ fn runFileOrMmap(
         const st = file.stat(shared.io) catch null;
         if (st) |info| {
             if (info.kind == .file and info.size > 0 and info.size <= std.math.maxInt(usize)) {
+                if (shared.on_event == null) {
+                    switch (try window_map.searchFileWindowed(S, sink, shared.io, file, info.size, path, engine, cfg)) {
+                        .done => |res| return res,
+                        .fallback => {},
+                    }
+                }
                 var mm = std.Io.File.MemoryMap.create(shared.io, file, .{
                     .len = @intCast(info.size),
                     .offset = 0,
@@ -1031,6 +1038,8 @@ fn FastLineSink(comptime mode: FastLineMode) type {
         path: []const u8,
         line_numbers: bool,
         multiline: bool,
+        last_line_number: u64 = 0,
+        last_line_offset: u64 = 0,
 
         const mid_file_flush_threshold: usize = 256 * 1024;
 
@@ -1060,6 +1069,12 @@ fn FastLineSink(comptime mode: FastLineMode) type {
 
         pub fn matched(self: *@This(), line: searcher.Line) bool {
             if (line.binary_status == .detected) return false;
+            if (self.line_numbers) {
+                if (line.number) |n| {
+                    self.last_line_number = n;
+                    self.last_line_offset = line.offset;
+                }
+            }
             switch (mode) {
                 .line => {
                     if (!self.writeBytes(line.bytes, line.number, ':')) return false;
@@ -1587,4 +1602,8 @@ test "multi-source streaming delivers events immediately without buffering all r
     });
     try testing.expectEqual(@as(u64, 1), stats_early.searches);
     try testing.expectEqual(@as(u32, 1), stream_early.ends);
+}
+
+test {
+    _ = window_map;
 }

@@ -931,6 +931,9 @@ fn runFileOrMmap(
                     const claimed = claimExtraWorkers(shared);
                     if (claimed >= 1) {
                         defer _ = shared.extra_workers.fetchSub(claimed, .acq_rel);
+                        if (cfg.byte_range == null and cfg.resume_from == 0) {
+                            platform.adviseSequentialFile(file);
+                        }
                         var fra = FileRa{ .file = file, .io = shared.io };
                         const ra = probe.RandomAccess{
                             .ctx = &fra,

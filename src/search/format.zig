@@ -219,6 +219,21 @@ pub fn compileReplacement(template: ?[]const u8, matcher: anytype) state_mod.Com
                 }
             }
             i += 1;
+        } else if (std.ascii.isAlphabetic(next) or next == '_') {
+            var end = i + 2;
+            while (end < repl.len and (std.ascii.isAlphanumeric(repl[end]) or repl[end] == '_')) : (end += 1) {}
+            const name = repl[i + 1 .. end];
+            if (i > lit_start) pushOp(&out, .{ .literal = repl[lit_start..i] });
+            if (re) |r| {
+                if (r.groupIndexByName(name)) |g| {
+                    if (g >= 1 and g <= max_capture_groups_cap) {
+                        pushOp(&out, .{ .group = @intCast(g) });
+                        saw_group = true;
+                    }
+                }
+            }
+            i = end;
+            lit_start = i;
         } else {
             i += 1;
         }
@@ -583,6 +598,24 @@ pub fn expandReplacementTemplate(
             if (dest) |d| d[written] = '$';
             written += 1;
             i += 1;
+        } else if (std.ascii.isAlphabetic(next) or next == '_') {
+            var end = i + 2;
+            while (end < repl.len and (std.ascii.isAlphanumeric(repl[end]) or repl[end] == '_')) : (end += 1) {}
+            const name = repl[i + 1 .. end];
+            if (re) |r| {
+                if (r.groupIndexByName(name)) |g| {
+                    if (caps) |c| {
+                        if (c.group(g)) |sp| {
+                            const gfrom = @min(sp.start, cap_source.len);
+                            const gto = @min(@max(sp.end, gfrom), cap_source.len);
+                            const seg = cap_source[gfrom..gto];
+                            if (dest) |d| if (seg.len > 0) @memcpy(d[written .. written + seg.len], seg);
+                            written += seg.len;
+                        }
+                    }
+                }
+            }
+            i = end;
         } else {
             if (dest) |d| d[written] = '$';
             written += 1;

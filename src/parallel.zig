@@ -810,15 +810,20 @@ fn tryStreamCompressed(
             slice_cfg.compression = .none;
             return try searcher.searchSlice(S, sink, compressed, path, engine, slice_cfg);
         },
-        .gzip, .zlib, .deflate => {
+        .gzip => {
             var in_reader = std.Io.Reader.fixed(compressed);
             var window: [std.compress.flate.max_window_len]u8 = undefined;
-            const container: std.compress.flate.Container = switch (format) {
-                .gzip => .gzip,
-                .zlib => .zlib,
-                .deflate => .raw,
-                else => unreachable,
-            };
+            var mm_buf: [8192]u8 = undefined;
+            var dec = decompress.MultiMemberGzipReader.init(&in_reader, &window, &mm_buf);
+            var stream_cfg = cfg;
+            stream_cfg.compression = .none;
+            stream_cfg.scratch = &worker.decomp_stream_buf;
+            return try searcher.searchReader(S, shared.allocator, sink, &dec.reader, path, engine, stream_cfg);
+        },
+        .zlib, .deflate => {
+            var in_reader = std.Io.Reader.fixed(compressed);
+            var window: [std.compress.flate.max_window_len]u8 = undefined;
+            const container: std.compress.flate.Container = if (format == .zlib) .zlib else .raw;
             var dec = std.compress.flate.Decompress.init(&in_reader, container, &window);
             var stream_cfg = cfg;
             stream_cfg.compression = .none;
@@ -1105,6 +1110,29 @@ fn FastLineSink(comptime mode: FastLineMode) type {
     };
 }
 
+fn fileHeadHasNul(io: std.Io, file: std.Io.File, worker: *Worker) bool {
+    const probe_cap: usize = 64 * 1024;
+    if (worker.scratch.len >= probe_cap) {
+        var got: usize = 0;
+        while (got < probe_cap) {
+            var iov = [_][]u8{worker.scratch[got..probe_cap]};
+            const n = file.readPositional(io, &iov, got) catch break;
+            if (n == 0) break;
+            got += n;
+        }
+        return std.mem.findScalar(u8, worker.scratch[0..got], 0) != null;
+    }
+    var stack_buf: [64 * 1024]u8 = undefined;
+    var got: usize = 0;
+    while (got < probe_cap) {
+        var iov = [_][]u8{stack_buf[got..probe_cap]};
+        const n = file.readPositional(io, &iov, got) catch break;
+        if (n == 0) break;
+        got += n;
+    }
+    return std.mem.findScalar(u8, stack_buf[0..got], 0) != null;
+}
+
 fn searchWith(worker: *Worker, engine: anytype, file: std.Io.File, path: []const u8) !void {
     const shared = worker.shared;
     var cfg = worker.config();
@@ -1121,7 +1149,7 @@ fn searchWith(worker: *Worker, engine: anytype, file: std.Io.File, path: []const
         _ = shared.emitEvent(.{ .begin = .{ .source_id = path } });
     }
 
-    const result = if (shared.emit == .count and shared.count_lines_only) blk: {
+    var result = if (shared.emit == .count and shared.count_lines_only) blk: {
         var count_sink = CountTally{};
         break :blk try runFileOrMmap(CountTally, worker, &count_sink, file, path, engine, cfg);
     } else if (direct_out and shared.emit == .files_with_matches) blk: {
@@ -1170,6 +1198,23 @@ fn searchWith(worker: *Worker, engine: anytype, file: std.Io.File, path: []const
         };
         break :blk try runFileOrMmap(Tally, worker, &sink, file, path, engine, cfg);
     };
+
+    // Match ripgrep `-l` binary-quit parity on directory walks: when a file matches
+    // early (e.g. line 1 under `cfg.exists = true`) before reaching a NUL byte within
+    // the initial 64 KiB read buffer, suppress reporting it as a matching file.
+    if (shared.emit == .files_with_matches and cfg.binary == .quit and result.matched_lines > 0) {
+        const suppressed_binary = result.outcome == .binary_quit or
+            (cfg.compression == .none and
+                (cfg.encoding == .none or cfg.encoding == .auto) and
+                cfg.charset == null and
+                result.nul_offset == null and
+                fileHeadHasNul(shared.io, file, worker));
+        if (suppressed_binary) {
+            result.matched_lines = 0;
+            result.matches = 0;
+            result.outcome = .binary_quit;
+        }
+    }
 
     noteSoft(worker, path, result);
     worker.recordSearch(result, result.matches, result.bytes_read);

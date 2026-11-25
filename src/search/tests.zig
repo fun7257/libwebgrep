@@ -7294,7 +7294,9 @@ test "compiled replacement templates: literal, $$, $0/$&, $1..$32, and ${name}" 
         .{ .tmpl = "($0|$&)", .expected = "x (foo=42|foo=42) (bar=99|bar=99)" },
         .{ .tmpl = "$2:$1", .expected = "x 42:foo 99:bar" },
         .{ .tmpl = "${val}->${key}", .expected = "x 42->foo 99->bar" },
+        .{ .tmpl = "$val->$key", .expected = "x 42->foo 99->bar" },
         .{ .tmpl = "pre-${missing}-post", .expected = "x pre--post pre--post" },
+        .{ .tmpl = "pre-$missing-post", .expected = "x pre--post pre--post" },
     };
 
     for (cases) |tc| {

@@ -115,18 +115,34 @@ pub fn decompressSlice(
     switch (format) {
         .gzip => {
             var window: [std.compress.flate.max_window_len]u8 = undefined;
-            var dec = std.compress.flate.Decompress.init(&in_reader, .gzip, &window);
-            try pumpDecompress(
-                allocator,
-                &dec.reader,
-                &in_reader,
-                compressed.len,
-                &out_list,
-                &total_decompressed,
-                max_decompressed_bytes,
-                ratio_cap,
-                offset_map,
-            );
+            var local_decompressed: u64 = 0;
+            while (true) {
+                var dec = std.compress.flate.Decompress.init(&in_reader, .gzip, &window);
+                try pumpDecompressAcc(
+                    allocator,
+                    &dec.reader,
+                    &in_reader,
+                    compressed.len,
+                    &out_list,
+                    &local_decompressed,
+                    &total_decompressed,
+                    max_decompressed_bytes,
+                    ratio_cap,
+                    offset_map,
+                );
+                // RFC 1952 concatenated multi-member gzip: skip optional NUL trailer padding,
+                // then continue if another gzip member magic (0x1F 0x8B) starts.
+                while (in_reader.seek < in_reader.end and in_reader.buffer[in_reader.seek] == 0) {
+                    in_reader.seek += 1;
+                }
+                if (in_reader.seek + 2 <= in_reader.end and
+                    in_reader.buffer[in_reader.seek] == 0x1F and
+                    in_reader.buffer[in_reader.seek + 1] == 0x8B)
+                {
+                    continue;
+                }
+                break;
+            }
         },
         .zstd => {
             const win_buf = try allocator.alloc(u8, std.compress.zstd.default_window_len + std.compress.zstd.block_size_max);
@@ -244,6 +260,57 @@ pub fn decompressSlice(
     return try out_list.toOwnedSlice(allocator);
 }
 
+/// Streaming RFC 1952 multi-member Gzip reader over a `std.Io.Reader.fixed` (or buffered) input,
+/// seamlessly transitioning across concatenated gzip members in constant O(window) memory.
+pub const MultiMemberGzipReader = struct {
+    input: *std.Io.Reader,
+    window: *[std.compress.flate.max_window_len]u8,
+    dec: std.compress.flate.Decompress,
+    done: bool = false,
+    reader: std.Io.Reader,
+
+    pub fn init(input: *std.Io.Reader, window: *[std.compress.flate.max_window_len]u8, buf: []u8) MultiMemberGzipReader {
+        return .{
+            .input = input,
+            .window = window,
+            .dec = std.compress.flate.Decompress.init(input, .gzip, window),
+            .done = false,
+            .reader = .{
+                .vtable = &.{ .stream = streamImpl },
+                .buffer = buf,
+                .seek = 0,
+                .end = 0,
+            },
+        };
+    }
+
+    fn streamImpl(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *MultiMemberGzipReader = @fieldParentPtr("reader", r);
+        while (true) {
+            if (self.done) return error.EndOfStream;
+            if (self.dec.reader.stream(w, limit)) |n| {
+                return n;
+            } else |err| switch (err) {
+                error.EndOfStream => {
+                    while (self.input.seek < self.input.end and self.input.buffer[self.input.seek] == 0) {
+                        self.input.seek += 1;
+                    }
+                    if (self.input.seek + 2 <= self.input.end and
+                        self.input.buffer[self.input.seek] == 0x1F and
+                        self.input.buffer[self.input.seek + 1] == 0x8B)
+                    {
+                        self.dec = std.compress.flate.Decompress.init(self.input, .gzip, self.window);
+                        continue;
+                    }
+                    self.done = true;
+                    return error.EndOfStream;
+                },
+                else => return err,
+            }
+        }
+    }
+};
+
 fn pumpDecompress(
     allocator: std.mem.Allocator,
     dec_reader: *std.Io.Reader,
@@ -255,8 +322,34 @@ fn pumpDecompress(
     ratio_cap: u64,
     offset_map: *OffsetMap,
 ) Error!void {
-    var chunk: [16384]u8 = undefined;
     var local_decompressed: u64 = 0;
+    return pumpDecompressAcc(
+        allocator,
+        dec_reader,
+        raw_reader,
+        total_raw_len,
+        out_list,
+        &local_decompressed,
+        total_decompressed,
+        max_decompressed_bytes,
+        ratio_cap,
+        offset_map,
+    );
+}
+
+fn pumpDecompressAcc(
+    allocator: std.mem.Allocator,
+    dec_reader: *std.Io.Reader,
+    raw_reader: *const std.Io.Reader,
+    total_raw_len: usize,
+    out_list: *std.ArrayList(u8),
+    local_decompressed: *u64,
+    total_decompressed: *u64,
+    max_decompressed_bytes: ?u64,
+    ratio_cap: u64,
+    offset_map: *OffsetMap,
+) Error!void {
+    var chunk: [16384]u8 = undefined;
     while (true) {
         const raw_before: u64 = @intCast(@min(raw_reader.seek, total_raw_len));
         const n = dec_reader.readSliceShort(&chunk) catch {
@@ -268,7 +361,7 @@ fn pumpDecompress(
         const out_before: u64 = @intCast(out_list.items.len);
         try offset_map.record(allocator, out_before, raw_before);
 
-        local_decompressed = std.math.add(u64, local_decompressed, n) catch return error.DecompressLimit;
+        local_decompressed.* = std.math.add(u64, local_decompressed.*, n) catch return error.DecompressLimit;
         total_decompressed.* = std.math.add(u64, total_decompressed.*, n) catch return error.DecompressLimit;
         if (max_decompressed_bytes) |cap| {
             if (total_decompressed.* > cap) {
@@ -278,9 +371,9 @@ fn pumpDecompress(
         }
 
         const raw_consumed: u64 = @max(1, @as(u64, @intCast(@min(raw_reader.seek, total_raw_len))));
-        if (local_decompressed >= ratio_check_min_bytes) {
+        if (local_decompressed.* >= ratio_check_min_bytes) {
             const max_allowed = std.math.mul(u64, raw_consumed, ratio_cap) catch std.math.maxInt(u64);
-            if (local_decompressed > max_allowed) {
+            if (local_decompressed.* > max_allowed) {
                 @branchHint(.cold);
                 return error.DecompressLimit;
             }
@@ -457,6 +550,50 @@ test "Zstd decompression and corrupt stream handling" {
         error.CorruptStream,
         decompressSlice(std.testing.allocator, &corrupt_zst, .auto, 0, 1024, 100, &dec_bytes, &map),
     );
+}
+
+test "multi-member RFC 1952 gzip decompression in decompressSlice and MultiMemberGzipReader" {
+    const alloc = std.testing.allocator;
+    const part1 = "member one alpha\nMATCH_ONE\n";
+    const part2 = "member two beta\nMATCH_TWO\n";
+    const part3 = "member three gamma\nMATCH_THREE\n";
+
+    const gz1 = try compressGzipStoredAlloc(alloc, part1);
+    defer alloc.free(gz1);
+    const gz2 = try compressGzipStoredAlloc(alloc, part2);
+    defer alloc.free(gz2);
+    const gz3 = try compressGzipStoredAlloc(alloc, part3);
+    defer alloc.free(gz3);
+
+    var concat = std.ArrayList(u8).empty;
+    defer concat.deinit(alloc);
+    try concat.appendSlice(alloc, gz1);
+    try concat.appendSlice(alloc, gz2);
+    try concat.appendSlice(alloc, gz3);
+
+    const expected = part1 ++ part2 ++ part3;
+    var dec_bytes: u64 = 0;
+    var map = OffsetMap{};
+    defer map.deinit(alloc);
+    const out = (try decompressSlice(alloc, concat.items, .gzip, 0, 4096, 100, &dec_bytes, &map)).?;
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings(expected, out);
+    try std.testing.expectEqual(@as(u64, expected.len), dec_bytes);
+
+    // Streaming MultiMemberGzipReader must yield byte-identical output across all 3 members.
+    var in_reader = std.Io.Reader.fixed(concat.items);
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var rbuf: [64]u8 = undefined;
+    var mm = MultiMemberGzipReader.init(&in_reader, &window, &rbuf);
+    var streamed = std.ArrayList(u8).empty;
+    defer streamed.deinit(alloc);
+    var tmp: [32]u8 = undefined;
+    while (true) {
+        const n = try mm.reader.readSliceShort(&tmp);
+        if (n == 0) break;
+        try streamed.appendSlice(alloc, tmp[0..n]);
+    }
+    try std.testing.expectEqualStrings(expected, streamed.items);
 }
 
 test {

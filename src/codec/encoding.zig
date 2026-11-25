@@ -172,7 +172,46 @@ pub fn fromCharset(label_or_header: []const u8) ?Encoding {
 }
 
 /// Heuristic character encoding detector for BOM-less, hint-less text samples (inspects up to 8 KiB).
+/// Trims 1..3 trailing bytes if and only if they form a valid RFC 3629 incomplete
+/// UTF-8 multi-byte sequence prefix (e.g., when a fixed-size detection probe window
+/// slices mid-codepoint). Never masks bare continuation bytes or invalid overlong/surrogate prefixes.
+fn trimIncompleteUtf8Tail(bytes: []const u8) []const u8 {
+    const max_back = @min(bytes.len, 3);
+    var back: usize = 1;
+    while (back <= max_back) : (back += 1) {
+        const idx = bytes.len - back;
+        const b = bytes[idx];
+        if ((b & 0xC0) == 0x80) continue;
+        const expected: usize = if (b >= 0xC2 and b <= 0xDF)
+            2
+        else if (b >= 0xE0 and b <= 0xEF)
+            3
+        else if (b >= 0xF0 and b <= 0xF4)
+            4
+        else
+            return bytes;
+        if (back < expected) {
+            if (back >= 2) {
+                const b1 = bytes[idx + 1];
+                if (b == 0xE0 and b1 < 0xA0) return bytes;
+                if (b == 0xED and b1 > 0x9F) return bytes;
+                if (b == 0xF0 and b1 < 0x90) return bytes;
+                if (b == 0xF4 and b1 > 0x8F) return bytes;
+            }
+            return bytes[0..idx];
+        }
+        return bytes;
+    }
+    return bytes;
+}
+
+/// Heuristically detects the character encoding of a raw byte sample (BOM, UTF-32/16 cadence,
+/// strict UTF-8 validation, and multi-byte legacy CJK/Windows-1252/1251 scoring).
 pub fn detectEncoding(sample: []const u8) Encoding {
+    return detectEncodingInternal(sample, sample.len > 8192);
+}
+
+fn detectEncodingInternal(sample: []const u8, truncated_end: bool) Encoding {
     if (sample.len == 0) return .utf8;
     switch (sniff(sample, true)) {
         .utf8 => return .utf8,
@@ -213,7 +252,8 @@ pub fn detectEncoding(sample: []const u8) Encoding {
         if (be16_hits * 2 >= units and be16_hits >= 2) return .utf16be;
     }
 
-    if (isAsciiSlice(head) or validUtf8(head)) return .utf8;
+    const utf8_head = if (truncated_end) trimIncompleteUtf8Tail(head) else head;
+    if (isAsciiSlice(utf8_head) or (utf8_head.len > 0 and validUtf8(utf8_head))) return .utf8;
 
     // Score multi-byte legacy CJK encodings
     const candidates = [_]struct { enc: Encoding, mode: coded_mode }{
@@ -654,7 +694,10 @@ pub const Decoder = struct {
             .need_more => return .{ .n = 0, .eof = false },
             .raw => {
                 if (self.fallback_mode != .raw) {
-                    self.mode = if (self.fallback_mode == .detect) encodingToMode(detectEncoding(pending)) else self.fallback_mode;
+                    self.mode = if (self.fallback_mode == .detect)
+                        encodingToMode(detectEncodingInternal(pending, !eof or pending.len > 8192))
+                    else
+                        self.fallback_mode;
                     return self.decodeAvailable(allocator, dest, eof);
                 }
                 self.mode = .raw;
@@ -1990,6 +2033,35 @@ test "v0.8 encodings: Windows-1252, GB18030, Shift_JIS, EUC-JP, Big5, EUC-KR, Wi
         if (pulled.eof) break;
     }
     try testing.expectEqualStrings("こんにちはｱｲｳ", out_buf[0..filled]);
+
+    // Mid-codepoint probe boundary splits: streaming 1024B probe (2-byte 'σ' = 0xCF 0x83 at 1023..1024)
+    // and slice >8192B probe (3-byte '中' = 0xE4 0xB8 0xAD straddling 8192) must both detect .utf8,
+    // while an untruncated legacy Windows-1252 byte 0xE9 at EOF must still detect .windows1252.
+    try testing.expectEqual(Encoding.windows1252, detectEncoding("caf\xE9"));
+
+    var split1024: [1060]u8 = @splat('a');
+    split1024[1023] = 0xCF;
+    split1024[1024] = 0x83; // 'σ'
+    @memcpy(split1024[1025 .. 1025 + "中文检索测试\n".len], "中文检索测试\n");
+    var utf8_src = Chunk{ .rest = &split1024, .cap = 128 };
+    var utf8_dec = Decoder.init(.detect);
+    defer utf8_dec.deinit(testing.allocator);
+    var utf8_out: [1200]u8 = undefined;
+    var utf8_filled: usize = 0;
+    var utf8_read: u64 = 0;
+    while (true) {
+        const pulled = try utf8_dec.pull(testing.allocator, Chunk.read, &utf8_src, 128, utf8_out[utf8_filled..], &utf8_read);
+        utf8_filled += pulled.n;
+        if (pulled.eof) break;
+    }
+    try testing.expectEqual(Decoder.Mode.utf8, utf8_dec.mode);
+    try testing.expectEqualStrings(&split1024, utf8_out[0..utf8_filled]);
+
+    var split8192: [8220]u8 = @splat('b');
+    split8192[8191] = 0xE4;
+    split8192[8192] = 0xB8;
+    split8192[8193] = 0xAD; // '中'
+    try testing.expectEqual(Encoding.utf8, detectEncoding(&split8192));
 }
 
 test "SIMD GBK and UTF-16LE parity with and without OffsetMap across slice and streaming" {

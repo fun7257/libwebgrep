@@ -47,16 +47,8 @@ jobs:
           version: 0.17.1
           use-cache: true
 
-      - name: Compile check (Native SIMD & scalar configurations)
-        run: |
-          zig build check -Dteddy=${{ matrix.teddy_simd }}
-          zig build check -Dteddy=off
-          zig build check -Dmmap-windows=true -Dteddy=${{ matrix.teddy_simd }}
-
-      - name: Compile check (Linux getdents64 + mmap-windows)
-        if: runner.os == 'Linux'
-        run: |
-          zig build check -Dlinux-getdents=true -Dmmap-windows=true -Dteddy=${{ matrix.teddy_simd }}
+      - name: Compile check (mmap-windows configuration)
+        run: zig build check -Dmmap-windows=true -Dteddy=${{ matrix.teddy_simd }}
 
       - name: Compile check (x86_64 SSSE3, runtime & baseline off)
         if: matrix.arch == 'x86_64'

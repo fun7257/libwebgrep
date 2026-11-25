@@ -2,7 +2,7 @@
 
 [English](API.md) | [简体中文](API.zh-CN.md)
 
-本文档是 **libwebgrep v0.10.1**（Zig `0.17.1`、零 libc 依赖、59 个导出 C ABI 函数）的完整参考手册，覆盖 `src/root.zig` 与 `include/webgrep.h` 导出的全部公共类型、函数与子模块。在代码中通过 `@import("libwebgrep")` 导入模块后，即可使用以下所有接口。
+本文档是 **libwebgrep v0.10.2**（Zig `0.17.1`、零 libc 依赖、59 个导出 C ABI 函数）的完整参考手册，覆盖 `src/root.zig` 与 `include/webgrep.h` 导出的全部公共类型、函数与子模块。在代码中通过 `@import("libwebgrep")` 导入模块后，即可使用以下所有接口。
 
 `libwebgrep` 在调用方提供的字节流（`*std.Io.Reader`）或内存切片（`[]const u8`）上执行搜索。涉及内存分配或流式 I/O 的入口显式接收 `std.mem.Allocator` 与 `std.Io`；纯内存切片搜索无需分配器。库内部不包含任何全局可变状态。
 
@@ -535,7 +535,7 @@ pub fn find(self: *const Regex, haystack: []const u8, start: usize, mode: MatchM
 
 ## 八、C ABI 跨语言绑定接口（`include/webgrep.h`）
 
-`zig build` 默认产出零 libc 依赖的静态库（`libwebgrep.a`）、动态库（`libwebgrep.so` / `.dylib`）与标准 C99/C11 头文件 `include/webgrep.h`（`WEBGREP_VERSION_MAJOR = 0`、`WEBGREP_VERSION_MINOR = 10`、`WEBGREP_VERSION_PATCH = 1`、`WEBGREP_VERSION_STRING = "0.10.1"`，`webgrep_version()` 返回 `"0.10.1"`，带 `WEBGREP_API` DLL 导入/导出宏），导出全部 **59 个 C ABI 函数**：
+`zig build` 默认产出零 libc 依赖的静态库（`libwebgrep.a`）、动态库（`libwebgrep.so` / `.dylib`）与标准 C99/C11 头文件 `include/webgrep.h`（`WEBGREP_VERSION_MAJOR = 0`、`WEBGREP_VERSION_MINOR = 10`、`WEBGREP_VERSION_PATCH = 2`、`WEBGREP_VERSION_STRING = "0.10.2"`，`webgrep_version()` 返回 `"0.10.2"`，带 `WEBGREP_API` DLL 导入/导出宏），导出全部 **59 个 C ABI 函数**：
 - **默认配置与版本（7）**：`webgrep_version`、`webgrep_find_options_default`、`webgrep_regex_options_default`、`webgrep_config_default`、`webgrep_tree_config_default`、`webgrep_probe_options_default`、`webgrep_bloom_config_default`
 - **匹配器、缓存与取消令牌（11）**：`webgrep_matcher_compile_literal`、`webgrep_matcher_compile_multi`、`webgrep_matcher_compile_regex`、`webgrep_matcher_compile_regex_set`、`webgrep_matcher_free`、`webgrep_scratch_new`、`webgrep_scratch_free`、`webgrep_cancel_new`、`webgrep_cancel_trigger`、`webgrep_cancel_reset`、`webgrep_cancel_free`
 - **查找、捕获组与拉式迭代（8）**：`webgrep_find`、`webgrep_regex_set_matches`、`webgrep_find_captures`、`webgrep_matcher_group_index`、`webgrep_pull_open_slice`、`webgrep_pull_open_reader`、`webgrep_pull_next`、`webgrep_pull_free`

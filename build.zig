@@ -4,6 +4,9 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer") orelse false;
+    const link_libc = b.option(bool, "link-libc", "Link libc into C ABI library artifacts (default: false)") orelse false;
+    const sanitize_c = b.option(bool, "sanitize-c", "Enable C sanitizer support (links libc into C ABI library artifacts)") orelse false;
+    const build_cli = b.option(bool, "cli", "Install standalone wg-cli executable (default: false)") orelse false;
     const fuzz_filter = b.option([]const u8, "fuzz-filter", "Run only tests whose name contains this substring");
     const bench_filter = b.option([]const u8, "bench-filter", "Run only benchmark scenarios whose name contains this substring");
     // OS- and ISA-specific optimizations are controlled via build options.
@@ -55,6 +58,7 @@ pub fn build(b: *std.Build) void {
     const options = b.addOptions();
     options.addOption(bool, "window_map", window_map);
     options.addOption(TeddyIsa, "teddy", teddy);
+    const options_mod = options.createModule();
     const test_filters: []const []const u8 = if (fuzz_filter) |filter| &.{filter} else &.{};
 
     const mod = b.addModule("libwebgrep", .{
@@ -63,7 +67,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .sanitize_thread = sanitize_thread,
     });
-    mod.addOptions("build_options", options);
+    mod.addImport("build_options", options_mod);
 
     const internal_mod = b.createModule(.{
         .root_source_file = b.path("src/internal.zig"),
@@ -71,16 +75,19 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .sanitize_thread = sanitize_thread,
     });
-    internal_mod.addOptions("build_options", options);
+    internal_mod.addImport("build_options", options_mod);
 
+    const c_api_link_libc = link_libc or sanitize_c;
     const c_api_mod = b.createModule(.{
         .root_source_file = b.path("src/c_api.zig"),
         .target = compile_target,
         .optimize = optimize,
         .sanitize_thread = sanitize_thread,
+        .link_libc = if (c_api_link_libc) true else null,
+        .sanitize_c = if (sanitize_c) .full else null,
         .pic = true,
     });
-    c_api_mod.addOptions("build_options", options);
+    c_api_mod.addImport("build_options", options_mod);
 
     const webgrep_static = b.addLibrary(.{
         .linkage = .static,
@@ -91,13 +98,43 @@ pub fn build(b: *std.Build) void {
     webgrep_static.installHeader(b.path("include/webgrep.h"), "webgrep.h");
     b.installArtifact(webgrep_static);
 
-    const webgrep_shared = b.addLibrary(.{
-        .linkage = .dynamic,
-        .name = "webgrep",
-        .root_module = c_api_mod,
-        .use_llvm = use_llvm,
+    const webgrep_shared = if (target.result.os.tag != .wasi) blk: {
+        const lib = b.addLibrary(.{
+            .linkage = .dynamic,
+            .name = "webgrep-shared",
+            .root_module = c_api_mod,
+            .use_llvm = use_llvm,
+        });
+        const shared_dest_sub_path: []const u8 = switch (target.result.os.tag) {
+            .macos, .ios, .tvos, .watchos, .visionos => "libwebgrep.dylib",
+            .windows => "webgrep.dll",
+            else => "libwebgrep.so",
+        };
+        const install_shared = b.addInstallArtifact(lib, .{
+            .dest_sub_path = shared_dest_sub_path,
+        });
+        b.getInstallStep().dependOn(&install_shared.step);
+        break :blk lib;
+    } else null;
+
+    const wg_cli_mod = b.createModule(.{
+        .root_source_file = b.path("bench/wg_cli.zig"),
+        .target = compile_target,
+        .optimize = optimize,
+        .sanitize_thread = sanitize_thread,
+        .imports = &.{
+            .{ .name = "libwebgrep_internal", .module = internal_mod },
+            .{ .name = "build_options", .module = options_mod },
+        },
     });
-    b.installArtifact(webgrep_shared);
+    const wg_cli = b.addExecutable(.{
+        .name = "wg-cli",
+        .use_llvm = use_llvm,
+        .root_module = wg_cli_mod,
+    });
+    if (build_cli) {
+        b.installArtifact(wg_cli);
+    }
 
     const lib_tests = b.addTest(.{
         .name = "libwebgrep-test",
@@ -202,7 +239,7 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&lib_tests.step);
     check_step.dependOn(&c_api_tests.step);
     check_step.dependOn(&webgrep_static.step);
-    check_step.dependOn(&webgrep_shared.step);
+    if (webgrep_shared) |shared| check_step.dependOn(&shared.step);
     check_step.dependOn(&example_tests.step);
     check_step.dependOn(&example_zh_tests.step);
     if (!teddy_matches) {
@@ -246,18 +283,6 @@ pub fn build(b: *std.Build) void {
         const fail = b.addFail("Benchmark binaries must be built with ReleaseFast: zig build bench-cli -Doptimize=ReleaseFast");
         bench_cli_step.dependOn(&fail.step);
     } else {
-        const wg_cli = b.addExecutable(.{
-            .name = "wg-cli",
-            .use_llvm = use_llvm,
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("bench/wg_cli.zig"),
-                .target = compile_target,
-                .optimize = optimize,
-                .imports = &.{
-                    .{ .name = "libwebgrep_internal", .module = internal_mod },
-                },
-            }),
-        });
         const install_wg_cli = b.addInstallArtifact(wg_cli, .{});
         bench_cli_step.dependOn(&install_wg_cli.step);
 

@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - 'v*'
   pull_request:
     branches:
       - main
@@ -17,25 +19,30 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Tier 1: Native execution (unit tests, 25-section C ABI, doc examples, ReleaseFast CLI)
   verify:
-    name: Build & Test (${{ matrix.name }})
+    name: Tier 1 (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: Linux (x86_64)
+          - name: Linux x86_64
             os: ubuntu-latest
             arch: x86_64
             teddy_simd: avx2
-          - name: Linux (arm64)
+          - name: Linux arm64
             os: ubuntu-24.04-arm
             arch: aarch64
             teddy_simd: neon
-          - name: macOS (arm64)
+          - name: macOS arm64
             os: macos-latest
             arch: aarch64
             teddy_simd: neon
+          - name: Windows x86_64
+            os: windows-latest
+            arch: x86_64
+            teddy_simd: runtime
 
     steps:
       - name: Checkout repository
@@ -50,27 +57,19 @@ jobs:
       - name: Compile check (mmap-windows configuration)
         run: zig build check -Dmmap-windows=true -Dteddy=${{ matrix.teddy_simd }}
 
-      - name: Compile check (x86_64 SSSE3, runtime & baseline off)
-        if: matrix.arch == 'x86_64'
-        run: |
-          zig build check -Dteddy=ssse3
-          zig build check -Dtarget=x86_64-linux-musl -Dteddy=off
-          zig build check -Dtarget=x86_64-linux-musl -Dteddy=runtime
+      - name: Compile check (x86_64 SSSE3)
+        if: runner.os == 'Linux' && matrix.arch == 'x86_64'
+        run: zig build check -Dteddy=ssse3
 
-      - name: Compile check (Windows x86_64 cross-target)
-        if: matrix.arch == 'x86_64'
-        run: zig build check -Dtarget=x86_64-windows-gnu
-
-      - name: Compile check (macOS x86_64 cross-target)
+      - name: Compile check (Tier 2 macOS x86_64 cross-target)
         if: runner.os == 'macOS'
-        run: |
-          zig build check -Dtarget=x86_64-macos -Dteddy=avx2
+        run: zig build check -Dtarget=x86_64-macos -Dteddy=avx2
 
       - name: Run unit, C ABI, and documentation tests (SIMD=${{ matrix.teddy_simd }})
         run: zig build test -Dteddy=${{ matrix.teddy_simd }}
 
       - name: Run unit, C ABI, and documentation tests (SIMD=runtime)
-        if: matrix.arch == 'x86_64'
+        if: runner.os == 'Linux' && matrix.arch == 'x86_64'
         run: zig build test -Dteddy=runtime
 
       - name: Run unit, C ABI, and documentation tests (SIMD=off)
@@ -78,3 +77,51 @@ jobs:
 
       - name: Verify ReleaseFast CLI compilation
         run: zig build bench-cli -Doptimize=ReleaseFast -Dteddy=${{ matrix.teddy_simd }}
+
+  # Tier 1 ReleaseFast: Run full test & C ABI suite under LLVM ReleaseFast optimization
+  verify-releasefast:
+    name: Tier 1 (Linux x86_64 ReleaseFast)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Zig 0.17.1
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+          use-cache: true
+
+      - name: Run unit, C ABI, and documentation tests (ReleaseFast AVX2)
+        run: zig build test -Doptimize=ReleaseFast -Dteddy=avx2
+
+  # Tier 2: Cross-compilation canaries (static musl, Big-Endian s390x, 32-bit WASI, RISC-V 64)
+  cross-tier2:
+    name: Tier 2 (Cross-Compile Canaries)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Zig 0.17.1
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+          use-cache: true
+
+      - name: Static musl targets (x86_64 runtime/off, aarch64)
+        run: |
+          zig build check -Dtarget=x86_64-linux-musl -Dteddy=runtime
+          zig build check -Dtarget=x86_64-linux-musl -Dteddy=off
+          zig build check -Dtarget=aarch64-linux-musl
+
+      - name: Big-Endian & RISC-V scalar targets (s390x, riscv64)
+        run: |
+          zig build check -Dtarget=s390x-linux-musl
+          zig build check -Dtarget=riscv64-linux-musl
+
+      - name: 32-bit WASI library build (wasm32-wasi)
+        run: zig build -Dtarget=wasm32-wasi
+
+      - name: Windows x86_64 cross-compile check (mingw-gnu)
+        run: zig build check -Dtarget=x86_64-windows-gnu

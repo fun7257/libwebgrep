@@ -2,13 +2,13 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-**`libwebgrep` (`v0.10.0`)** is an ultra-fast, embeddable SIMD text and regular expression search engine library written in pure **Zig `0.17.1`**, purpose-built for multi-tenant web services, log analytics, and code search backends.
+**`libwebgrep` (`v0.10.3`)** is an ultra-fast, embeddable SIMD text and regular expression search engine library written in pure **Zig `0.17.1`**, purpose-built for multi-tenant web services, log analytics, and code search backends.
 
 It ships with **zero external dependencies**, **does not link `libc`**, guarantees **worst-case $O(n)$ linear time** across all literal, multi-pattern, and regex queries, and enforces strict **multi-tenant resource budgets** (scan bytes, wall-clock deadlines, memory caps, and Zip-Bomb decompression guards).
 
 ---
 
-## Key Highlights (`v0.10.0`)
+## Key Highlights (`v0.10.3`)
 
 - **93 / 93 (100% WIN) vs. `ripgrep 16.0.0`, Runtime CPUID Dispatch & Cross-Arch Portability**:
   - **End-to-End `ripgrep 16.0.0` Benchmark Sweep**: Wins **93 / 93** scenarios (**0 TIE / 0 LAG / 0 MISMATCH**, grand geomean **`1.82x`**, min **`1.06x`**) across Core (`S01`–`S19`, 22/22, geomean **`1.31x`**), Adversarial Stress (`X01`–`X13`, 15/15, geomean **`1.89x`**), P0–P1 (`Y01`–`Y16`, 41/41, geomean **`2.21x`**), and Extended (`R01`–`P03`, 15/15, geomean **`1.74x`**) suites, reaching **`25.31 GB/s`** on 8-thread 2.49 GB directory scans (`S15 --mmap`, `97.97 ms`).
@@ -20,10 +20,10 @@ It ships with **zero external dependencies**, **does not link `libc`**, guarante
   - **Zero-Copy 8 MiB Windowed `mmap` (`src/io/window_map.zig`)**: Integrated directly into `src/parallel.zig` and single-file `--mmap` search on Linux to keep PTE pages L2/L3-hot at `munmap` time, paired with 64B-aligned `preadv` streaming buffers to eliminate 4K-aliasing cliffs.
   - **In-Process Streaming Decompression & Zero-Disk Archives**: Streams **Gzip, Zlib, Deflate, Zstd, XZ, LZ4, Bzip2, and Brotli** in-process without spawning external binaries, enforcing `max_decompressed_bytes` and `max_compression_ratio` (default `100:1`) on every chunk to stop Zip Bombs; supports constant-memory `searchTarStream`, zero-disk in-memory `ArchiveTree` (`.tar.*`, `.zip` / ZIP64, nested archives) with parallel `Scheduler` support and Zip-Slip protection.
   - **SIMD Multi-Encoding Transcoding**: Sniffs UTF-8 / UTF-16 / UTF-32 BOMs and transcodes **SIMD GBK (direct UTF-8 LUT / Variant H), GB18030, SIMD UTF-16LE, UTF-16BE, Latin-1, Windows-1252, Windows-1251, Shift-JIS, EUC-JP, Big5, and EUC-KR** (plus heuristic detection and HTTP `charset` hints), while maintaining run-level `OffsetMap` translations (`raw_offset`) and UTF-16 code-unit spans.
-- **Hardened for Multi-Tenant Server Embedding, 172 File Types, 59-Function C ABI & Fuzz/OOM Audit**:
+- **Hardened for Multi-Tenant Server Embedding, 172 File Types, 60-Function C ABI & Fuzz/OOM Audit**:
   - Public service entry points (`searchSource`, `searchSourceSlice`, `resumeSourceSlice`, `openSourcePull`, `openReaderPull`) operate strictly on caller-supplied `std.Io.Reader` streams or memory slices with caller-assigned `source_id`—eliminating path traversal (`CWE-22`) by design.
-  - Reusable `Scratch` buffer pool (`SearchConfig.scratch_pool`), runtime type-erased `AnyMatcher` / `AnyEventSink`, **172 built-in file types** (`src/walk/types.zig`), and a **59-function** zero-`libc` C ABI (`include/webgrep.h`, `WEBGREP_API`).
-  - Verified by **`1,027 / 1,027` tests** (`zig build test` AVX2 LLVM), **`1,013 / 1,013` tests** (`-Dteddy=off` self-hosted `x86_64`), **`25 / 25` C ABI test sections**, **5 differential fuzz suites**, and a `std.testing.checkAllAllocationFailures` OOM injection audit (`src/fuzz.zig`).
+  - Reusable `Scratch` buffer pool (`SearchConfig.scratch_pool`), configurable CRLF handling (`SearchConfig.strip_cr`), runtime type-erased `AnyMatcher` / `AnyEventSink`, **172 built-in file types** (`src/walk/types.zig`), and a **60-function** zero-`libc` C ABI (`include/webgrep.h`, `WEBGREP_API`), including custom allocator hooks (`webgrep_set_allocator`) and distinct `WEBGREP_ERR_PATH_TRAVERSAL` / `WEBGREP_ERR_UNSUPPORTED_FORMAT` status codes.
+  - Verified by Zig unit/E2E/adversarial/doc tests, **`27 / 27` C ABI test sections** (including exhaustive OOM-rollback leak audits), **5 differential fuzz suites**, a `std.testing.checkAllAllocationFailures` OOM injection audit (`src/fuzz.zig`), and optional standalone CLI parity binary `wg-cli` (`-Dcli=true` / `zig build bench-cli`).
 
 ---
 
@@ -131,13 +131,16 @@ defer set.deinit();
 ## Building, Testing, Fuzzing & Cross-Compiling
 
 ```sh
-# Run all 1,027 unit, E2E, adversarial, differential fuzz, OOM audit, 59-fn C ABI (25 sections), and API doc tests
+# Run all unit, E2E, adversarial, differential fuzz, OOM audit, 60-fn C ABI (27 sections), and API doc tests
 zig build test --summary all
 
 # Build static & shared libraries (libwebgrep.a / libwebgrep.so / .dylib) and install include/webgrep.h
 zig build
 
-# Run 1,013 tests with Teddy SIMD disabled (baseline self-hosted x86_64 verification)
+# Also build and install the standalone ripgrep-compatible CLI binary (`zig-out/bin/wg-cli`)
+zig build -Dcli=true -Doptimize=ReleaseFast
+
+# Run tests with Teddy SIMD disabled (baseline self-hosted x86_64 verification)
 zig build test -Dteddy=off --summary all
 
 # Run the dedicated 5-suite cross-layer differential fuzz & OOM injection audit
@@ -149,20 +152,32 @@ zig build bench -Doptimize=ReleaseFast -Dteddy=avx2
 # Filter specific benchmark scenarios
 zig build bench -Doptimize=ReleaseFast -Dteddy=avx2 -Dbench-filter=regex_
 
-# Cross-compile verification (no execution required)
+# Cross-compile verification (Tier 2 targets, no execution required)
 zig build check -Dtarget=x86_64-linux-musl -Dteddy=runtime
 zig build check -Dtarget=x86_64-linux-musl -Dteddy=off
 zig build check -Dtarget=aarch64-linux-musl
 zig build check -Dtarget=s390x-linux-musl
+zig build check -Dtarget=riscv64-linux-musl
 zig build -Dtarget=wasm32-wasi
 ```
+
+### Platform Support Policy
+
+| Tier | Platforms | Guarantee |
+| :--- | :--- | :--- |
+| **Tier 1** | `x86_64-linux`, `aarch64-linux`, `aarch64-macos`, `x86_64-windows` | Native CI execution of all Zig unit tests, 27-section C11 ABI suite, doc examples, and `ReleaseFast` builds (`avx2`/`neon`/`runtime`/`off`). |
+| **Tier 2** | `x86_64-linux-musl`, `aarch64-linux-musl`, `x86_64-macos`, `wasm32-wasi`, `s390x-linux-musl`, `riscv64-linux-musl` | CI cross-compilation gate guarding static musl containers, Intel Mac, 32-bit WASI, Big-Endian byte order, and pure 64-bit scalar builds. |
+| **Tier 3** | `*BSD` (`FreeBSD` / `OpenBSD` / `NetBSD`) | Best-effort POSIX compatibility; community-tested without blocking CI. |
 
 ### Build Options
 
 | Option | Values | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `-Dteddy` | `runtime`, `off`, `neon`, `ssse3`, `avx2` | `runtime` on `x86_64`, `neon` on `aarch64` | Selects static SIMD backend or CPUID runtime dispatch (`runtime`) |
+| `-Dteddy` | `runtime`, `off`, `neon`, `ssse3`, `avx2` | Auto-detected per target (`avx2`/`ssse3`/`off` on `x86_64`, `neon`/`off` on `aarch64`, `off` on other targets) | Selects static SIMD backend or CPUID runtime dispatch (`runtime`) |
 | `-Dmmap-windows` | `bool` | `false` | Maps large files in 8 MiB rolling windows instead of `readPositional` (`src/io/window_map.zig`) |
+| `-Dcli` | `bool` | `false` | Installs the standalone `wg-cli` executable (supports `-V`, stdin/`-`, multi-path, `-b`, `--passthru`, `-u`/`-uu`/`-uuu`, `--hidden`, `--max-depth`, `--max-filesize`, `-0`, `--null-data`, `--crlf`, `-z` `.br`/`.zlib`) |
+| `-Dlink-libc` | `bool` | `false` | Links `libc` into C ABI library artifacts |
+| `-Dsanitize-c` | `bool` | `false` | Enables C sanitizer support (automatically links `libc` into C ABI artifacts) |
 | `-Dsanitize-thread` | `bool` | `false` | Enables ThreadSanitizer (`TSan`) |
 | `-Dbench-filter` | `string` | `null` | Runs only microbenchmark scenarios whose names contain the substring |
 | `-Dfuzz-filter` | `string` | `null` | Runs only fuzz test targets whose names contain the substring |

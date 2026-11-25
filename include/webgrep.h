@@ -2,8 +2,9 @@
  * @file webgrep.h
  * @brief C ABI and Cross-Language FFI Header for libwebgrep v0.10.3.
  *
- * Thread-safe, zero-global-state SIMD literal, multi-pattern, and linear-time
- * regular expression search engine with in-memory archive and streaming reader support.
+ * Thread-safe SIMD literal, multi-pattern, and linear-time regular expression
+ * search engine with in-memory archive, streaming reader, and optional custom
+ * allocator (`webgrep_set_allocator`) support.
  */
 
 #ifndef WEBGREP_H
@@ -1001,7 +1002,9 @@ WEBGREP_API int webgrep_search_reader_flow(
 /**
  * 60. Installs a process-wide custom allocator for all C ABI heap allocations.
  * Pass NULL (or a struct with NULL `alloc`/`free`) to restore the default allocator.
- * Free handles allocated under the previous allocator before switching.
+ * Lifecycle contract: must be configured before creating any handles, and may only
+ * be switched or reset after all handles allocated under the previous allocator
+ * have been freed (freeing a handle across different allocators is undefined).
  */
 WEBGREP_API void webgrep_set_allocator(const webgrep_allocator_t *alloc);
 

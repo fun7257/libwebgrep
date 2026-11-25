@@ -2,7 +2,7 @@
 
 [English](API.md) | [简体中文](API.zh-CN.md)
 
-This document is the complete reference for **libwebgrep v0.10.2** (Zig `0.17.1`, zero-libc, 59 exported C ABI functions) covering all public declarations exported by `src/root.zig` and `include/webgrep.h`. Importing the module as `@import("libwebgrep")` gives access to every type, function, and submodule documented below.
+This document is the complete reference for **libwebgrep v0.10.3** (Zig `0.17.1`, zero-libc, 60 exported C ABI functions) covering all public declarations exported by `src/root.zig` and `include/webgrep.h`. Importing the module as `@import("libwebgrep")` gives access to every type, function, and submodule documented below.
 
 `libwebgrep` searches byte streams and in-memory slices provided by the caller. Entry points that allocate or perform I/O accept an explicit `std.mem.Allocator` and `std.Io`. Pure in-memory slice search requires neither. The library holds no mutable global state.
 
@@ -1207,7 +1207,7 @@ All multi-tenant budgets are configured via `SearchConfig` and enforced determin
 | `before` / `after` | `?u32` | `null` | Default limit `10` (`max_context_lines`) | Asymmetric before/after context lines |
 | `max_context_lines` | `?u32` | `null` | Default `10` (caller-configurable) | Maximum allowed context lines |
 | `passthru` | `bool` | `false` | `false` | Emits all lines (`match` and `context`), bounded by `max_output_bytes` |
-| `replacement` | `?[]const u8` | `null` | `null` | Read-only replacement preview template (`$0`, `$&`, `$1`..`$32`, `${1}`..`${32}`, `${name}`, `$$`) |
+| `replacement` | `?[]const u8` | `null` | `null` | Read-only replacement preview template (`$0`, `$&`, `$1`..`$32`, `${1}`..`${32}`, `$name`, `${name}`, `$$`) |
 | `max_count` | `?u64` | `null` | Unbounded | Per-source matched line limit (`Outcome.stopped`) |
 | `max_results` | `?u64` | `null` | Unbounded | Request-level matched line limit (populates `resume_at`) |
 | `resume_from` | `u64` | `0` | `0` | Searchable byte offset to start/resume scanning from |
@@ -1216,6 +1216,7 @@ All multi-tenant budgets are configured via `SearchConfig` and enforced determin
 | `stop_on_nonmatch` | `bool` | `false` | `false` | Stops and closes upstream on first non-matching line after a match |
 | `binary` | `BinaryPolicy` | `.quit` | `.quit` | Binary handling (`quit`, `report`, `none`) |
 | `null_data` | `bool` | `false` | `false` | Uses NUL (`0x00`) as record delimiter instead of LF |
+| `strip_cr` | `bool` | `true` | `true` | Strips a single `\r` preceding `\n` on CRLF lines (set `false` to preserve trailing `\r` verbatim) |
 | `encoding` | `Encoding` | `.auto` | `.auto` | BOM sniffing, heuristic `.detect`, or explicit encoding (`utf8`, `utf16le/be`, `utf32le/be`, `gbk`, `gb18030`, `shift_jis`, `euc_jp`, `big5`, `euc_kr`, `latin1`, `windows1252`, `windows1251`, `none`) |
 | `charset` | `?[]const u8` | `null` | `null` | WHATWG or HTTP `Content-Type` charset hint |
 | `compression` | `Compression` | `.none` | `.none` | In-process streaming decompression (`none`, `auto`, `gzip`, `zlib`, `deflate`, `zstd`, `xz`, `lz4`, `bzip2`, `brotli`) |
@@ -1365,21 +1366,24 @@ Generic Chase-Lev work-stealing scheduler executing `initial_tasks` and recursiv
 
 ## C ABI (`include/webgrep.h`)
 
-`zig build` installs zero-libc static (`libwebgrep.a`) and shared (`libwebgrep.so` / `.dylib`) libraries along with `include/webgrep.h` (`WEBGREP_VERSION_MAJOR = 0`, `WEBGREP_VERSION_MINOR = 10`, `WEBGREP_VERSION_PATCH = 2`, `WEBGREP_VERSION_STRING = "0.10.2"`, `webgrep_version()` returns `"0.10.2"`), exposing **59 C ABI functions** (`callconv(.c)` with `WEBGREP_API` DLL import/export macro support):
+`zig build` installs zero-libc static (`libwebgrep.a`) and shared (`libwebgrep.so` / `.dylib` / `webgrep.dll`) libraries along with `include/webgrep.h` (`WEBGREP_VERSION_MAJOR = 0`, `WEBGREP_VERSION_MINOR = 10`, `WEBGREP_VERSION_PATCH = 3`, `WEBGREP_VERSION_STRING = "0.10.3"`, `webgrep_version()` returns `"0.10.3"`), exposing **60 C ABI functions** (`callconv(.c)` with `WEBGREP_API` DLL import/export macro support):
 - **Version & Defaults (7)**: `webgrep_version`, `webgrep_find_options_default`, `webgrep_regex_options_default`, `webgrep_config_default`, `webgrep_tree_config_default`, `webgrep_probe_options_default`, `webgrep_bloom_config_default`
 - **Matchers & Scratch (7)**: `webgrep_matcher_compile_literal`, `webgrep_matcher_compile_multi`, `webgrep_matcher_compile_regex`, `webgrep_matcher_compile_regex_set`, `webgrep_matcher_free`, `webgrep_scratch_new`, `webgrep_scratch_free`
 - **Direct Find, RegexSet, Captures & Named Groups (4)**: `webgrep_find`, `webgrep_regex_set_matches`, `webgrep_find_captures`, `webgrep_matcher_group_index`
 - **Cancellation Tokens (4)**: `webgrep_cancel_new`, `webgrep_cancel_trigger`, `webgrep_cancel_reset`, `webgrep_cancel_free`
 - **Slice, Streaming, Range, Reverse, Probe & Archive Search (9)**: `webgrep_search_slice`, `webgrep_search_reader`, `webgrep_search_range`, `webgrep_search_reverse_slice`, `webgrep_search_reverse_at`, `webgrep_probe_line_slice`, `webgrep_probe_line_at`, `webgrep_search_archive_slice`, `webgrep_search_archive_reader`
-- **Pull-Mode Iterators (4)**: `webgrep_pull_open_slice`, `webgrep_pull_open_reader`, `webgrep_pull_next`, `webgrep_pull_free`
+- **Pull-Mode Iterators (4)**: `webgrep_pull_open_slice`, `webgrep_pull_open_reader`, `webgrep_pull_next` (zero-copy `text_ptr` on valid UTF-8, lossy `U+FFFD` on invalid UTF-8), `webgrep_pull_free`
 - **N-gram Bloom Filter (7)**: `webgrep_bloom_new`, `webgrep_bloom_free`, `webgrep_bloom_add`, `webgrep_bloom_merge`, `webgrep_bloom_may_contain`, `webgrep_bloom_serialize`, `webgrep_bloom_deserialize`
 - **Seekable Zstd Table & Indexed Gzip (10)**: `webgrep_zstd_seek_table_parse`, `webgrep_zstd_seek_table_free`, `webgrep_zstd_seek_table_uncompressed_size`, `webgrep_zstd_seek_table_read_at`, `webgrep_gzip_index_build`, `webgrep_gzip_index_free`, `webgrep_gzip_index_uncompressed_size`, `webgrep_gzip_index_serialize`, `webgrep_gzip_index_deserialize`, `webgrep_gzip_index_read_at`
 - **Flow Control & Stateless Resume Pagination (7)**: `webgrep_resume_state_new`, `webgrep_resume_state_free`, `webgrep_resume_state_reset`, `webgrep_resume_state_offset`, `webgrep_resume_state_is_paused`, `webgrep_search_slice_flow`, `webgrep_search_reader_flow`
+- **Process-Wide Custom Allocator Hook (1)**: `webgrep_set_allocator` (`webgrep_allocator_t`, configure before creating handles and switch/reset only after freeing all prior handles)
 
-Key C ABI enumerations in `include/webgrep.h`:
+Key C ABI enumerations & error codes in `include/webgrep.h`:
+- `webgrep_status_t`: `WEBGREP_OK (0)`, `WEBGREP_ERR_INVALID_ARG (-1)`, `WEBGREP_ERR_OUT_OF_MEMORY (-2)`, `WEBGREP_ERR_SYNTAX (-3)`, `WEBGREP_ERR_TOO_LARGE (-4)`, `WEBGREP_ERR_BUDGET_EXCEEDED (-5)`, `WEBGREP_ERR_IO (-6)`, `WEBGREP_ERR_CORRUPT_ARCHIVE (-7)`, `WEBGREP_ERR_ARCHIVE_LIMIT (-8)`, `WEBGREP_ERR_PATH_TRAVERSAL (-9)`, `WEBGREP_ERR_UNSUPPORTED_FORMAT (-10)`.
+- `webgrep_config_t.max_compression_ratio`: configurable decompression expansion ratio cap (`0` uses default `100`, `UINT64_MAX` disables ratio checking; exceeding it records `WEBGREP_LIMIT_DECOMPRESSED_BYTES` and returns `WEBGREP_ERR_BUDGET_EXCEEDED`).
 - `webgrep_whole_word_mode_t` (for `webgrep_config_t.whole_word`): `WEBGREP_WHOLE_WORD_OFF = 0`, `WEBGREP_WHOLE_WORD_UNICODE = 1` (UTS #18 Unicode 16.0 word boundaries, matching any non-zero/non-ASCII value for backward compatibility), `WEBGREP_WHOLE_WORD_ASCII = 2` (ASCII `[0-9A-Za-z_]`, matching `rg -w --no-unicode`).
 - `webgrep_flow_action_t` (for `webgrep_flow_t` in `webgrep_flow_line_cb`): `WEBGREP_FLOW_CONT = 0`, `WEBGREP_FLOW_STOP = 1`, `WEBGREP_FLOW_PAUSE = 2`, `WEBGREP_FLOW_SKIP_TO = 3`.
-- `webgrep_status_t`, `webgrep_case_mode_t`, `webgrep_match_mode_t`, `webgrep_binary_policy_t`, `webgrep_encoding_t` (17 codecs), `webgrep_compression_t` (10 codecs), `webgrep_archive_format_t` (8 formats), `webgrep_limit_hit_t`, `webgrep_line_number_mode_t`, and `webgrep_entry_kind_t`.
+- Other enumerations: `webgrep_case_mode_t`, `webgrep_match_mode_t`, `webgrep_binary_policy_t`, `webgrep_encoding_t` (17 codecs), `webgrep_compression_t` (10 codecs), `webgrep_archive_format_t` (8 formats), `webgrep_limit_hit_t`, `webgrep_line_number_mode_t`, and `webgrep_entry_kind_t`.
 
 ---
 

@@ -19,7 +19,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Tier 1: Native execution (unit tests, 25-section C ABI, doc examples, ReleaseFast CLI)
+  # Tier 1: Native execution (unit tests, 27-section C ABI, doc examples, ReleaseFast CLI)
   verify:
     name: Tier 1 (${{ matrix.name }})
     runs-on: ${{ matrix.os }}

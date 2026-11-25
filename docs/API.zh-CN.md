@@ -2,7 +2,7 @@
 
 [English](API.md) | [简体中文](API.zh-CN.md)
 
-本文档是 **libwebgrep v0.10.2**（Zig `0.17.1`、零 libc 依赖、59 个导出 C ABI 函数）的完整参考手册，覆盖 `src/root.zig` 与 `include/webgrep.h` 导出的全部公共类型、函数与子模块。在代码中通过 `@import("libwebgrep")` 导入模块后，即可使用以下所有接口。
+本文档是 **libwebgrep v0.10.3**（Zig `0.17.1`、零 libc 依赖、60 个导出 C ABI 函数）的完整参考手册，覆盖 `src/root.zig` 与 `include/webgrep.h` 导出的全部公共类型、函数与子模块。在代码中通过 `@import("libwebgrep")` 导入模块后，即可使用以下所有接口。
 
 `libwebgrep` 在调用方提供的字节流（`*std.Io.Reader`）或内存切片（`[]const u8`）上执行搜索。涉及内存分配或流式 I/O 的入口显式接收 `std.mem.Allocator` 与 `std.Io`；纯内存切片搜索无需分配器。库内部不包含任何全局可变状态。
 
@@ -131,7 +131,7 @@ pub fn find(self: *const Regex, haystack: []const u8, start: usize, mode: MatchM
 | `before` / `after` | `?u32` | `null` | 默认上限 `10` 行（可通过 `max_context_lines` 配置） | 单独指定前置 / 后置上下文行数 |
 | `max_context_lines` | `?u32` | `null` | 默认 `10` 行（可按需上调或下调） | 最大允许的上下文行数上限 |
 | `passthru` | `bool` | `false` | `false` | 全文高亮模式：未命中行作为 `context` 交出，受 `max_output_bytes` 约束 |
-| `replacement` | `?[]const u8` | `null` | `null` | 只读替换预览模板（填充 `Span.replacement` 与 `LineEvent.replaced`，不改原输入） |
+| `replacement` | `?[]const u8` | `null` | `null` | 只读替换预览模板（支持 `$0`、`$&`、`$1`..`$32`、`${1}`..`${32}`、`$name`、`${name}`、`$$`，不改原输入） |
 | `max_count` | `?u64` | `null` | 不限 | 单来源最大匹配行数（达到后 `outcome = .stopped`） |
 | `max_results` | `?u64` | `null` | 不限 | 请求级最大匹配行数（达到后 `limit_hit = .max_results` 并填 `resume_at`） |
 | `resume_from` | `u64` | `0` | `0` | 从可搜索流的指定字节偏移处开始扫描 |
@@ -140,6 +140,7 @@ pub fn find(self: *const Regex, haystack: []const u8, start: usize, mode: MatchM
 | `stop_on_nonmatch` | `bool` | `false` | `false` | 有序流提前停止：出现匹配后遇到第一条不匹配行立即停止并关闭上游 |
 | `binary` | `BinaryPolicy` | `.quit` | `.quit` | 二进制处理策略：`.quit`（默认跳过）、`.report`（探测但不交出行）、`.none`（按文本） |
 | `null_data` | `bool` | `false` | `false` | 用 NUL (`0x00`) 代替 `\n` 分隔记录 |
+| `strip_cr` | `bool` | `true` | `true` | 是否剥离 `\n` 前紧邻的单个 `\r`（CRLF）；设为 `false` 可原样保留行尾 `\r` |
 | `encoding` | `Encoding` | `.auto` | `.auto` | 编码处理：`.auto`（嗅探 BOM 或用 `charset`）、`.detect`（启发式自动识别）、`.utf8`、`.utf16le/be`、`.utf32le/be`、`.gbk`、`.gb18030`、`.shift_jis`、`.euc_jp`、`.big5`、`.euc_kr`、`.latin1`、`.windows1252`、`.windows1251`、`.none`（GBK 与 UTF-16LE 启用 SIMD 批量转码与零拷贝 `Decoder` 缓冲） |
 | `charset` | `?[]const u8` | `null` | `null` | WHATWG 标签或 HTTP `Content-Type` 字符集提示（如 `"gb18030"`、`"shift_jis"`、`"windows-1252"`） |
 | `compression` | `Compression` | `.none` | `.none` | 进程内流式解压（等价 `-z`）：`.none`、`.auto`（魔数识别 Gzip/Zstd/XZ/Bzip2/LZ4）、`.gzip`、`.zlib`、`.deflate`、`.zstd`、`.xz`、`.lz4`、`.bzip2`、`.brotli` |
@@ -535,18 +536,21 @@ pub fn find(self: *const Regex, haystack: []const u8, start: usize, mode: MatchM
 
 ## 八、C ABI 跨语言绑定接口（`include/webgrep.h`）
 
-`zig build` 默认产出零 libc 依赖的静态库（`libwebgrep.a`）、动态库（`libwebgrep.so` / `.dylib`）与标准 C99/C11 头文件 `include/webgrep.h`（`WEBGREP_VERSION_MAJOR = 0`、`WEBGREP_VERSION_MINOR = 10`、`WEBGREP_VERSION_PATCH = 2`、`WEBGREP_VERSION_STRING = "0.10.2"`，`webgrep_version()` 返回 `"0.10.2"`，带 `WEBGREP_API` DLL 导入/导出宏），导出全部 **59 个 C ABI 函数**：
+`zig build` 默认产出零 libc 依赖的静态库（`libwebgrep.a`）、动态库（`libwebgrep.so` / `.dylib` / `webgrep.dll`）与标准 C99/C11 头文件 `include/webgrep.h`（`WEBGREP_VERSION_MAJOR = 0`、`WEBGREP_VERSION_MINOR = 10`、`WEBGREP_VERSION_PATCH = 3`、`WEBGREP_VERSION_STRING = "0.10.3"`，`webgrep_version()` 返回 `"0.10.3"`，带 `WEBGREP_API` DLL 导入/导出宏），导出全部 **60 个 C ABI 函数**：
 - **默认配置与版本（7）**：`webgrep_version`、`webgrep_find_options_default`、`webgrep_regex_options_default`、`webgrep_config_default`、`webgrep_tree_config_default`、`webgrep_probe_options_default`、`webgrep_bloom_config_default`
 - **匹配器、缓存与取消令牌（11）**：`webgrep_matcher_compile_literal`、`webgrep_matcher_compile_multi`、`webgrep_matcher_compile_regex`、`webgrep_matcher_compile_regex_set`、`webgrep_matcher_free`、`webgrep_scratch_new`、`webgrep_scratch_free`、`webgrep_cancel_new`、`webgrep_cancel_trigger`、`webgrep_cancel_reset`、`webgrep_cancel_free`
-- **查找、捕获组与拉式迭代（8）**：`webgrep_find`、`webgrep_regex_set_matches`、`webgrep_find_captures`、`webgrep_matcher_group_index`、`webgrep_pull_open_slice`、`webgrep_pull_open_reader`、`webgrep_pull_next`、`webgrep_pull_free`
+- **查找、捕获组与拉式迭代（8）**：`webgrep_find`、`webgrep_regex_set_matches`、`webgrep_find_captures`、`webgrep_matcher_group_index`、`webgrep_pull_open_slice`、`webgrep_pull_open_reader`、`webgrep_pull_next`（合法 UTF-8 零拷贝、非法 UTF-8 返回 `U+FFFD` 有损副本）、`webgrep_pull_free`
 - **流式、随机访问与归档检索（9）**：`webgrep_search_slice`、`webgrep_search_reader`、`webgrep_search_range`、`webgrep_search_reverse_slice`、`webgrep_search_reverse_at`、`webgrep_probe_line_slice`、`webgrep_probe_line_at`、`webgrep_search_archive_slice`、`webgrep_search_archive_reader`
 - **Bloom 预筛与随机解压索引（17）**：`webgrep_bloom_new`、`webgrep_bloom_free`、`webgrep_bloom_add`、`webgrep_bloom_merge`、`webgrep_bloom_may_contain`、`webgrep_bloom_serialize`、`webgrep_bloom_deserialize`、`webgrep_zstd_seek_table_parse`、`webgrep_zstd_seek_table_free`、`webgrep_zstd_seek_table_uncompressed_size`、`webgrep_zstd_seek_table_read_at`、`webgrep_gzip_index_build`、`webgrep_gzip_index_free`、`webgrep_gzip_index_uncompressed_size`、`webgrep_gzip_index_serialize`、`webgrep_gzip_index_deserialize`、`webgrep_gzip_index_read_at`
 - **流控回调与无状态续查分页（7）**：`webgrep_resume_state_new`、`webgrep_resume_state_free`、`webgrep_resume_state_reset`、`webgrep_resume_state_offset`、`webgrep_resume_state_is_paused`、`webgrep_search_slice_flow`、`webgrep_search_reader_flow`
+- **进程级自定义分配器钩子（1）**：`webgrep_set_allocator`（`webgrep_allocator_t`，需在创建任何句柄前配置，且仅在所有既有句柄释放后再切换/重置）
 
-关键 C ABI 枚举与配置说明（`include/webgrep.h`）：
+关键 C ABI 枚举与状态码说明（`include/webgrep.h`）：
+- `webgrep_status_t`：`WEBGREP_OK (0)`、`WEBGREP_ERR_INVALID_ARG (-1)`、`WEBGREP_ERR_OUT_OF_MEMORY (-2)`、`WEBGREP_ERR_SYNTAX (-3)`、`WEBGREP_ERR_TOO_LARGE (-4)`、`WEBGREP_ERR_BUDGET_EXCEEDED (-5)`、`WEBGREP_ERR_IO (-6)`、`WEBGREP_ERR_CORRUPT_ARCHIVE (-7)`、`WEBGREP_ERR_ARCHIVE_LIMIT (-8)`、`WEBGREP_ERR_PATH_TRAVERSAL (-9)`、`WEBGREP_ERR_UNSUPPORTED_FORMAT (-10)`。
+- `webgrep_config_t.max_compression_ratio`：可配置的解压膨胀比上限（`0` 使用默认 `100`，`UINT64_MAX` 关闭膨胀比检查；超限记为 `WEBGREP_LIMIT_DECOMPRESSED_BYTES` 并返回 `WEBGREP_ERR_BUDGET_EXCEEDED`）。
 - `webgrep_whole_word_mode_t`（用于 `webgrep_config_t.whole_word`）：`WEBGREP_WHOLE_WORD_OFF = 0`（关闭）、`WEBGREP_WHOLE_WORD_UNICODE = 1`（UTS #18 Unicode 16.0 词边界，非零且非 ASCII 值默认按 Unicode 语义保持向后兼容）、`WEBGREP_WHOLE_WORD_ASCII = 2`（仅 ASCII `[0-9A-Za-z_]`，对应 `rg -w --no-unicode`）。
 - `webgrep_flow_action_t`（配合 `webgrep_flow_t` 与 `webgrep_flow_line_cb`）：`WEBGREP_FLOW_CONT = 0`、`WEBGREP_FLOW_STOP = 1`、`WEBGREP_FLOW_PAUSE = 2`、`WEBGREP_FLOW_SKIP_TO = 3`。
-- 其他完整枚举：`webgrep_status_t`、`webgrep_case_mode_t`、`webgrep_match_mode_t`、`webgrep_binary_policy_t`、`webgrep_encoding_t`（17 种编码）、`webgrep_compression_t`（10 种压缩格式）、`webgrep_archive_format_t`（8 种归档格式）、`webgrep_limit_hit_t`、`webgrep_line_number_mode_t` 与 `webgrep_entry_kind_t`。
+- 其他完整枚举：`webgrep_case_mode_t`、`webgrep_match_mode_t`、`webgrep_binary_policy_t`、`webgrep_encoding_t`（17 种编码）、`webgrep_compression_t`（10 种压缩格式）、`webgrep_archive_format_t`（8 种归档格式）、`webgrep_limit_hit_t`、`webgrep_line_number_mode_t` 与 `webgrep_entry_kind_t`。
 
 ---
 

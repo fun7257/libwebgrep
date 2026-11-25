@@ -1067,10 +1067,13 @@ fn FastLineSink(comptime mode: FastLineMode) type {
         line_numbers: bool,
         byte_offset: bool,
         multiline: bool,
+        defer_binary_flush: bool = false,
+        max_seen_offset: u64 = 0,
         last_line_number: u64 = 0,
         last_line_offset: u64 = 0,
 
         const mid_file_flush_threshold: usize = 256 * 1024;
+        const binary_probe_cap: u64 = 64 * 1024;
 
         fn writeBytes(self: *@This(), bytes: []const u8, base_line_num: ?u64, base_offset: u64, sep: u8) bool {
             const alloc = self.worker.shared.allocator;
@@ -1094,6 +1097,7 @@ fn FastLineSink(comptime mode: FastLineMode) type {
         }
 
         fn maybeFlush(self: *@This()) bool {
+            if (self.defer_binary_flush and self.max_seen_offset < binary_probe_cap) return true;
             if (self.worker.out_buf.items.len >= mid_file_flush_threshold) {
                 self.worker.flushOut();
                 if (self.worker.shared.write_failed.load(.acquire)) return false;
@@ -1103,6 +1107,7 @@ fn FastLineSink(comptime mode: FastLineMode) type {
 
         pub fn matched(self: *@This(), line: searcher.Line) bool {
             if (line.binary_status == .detected) return false;
+            if (line.offset > self.max_seen_offset) self.max_seen_offset = line.offset;
             if (self.line_numbers) {
                 if (line.number) |n| {
                     self.last_line_number = n;
@@ -1144,6 +1149,7 @@ fn FastLineSink(comptime mode: FastLineMode) type {
 
         pub fn context(self: *@This(), line: searcher.Line) bool {
             if (line.binary_status == .detected) return false;
+            if (line.offset > self.max_seen_offset) self.max_seen_offset = line.offset;
             if (!self.writeBytes(line.bytes, line.number, line.offset, '-')) return false;
             return self.maybeFlush();
         }
@@ -1211,6 +1217,7 @@ fn searchWith(worker: *Worker, engine: anytype, file: std.Io.File, path: []const
         var count_sink = CountTally{};
         break :blk try runFileOrMmap(CountTally, worker, &count_sink, file, path, engine, cfg);
     } else if (direct_out and shared.emit == .text) blk: {
+        const defer_bin_flush = cfg.binary == .quit and !cfg.null_data;
         if (shared.only_matching and cfg.replacement != null) {
             var text_sink = FastLineSink(.only_matching_replace){
                 .worker = worker,
@@ -1220,6 +1227,7 @@ fn searchWith(worker: *Worker, engine: anytype, file: std.Io.File, path: []const
                 .line_numbers = cfg.line_numbers,
                 .byte_offset = shared.byte_offset,
                 .multiline = cfg.multiline,
+                .defer_binary_flush = defer_bin_flush,
             };
             break :blk try runFileOrMmap(FastLineSink(.only_matching_replace), worker, &text_sink, file, path, engine, cfg);
         } else if (shared.only_matching) {
@@ -1231,6 +1239,7 @@ fn searchWith(worker: *Worker, engine: anytype, file: std.Io.File, path: []const
                 .line_numbers = cfg.line_numbers,
                 .byte_offset = shared.byte_offset,
                 .multiline = cfg.multiline,
+                .defer_binary_flush = defer_bin_flush,
             };
             break :blk try runFileOrMmap(FastLineSink(.only_matching), worker, &text_sink, file, path, engine, cfg);
         } else if (cfg.replacement != null) {
@@ -1242,6 +1251,7 @@ fn searchWith(worker: *Worker, engine: anytype, file: std.Io.File, path: []const
                 .line_numbers = cfg.line_numbers,
                 .byte_offset = shared.byte_offset,
                 .multiline = cfg.multiline,
+                .defer_binary_flush = defer_bin_flush,
             };
             break :blk try runFileOrMmap(FastLineSink(.replace), worker, &text_sink, file, path, engine, cfg);
         } else {
@@ -1253,6 +1263,7 @@ fn searchWith(worker: *Worker, engine: anytype, file: std.Io.File, path: []const
                 .line_numbers = cfg.line_numbers,
                 .byte_offset = shared.byte_offset,
                 .multiline = cfg.multiline,
+                .defer_binary_flush = defer_bin_flush,
             };
             break :blk try runFileOrMmap(FastLineSink(.line), worker, &text_sink, file, path, engine, cfg);
         }

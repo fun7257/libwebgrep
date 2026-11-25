@@ -143,6 +143,9 @@ pub const SearchConfig = struct {
     binary: BinaryPolicy = .quit,
     /// Delimit records by NUL. LF inside a record does not break lines, and NUL is not treated as a binary signal.
     null_data: bool = false,
+    /// When true (default), strip a single trailing `\r` before `\n` in LF mode.
+    /// Set to false to treat only `\n` as line delimiter (preserving trailing `\r` in line bytes, matching `rg` without `--crlf`).
+    strip_cr: bool = true,
     /// Sniff for a BOM at the start of the stream by default. `.none` disables sniffing and transcoding.
     encoding: Encoding = .auto,
     /// Optional HTTP Content-Type or WHATWG charset hint (e.g., `"gbk"`, `"text/plain; charset=gbk"`).

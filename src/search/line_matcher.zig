@@ -394,12 +394,13 @@ fn streamSpans(
         var next_pos: usize = undefined;
         if (span_end == hit.start) {
             // Zero-width match: match `gatherSpans` semantics on line boundaries and CRLF.
+            const at_crlf = config.strip_cr and hit.start + 1 < effective_limit and buf[hit.start] == '\r' and buf[hit.start + 1] == '\n';
             const at_eol = hit.start == effective_limit or
                 buf[hit.start] == '\n' or
-                (buf[hit.start] == '\r' and hit.start + 1 < effective_limit and buf[hit.start + 1] == '\n');
+                at_crlf;
             const prev_is_content = hit.start > 0 and buf[hit.start - 1] != '\n';
             if (at_eol and prev_is_content) {
-                if (hit.start + 1 < effective_limit and buf[hit.start] == '\r' and buf[hit.start + 1] == '\n') {
+                if (at_crlf) {
                     pos = hit.start + 2;
                 } else if (hit.start < effective_limit and buf[hit.start] == '\n') {
                     pos = hit.start + 1;
@@ -408,13 +409,13 @@ fn streamSpans(
                 }
                 continue;
             }
-            if (hit.start + 1 < effective_limit and buf[hit.start] == '\r' and buf[hit.start + 1] == '\n') {
+            if (at_crlf) {
                 next_pos = hit.start + 2;
             } else {
                 next_pos = hit.start + 1;
             }
         } else {
-            if (buf[span_end - 1] == '\r' and span_end < effective_limit and buf[span_end] == '\n') {
+            if (config.strip_cr and buf[span_end - 1] == '\r' and span_end < effective_limit and buf[span_end] == '\n') {
                 span_end -= 1;
                 if (span_end == hit.start) {
                     pos = hit.end;
@@ -669,7 +670,7 @@ fn scanFinderFastLoop(
             const ls = boundedLineStart(buf, pos, hit.start, config);
             var ce = line_end;
             if (ce > ls and buf[ce - 1] == '\n') ce -= 1;
-            if (ce > ls and buf[ce - 1] == '\r') ce -= 1;
+            if (config.strip_cr and ce > ls and buf[ce - 1] == '\r') ce -= 1;
 
             if (config.max_line_len > 0 and ce - ls > config.max_line_len) {
                 @branchHint(.unlikely);

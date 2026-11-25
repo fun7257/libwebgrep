@@ -678,7 +678,7 @@ pub fn contentEnd(buf: []const u8, line: Range, config: SearchConfig) usize {
     var end = line.end;
     const sep = recordSep(config);
     if (end > line.start and end <= buf.len and buf[end - 1] == sep) end -= 1;
-    if (!config.null_data and end > line.start and end <= buf.len and buf[end - 1] == '\r') end -= 1;
+    if (!config.null_data and config.strip_cr and end > line.start and end <= buf.len and buf[end - 1] == '\r') end -= 1;
     return end;
 }
 

@@ -71,6 +71,14 @@ pub const Run = struct {
     count_lines_only: bool = false,
     /// Emit only matched spans (equivalent to `-o`/`--only-matching`) in direct text output mode.
     only_matching: bool = false,
+    /// Prefix output lines with the file path in direct output mode (false for `-I`/`--no-filename`).
+    show_filename: bool = true,
+    /// Prefix output lines/spans with 0-based byte offset (`-b`/`--byte-offset`) in direct text output mode.
+    byte_offset: bool = false,
+    /// Separate filenames with NUL (`\x00`) instead of `:`/`-`/`\n` (`-0`/`--null`) in direct output mode.
+    null_filename: bool = false,
+    /// Emit `--\n` between distinct files when context lines are enabled (`-A`/`-B`/`-C`).
+    context_file_sep: bool = false,
     /// Optional output flag set to true if any soft walk/open/read errors occurred during the run.
     has_soft_errors: ?*bool = null,
     emit: Emit = .text,
@@ -103,6 +111,10 @@ const Shared = struct {
     use_mmap: bool = false,
     count_lines_only: bool = false,
     only_matching: bool = false,
+    show_filename: bool = true,
+    byte_offset: bool = false,
+    null_filename: bool = false,
+    context_file_sep: bool = false,
     finder: finder_mod.Finder,
     /// When non-null, workers share this read-only automaton instead of using `finder`.
     many: ?*multi_mod.Multi = null,
@@ -171,6 +183,7 @@ const Worker = struct {
     decomp_stream_buf: []u8 = &.{},
     zstd_win_buf: []u8 = &.{},
     out_buf: std.ArrayList(u8) = .empty,
+    file_has_flushed: bool = false,
     local_searches: u64 = 0,
     local_searches_with_match: u64 = 0,
     local_matched_lines: u64 = 0,
@@ -201,11 +214,20 @@ const Worker = struct {
         self.shared.lock.lockUncancelable(self.shared.io);
         defer self.shared.lock.unlock(self.shared.io);
         if (!self.shared.write_failed.load(.monotonic)) {
-            self.shared.stdout.writeAll(data) catch {
-                self.shared.write_failed.store(true, .release);
-                requestStop(self.shared);
-            };
-            self.shared.saw.* = true;
+            if (self.shared.context_file_sep and !self.file_has_flushed and self.shared.saw.*) {
+                self.shared.stdout.writeAll("--\n") catch {
+                    self.shared.write_failed.store(true, .release);
+                    requestStop(self.shared);
+                };
+            }
+            if (!self.shared.write_failed.load(.monotonic)) {
+                self.shared.stdout.writeAll(data) catch {
+                    self.shared.write_failed.store(true, .release);
+                    requestStop(self.shared);
+                };
+                self.shared.saw.* = true;
+                self.file_has_flushed = true;
+            }
         }
         self.local_bytes_printed += data.len;
         self.out_buf.clearRetainingCapacity();
@@ -333,6 +355,10 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, req: Run) !Stats {
         .use_mmap = req.use_mmap,
         .count_lines_only = req.count_lines_only,
         .only_matching = req.only_matching,
+        .show_filename = req.show_filename,
+        .byte_offset = req.byte_offset,
+        .null_filename = req.null_filename,
+        .context_file_sep = req.context_file_sep,
         .finder = finder,
         .many = if (many) |*engine| engine else null,
         .regex = req.regex,
@@ -595,12 +621,13 @@ fn onFile(ctx: *anyopaque, visit: walker.Visit) anyerror!walker.Control {
                 _ = shared.searches_with_match.fetchAdd(1, .monotonic);
                 shared.any_match.store(true, .release);
                 const alloc = shared.allocator;
+                const term: u8 = if (shared.null_filename) 0 else '\n';
                 worker.out_buf.ensureUnusedCapacity(alloc, visit.path.len + 1) catch {
                     requestStop(shared);
                     return .stop;
                 };
                 worker.out_buf.appendSliceAssumeCapacity(visit.path);
-                worker.out_buf.appendAssumeCapacity('\n');
+                worker.out_buf.appendAssumeCapacity(term);
                 if (worker.out_buf.items.len >= 64 * 1024) {
                     worker.flushOut();
                     if (shared.write_failed.load(.acquire)) return .stop;
@@ -614,12 +641,13 @@ fn onFile(ctx: *anyopaque, visit: walker.Visit) anyerror!walker.Control {
             worker.local_searches += 1;
             worker.local_searches_with_match += 1;
             const alloc = shared.allocator;
+            const term: u8 = if (shared.null_filename) 0 else '\n';
             worker.out_buf.ensureUnusedCapacity(alloc, visit.path.len + 1) catch {
                 requestStop(shared);
                 return .stop;
             };
             worker.out_buf.appendSliceAssumeCapacity(visit.path);
-            worker.out_buf.appendAssumeCapacity('\n');
+            worker.out_buf.appendAssumeCapacity(term);
             if (worker.out_buf.items.len >= 64 * 1024) {
                 worker.flushOut();
                 if (shared.write_failed.load(.acquire)) return .stop;
@@ -995,15 +1023,24 @@ inline fn appendFormattedLineSep(
     alloc: std.mem.Allocator,
     buf: *std.ArrayList(u8),
     path: []const u8,
+    show_filename: bool,
+    null_filename: bool,
     line_number: ?u64,
+    byte_offset: ?u64,
     sep: u8,
     bytes: []const u8,
 ) !void {
-    try buf.ensureUnusedCapacity(alloc, path.len + 24 + bytes.len);
-    buf.appendSliceAssumeCapacity(path);
-    buf.appendAssumeCapacity(sep);
+    try buf.ensureUnusedCapacity(alloc, path.len + 48 + bytes.len);
+    if (show_filename) {
+        buf.appendSliceAssumeCapacity(path);
+        buf.appendAssumeCapacity(if (null_filename) 0 else sep);
+    }
     if (line_number) |num| {
         appendU64(buf, num);
+        buf.appendAssumeCapacity(sep);
+    }
+    if (byte_offset) |off| {
+        appendU64(buf, off);
         buf.appendAssumeCapacity(sep);
     }
     buf.appendSliceAssumeCapacity(bytes);
@@ -1025,25 +1062,33 @@ fn FastLineSink(comptime mode: FastLineMode) type {
 
         worker: *Worker,
         path: []const u8,
+        show_filename: bool,
+        null_filename: bool,
         line_numbers: bool,
+        byte_offset: bool,
         multiline: bool,
         last_line_number: u64 = 0,
         last_line_offset: u64 = 0,
 
         const mid_file_flush_threshold: usize = 256 * 1024;
 
-        fn writeBytes(self: *@This(), bytes: []const u8, base_line_num: ?u64, sep: u8) bool {
+        fn writeBytes(self: *@This(), bytes: []const u8, base_line_num: ?u64, base_offset: u64, sep: u8) bool {
             const alloc = self.worker.shared.allocator;
             const buf = &self.worker.out_buf;
             if (self.multiline and std.mem.findScalar(u8, bytes, '\n') != null) {
                 var it = std.mem.splitScalar(u8, bytes, '\n');
                 var idx: u64 = 0;
+                var off_acc: u64 = base_offset;
                 while (it.next()) |sub| : (idx += 1) {
                     const ln: ?u64 = if (self.line_numbers) (if (base_line_num) |n| n + idx else null) else null;
-                    appendFormattedLineSep(alloc, buf, self.path, ln, sep, sub) catch return false;
+                    const bo: ?u64 = if (self.byte_offset) off_acc else null;
+                    appendFormattedLineSep(alloc, buf, self.path, self.show_filename, self.null_filename, ln, bo, sep, sub) catch return false;
+                    off_acc += sub.len + 1;
                 }
             } else {
-                appendFormattedLineSep(alloc, buf, self.path, if (self.line_numbers) base_line_num else null, sep, bytes) catch return false;
+                const ln: ?u64 = if (self.line_numbers) base_line_num else null;
+                const bo: ?u64 = if (self.byte_offset) base_offset else null;
+                appendFormattedLineSep(alloc, buf, self.path, self.show_filename, self.null_filename, ln, bo, sep, bytes) catch return false;
             }
             return true;
         }
@@ -1066,11 +1111,11 @@ fn FastLineSink(comptime mode: FastLineMode) type {
             }
             switch (mode) {
                 .line => {
-                    if (!self.writeBytes(line.bytes, line.number, ':')) return false;
+                    if (!self.writeBytes(line.bytes, line.number, line.offset, ':')) return false;
                 },
                 .replace => {
                     const text = line.replaced orelse line.bytes;
-                    if (!self.writeBytes(text, line.number, ':')) return false;
+                    if (!self.writeBytes(text, line.number, line.offset, ':')) return false;
                 },
                 .only_matching, .only_matching_replace => {
                     var prev_pos: usize = 0;
@@ -1090,7 +1135,7 @@ fn FastLineSink(comptime mode: FastLineMode) type {
                             }
                             break :blk n + nl_acc;
                         } else null;
-                        if (!self.writeBytes(seg, base_ln, ':')) return false;
+                        if (!self.writeBytes(seg, base_ln, line.offset + from, ':')) return false;
                     }
                 },
             }
@@ -1099,7 +1144,7 @@ fn FastLineSink(comptime mode: FastLineMode) type {
 
         pub fn context(self: *@This(), line: searcher.Line) bool {
             if (line.binary_status == .detected) return false;
-            if (!self.writeBytes(line.bytes, line.number, '-')) return false;
+            if (!self.writeBytes(line.bytes, line.number, line.offset, '-')) return false;
             return self.maybeFlush();
         }
 
@@ -1136,6 +1181,13 @@ fn fileHeadHasNul(io: std.Io, file: std.Io.File, worker: *Worker) bool {
 fn searchWith(worker: *Worker, engine: anytype, file: std.Io.File, path: []const u8) !void {
     const shared = worker.shared;
     var cfg = worker.config();
+    if (cfg.compression == .auto) {
+        if (std.ascii.endsWithIgnoreCase(path, ".br")) {
+            cfg.compression = .brotli;
+        } else if (std.ascii.endsWithIgnoreCase(path, ".zlib")) {
+            cfg.compression = .zlib;
+        }
+    }
     if (shared.request_cap != std.math.maxInt(u64)) {
         const used = shared.request_used.load(.monotonic);
         if (used >= shared.request_cap) return;
@@ -1145,6 +1197,8 @@ fn searchWith(worker: *Worker, engine: anytype, file: std.Io.File, path: []const
     }
 
     const direct_out = shared.write_output and shared.on_event == null;
+    worker.file_has_flushed = false;
+    const file_out_start = worker.out_buf.items.len;
     if (!direct_out and shared.on_event != null) {
         _ = shared.emitEvent(.{ .begin = .{ .source_id = path } });
     }
@@ -1161,7 +1215,10 @@ fn searchWith(worker: *Worker, engine: anytype, file: std.Io.File, path: []const
             var text_sink = FastLineSink(.only_matching_replace){
                 .worker = worker,
                 .path = path,
+                .show_filename = shared.show_filename,
+                .null_filename = shared.null_filename,
                 .line_numbers = cfg.line_numbers,
+                .byte_offset = shared.byte_offset,
                 .multiline = cfg.multiline,
             };
             break :blk try runFileOrMmap(FastLineSink(.only_matching_replace), worker, &text_sink, file, path, engine, cfg);
@@ -1169,7 +1226,10 @@ fn searchWith(worker: *Worker, engine: anytype, file: std.Io.File, path: []const
             var text_sink = FastLineSink(.only_matching){
                 .worker = worker,
                 .path = path,
+                .show_filename = shared.show_filename,
+                .null_filename = shared.null_filename,
                 .line_numbers = cfg.line_numbers,
+                .byte_offset = shared.byte_offset,
                 .multiline = cfg.multiline,
             };
             break :blk try runFileOrMmap(FastLineSink(.only_matching), worker, &text_sink, file, path, engine, cfg);
@@ -1177,7 +1237,10 @@ fn searchWith(worker: *Worker, engine: anytype, file: std.Io.File, path: []const
             var text_sink = FastLineSink(.replace){
                 .worker = worker,
                 .path = path,
+                .show_filename = shared.show_filename,
+                .null_filename = shared.null_filename,
                 .line_numbers = cfg.line_numbers,
+                .byte_offset = shared.byte_offset,
                 .multiline = cfg.multiline,
             };
             break :blk try runFileOrMmap(FastLineSink(.replace), worker, &text_sink, file, path, engine, cfg);
@@ -1185,7 +1248,10 @@ fn searchWith(worker: *Worker, engine: anytype, file: std.Io.File, path: []const
             var text_sink = FastLineSink(.line){
                 .worker = worker,
                 .path = path,
+                .show_filename = shared.show_filename,
+                .null_filename = shared.null_filename,
                 .line_numbers = cfg.line_numbers,
+                .byte_offset = shared.byte_offset,
                 .multiline = cfg.multiline,
             };
             break :blk try runFileOrMmap(FastLineSink(.line), worker, &text_sink, file, path, engine, cfg);
@@ -1199,17 +1265,27 @@ fn searchWith(worker: *Worker, engine: anytype, file: std.Io.File, path: []const
         break :blk try runFileOrMmap(Tally, worker, &sink, file, path, engine, cfg);
     };
 
-    // Match ripgrep `-l` binary-quit parity on directory walks: when a file matches
-    // early (e.g. line 1 under `cfg.exists = true`) before reaching a NUL byte within
-    // the initial 64 KiB read buffer, suppress reporting it as a matching file.
-    if (shared.emit == .files_with_matches and cfg.binary == .quit and result.matched_lines > 0) {
-        const suppressed_binary = result.outcome == .binary_quit or
-            (cfg.compression == .none and
-                (cfg.encoding == .none or cfg.encoding == .auto) and
-                cfg.charset == null and
-                result.nul_offset == null and
-                fileHeadHasNul(shared.io, file, worker));
+    // Match ripgrep binary-quit parity on directory walks: when binary-quit triggers
+    // within the initial 64 KiB read buffer (or an early-stop mode such as `-l` / `-m`
+    // stops before scanning past a NUL in the initial 64 KiB), suppress buffered output
+    // and counts for the file.
+    if (cfg.binary == .quit and !cfg.null_data and result.matched_lines > 0) {
+        const binary_probe_cap: u64 = 64 * 1024;
+        const can_probe_head = cfg.compression == .none and
+            (cfg.encoding == .none or cfg.encoding == .auto) and
+            cfg.charset == null and
+            result.nul_offset == null;
+        const suppressed_binary = if (shared.emit == .files_with_matches)
+            result.outcome == .binary_quit or (can_probe_head and fileHeadHasNul(shared.io, file, worker))
+        else if (direct_out and (shared.emit == .text or shared.emit == .count))
+            (result.outcome == .binary_quit and (result.nul_offset orelse 0) < binary_probe_cap) or
+                (cfg.max_count != null and can_probe_head and fileHeadHasNul(shared.io, file, worker))
+        else
+            false;
         if (suppressed_binary) {
+            if (direct_out and shared.emit == .text and !worker.file_has_flushed) {
+                worker.out_buf.items.len = file_out_start;
+            }
             result.matched_lines = 0;
             result.matches = 0;
             result.outcome = .binary_quit;
@@ -1224,8 +1300,10 @@ fn searchWith(worker: *Worker, engine: anytype, file: std.Io.File, path: []const
         if (shared.emit == .count and shared.count_lines_only) {
             if (result.matched_lines > 0) {
                 try worker.out_buf.ensureUnusedCapacity(alloc, path.len + 24);
-                worker.out_buf.appendSliceAssumeCapacity(path);
-                worker.out_buf.appendAssumeCapacity(':');
+                if (shared.show_filename) {
+                    worker.out_buf.appendSliceAssumeCapacity(path);
+                    worker.out_buf.appendAssumeCapacity(if (shared.null_filename) 0 else ':');
+                }
                 appendU64(&worker.out_buf, result.matched_lines);
                 worker.out_buf.appendAssumeCapacity('\n');
             }
@@ -1233,17 +1311,24 @@ fn searchWith(worker: *Worker, engine: anytype, file: std.Io.File, path: []const
             if (result.matched_lines > 0) {
                 try worker.out_buf.ensureUnusedCapacity(alloc, path.len + 1);
                 worker.out_buf.appendSliceAssumeCapacity(path);
-                worker.out_buf.appendAssumeCapacity('\n');
+                worker.out_buf.appendAssumeCapacity(if (shared.null_filename) 0 else '\n');
             }
         } else if (result.outcome == .binary_matched) {
-            const prefix = "Binary file ";
-            const suffix = " matches\n";
-            try worker.out_buf.ensureUnusedCapacity(alloc, prefix.len + path.len + suffix.len);
-            worker.out_buf.appendSliceAssumeCapacity(prefix);
-            worker.out_buf.appendSliceAssumeCapacity(path);
-            worker.out_buf.appendSliceAssumeCapacity(suffix);
+            const nul_off = result.binary_offset orelse 0;
+            const mid = "binary file matches (found \"\\0\" byte around offset ";
+            const tail = ")\n";
+            try worker.out_buf.ensureUnusedCapacity(alloc, path.len + mid.len + 24 + tail.len + 2);
+            if (shared.show_filename) {
+                worker.out_buf.appendSliceAssumeCapacity(path);
+                worker.out_buf.appendSliceAssumeCapacity(": ");
+            }
+            worker.out_buf.appendSliceAssumeCapacity(mid);
+            appendU64(&worker.out_buf, nul_off);
+            worker.out_buf.appendSliceAssumeCapacity(tail);
         }
-        if (worker.out_buf.items.len >= 64 * 1024) {
+        if (shared.context_file_sep and worker.out_buf.items.len > 0) {
+            worker.flushOut();
+        } else if (worker.out_buf.items.len >= 64 * 1024) {
             worker.flushOut();
         }
     } else if (shared.on_event != null) {
@@ -1631,6 +1716,59 @@ test "multi-source streaming delivers events immediately without buffering all r
     });
     try testing.expectEqual(@as(u64, 1), stats_early.searches);
     try testing.expectEqual(@as(u32, 1), stream_early.ends);
+}
+
+test "direct text and count walks suppress pre-NUL matches when binary-quit triggers in initial buffer" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "a_text.txt", .data = "WALK_NEEDLE\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b_binary.bin", .data = "WALK_NEEDLE\n\x00\x01\x02BINARY_AFTER_NUL\n" });
+
+    const root = try tempRoot(tmp.dir);
+    defer testing.allocator.free(root);
+
+    // Text mode (-n) must emit only a_text.txt and suppress pre-NUL line 1 from b_binary.bin.
+    {
+        var out: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer out.deinit();
+        var saw = false;
+        const stats = try run(testing.allocator, io, .{
+            .pattern = "WALK_NEEDLE",
+            .roots = &.{root},
+            .search = .{ .line_numbers = true, .binary = .quit },
+            .walk = .{ .threads = 1, .sort_by = .path },
+            .emit = .text,
+            .write_output = true,
+            .stdout = &out.writer,
+            .saw_output = &saw,
+        });
+        try testing.expectEqual(@as(u64, 1), stats.matched_lines);
+        try testing.expectEqual(@as(u64, 1), stats.searches_with_match);
+        try testing.expect(std.mem.find(u8, out.written(), "a_text.txt:1:WALK_NEEDLE\n") != null);
+        try testing.expect(std.mem.find(u8, out.written(), "b_binary.bin") == null);
+    }
+
+    // Count mode (-c) must likewise suppress b_binary.bin.
+    {
+        var out: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer out.deinit();
+        var saw = false;
+        const stats = try run(testing.allocator, io, .{
+            .pattern = "WALK_NEEDLE",
+            .roots = &.{root},
+            .search = .{ .binary = .quit },
+            .walk = .{ .threads = 1, .sort_by = .path },
+            .emit = .count,
+            .count_lines_only = true,
+            .write_output = true,
+            .stdout = &out.writer,
+            .saw_output = &saw,
+        });
+        try testing.expectEqual(@as(u64, 1), stats.matched_lines);
+        try testing.expect(std.mem.find(u8, out.written(), "a_text.txt:1\n") != null);
+        try testing.expect(std.mem.find(u8, out.written(), "b_binary.bin") == null);
+    }
 }
 
 test {

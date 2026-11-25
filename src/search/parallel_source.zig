@@ -289,6 +289,7 @@ fn RecorderType(comptime fast_line: bool) type {
         used: usize = 0,
         sep: u8,
         null_data: bool,
+        strip_cr: bool = true,
 
         fn within(buf: []const u8, s: []const u8) bool {
             const lo = @intFromPtr(buf.ptr);
@@ -361,7 +362,7 @@ fn RecorderType(comptime fast_line: bool) type {
         pub fn matched(self: *Self, line: Line) bool {
             const rel: usize = @intCast(line.offset);
             var e: usize = rel + @as(usize, @intCast(line.line_len));
-            if (!self.null_data and e < self.data.len and self.data[e] == '\r') e += 1;
+            if (!self.null_data and self.strip_cr and e < self.data.len and self.data[e] == '\r') e += 1;
             const ends_sep = e < self.data.len and self.data[e] == self.sep;
             if (ends_sep) e += 1;
 
@@ -1000,6 +1001,7 @@ fn Run(comptime B: type, comptime MT: type) type {
                     .cap = self.rec_cap,
                     .sep = self.sep,
                     .null_data = self.config.null_data,
+                    .strip_cr = self.config.strip_cr,
                 };
                 slot.result = sequentialSlice(RecSink, &rec, data, "", self.matcher, cfg) catch |err| {
                     slot.err = err;

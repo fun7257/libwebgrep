@@ -683,7 +683,7 @@ fn pumpLongWithBacking(
                 if (state.long_active) {
                     if (std.mem.findScalar(u8, buf.*[0..nul_idx], recordSep(config))) |nl| {
                         var content_len = nl;
-                        if (!config.null_data and nl > 0 and buf.*[nl - 1] == '\r') content_len = nl - 1;
+                        if (!config.null_data and config.strip_cr and nl > 0 and buf.*[nl - 1] == '\r') content_len = nl - 1;
                         try noteLong(allocator, matcher, buf.*[0..content_len], hold, seen, state, config, true);
                         if (!try finishLongWithBacking(S, sink, buf, filled, hold.*, seen.*, state, config, content_len, nl + 1, backing)) return false;
                         const rem_nul = nul_idx - (nl + 1);
@@ -716,7 +716,7 @@ fn pumpLongWithBacking(
     const sep = recordSep(config);
     if (std.mem.findScalar(u8, buf.*[0..filled.*], sep)) |nl| {
         var content_len = nl;
-        if (!config.null_data and nl > 0 and buf.*[nl - 1] == '\r') content_len = nl - 1;
+        if (!config.null_data and config.strip_cr and nl > 0 and buf.*[nl - 1] == '\r') content_len = nl - 1;
         try noteLong(allocator, matcher, buf.*[0..content_len], hold, seen, state, config, true);
         return finishLongWithBacking(S, sink, buf, filled, hold.*, seen.*, state, config, content_len, nl + 1, backing);
     }

@@ -327,7 +327,7 @@ fn readPrefixCode(allocator: std.mem.Allocator, br: *BitReader, alphabet_size: u
             }
             const old_repeat = repeat;
             if (repeat > 0) {
-                repeat = (repeat - 2) << extra_bits;
+                repeat = (repeat - 2) << @intCast(extra_bits);
             }
             repeat += (try br.readBits(extra_bits)) + 3;
             const delta = repeat - old_repeat;

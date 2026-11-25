@@ -11,6 +11,7 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const encoding = @import("../codec/encoding.zig");
+const matcher_mod = @import("../matcher.zig");
 const memchr = @import("../finder/memchr.zig");
 const platform = @import("platform.zig");
 const searcher = @import("../searcher.zig");
@@ -63,6 +64,26 @@ pub fn searchFileWindowed(
     return searchFileWindowedSized(S, sink, io, file, file_size, name, matcher, config, window_len);
 }
 
+fn searchWindowSlice(
+    comptime S: type,
+    sink: *S,
+    bytes: []const u8,
+    base_offset: u64,
+    name: []const u8,
+    matcher: anytype,
+    config: searcher.SearchConfig,
+) !sink_mod.Result {
+    var win_cfg = config;
+    win_cfg.encoding = .none;
+    if (base_offset > 0) win_cfg.stream_offset = base_offset;
+    var prepared = searcher.pipeline_mod.Prepared{
+        .bytes = bytes,
+        .base_searchable_offset = base_offset,
+        .offset_map = .{ .base_raw_offset = base_offset },
+    };
+    return searcher.pipeline_mod.searchPrepared(S, sink, &prepared, name, matcher, win_cfg);
+}
+
 /// Parameterized-window-size variant of `searchFileWindowed` (exposed for fast unit testing
 /// with smaller windows such as 64 KiB). Requires `file_size > win_size + win_size / 2`.
 pub fn searchFileWindowedSized(
@@ -80,6 +101,7 @@ pub fn searchFileWindowedSized(
     if (comptime builtin.os.tag != .linux) return .fallback;
     if (!isEligible(matcher, config)) return .fallback;
     if (win_size == 0) return .fallback;
+    matcher_mod.validateMatcher(@TypeOf(matcher));
 
     const min_file_size: u64 = @as(u64, win_size) + @as(u64, win_size / 2);
     if (file_size <= min_file_size or file_size > std.math.maxInt(usize)) return .fallback;
@@ -89,6 +111,7 @@ pub fn searchFileWindowedSized(
     const page_mask: u64 = page_size - 1;
     const sep: u8 = if (config.null_data) 0 else '\n';
     const has_tail_line_tracking = comptime (@hasField(S, "last_line_number") and @hasField(S, "last_line_offset"));
+    const track_line_numbers = (config.line_numbers or config.initial_line_number != null or config.line_number_mode == .from_one) and config.line_number_mode != .unknown;
 
     platform.adviseSequentialFile(file);
 
@@ -151,9 +174,8 @@ pub fn searchFileWindowedSized(
                 defer std.posix.munmap(rem_mapped);
                 std.posix.madvise(rem_mapped.ptr, rem_mapped.len, std.posix.MADV.SEQUENTIAL) catch {};
                 var rem_cfg = config;
-                rem_cfg.encoding = .none;
-                if (config.line_numbers) rem_cfg.initial_line_number = next_line_no;
-                const rem_res = try searcher.searchSlice(S, sink, rem_mapped[delta..rem_len], name, matcher, rem_cfg);
+                if (track_line_numbers) rem_cfg.initial_line_number = next_line_no;
+                const rem_res = try searchWindowSlice(S, sink, rem_mapped[delta..rem_len], offset, name, matcher, rem_cfg);
                 agg.matched_lines += rem_res.matched_lines;
                 agg.matches += rem_res.matches;
                 agg.bytes_read += rem_res.bytes_read;
@@ -163,11 +185,11 @@ pub fn searchFileWindowedSized(
                 agg.outcome = rem_res.outcome;
                 if (rem_res.nul_offset) |no| {
                     if (agg.nul_offset == null) {
-                        agg.nul_offset = offset + no;
-                        agg.binary_offset = offset + no;
+                        agg.nul_offset = no;
+                        agg.binary_offset = no;
                     }
                 }
-                if (rem_res.resume_at) |ra| agg.resume_at = offset + ra;
+                if (rem_res.resume_at) |ra| agg.resume_at = ra;
                 agg.limit_hit = rem_res.limit_hit;
                 agg.partial = rem_res.partial;
                 agg.paused = rem_res.paused;
@@ -179,14 +201,13 @@ pub fn searchFileWindowedSized(
         };
 
         var win_cfg = config;
-        win_cfg.encoding = .none;
-        if (config.line_numbers) win_cfg.initial_line_number = next_line_no;
+        if (track_line_numbers) win_cfg.initial_line_number = next_line_no;
         if (has_tail_line_tracking) {
             sink.last_line_number = 0;
             sink.last_line_offset = 0;
         }
 
-        const res = try searcher.searchSlice(S, sink, chunk, name, matcher, win_cfg);
+        const res = try searchWindowSlice(S, sink, chunk, offset, name, matcher, win_cfg);
 
         agg.matched_lines += res.matched_lines;
         agg.matches += res.matches;
@@ -196,14 +217,14 @@ pub fn searchFileWindowedSized(
         agg.elapsed_ns += res.elapsed_ns;
         if (res.nul_offset) |no| {
             if (agg.nul_offset == null) {
-                agg.nul_offset = offset + no;
-                agg.binary_offset = offset + no;
+                agg.nul_offset = no;
+                agg.binary_offset = no;
             }
         }
 
         if (res.outcome == .binary_quit or res.outcome == .binary_matched or res.outcome == .stopped) {
             agg.outcome = res.outcome;
-            if (res.resume_at) |ra| agg.resume_at = offset + ra;
+            if (res.resume_at) |ra| agg.resume_at = ra;
             agg.limit_hit = res.limit_hit;
             agg.partial = res.partial;
             agg.paused = res.paused;
@@ -212,10 +233,10 @@ pub fn searchFileWindowedSized(
             return .{ .done = agg };
         }
 
-        if (config.line_numbers and config.line_number_mode != .unknown and !at_eof) {
+        if (track_line_numbers and !at_eof) {
             if (has_tail_line_tracking) {
-                if (sink.last_line_number != 0 and sink.last_line_offset <= chunk.len) {
-                    const tail_start: usize = @intCast(sink.last_line_offset);
+                if (sink.last_line_number != 0 and sink.last_line_offset >= offset and sink.last_line_offset - offset <= chunk.len) {
+                    const tail_start: usize = @intCast(sink.last_line_offset - offset);
                     next_line_no = sink.last_line_number + memchr.count(memchr.native_width, chunk, tail_start, chunk.len, sep);
                 } else {
                     next_line_no += memchr.count(memchr.native_width, chunk, 0, chunk.len, sep);
@@ -690,5 +711,147 @@ test "searchFileWindowedSized handles > window single-line fallback, mid-file lo
         var sink = TestCountSink{};
         const out = try searchFileWindowedSized(TestCountSink, &sink, io, file, bom_buf.items.len, "bom.txt", &finder, .{ .encoding = .auto }, win_size);
         try std.testing.expect(out == .fallback);
+    }
+}
+
+fn TestOffsetSink(comptime fast_line: bool) type {
+    return struct {
+        pub const matched_fast_line = fast_line;
+
+        allocator: std.mem.Allocator,
+        out: std.ArrayList(u8) = .empty,
+        last_line_number: u64 = 0,
+        last_line_offset: u64 = 0,
+
+        fn deinit(self: *@This()) void {
+            self.out.deinit(self.allocator);
+        }
+
+        pub fn matched(self: *@This(), line: sink_mod.Line) bool {
+            if (line.number) |n| {
+                self.last_line_number = n;
+                self.last_line_offset = line.offset;
+            }
+            var prefix_buf: [96]u8 = undefined;
+            const prefix = std.fmt.bufPrint(&prefix_buf, "{d}:{d}:{d}:", .{
+                line.number orelse 0,
+                line.offset,
+                line.raw_offset,
+            }) catch return false;
+            self.out.appendSlice(self.allocator, prefix) catch return false;
+            self.out.appendSlice(self.allocator, line.bytes) catch return false;
+            self.out.append(self.allocator, '\n') catch return false;
+            return true;
+        }
+    };
+}
+
+test "searchFileWindowedSized preserves absolute byte_offset and raw_offset across windows" {
+    if (comptime builtin.os.tag != .linux) return;
+
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const finder_mod = @import("../finder/finder.zig");
+    const win_size: usize = 64 * 1024;
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    // Build ~220 KiB across ~4 windows of 64 KiB, including a quiet window and matches in windows 0, 2, 3.
+    var line_idx: usize = 0;
+    while (buf.items.len < 220 * 1024) : (line_idx += 1) {
+        const cur_len = buf.items.len;
+        const in_quiet_window = (cur_len >= 64 * 1024 and cur_len < 130 * 1024);
+        if (!in_quiet_window and line_idx % 41 == 0) {
+            var tmp_line: [64]u8 = undefined;
+            const s = try std.fmt.bufPrint(&tmp_line, "row-{d:0>6} needle hit\n", .{line_idx});
+            try buf.appendSlice(alloc, s);
+        } else {
+            var tmp_line: [64]u8 = undefined;
+            const s = try std.fmt.bufPrint(&tmp_line, "row-{d:0>6} filler 0123456789abcdef0123456789\n", .{line_idx});
+            try buf.appendSlice(alloc, s);
+        }
+    }
+    try buf.appendSlice(alloc, "eof-tail needle");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "offsets.txt", .data = buf.items });
+    const file = try tmp.dir.openFile(io, "offsets.txt", .{});
+    defer file.close(io);
+
+    const finder = try finder_mod.Finder.init("needle", .{});
+    const cfg = searcher.SearchConfig{ .line_numbers = true, .encoding = .auto, .binary = .quit };
+
+    // Fast-line sink with tail tracking (matches wg-cli PrintSink / FastLineSink).
+    {
+        var ref_sink = TestOffsetSink(true){ .allocator = alloc };
+        defer ref_sink.deinit();
+        const ref_res = try searcher.searchSlice(TestOffsetSink(true), &ref_sink, buf.items, "offsets.txt", &finder, cfg);
+
+        var win_sink = TestOffsetSink(true){ .allocator = alloc };
+        defer win_sink.deinit();
+        const win_out = try searchFileWindowedSized(TestOffsetSink(true), &win_sink, io, file, buf.items.len, "offsets.txt", &finder, cfg, win_size);
+        const win_res = switch (win_out) {
+            .done => |r| r,
+            .fallback => return error.TestUnexpectedResult,
+        };
+        try std.testing.expectEqual(ref_res.matched_lines, win_res.matched_lines);
+        try std.testing.expectEqual(ref_res.bytes_read, win_res.bytes_read);
+        try std.testing.expectEqual(ref_res.bytes_searched, win_res.bytes_searched);
+        try std.testing.expectEqualStrings(ref_sink.out.items, win_sink.out.items);
+    }
+
+    // Standard buildLine sink (verifies offset_map.base_raw_offset -> line.raw_offset across windows).
+    {
+        var ref_sink = TestOffsetSink(false){ .allocator = alloc };
+        defer ref_sink.deinit();
+        const ref_res = try searcher.searchSlice(TestOffsetSink(false), &ref_sink, buf.items, "offsets.txt", &finder, cfg);
+
+        var win_sink = TestOffsetSink(false){ .allocator = alloc };
+        defer win_sink.deinit();
+        const win_out = try searchFileWindowedSized(TestOffsetSink(false), &win_sink, io, file, buf.items.len, "offsets.txt", &finder, cfg, win_size);
+        const win_res = switch (win_out) {
+            .done => |r| r,
+            .fallback => return error.TestUnexpectedResult,
+        };
+        try std.testing.expectEqual(ref_res.matched_lines, win_res.matched_lines);
+        try std.testing.expectEqual(ref_res.bytes_read, win_res.bytes_read);
+        try std.testing.expectEqual(ref_res.bytes_searched, win_res.bytes_searched);
+        try std.testing.expectEqualStrings(ref_sink.out.items, win_sink.out.items);
+    }
+
+    // Mid-file > win_size single line tail also preserves absolute offsets.
+    {
+        var mid: std.ArrayList(u8) = .empty;
+        defer mid.deinit(alloc);
+        while (mid.items.len < 70 * 1024) {
+            try mid.appendSlice(alloc, "prefix needle 0123456789abcdef\n");
+        }
+        try mid.appendNTimes(alloc, 'z', 45 * 1024);
+        try mid.appendSlice(alloc, "needle");
+        try mid.appendNTimes(alloc, 'y', 45 * 1024);
+        try mid.append(alloc, '\n');
+        try mid.appendSlice(alloc, "after-long needle\n");
+
+        try tmp.dir.writeFile(io, .{ .sub_path = "midlong_off.txt", .data = mid.items });
+        const mid_file = try tmp.dir.openFile(io, "midlong_off.txt", .{});
+        defer mid_file.close(io);
+
+        var ref_sink = TestOffsetSink(false){ .allocator = alloc };
+        defer ref_sink.deinit();
+        const ref_res = try searcher.searchSlice(TestOffsetSink(false), &ref_sink, mid.items, "midlong_off.txt", &finder, cfg);
+
+        var win_sink = TestOffsetSink(false){ .allocator = alloc };
+        defer win_sink.deinit();
+        const win_out = try searchFileWindowedSized(TestOffsetSink(false), &win_sink, io, mid_file, mid.items.len, "midlong_off.txt", &finder, cfg, win_size);
+        const win_res = switch (win_out) {
+            .done => |r| r,
+            .fallback => return error.TestUnexpectedResult,
+        };
+        try std.testing.expectEqual(ref_res.matched_lines, win_res.matched_lines);
+        try std.testing.expectEqual(ref_res.bytes_read, win_res.bytes_read);
+        try std.testing.expectEqual(ref_res.bytes_searched, win_res.bytes_searched);
+        try std.testing.expectEqualStrings(ref_sink.out.items, win_sink.out.items);
     }
 }

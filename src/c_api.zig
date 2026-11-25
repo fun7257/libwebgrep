@@ -24,7 +24,8 @@ const probe_mod = @import("probe.zig");
 const tree_mod = @import("search/tree.zig");
 
 const builtin = @import("builtin");
-pub const c_alloc = if (builtin.is_test)
+
+pub const default_c_alloc: std.mem.Allocator = if (builtin.is_test)
     std.testing.allocator
 else if (builtin.link_libc)
     std.heap.c_allocator
@@ -34,6 +35,84 @@ else if (builtin.single_threaded)
     std.heap.page_allocator
 else
     std.heap.smp_allocator;
+
+pub const webgrep_allocator_t = extern struct {
+    alloc: ?*const fn (ctx: ?*anyopaque, size: usize, alignment: usize) callconv(.c) ?*anyopaque = null,
+    free: ?*const fn (ctx: ?*anyopaque, ptr: ?*anyopaque, size: usize, alignment: usize) callconv(.c) void = null,
+    ctx: ?*anyopaque = null,
+};
+
+var custom_alloc_lock: std.atomic.Value(u32) = .init(0);
+var custom_alloc_enabled: std.atomic.Value(bool) = .init(false);
+var custom_alloc_cfg: webgrep_allocator_t = .{};
+
+fn loadCustomAlloc() ?webgrep_allocator_t {
+    if (!custom_alloc_enabled.load(.acquire)) return null;
+    while (custom_alloc_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+        std.atomic.spinLoopHint();
+    }
+    defer custom_alloc_lock.store(0, .release);
+    if (custom_alloc_cfg.alloc != null and custom_alloc_cfg.free != null) {
+        return custom_alloc_cfg;
+    }
+    return null;
+}
+
+fn cAllocAlloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+    if (loadCustomAlloc()) |cb| {
+        const align_bytes = @as(usize, 1) << @intFromEnum(alignment);
+        const raw = cb.alloc.?(cb.ctx, len, align_bytes) orelse return null;
+        return @ptrCast(raw);
+    }
+    return default_c_alloc.rawAlloc(len, alignment, ret_addr);
+}
+
+fn cAllocResize(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+    if (custom_alloc_enabled.load(.acquire)) return false;
+    return default_c_alloc.rawResize(memory, alignment, new_len, ret_addr);
+}
+
+fn cAllocRemap(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+    if (custom_alloc_enabled.load(.acquire)) return null;
+    return default_c_alloc.rawRemap(memory, alignment, new_len, ret_addr);
+}
+
+fn cAllocFree(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+    if (loadCustomAlloc()) |cb| {
+        const align_bytes = @as(usize, 1) << @intFromEnum(alignment);
+        cb.free.?(cb.ctx, @ptrCast(memory.ptr), memory.len, align_bytes);
+        return;
+    }
+    default_c_alloc.rawFree(memory, alignment, ret_addr);
+}
+
+const c_alloc_vtable: std.mem.Allocator.VTable = .{
+    .alloc = cAllocAlloc,
+    .resize = cAllocResize,
+    .remap = cAllocRemap,
+    .free = cAllocFree,
+};
+
+pub const c_alloc: std.mem.Allocator = .{
+    .ptr = undefined,
+    .vtable = &c_alloc_vtable,
+};
+
+pub export fn webgrep_set_allocator(alloc: ?*const webgrep_allocator_t) callconv(.c) void {
+    while (custom_alloc_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+        std.atomic.spinLoopHint();
+    }
+    defer custom_alloc_lock.store(0, .release);
+    if (alloc) |a| {
+        if (a.alloc != null and a.free != null) {
+            custom_alloc_cfg = a.*;
+            custom_alloc_enabled.store(true, .release);
+            return;
+        }
+    }
+    custom_alloc_cfg = .{};
+    custom_alloc_enabled.store(false, .release);
+}
 
 // ============================================================================
 // Status & Error Codes
@@ -49,6 +128,8 @@ pub const WEBGREP_ERR_LIMIT_EXCEEDED: c_int = -5;
 pub const WEBGREP_ERR_IO: c_int = -6;
 pub const WEBGREP_ERR_CORRUPT_ARCHIVE: c_int = -7;
 pub const WEBGREP_ERR_ARCHIVE_LIMIT: c_int = -8;
+pub const WEBGREP_ERR_PATH_TRAVERSAL: c_int = -9;
+pub const WEBGREP_ERR_UNSUPPORTED_FORMAT: c_int = -10;
 
 pub const WEBGREP_LINE_NUM_AUTO: i32 = 0;
 pub const WEBGREP_LINE_NUM_FROM_ONE: i32 = 1;
@@ -815,7 +896,7 @@ pub fn populateCSummary(out_summary: ?*webgrep_summary_t, res: sink_mod.Result, 
 // ============================================================================
 
 pub export fn webgrep_version() callconv(.c) [*:0]const u8 {
-    return "0.10.2";
+    return "0.10.3";
 }
 
 pub export fn webgrep_find_options_default() callconv(.c) webgrep_find_options_t {
@@ -847,11 +928,12 @@ pub export fn webgrep_matcher_compile_literal(
     const find_opts = toFindOptions(opts) orelse return WEBGREP_ERR_INVALID_ARG;
     const pat: []const u8 = if (pattern_ptr) |p| p[0..pattern_len] else "";
 
+    var ok = false;
     const owned = if (pat.len > 0)
         c_alloc.dupe(u8, pat) catch return WEBGREP_ERR_OUT_OF_MEMORY
     else
         @as([]u8, &.{});
-    errdefer if (owned.len > 0) c_alloc.free(owned);
+    defer if (!ok and owned.len > 0) c_alloc.free(owned);
 
     const f = finder_mod.Finder.init(owned, find_opts) catch |err| return switch (err) {
         error.PatternHasNewline => WEBGREP_ERR_SYNTAX,
@@ -868,6 +950,7 @@ pub export fn webgrep_matcher_compile_literal(
         },
     };
     box.bindAnyMatcher();
+    ok = true;
     out.* = @ptrCast(box);
     return WEBGREP_OK;
 }
@@ -891,23 +974,24 @@ pub export fn webgrep_matcher_compile_multi(
         }
     }
 
+    var ok = false;
     const owned_patterns = if (patterns_len > 0)
         c_alloc.alloc([]u8, patterns_len) catch return WEBGREP_ERR_OUT_OF_MEMORY
     else
         @as([][]u8, &.{});
     var initialized_count: usize = 0;
-    errdefer {
+    defer if (!ok) {
         for (owned_patterns[0..initialized_count]) |p| {
             if (p.len > 0) c_alloc.free(p);
         }
         if (owned_patterns.len > 0) c_alloc.free(owned_patterns);
-    }
+    };
 
     const pattern_slices = if (patterns_len > 0)
         c_alloc.alloc([]const u8, patterns_len) catch return WEBGREP_ERR_OUT_OF_MEMORY
     else
         @as([][]const u8, &.{});
-    errdefer if (pattern_slices.len > 0) c_alloc.free(pattern_slices);
+    defer if (!ok and pattern_slices.len > 0) c_alloc.free(pattern_slices);
 
     if (patterns_len > 0) {
         const c_pats = patterns_ptr.?[0..patterns_len];
@@ -928,7 +1012,7 @@ pub export fn webgrep_matcher_compile_multi(
         error.PatternHasNewline => WEBGREP_ERR_SYNTAX,
         error.PatternCountExceeded, error.PatternBytesExceeded => WEBGREP_ERR_TOO_LARGE,
     };
-    errdefer m.deinit();
+    defer if (!ok) m.deinit();
 
     const box = c_alloc.create(MatcherBox) catch return WEBGREP_ERR_OUT_OF_MEMORY;
     box.* = .{
@@ -941,6 +1025,7 @@ pub export fn webgrep_matcher_compile_multi(
         },
     };
     box.bindAnyMatcher();
+    ok = true;
     out.* = @ptrCast(box);
     return WEBGREP_OK;
 }
@@ -960,18 +1045,20 @@ pub export fn webgrep_matcher_compile_regex(
     const re_opts = toRegexOptions(opts) orelse return WEBGREP_ERR_INVALID_ARG;
     const pat: []const u8 = if (pattern_ptr) |p| p[0..pattern_len] else "";
 
+    var ok = false;
     var z_diag: regex_mod.CompileDiagnostic = .{};
     var re = regex_mod.Regex.initDiagnostic(c_alloc, pat, re_opts, &z_diag) catch |err| {
         fillCDiag(out_diag, z_diag);
         return mapRegexError(err);
     };
-    errdefer re.deinit();
+    defer if (!ok) re.deinit();
 
     const box = c_alloc.create(MatcherBox) catch return WEBGREP_ERR_OUT_OF_MEMORY;
     box.* = .{
         .payload = .{ .regex = re },
     };
     box.bindAnyMatcher();
+    ok = true;
     out.* = @ptrCast(box);
     return WEBGREP_OK;
 }
@@ -1001,18 +1088,20 @@ pub export fn webgrep_matcher_compile_regex_set(
         }
     }
 
+    var ok = false;
     var z_diag: regex_mod.CompileDiagnostic = .{};
     var rs = regex_mod.RegexSet.initDiagnostic(c_alloc, slices, re_opts, &z_diag) catch |err| {
         fillCDiag(out_diag, z_diag);
         return mapRegexError(err);
     };
-    errdefer rs.deinit();
+    defer if (!ok) rs.deinit();
 
     const box = c_alloc.create(MatcherBox) catch return WEBGREP_ERR_OUT_OF_MEMORY;
     box.* = .{
         .payload = .{ .regex_set = rs },
     };
     box.bindAnyMatcher();
+    ok = true;
     out.* = @ptrCast(box);
     return WEBGREP_OK;
 }
@@ -1262,10 +1351,9 @@ pub export fn webgrep_search_archive_slice(
     var tree = archive_mod.ArchiveTree.initFromSlice(c_alloc, archive_bytes, z_tcfg.archive) catch |err| return switch (err) {
         error.OutOfMemory => WEBGREP_ERR_OUT_OF_MEMORY,
         error.ArchiveLimit => WEBGREP_ERR_ARCHIVE_LIMIT,
-        error.UnsupportedFormat,
-        error.CorruptArchive,
-        error.PathTraversal,
-        => WEBGREP_ERR_CORRUPT_ARCHIVE,
+        error.PathTraversal => WEBGREP_ERR_PATH_TRAVERSAL,
+        error.UnsupportedFormat => WEBGREP_ERR_UNSUPPORTED_FORMAT,
+        error.CorruptArchive => WEBGREP_ERR_CORRUPT_ARCHIVE,
     };
     defer tree.deinit();
 
@@ -1406,7 +1494,7 @@ comptime {
 
 test "c_api: version and options default" {
     const ver = std.mem.span(webgrep_version());
-    try std.testing.expectEqualStrings("0.10.2", ver);
+    try std.testing.expectEqualStrings("0.10.3", ver);
 
     const fopts = webgrep_find_options_default();
     try std.testing.expectEqual(@as(c_int, 0), fopts.case_mode);
@@ -1792,4 +1880,125 @@ test "c_api: null options parity, byte_range, line_number_mode, line_filter, rev
         try std.testing.expectEqual(@as(u64, 1), tsum.files_searched);
         try std.testing.expectEqual(@as(u64, 1), tsum.matched_files);
     }
+}
+
+test "c_api: custom allocator hook, OOM injection, distinct archive errors, and isolated ratio check" {
+    // 1. Custom allocator hook tracks all allocations/frees and can inject OOM
+    const AllocTracker = struct {
+        alloc_calls: usize = 0,
+        free_calls: usize = 0,
+        live_bytes: usize = 0,
+        fail_after: ?usize = null,
+
+        fn cAlloc(raw_ctx: ?*anyopaque, size: usize, alignment: usize) callconv(.c) ?*anyopaque {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx.?));
+            if (self.fail_after) |limit| {
+                if (self.alloc_calls >= limit) return null;
+            }
+            const log2: u6 = @intCast(@ctz(@max(alignment, 1)));
+            const ptr = std.testing.allocator.rawAlloc(size, @enumFromInt(log2), @returnAddress()) orelse return null;
+            self.alloc_calls += 1;
+            self.live_bytes += size;
+            return @ptrCast(ptr);
+        }
+
+        fn cFree(raw_ctx: ?*anyopaque, raw_ptr: ?*anyopaque, size: usize, alignment: usize) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx.?));
+            const ptr: [*]u8 = @ptrCast(raw_ptr orelse return);
+            const log2: u6 = @intCast(@ctz(@max(alignment, 1)));
+            std.testing.allocator.rawFree(ptr[0..size], @enumFromInt(log2), @returnAddress());
+            self.free_calls += 1;
+            self.live_bytes -= size;
+        }
+    };
+
+    var tracker = AllocTracker{};
+    const custom = webgrep_allocator_t{
+        .alloc = AllocTracker.cAlloc,
+        .free = AllocTracker.cFree,
+        .ctx = &tracker,
+    };
+    webgrep_set_allocator(&custom);
+    defer webgrep_set_allocator(null);
+
+    {
+        var m: ?*webgrep_matcher_t = null;
+        try std.testing.expectEqual(WEBGREP_OK, webgrep_matcher_compile_regex("user_[0-9]+", 11, null, null, &m));
+        defer webgrep_matcher_free(m);
+        const s = webgrep_scratch_new() orelse return error.OutOfMemory;
+        defer webgrep_scratch_free(s);
+        var cfg = webgrep_config_default();
+        cfg.scratch = s;
+        var sum: webgrep_summary_t = .{};
+        const data = "a user_42 b\n";
+        try std.testing.expectEqual(WEBGREP_OK, webgrep_search_slice(m, data.ptr, data.len, &cfg, null, null, &sum));
+        try std.testing.expectEqual(@as(u64, 1), sum.matched_lines);
+    }
+    try std.testing.expect(tracker.alloc_calls > 0);
+    try std.testing.expectEqual(tracker.alloc_calls, tracker.free_calls);
+    try std.testing.expectEqual(@as(usize, 0), tracker.live_bytes);
+
+    // Deterministic OOM injection returns WEBGREP_ERR_OUT_OF_MEMORY with zero leaks
+    tracker.fail_after = tracker.alloc_calls;
+    var oom_m: ?*webgrep_matcher_t = null;
+    try std.testing.expectEqual(WEBGREP_ERR_OUT_OF_MEMORY, webgrep_matcher_compile_literal("needle", 6, null, &oom_m));
+    try std.testing.expect(oom_m == null);
+    try std.testing.expectEqual(@as(usize, 0), tracker.live_bytes);
+
+    // Restore default allocator
+    webgrep_set_allocator(null);
+
+    // 2. Distinct WEBGREP_ERR_PATH_TRAVERSAL and WEBGREP_ERR_UNSUPPORTED_FORMAT
+    var m: ?*webgrep_matcher_t = null;
+    try std.testing.expectEqual(WEBGREP_OK, webgrep_matcher_compile_literal("HIT", 3, null, &m));
+    defer webgrep_matcher_free(m);
+
+    const traversal_tar = try archive_mod.buildTestTarAlloc(std.testing.allocator, &.{
+        .{ .path = "../etc/passwd", .data = "HIT\n" },
+    });
+    defer std.testing.allocator.free(traversal_tar);
+    var tsum: webgrep_tree_summary_t = .{};
+    try std.testing.expectEqual(WEBGREP_ERR_PATH_TRAVERSAL, webgrep_search_archive_slice(m, traversal_tar.ptr, traversal_tar.len, null, null, null, &tsum));
+
+    // Encrypted ZIP (bit 0 set in flags) -> WEBGREP_ERR_UNSUPPORTED_FORMAT
+    const enc_zip = try archive_mod.buildTestZipAlloc(std.testing.allocator, &.{
+        .{ .path = "secret.txt", .data = "HIT\n" },
+    });
+    defer std.testing.allocator.free(enc_zip);
+    enc_zip[6] |= 1; // LFH general purpose bit flag bit 0 (encrypted)
+    // Find central directory header signature PK\x01\x02 and set bit 0 on its flags (offset +8)
+    if (std.mem.indexOf(u8, enc_zip, "PK\x01\x02")) |cd_off| {
+        enc_zip[cd_off + 8] |= 1;
+    }
+    try std.testing.expectEqual(WEBGREP_ERR_UNSUPPORTED_FORMAT, webgrep_search_archive_slice(m, enc_zip.ptr, enc_zip.len, null, null, null, &tsum));
+
+    // 3. Isolated max_compression_ratio check (large max_decode_bytes = 64 MiB, ratio = 5)
+    // Valid 29-byte RFC 1952 Gzip bomb inflating to 1032 'A' bytes (ratio 35.6x > 5)
+    const bomb_gz = [_]u8{
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff,
+        0x73, 0x74, 0x1c, 0x05, 0xa3, 0x60, 0x14, 0x8c, 0x74, 0x00,
+        0x00, 0xdb, 0xbc, 0x2d, 0x49, 0x08, 0x04, 0x00, 0x00,
+    };
+    var ratio_cfg = webgrep_config_default();
+    ratio_cfg.compression = 2; // WEBGREP_COMPRESSION_GZIP
+    ratio_cfg.max_decode_bytes = 64 * 1024 * 1024;
+    ratio_cfg.max_compression_ratio = 5;
+    var rsum: webgrep_summary_t = .{};
+    try std.testing.expectEqual(WEBGREP_ERR_BUDGET_EXCEEDED, webgrep_search_slice(m, &bomb_gz, bomb_gz.len, &ratio_cfg, null, null, &rsum));
+    try std.testing.expectEqual(@as(c_int, 4), rsum.limit_hit); // WEBGREP_LIMIT_DECOMPRESSED_BYTES
+
+    // Same payload succeeds when ratio cap is raised above 35.6x (confirming ratio was the sole trigger)
+    ratio_cfg.max_compression_ratio = 100;
+    rsum = .{};
+    try std.testing.expectEqual(WEBGREP_OK, webgrep_search_slice(m, &bomb_gz, bomb_gz.len, &ratio_cfg, null, null, &rsum));
+    try std.testing.expectEqual(@as(c_int, 0), rsum.limit_hit);
+
+    // Isolated max_decode_bytes check (max_compression_ratio = UINT64_MAX disables ratio check)
+    var byte_cfg = webgrep_config_default();
+    byte_cfg.compression = 2;
+    byte_cfg.max_decode_bytes = 128;
+    byte_cfg.max_compression_ratio = std.math.maxInt(u64);
+    var bsum: webgrep_summary_t = .{};
+    try std.testing.expectEqual(WEBGREP_ERR_BUDGET_EXCEEDED, webgrep_search_slice(m, &bomb_gz, bomb_gz.len, &byte_cfg, null, null, &bsum));
+    try std.testing.expectEqual(@as(c_int, 4), bsum.limit_hit);
 }

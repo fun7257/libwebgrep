@@ -15,6 +15,7 @@ const config_mod = @import("search/config.zig");
 const pull_mod = @import("search/pull.zig");
 const archive_mod = @import("codec/archive.zig");
 const decompress_mod = @import("codec/decompress.zig");
+const encoding_mod = @import("codec/encoding.zig");
 const probe_mod = @import("probe.zig");
 const tree_mod = @import("search/tree.zig");
 const bloom_mod = @import("finder/bloom.zig");
@@ -161,6 +162,7 @@ const PullBox = struct {
         reader: pull_mod.ReaderPull(*const matcher_mod.AnyMatcher),
     } = undefined,
     cur_spans: std.ArrayList(api.webgrep_span_t) = .empty,
+    cur_text: std.ArrayList(u8) = .empty,
     summary: api.webgrep_summary_t = .{},
     had_soft_error: bool = false,
     saw_decompressed_limit: bool = false,
@@ -172,6 +174,7 @@ const PullBox = struct {
             .reader => |*rp| rp.deinit(),
         }
         self.cur_spans.deinit(c_alloc);
+        self.cur_text.deinit(c_alloc);
         self.cfg_guard.deinit();
         c_alloc.destroy(self);
     }
@@ -490,7 +493,7 @@ pub export fn webgrep_pull_open_slice(
     const box = c_alloc.create(PullBox) catch return api.WEBGREP_ERR_OUT_OF_MEMORY;
     box.* = .{};
     var keep = false;
-    errdefer if (!keep) {
+    defer if (!keep) {
         box.cfg_guard.deinit();
         c_alloc.destroy(box);
     };
@@ -523,7 +526,7 @@ pub export fn webgrep_pull_open_reader(
     const box = c_alloc.create(PullBox) catch return api.WEBGREP_ERR_OUT_OF_MEMORY;
     box.* = .{};
     var keep = false;
-    errdefer if (!keep) {
+    defer if (!keep) {
         box.cfg_guard.deinit();
         c_alloc.destroy(box);
     };
@@ -595,6 +598,15 @@ pub export fn webgrep_pull_next(
                         });
                     }
                 }
+                const text_slice: []const u8 = if (std.unicode.utf8ValidateSlice(ev.bytes))
+                    ev.bytes
+                else blk: {
+                    const need = encoding_mod.lossyLen(ev.bytes);
+                    box.cur_text.clearRetainingCapacity();
+                    box.cur_text.resize(c_alloc, need) catch return api.WEBGREP_ERR_OUT_OF_MEMORY;
+                    const written = encoding_mod.writeLossy(ev.bytes, box.cur_text.items);
+                    break :blk box.cur_text.items[0..written];
+                };
                 out_ev.* = .{
                     .path_ptr = if (ev.source_id.len > 0) ev.source_id.ptr else null,
                     .path_len = ev.source_id.len,
@@ -602,8 +614,8 @@ pub export fn webgrep_pull_next(
                     .byte_offset = ev.absolute_offset,
                     .column = ev.column orelse 0,
                     .u16_column = ev.u16_column orelse 0,
-                    .text_ptr = ev.bytes.ptr,
-                    .text_len = ev.bytes.len,
+                    .text_ptr = text_slice.ptr,
+                    .text_len = text_slice.len,
                     .bytes_ptr = ev.bytes.ptr,
                     .bytes_len = ev.bytes.len,
                     .replaced_ptr = if (ev.replaced) |r| r.ptr else null,
@@ -713,6 +725,8 @@ pub export fn webgrep_search_archive_reader(
         return switch (err) {
             error.OutOfMemory => api.WEBGREP_ERR_OUT_OF_MEMORY,
             error.ArchiveLimit => api.WEBGREP_ERR_ARCHIVE_LIMIT,
+            error.PathTraversal => api.WEBGREP_ERR_PATH_TRAVERSAL,
+            error.UnsupportedFormat => api.WEBGREP_ERR_UNSUPPORTED_FORMAT,
             error.ContextLinesExceeded,
             error.BudgetExceeded,
             error.BufferLimit,
@@ -1562,6 +1576,8 @@ pub export fn webgrep_search_slice_flow(
         rb.has_result = true;
     }
     api.populateCSummary(out_summary, res, c_sink.stopped or c_sink.paused);
+    if (res.soft_error != null) return api.WEBGREP_ERR_IO;
+    if (res.limit_hit == .decompressed_bytes) return api.WEBGREP_ERR_BUDGET_EXCEEDED;
     return api.WEBGREP_OK;
 }
 
@@ -1613,6 +1629,7 @@ pub export fn webgrep_search_reader_flow(
     }
     api.populateCSummary(out_summary, res, c_sink.stopped or c_sink.paused);
     if (c_reader.failed or res.soft_error != null) return api.WEBGREP_ERR_IO;
+    if (res.limit_hit == .decompressed_bytes) return api.WEBGREP_ERR_BUDGET_EXCEEDED;
     return api.WEBGREP_OK;
 }
 
@@ -1716,4 +1733,90 @@ test "c_api_ext v0.8: contains_regexes, excludes_regexes, unicode_classes, Flow.
     try std.testing.expectEqual(api.WEBGREP_OK, webgrep_search_slice_flow(m_hit, doc.ptr, doc.len, null, null, SkipCtx.cb, &sk, &s3));
     try std.testing.expectEqual(@as(usize, 2), sk.count);
     try std.testing.expectEqual(@as(u64, 3), sk.last_line);
+}
+
+test "c_api_ext: webgrep_pull_next UTF-8 text_ptr contract (zero-copy valid + lossy U+FFFD invalid)" {
+    var m: ?*api.webgrep_matcher_t = null;
+    try std.testing.expectEqual(api.WEBGREP_OK, api.webgrep_matcher_compile_literal("TAG", 3, null, &m));
+    defer api.webgrep_matcher_free(m);
+
+    // Line 1: valid UTF-8 ("TAG café"), Line 2: invalid UTF-8 ("TAG \xFF\xFE end"), Line 3: valid UTF-8 ("TAG ok")
+    const doc = "TAG caf\xc3\xa9\nTAG \xff\xfe end\nTAG ok\n";
+
+    // Slice pull iterator
+    {
+        var pull: ?*webgrep_pull_t = null;
+        try std.testing.expectEqual(api.WEBGREP_OK, webgrep_pull_open_slice(m, doc.ptr, doc.len, null, &pull));
+        defer webgrep_pull_free(pull);
+
+        var ev: api.webgrep_line_event_t = .{};
+        var sum: api.webgrep_summary_t = .{};
+
+        // Valid UTF-8 -> zero-copy (text_ptr == bytes_ptr)
+        try std.testing.expectEqual(@as(c_int, 1), webgrep_pull_next(pull, &ev, &sum));
+        try std.testing.expectEqual(ev.bytes_ptr, ev.text_ptr);
+        try std.testing.expectEqualStrings("TAG caf\xc3\xa9", ev.text_ptr.?[0..ev.text_len]);
+
+        // Invalid UTF-8 -> bytes_ptr holds raw bytes, text_ptr holds valid UTF-8 with U+FFFD replacements
+        try std.testing.expectEqual(@as(c_int, 1), webgrep_pull_next(pull, &ev, &sum));
+        try std.testing.expectEqualStrings("TAG \xff\xfe end", ev.bytes_ptr.?[0..ev.bytes_len]);
+        const text2 = ev.text_ptr.?[0..ev.text_len];
+        try std.testing.expect(std.unicode.utf8ValidateSlice(text2));
+        try std.testing.expectEqualStrings("TAG \u{FFFD}\u{FFFD} end", text2);
+        try std.testing.expect(ev.text_ptr != ev.bytes_ptr);
+
+        // Subsequent valid UTF-8 line -> back to zero-copy
+        try std.testing.expectEqual(@as(c_int, 1), webgrep_pull_next(pull, &ev, &sum));
+        try std.testing.expectEqual(ev.bytes_ptr, ev.text_ptr);
+        try std.testing.expectEqualStrings("TAG ok", ev.text_ptr.?[0..ev.text_len]);
+
+        try std.testing.expectEqual(@as(c_int, 0), webgrep_pull_next(pull, &ev, &sum));
+        try std.testing.expectEqual(@as(u64, 3), sum.matched_lines);
+    }
+
+    // Reader pull iterator
+    const ChunkReader = struct {
+        data: []const u8,
+        pos: usize = 0,
+        fn read(buf: [*c]u8, cap: usize, out_n: [*c]usize, userdata: ?*anyopaque) callconv(.c) c_int {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            if (self.pos >= self.data.len) {
+                out_n.* = 0;
+                return 0;
+            }
+            const n = @min(@min(cap, 6), self.data.len - self.pos);
+            @memcpy(buf[0..n], self.data[self.pos .. self.pos + n]);
+            self.pos += n;
+            out_n.* = n;
+            return 0;
+        }
+    };
+    {
+        var cr = ChunkReader{ .data = doc };
+        var pull: ?*webgrep_pull_t = null;
+        try std.testing.expectEqual(api.WEBGREP_OK, webgrep_pull_open_reader(m, ChunkReader.read, &cr, null, &pull));
+        defer webgrep_pull_free(pull);
+
+        var ev: api.webgrep_line_event_t = .{};
+        var sum: api.webgrep_summary_t = .{};
+        try std.testing.expectEqual(@as(c_int, 1), webgrep_pull_next(pull, &ev, &sum));
+        try std.testing.expectEqual(ev.bytes_ptr, ev.text_ptr);
+        try std.testing.expectEqual(@as(c_int, 1), webgrep_pull_next(pull, &ev, &sum));
+        try std.testing.expectEqualStrings("TAG \xff\xfe end", ev.bytes_ptr.?[0..ev.bytes_len]);
+        try std.testing.expectEqualStrings("TAG \u{FFFD}\u{FFFD} end", ev.text_ptr.?[0..ev.text_len]);
+        try std.testing.expectEqual(@as(c_int, 1), webgrep_pull_next(pull, &ev, &sum));
+        try std.testing.expectEqual(ev.bytes_ptr, ev.text_ptr);
+        try std.testing.expectEqual(@as(c_int, 0), webgrep_pull_next(pull, &ev, &sum));
+    }
+
+    // Streaming archive reader path traversal -> WEBGREP_ERR_PATH_TRAVERSAL
+    const traversal_tar = try archive_mod.buildTestTarAlloc(std.testing.allocator, &.{
+        .{ .path = "../escape.txt", .data = "TAG\n" },
+    });
+    defer std.testing.allocator.free(traversal_tar);
+    {
+        var cr = ChunkReader{ .data = traversal_tar };
+        var tsum: api.webgrep_tree_summary_t = .{};
+        try std.testing.expectEqual(api.WEBGREP_ERR_PATH_TRAVERSAL, webgrep_search_archive_reader(m, ChunkReader.read, &cr, null, null, null, &tsum));
+    }
 }

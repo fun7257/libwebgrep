@@ -1,6 +1,6 @@
 /**
  * @file webgrep.h
- * @brief C ABI and Cross-Language FFI Header for libwebgrep v0.10.2.
+ * @brief C ABI and Cross-Language FFI Header for libwebgrep v0.10.3.
  *
  * Thread-safe, zero-global-state SIMD literal, multi-pattern, and linear-time
  * regular expression search engine with in-memory archive and streaming reader support.
@@ -35,23 +35,25 @@ extern "C" {
 
 #define WEBGREP_VERSION_MAJOR 0
 #define WEBGREP_VERSION_MINOR 10
-#define WEBGREP_VERSION_PATCH 2
-#define WEBGREP_VERSION_STRING "0.10.2"
+#define WEBGREP_VERSION_PATCH 3
+#define WEBGREP_VERSION_STRING "0.10.3"
 
 /* ============================================================================
  * Status & Error Codes
  * ========================================================================= */
 
 typedef enum webgrep_status_e {
-    WEBGREP_OK                  =  0,
-    WEBGREP_ERR_INVALID_ARG     = -1,
-    WEBGREP_ERR_OUT_OF_MEMORY   = -2,
-    WEBGREP_ERR_SYNTAX          = -3,
-    WEBGREP_ERR_TOO_LARGE       = -4,
-    WEBGREP_ERR_BUDGET_EXCEEDED = -5,
-    WEBGREP_ERR_IO              = -6,
-    WEBGREP_ERR_CORRUPT_ARCHIVE = -7,
-    WEBGREP_ERR_ARCHIVE_LIMIT   = -8
+    WEBGREP_OK                     =  0,
+    WEBGREP_ERR_INVALID_ARG        = -1,
+    WEBGREP_ERR_OUT_OF_MEMORY      = -2,
+    WEBGREP_ERR_SYNTAX             = -3,
+    WEBGREP_ERR_TOO_LARGE          = -4,
+    WEBGREP_ERR_BUDGET_EXCEEDED    = -5,
+    WEBGREP_ERR_IO                 = -6,
+    WEBGREP_ERR_CORRUPT_ARCHIVE    = -7,
+    WEBGREP_ERR_ARCHIVE_LIMIT      = -8,
+    WEBGREP_ERR_PATH_TRAVERSAL     = -9,
+    WEBGREP_ERR_UNSUPPORTED_FORMAT = -10
 } webgrep_status_t;
 
 /* Convenience aliases for error codes */
@@ -66,8 +68,6 @@ typedef enum webgrep_status_e {
 #define WEBGREP_ERR_ARCHIVE_INVALID    WEBGREP_ERR_CORRUPT_ARCHIVE
 #define WEBGREP_ERR_ARCHIVE_CORRUPT    WEBGREP_ERR_CORRUPT_ARCHIVE
 #define WEBGREP_ERR_ARCHIVE            WEBGREP_ERR_CORRUPT_ARCHIVE
-#define WEBGREP_ERR_PATH_TRAVERSAL     WEBGREP_ERR_CORRUPT_ARCHIVE
-#define WEBGREP_ERR_UNSUPPORTED_FORMAT WEBGREP_ERR_CORRUPT_ARCHIVE
 
 /* ============================================================================
  * Enumerations
@@ -148,7 +148,13 @@ typedef enum webgrep_flow_action_e {
     WEBGREP_FLOW_SKIP_TO = 3
 } webgrep_flow_action_t;
 
-/** Budget limit reached during a search. */
+/**
+ * Budget limit reached during a search.
+ * Note: Exceeding either `max_decode_bytes` (decompressed byte cap) or `max_compression_ratio`
+ * (expansion ratio cap; 0 uses default 100, UINT64_MAX disables ratio check) records
+ * `WEBGREP_LIMIT_DECOMPRESSED_BYTES` and returns `WEBGREP_ERR_BUDGET_EXCEEDED`
+ * (or `WEBGREP_ERR_ARCHIVE_LIMIT` when unpacking archives).
+ */
 typedef enum webgrep_limit_hit_e {
     WEBGREP_LIMIT_NONE               = 0,
     WEBGREP_LIMIT_MAX_RESULTS        = 1,
@@ -524,10 +530,21 @@ typedef int (*webgrep_read_cb)(uint8_t *buf, size_t cap, size_t *out_n, void *us
 typedef int (*webgrep_read_at_cb)(uint64_t offset, uint8_t *buf, size_t cap, size_t *out_n, void *userdata);
 
 /* ============================================================================
- * Exported C ABI Functions (59 Functions)
+ * Custom Allocator Hook
  * ========================================================================= */
 
-/** 1. Returns the null-terminated semantic version string ("0.10.2"). */
+/** Custom allocator callbacks installed via `webgrep_set_allocator`. */
+typedef struct webgrep_allocator_t {
+    void *(*alloc)(void *ctx, size_t size, size_t alignment);
+    void (*free)(void *ctx, void *ptr, size_t size, size_t alignment);
+    void *ctx;
+} webgrep_allocator_t;
+
+/* ============================================================================
+ * Exported C ABI Functions (60 Functions)
+ * ========================================================================= */
+
+/** 1. Returns the null-terminated semantic version string ("0.10.3"). */
 WEBGREP_API const char *webgrep_version(void);
 
 /** 2. Returns default literal/multi find options by value. */
@@ -980,6 +997,13 @@ WEBGREP_API int webgrep_search_reader_flow(
     void                    *userdata,
     webgrep_summary_t       *out_summary
 );
+
+/**
+ * 60. Installs a process-wide custom allocator for all C ABI heap allocations.
+ * Pass NULL (or a struct with NULL `alloc`/`free`) to restore the default allocator.
+ * Free handles allocated under the previous allocator before switching.
+ */
+WEBGREP_API void webgrep_set_allocator(const webgrep_allocator_t *alloc);
 
 #ifdef __cplusplus
 }

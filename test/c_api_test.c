@@ -1,16 +1,23 @@
 /**
  * @file c_api_test.c
- * @brief Comprehensive C ABI and FFI verification suite for libwebgrep v0.10.2.
+ * @brief Comprehensive C ABI and FFI verification suite for libwebgrep v0.10.3.
  *
- * Exercises all 52 exported C ABI functions, adversarial streaming reader callbacks,
+ * Exercises all 60 exported C ABI functions, adversarial streaming reader callbacks,
  * corrupt and path-traversal archives, NULL/boundary pointer checks, 1,000 allocation/free
  * cycles, and 8-thread concurrent shared-matcher stress tests.
  */
 
 #include "../include/webgrep.h"
 
+/* Ensure test assertions and side-effecting calls remain active under ReleaseFast (-DNDEBUG). */
+#undef NDEBUG
 #include <assert.h>
-#include <pthread.h>
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#else
+#  include <pthread.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -300,12 +307,11 @@ typedef struct {
     int                      passed;
 } thread_worker_arg_t;
 
-static void *concurrent_worker(void *arg) {
-    thread_worker_arg_t *w = (thread_worker_arg_t *)arg;
+static void concurrent_worker_run(thread_worker_arg_t *w) {
     webgrep_scratch_t *scratch = webgrep_scratch_new();
     if (!scratch) {
         w->passed = 0;
-        return NULL;
+        return;
     }
 
     webgrep_config_t cfg = webgrep_config_default();
@@ -320,7 +326,7 @@ static void *concurrent_worker(void *arg) {
         if (f_rc != 1 || m.start != 17) {
             webgrep_scratch_free(scratch);
             w->passed = 0;
-            return NULL;
+            return;
         }
 
         uint32_t ids[4] = {0};
@@ -329,7 +335,7 @@ static void *concurrent_worker(void *arg) {
         if (s_rc != WEBGREP_OK || count != 2 || ids[0] != 0 || ids[1] != 1) {
             webgrep_scratch_free(scratch);
             w->passed = 0;
-            return NULL;
+            return;
         }
 
         line_capture_ctx_t lctx;
@@ -348,13 +354,61 @@ static void *concurrent_worker(void *arg) {
         if (sr_rc != WEBGREP_OK || sum.matched_lines != 2 || lctx.matched_lines != 2) {
             webgrep_scratch_free(scratch);
             w->passed = 0;
-            return NULL;
+            return;
         }
     }
 
     webgrep_scratch_free(scratch);
     w->passed = 1;
+}
+
+#ifdef _WIN32
+static DWORD WINAPI concurrent_worker(LPVOID arg) {
+    concurrent_worker_run((thread_worker_arg_t *)arg);
+    return 0;
+}
+#else
+static void *concurrent_worker(void *arg) {
+    concurrent_worker_run((thread_worker_arg_t *)arg);
     return NULL;
+}
+#endif
+
+/* ============================================================================
+ * Custom Allocator Test Hook
+ * ========================================================================= */
+
+typedef struct {
+    size_t allocs;
+    size_t frees;
+    size_t live_bytes;
+    size_t fail_after;
+    int    enable_fail;
+} c_test_alloc_ctx_t;
+
+static void *c_test_alloc(void *ctx, size_t size, size_t alignment) {
+    c_test_alloc_ctx_t *st = (c_test_alloc_ctx_t *)ctx;
+    if (st->enable_fail && st->allocs >= st->fail_after) return NULL;
+    size_t align = alignment < sizeof(void *) ? sizeof(void *) : alignment;
+    size_t total = size + align + sizeof(void *);
+    uint8_t *raw = (uint8_t *)malloc(total);
+    if (!raw) return NULL;
+    uintptr_t addr = (uintptr_t)(raw + sizeof(void *));
+    uintptr_t aligned = (addr + align - 1u) & ~(uintptr_t)(align - 1u);
+    ((void **)aligned)[-1] = raw;
+    st->allocs++;
+    st->live_bytes += size;
+    return (void *)aligned;
+}
+
+static void c_test_free(void *ctx, void *ptr, size_t size, size_t alignment) {
+    (void)alignment;
+    c_test_alloc_ctx_t *st = (c_test_alloc_ctx_t *)ctx;
+    if (!ptr) return;
+    void *raw = ((void **)ptr)[-1];
+    free(raw);
+    st->frees++;
+    st->live_bytes -= size;
 }
 
 /* ============================================================================
@@ -367,7 +421,7 @@ int main(void) {
     /* 1. webgrep_version() */
     const char *ver = webgrep_version();
     assert(ver != NULL);
-    assert(strcmp(ver, "0.10.2") == 0);
+    assert(strcmp(ver, "0.10.3") == 0);
     printf("[1/16] webgrep_version(): PASS (version=\"%s\")\n", ver);
 
     /* 2. *_default() option & config functions */
@@ -661,8 +715,23 @@ int main(void) {
     webgrep_matcher_t *shared_rset = NULL;
     assert(webgrep_matcher_compile_regex_set(shared_pats, 2, NULL, NULL, &shared_rset) == WEBGREP_OK);
 
-    pthread_t threads[8];
     thread_worker_arg_t targs[8];
+#ifdef _WIN32
+    HANDLE threads[8];
+    for (int t = 0; t < 8; ++t) {
+        targs[t].lit_matcher = shared_lit;
+        targs[t].re_set_matcher = shared_rset;
+        targs[t].passed = 0;
+        threads[t] = CreateThread(NULL, 0, concurrent_worker, &targs[t], 0, NULL);
+        assert(threads[t] != NULL);
+    }
+    for (int t = 0; t < 8; ++t) {
+        assert(WaitForSingleObject(threads[t], INFINITE) == WAIT_OBJECT_0);
+        assert(CloseHandle(threads[t]) != 0);
+        assert(targs[t].passed == 1);
+    }
+#else
+    pthread_t threads[8];
     for (int t = 0; t < 8; ++t) {
         targs[t].lit_matcher = shared_lit;
         targs[t].re_set_matcher = shared_rset;
@@ -673,6 +742,7 @@ int main(void) {
         assert(pthread_join(threads[t], NULL) == 0);
         assert(targs[t].passed == 1);
     }
+#endif
     webgrep_matcher_free(shared_lit);
     webgrep_matcher_free(shared_rset);
     printf("[15/16] Multithreaded concurrency (8 threads, shared matchers): PASS\n");
@@ -1273,7 +1343,326 @@ int main(void) {
         webgrep_matcher_free(m_inc);
         webgrep_matcher_free(m_exc);
     }
-    printf("[25/25] v0.8 C ABI (regex filters, unicode_classes, Flow.skipTo/pause, ResumeState, encodings): PASS\n");
-    printf("=== ALL 25 C ABI TEST SECTIONS PASSED ===\n");
+    printf("[25/26] v0.8 C ABI (regex filters, unicode_classes, Flow.skipTo/pause, ResumeState, encodings): PASS\n");
+
+    /* 26. v0.10.3 C ABI: custom allocator hook, pull_next lossy UTF-8, distinct archive error codes, isolated ratio check */
+    {
+        /* (a) Custom allocator hook: tracks all allocations/frees and deterministic OOM */
+        c_test_alloc_ctx_t actx = { 0, 0, 0, 0, 0 };
+        webgrep_allocator_t custom_alloc = {
+            .alloc = c_test_alloc,
+            .free = c_test_free,
+            .ctx = &actx
+        };
+        webgrep_set_allocator(&custom_alloc);
+        {
+            webgrep_matcher_t *cm_re = NULL;
+            assert(webgrep_matcher_compile_regex((const uint8_t *)"item_[0-9]+", 11, NULL, NULL, &cm_re) == WEBGREP_OK);
+            webgrep_scratch_t *cs = webgrep_scratch_new();
+            assert(cs != NULL);
+            webgrep_config_t ccfg = webgrep_config_default();
+            ccfg.scratch = cs;
+            webgrep_summary_t csum;
+            const char *cdoc = "row item_7 ok\n";
+            assert(webgrep_search_slice(cm_re, (const uint8_t *)cdoc, strlen(cdoc), &ccfg, NULL, NULL, &csum) == WEBGREP_OK);
+            assert(csum.matched_lines == 1);
+            webgrep_scratch_free(cs);
+            webgrep_matcher_free(cm_re);
+        }
+        assert(actx.allocs > 0 && actx.allocs == actx.frees && actx.live_bytes == 0);
+
+        actx.enable_fail = 1;
+        actx.fail_after = actx.allocs;
+        webgrep_matcher_t *oom_m = NULL;
+        assert(webgrep_matcher_compile_literal((const uint8_t *)"oom", 3, NULL, &oom_m) == WEBGREP_ERR_OUT_OF_MEMORY);
+        assert(oom_m == NULL && actx.live_bytes == 0);
+        webgrep_set_allocator(NULL);
+
+        /* (b) webgrep_pull_next UTF-8 contract: valid zero-copy vs invalid U+FFFD lossy text */
+        webgrep_matcher_t *m_tag = NULL;
+        assert(webgrep_matcher_compile_literal((const uint8_t *)"TAG", 3, NULL, &m_tag) == WEBGREP_OK);
+        const uint8_t bad_utf8_doc[] = {
+            'T','A','G',' ','o','k','\n',
+            'T','A','G',' ',0xFF,0xFE,' ','x','\n'
+        };
+        webgrep_pull_t *pull = NULL;
+        assert(webgrep_pull_open_slice(m_tag, bad_utf8_doc, sizeof(bad_utf8_doc), NULL, &pull) == WEBGREP_OK);
+        webgrep_line_event_t ev;
+        webgrep_summary_t sum;
+        assert(webgrep_pull_next(pull, &ev, &sum) == 1);
+        assert(ev.text_ptr == ev.bytes_ptr && ev.text_len == 6);
+        assert(webgrep_pull_next(pull, &ev, &sum) == 1);
+        assert(ev.bytes_len == 8 && ev.bytes_ptr[4] == 0xFF && ev.bytes_ptr[5] == 0xFE);
+        assert(ev.text_ptr != ev.bytes_ptr);
+        const uint8_t expected_lossy[] = { 'T','A','G',' ',0xEF,0xBF,0xBD,0xEF,0xBF,0xBD,' ','x' };
+        assert(ev.text_len == sizeof(expected_lossy));
+        assert(memcmp(ev.text_ptr, expected_lossy, sizeof(expected_lossy)) == 0);
+        assert(webgrep_pull_next(pull, &ev, &sum) == 0);
+        webgrep_pull_free(pull);
+
+        /* (b) Distinct WEBGREP_ERR_PATH_TRAVERSAL (-9) and WEBGREP_ERR_UNSUPPORTED_FORMAT (-10) */
+        assert(WEBGREP_ERR_PATH_TRAVERSAL == -9);
+        assert(WEBGREP_ERR_UNSUPPORTED_FORMAT == -10);
+        assert(WEBGREP_ERR_PATH_TRAVERSAL != WEBGREP_ERR_CORRUPT_ARCHIVE);
+        assert(WEBGREP_ERR_UNSUPPORTED_FORMAT != WEBGREP_ERR_CORRUPT_ARCHIVE);
+
+        uint8_t trav_tar[2048];
+        memset(trav_tar, 0, sizeof(trav_tar));
+        write_tar_header(trav_tar, "../etc/passwd", 4, '0', NULL);
+        memcpy(trav_tar + 512, "TAG\n", 4);
+        webgrep_tree_summary_t tsum;
+        assert(webgrep_search_archive_slice(m_tag, trav_tar, sizeof(trav_tar), NULL, NULL, NULL, &tsum) == WEBGREP_ERR_PATH_TRAVERSAL);
+
+        uint8_t enc_zip[512];
+        size_t ez_len = build_stored_zip_single(enc_zip, sizeof(enc_zip), "enc.txt", (const uint8_t *)"TAG\n", 4);
+        enc_zip[6] |= 1u;
+        size_t cd_pos = 30 + strlen("enc.txt") + 4;
+        enc_zip[cd_pos + 8] |= 1u;
+        assert(webgrep_search_archive_slice(m_tag, enc_zip, ez_len, NULL, NULL, NULL, &tsum) == WEBGREP_ERR_UNSUPPORTED_FORMAT);
+
+        /* (c) Isolated max_compression_ratio (large max_decode_bytes = 64 MiB, ratio = 5)
+         * Valid 29-byte RFC 1952 Gzip bomb inflating to 1032 'A' bytes (ratio 35.6x > 5) */
+        const uint8_t bomb_gz[] = {
+            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff,
+            0x73, 0x74, 0x1c, 0x05, 0xa3, 0x60, 0x14, 0x8c, 0x74, 0x00,
+            0x00, 0xdb, 0xbc, 0x2d, 0x49, 0x08, 0x04, 0x00, 0x00
+        };
+        webgrep_config_t rcfg = webgrep_config_default();
+        rcfg.compression = WEBGREP_COMPRESSION_GZIP;
+        rcfg.max_decode_bytes = 64u * 1024u * 1024u;
+        rcfg.max_compression_ratio = 5;
+        memset(&sum, 0, sizeof(sum));
+        assert(webgrep_search_slice(m_tag, bomb_gz, sizeof(bomb_gz), &rcfg, NULL, NULL, &sum) == WEBGREP_ERR_BUDGET_EXCEEDED);
+        assert(sum.limit_hit == WEBGREP_LIMIT_DECOMPRESSED_BYTES);
+
+        rcfg.max_compression_ratio = 100;
+        memset(&sum, 0, sizeof(sum));
+        assert(webgrep_search_slice(m_tag, bomb_gz, sizeof(bomb_gz), &rcfg, NULL, NULL, &sum) == WEBGREP_OK);
+        assert(sum.limit_hit == WEBGREP_LIMIT_NONE);
+
+        rcfg.max_decode_bytes = 128;
+        rcfg.max_compression_ratio = UINT64_MAX;
+        memset(&sum, 0, sizeof(sum));
+        assert(webgrep_search_slice(m_tag, bomb_gz, sizeof(bomb_gz), &rcfg, NULL, NULL, &sum) == WEBGREP_ERR_BUDGET_EXCEEDED);
+        assert(sum.limit_hit == WEBGREP_LIMIT_DECOMPRESSED_BYTES);
+
+        webgrep_matcher_free(m_tag);
+    }
+    printf("[26/27] v0.10.3 C ABI (custom allocator, pull_next UTF-8, path traversal/unsupported format, isolated ratio): PASS\n");
+
+    /* 27. C ABI error-path & exhaustive OOM-rollback leak regression (compile_*, pull_open_*) */
+    {
+        /* Compile a valid matcher under the default allocator for pull_open_* leak checks */
+        webgrep_matcher_t *valid_m = NULL;
+        assert(webgrep_matcher_compile_literal((const uint8_t *)"HIT", 3, NULL, &valid_m) == WEBGREP_OK);
+
+        c_test_alloc_ctx_t actx = { 0, 0, 0, 0, 0 };
+        webgrep_allocator_t custom_alloc = {
+            .alloc = c_test_alloc,
+            .free = c_test_free,
+            .ctx = &actx
+        };
+        webgrep_set_allocator(&custom_alloc);
+
+        /* (a) Deterministic non-OOM error returns must leave live_bytes == 0 */
+        {
+            webgrep_matcher_t *m = NULL;
+            webgrep_find_options_t fo = webgrep_find_options_default();
+            assert(webgrep_matcher_compile_literal((const uint8_t *)"a\nb", 3, &fo, &m) == WEBGREP_ERR_SYNTAX);
+            assert(m == NULL && actx.live_bytes == 0 && actx.allocs == actx.frees);
+
+            webgrep_pattern_t nl_pats[2] = {
+                { (const uint8_t *)"alpha", 5 },
+                { (const uint8_t *)"be\nta", 5 }
+            };
+            assert(webgrep_matcher_compile_multi(nl_pats, 2, &fo, &m) == WEBGREP_ERR_SYNTAX);
+            assert(m == NULL && actx.live_bytes == 0 && actx.allocs == actx.frees);
+
+            fo.max_patterns = 1;
+            webgrep_pattern_t ok_pats[2] = {
+                { (const uint8_t *)"alpha", 5 },
+                { (const uint8_t *)"beta",  4 }
+            };
+            assert(webgrep_matcher_compile_multi(ok_pats, 2, &fo, &m) == WEBGREP_ERR_TOO_LARGE);
+            assert(m == NULL && actx.live_bytes == 0 && actx.allocs == actx.frees);
+
+            fo = webgrep_find_options_default();
+            fo.max_pattern_bytes = 3;
+            assert(webgrep_matcher_compile_multi(ok_pats, 1, &fo, &m) == WEBGREP_ERR_TOO_LARGE);
+            assert(m == NULL && actx.live_bytes == 0 && actx.allocs == actx.frees);
+
+            webgrep_compile_diag_t diag;
+            assert(webgrep_matcher_compile_regex((const uint8_t *)"(unclosed", 9, NULL, &diag, &m) == WEBGREP_ERR_SYNTAX);
+            assert(m == NULL && actx.live_bytes == 0 && actx.allocs == actx.frees);
+
+            webgrep_pattern_t bad_rset[2] = {
+                { (const uint8_t *)"valid_[0-9]+", 12 },
+                { (const uint8_t *)"[unclosed",     9 }
+            };
+            assert(webgrep_matcher_compile_regex_set(bad_rset, 2, NULL, &diag, &m) == WEBGREP_ERR_SYNTAX);
+            assert(m == NULL && actx.live_bytes == 0 && actx.allocs == actx.frees);
+
+            /* pull_open_slice & pull_open_reader error returns after PullBox + ConfigGuard allocation */
+            webgrep_pull_t *pull = NULL;
+            webgrep_config_t bad_cfg = webgrep_config_default();
+            bad_cfg.encoding = 999; /* invalid encoding after PullBox create */
+            assert(webgrep_pull_open_slice(valid_m, (const uint8_t *)"HIT\n", 4, &bad_cfg, &pull) == WEBGREP_ERR_INVALID_ARG);
+            assert(pull == NULL && actx.live_bytes == 0 && actx.allocs == actx.frees);
+
+            mem_reader_ctx_t mr = { .data = (const uint8_t *)"HIT\n", .len = 4, .pos = 0, .chunk_size = 4 };
+            assert(webgrep_pull_open_reader(valid_m, mem_read_cb, &mr, &bad_cfg, &pull) == WEBGREP_ERR_INVALID_ARG);
+            assert(pull == NULL && actx.live_bytes == 0 && actx.allocs == actx.frees);
+
+            /* contains_ptr allocates before excludes_ptr fails InvalidArg */
+            webgrep_pattern_t filt_pat[1] = { { (const uint8_t *)"HIT", 3 } };
+            webgrep_config_t partial_cfg = webgrep_config_default();
+            partial_cfg.contains_ptr = filt_pat;
+            partial_cfg.contains_len = 1;
+            partial_cfg.excludes_ptr = NULL;
+            partial_cfg.excludes_len = 1;
+            assert(webgrep_pull_open_slice(valid_m, (const uint8_t *)"HIT\n", 4, &partial_cfg, &pull) == WEBGREP_ERR_INVALID_ARG);
+            assert(pull == NULL && actx.live_bytes == 0 && actx.allocs == actx.frees);
+            assert(webgrep_pull_open_reader(valid_m, mem_read_cb, &mr, &partial_cfg, &pull) == WEBGREP_ERR_INVALID_ARG);
+            assert(pull == NULL && actx.live_bytes == 0 && actx.allocs == actx.frees);
+        }
+
+        /* (b) Exhaustive OOM-rollback sweep: fail at every single allocation site (0..N) */
+        {
+            /* 1. compile_literal */
+            int reached_ok = 0;
+            for (size_t k = 0; k < 64; ++k) {
+                actx.allocs = 0; actx.frees = 0; actx.live_bytes = 0;
+                actx.enable_fail = 1; actx.fail_after = k;
+                webgrep_matcher_t *m = NULL;
+                int rc = webgrep_matcher_compile_literal((const uint8_t *)"needle_oom", 10, NULL, &m);
+                if (rc == WEBGREP_OK) {
+                    assert(m != NULL);
+                    webgrep_matcher_free(m);
+                    assert(actx.live_bytes == 0 && actx.allocs == actx.frees);
+                    reached_ok = 1;
+                    break;
+                }
+                assert(rc == WEBGREP_ERR_OUT_OF_MEMORY && m == NULL);
+                assert(actx.live_bytes == 0 && actx.allocs == actx.frees);
+            }
+            assert(reached_ok == 1);
+
+            /* 2. compile_multi */
+            webgrep_pattern_t mpats[2] = {
+                { (const uint8_t *)"alpha_oom", 9 },
+                { (const uint8_t *)"beta_oom",  8 }
+            };
+            reached_ok = 0;
+            for (size_t k = 0; k < 128; ++k) {
+                actx.allocs = 0; actx.frees = 0; actx.live_bytes = 0;
+                actx.enable_fail = 1; actx.fail_after = k;
+                webgrep_matcher_t *m = NULL;
+                int rc = webgrep_matcher_compile_multi(mpats, 2, NULL, &m);
+                if (rc == WEBGREP_OK) {
+                    assert(m != NULL);
+                    webgrep_matcher_free(m);
+                    assert(actx.live_bytes == 0 && actx.allocs == actx.frees);
+                    reached_ok = 1;
+                    break;
+                }
+                assert(rc == WEBGREP_ERR_OUT_OF_MEMORY && m == NULL);
+                assert(actx.live_bytes == 0 && actx.allocs == actx.frees);
+            }
+            assert(reached_ok == 1);
+
+            /* 3. compile_regex */
+            reached_ok = 0;
+            for (size_t k = 0; k < 256; ++k) {
+                actx.allocs = 0; actx.frees = 0; actx.live_bytes = 0;
+                actx.enable_fail = 1; actx.fail_after = k;
+                webgrep_matcher_t *m = NULL;
+                webgrep_compile_diag_t diag;
+                int rc = webgrep_matcher_compile_regex((const uint8_t *)"user_([0-9]+)", 13, NULL, &diag, &m);
+                if (rc == WEBGREP_OK) {
+                    assert(m != NULL);
+                    webgrep_matcher_free(m);
+                    assert(actx.live_bytes == 0 && actx.allocs == actx.frees);
+                    reached_ok = 1;
+                    break;
+                }
+                assert(rc == WEBGREP_ERR_OUT_OF_MEMORY && m == NULL);
+                assert(actx.live_bytes == 0 && actx.allocs == actx.frees);
+            }
+            assert(reached_ok == 1);
+
+            /* 4. compile_regex_set */
+            webgrep_pattern_t rpats[2] = {
+                { (const uint8_t *)"err_[0-9]+",  10 },
+                { (const uint8_t *)"warn_[a-z]+", 11 }
+            };
+            reached_ok = 0;
+            for (size_t k = 0; k < 256; ++k) {
+                actx.allocs = 0; actx.frees = 0; actx.live_bytes = 0;
+                actx.enable_fail = 1; actx.fail_after = k;
+                webgrep_matcher_t *m = NULL;
+                webgrep_compile_diag_t diag;
+                int rc = webgrep_matcher_compile_regex_set(rpats, 2, NULL, &diag, &m);
+                if (rc == WEBGREP_OK) {
+                    assert(m != NULL);
+                    webgrep_matcher_free(m);
+                    assert(actx.live_bytes == 0 && actx.allocs == actx.frees);
+                    reached_ok = 1;
+                    break;
+                }
+                assert(rc == WEBGREP_ERR_OUT_OF_MEMORY && m == NULL);
+                assert(actx.live_bytes == 0 && actx.allocs == actx.frees);
+            }
+            assert(reached_ok == 1);
+
+            /* 5. pull_open_slice (with contains_ptr so ConfigGuard allocates) */
+            webgrep_pattern_t cpat[1] = { { (const uint8_t *)"HIT", 3 } };
+            webgrep_config_t pcfg = webgrep_config_default();
+            pcfg.contains_ptr = cpat;
+            pcfg.contains_len = 1;
+            const char *pdoc = "HIT line\n";
+            reached_ok = 0;
+            for (size_t k = 0; k < 64; ++k) {
+                actx.allocs = 0; actx.frees = 0; actx.live_bytes = 0;
+                actx.enable_fail = 1; actx.fail_after = k;
+                webgrep_pull_t *pull = NULL;
+                int rc = webgrep_pull_open_slice(valid_m, (const uint8_t *)pdoc, strlen(pdoc), &pcfg, &pull);
+                if (rc == WEBGREP_OK) {
+                    assert(pull != NULL);
+                    webgrep_pull_free(pull);
+                    assert(actx.live_bytes == 0 && actx.allocs == actx.frees);
+                    reached_ok = 1;
+                    break;
+                }
+                assert(rc == WEBGREP_ERR_OUT_OF_MEMORY && pull == NULL);
+                assert(actx.live_bytes == 0 && actx.allocs == actx.frees);
+            }
+            assert(reached_ok == 1);
+
+            /* 6. pull_open_reader (with contains_ptr so ConfigGuard + ReaderPull allocate) */
+            reached_ok = 0;
+            for (size_t k = 0; k < 64; ++k) {
+                actx.allocs = 0; actx.frees = 0; actx.live_bytes = 0;
+                actx.enable_fail = 1; actx.fail_after = k;
+                mem_reader_ctx_t mr = { .data = (const uint8_t *)pdoc, .len = strlen(pdoc), .pos = 0, .chunk_size = 4 };
+                webgrep_pull_t *pull = NULL;
+                int rc = webgrep_pull_open_reader(valid_m, mem_read_cb, &mr, &pcfg, &pull);
+                if (rc == WEBGREP_OK) {
+                    assert(pull != NULL);
+                    webgrep_pull_free(pull);
+                    assert(actx.live_bytes == 0 && actx.allocs == actx.frees);
+                    reached_ok = 1;
+                    break;
+                }
+                assert(rc == WEBGREP_ERR_OUT_OF_MEMORY && pull == NULL);
+                assert(actx.live_bytes == 0 && actx.allocs == actx.frees);
+            }
+            assert(reached_ok == 1);
+        }
+
+        webgrep_set_allocator(NULL);
+        webgrep_matcher_free(valid_m);
+    }
+    printf("[27/27] C ABI error-path & OOM-rollback zero-leak regression (compile_*, pull_open_*): PASS\n");
+    printf("=== ALL 27 C ABI TEST SECTIONS PASSED ===\n");
     return 0;
 }

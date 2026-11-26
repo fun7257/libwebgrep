@@ -1189,7 +1189,10 @@ test "symbolic links are not traversed and cannot escape search root" {
     try tmp.dir.writeFile(io, .{ .sub_path = "root/inside.txt", .data = "inside" });
     try tmp.dir.createDir(io, "root/sub", .default_dir);
     try tmp.dir.writeFile(io, .{ .sub_path = "root/sub/nested.txt", .data = "nested" });
-    try tmp.dir.symLink(io, "inside.txt", "root/link_inside", .{});
+    tmp.dir.symLink(io, "inside.txt", "root/link_inside", .{}) catch |err| switch (err) {
+        error.AccessDenied, error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
     try tmp.dir.symLink(io, "../outside.txt", "root/link_outside", .{});
     try tmp.dir.symLink(io, "sub", "root/link_sub", .{ .is_directory = true });
     try tmp.dir.symLink(io, "../escaped", "root/link_dir", .{ .is_directory = true });
@@ -1534,7 +1537,10 @@ test "follow_symlinks traverses files and dirs, halts on cycles, and soft-errors
     try tmp.dir.writeFile(io, .{ .sub_path = "root/real.txt", .data = "real" });
     try tmp.dir.createDir(io, "root/sub", .default_dir);
     try tmp.dir.writeFile(io, .{ .sub_path = "root/sub/nested.txt", .data = "nested" });
-    try tmp.dir.symLink(io, "../target_file.txt", "root/link_file.txt", .{});
+    tmp.dir.symLink(io, "../target_file.txt", "root/link_file.txt", .{}) catch |err| switch (err) {
+        error.AccessDenied, error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
     try tmp.dir.symLink(io, "../target_dir", "root/link_dir", .{ .is_directory = true });
     try tmp.dir.symLink(io, "..", "root/sub/loop_to_root", .{ .is_directory = true });
     try tmp.dir.symLink(io, "does_not_exist.txt", "root/broken_link", .{});

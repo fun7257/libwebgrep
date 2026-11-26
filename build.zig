@@ -328,7 +328,7 @@ fn readRepoFile(b: *std.Build, sub_path: []const u8) []const u8 {
         sub_path
     else
         b.pathJoin(&.{ b.root.sub_path, sub_path });
-    return b.root.root_dir.handle.readFileAlloc(
+    const raw = b.root.root_dir.handle.readFileAlloc(
         b.graph.io,
         full,
         b.allocator,
@@ -336,6 +336,18 @@ fn readRepoFile(b: *std.Build, sub_path: []const u8) []const u8 {
     ) catch |err| {
         std.process.fatal("failed to read {s}: {s}", .{ sub_path, @errorName(err) });
     };
+    // Normalize CRLF -> LF so documentation checks and example extraction are
+    // unaffected by Windows `core.autocrlf = true` checkouts.
+    if (std.mem.indexOf(u8, raw, "\r\n") == null) return raw;
+    const out = b.allocator.alloc(u8, raw.len) catch @panic("OOM");
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i < raw.len) : (i += 1) {
+        if (raw[i] == '\r' and i + 1 < raw.len and raw[i + 1] == '\n') continue;
+        out[w] = raw[i];
+        w += 1;
+    }
+    return out[0..w];
 }
 
 fn extractApiExample(md: []const u8) []const u8 {

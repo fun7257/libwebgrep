@@ -3,7 +3,7 @@
 //! This is how each platform obtains the same pair of numbers, not an optional performance toggle:
 //! Linux uses `dev_major` / `dev_minor` / `ino` from `statx`.
 //! Other POSIX platforms use `dev` / `ino` from `fstat`.
-//! Windows `File.Stat` lacks a device ID, so only the inode is used (noted in the design documentation).
+//! Windows uses `NtQueryVolumeInformationFile` (`VolumeSerialNumber`) and `NtQueryInformationFile` (`IndexNumber`).
 
 const builtin = @import("builtin");
 const std = @import("std");
@@ -22,20 +22,53 @@ pub const Error = error{Unexpected} || std.Io.File.StatError;
 pub fn fromDir(dir: std.Io.Dir) Error!Id {
     switch (builtin.os.tag) {
         .linux => return linuxId(dir.handle),
-        .windows => return .{ .dev = 0, .ino = 0 },
+        .windows => return windowsId(dir.handle),
         else => return posixId(dir.handle),
     }
 }
 
 pub fn fromFile(io: std.Io, file: std.Io.File) Error!Id {
+    _ = io;
     switch (builtin.os.tag) {
         .linux => return linuxId(file.handle),
-        .windows => {
-            const stat = try file.stat(io);
-            return .{ .dev = 0, .ino = toU64(stat.inode) };
-        },
+        .windows => return windowsId(file.handle),
         else => return posixId(file.handle),
     }
+}
+
+fn windowsId(handle: std.os.windows.HANDLE) Error!Id {
+    const windows = std.os.windows;
+    var io_status_block: windows.IO_STATUS_BLOCK = undefined;
+    var info: windows.FILE.INTERNAL_INFORMATION = undefined;
+    switch (windows.ntdll.NtQueryInformationFile(
+        handle,
+        &io_status_block,
+        &info,
+        @sizeOf(windows.FILE.INTERNAL_INFORMATION),
+        .Internal,
+    )) {
+        .SUCCESS => {},
+        else => return error.Unexpected,
+    }
+    var vol_dev: u64 = 0;
+    var vol_buf: [@sizeOf(windows.FILE.FS_VOLUME_INFORMATION) + 128]u8 align(@alignOf(windows.FILE.FS_VOLUME_INFORMATION)) = undefined;
+    switch (windows.ntdll.NtQueryVolumeInformationFile(
+        handle,
+        &io_status_block,
+        &vol_buf,
+        vol_buf.len,
+        .Volume,
+    )) {
+        .SUCCESS, .BUFFER_OVERFLOW => {
+            const vol: *const windows.FILE.FS_VOLUME_INFORMATION = @ptrCast(&vol_buf);
+            vol_dev = vol.VolumeSerialNumber;
+        },
+        else => {},
+    }
+    return .{
+        .dev = vol_dev,
+        .ino = toU64(info.IndexNumber),
+    };
 }
 
 fn linuxId(handle: std.posix.fd_t) Error!Id {

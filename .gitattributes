@@ -1,0 +1,12 @@
+# Enforce consistent LF line endings across Linux, macOS, and Windows checkouts
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.bin binary
+*.gz binary
+*.zst binary
+*.xz binary
+*.bz2 binary
+*.lz4 binary
+*.zip binary
+*.tar binary
